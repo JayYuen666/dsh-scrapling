@@ -1,0 +1,121 @@
+name: publish
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  # npm trusted publishing（OIDC）要这一项，缺了报 ENEEDAUTH。这条不能省：pnpm 在这里
+  # 拿 id-token 去 registry 换发布凭据，没有它就换不到。缺这条时报的是
+  # ERR_PNPM_ID_TOKEN_GITHUB_WORKFLOW_INCORRECT_PERMISSIONS。
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # action 按 tag 引用意味着上游动 tag 就等于本仓换了构建器。钉 commit SHA，
+      # tag 版本写在同行注释里，升级时照着改这一行即可。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 12
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # 测试里有一批用例以 existsSync(_env/.venv/bin/python3) 为前提才能真跑起来。那个目录被
+      # gitignore（它是机器本地状态），所以 CI 上必须自己备一份。缺了它，那批用例会退化成空转：
+      # host.ts 的覆盖率从 100% 掉到 58%，门禁随之变红——而报错只说「覆盖率不达标」，真正的原因
+      # （环境没备）不出现在任何一行日志里。已实测：本地把 venv 移走，能逐位复现 CI 的数字。
+      # 是 `fetchers` 不是 `rag`：后者才是本插件要的——`extractionType` 默认 markdown，而
+      # markdownify 在 rag 里、不在 fetchers 里。装成 fetchers 的话第一次抓取就抛
+      # ModuleNotFoundError，爬虫那条则因为等一个永远不会出现的产出而变成 20s 超时。
+      # 浏览器**不装**：runner 上没有浏览器二进制时，那次运行里除上面两条外 292 条全过，
+      # 依赖浏览器的是 runIf 门控的占位用例。运行期要用 render / capture_xhr / stealth 时
+      # 才需要浏览器，那是用户侧的运行时依赖，不是测试门槛。
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: 备 sidecar 解释器（覆盖率门禁的前提）
+        run: |
+          python -m venv _env/.venv
+          _env/.venv/bin/python -m pip install --upgrade pip
+          _env/.venv/bin/python -m pip install "scrapling[rag]>=0.4.15,<0.5"
+          _env/.venv/bin/python -c "import scrapling; print('scrapling', scrapling.__version__)"
+      # 首次发布必须先有 token：Trusted Publisher 只能在 npmjs.com 的**包设置页**配置，而那个页面
+      # 只有包已发布后才存在（registry 上查不到本包时，配置入口根本无处可点）。因此顺序是：
+      # ① 配 secrets.NPM_TOKEN，发第一版；② 到包设置页登记 Trusted Publisher；
+      # ③ 验证 OIDC 真能跑通后，再删掉 NPM_TOKEN 并吊销旧 automation token。
+      # ② 到 ③ 之间别拖太久：新建的 trusted publisher 配置有 2 天窗口，期内必须完成第一次
+      # 成功发布，过期即失效且不可编辑，只能删除重建。
+      - name: 确认发布凭据（OIDC 优先，回落静态 token）
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          TOKEN="$(printf '%s' "$NPM_TOKEN" | tr -d '\r\n[:space:]')"
+          if [ -n "$TOKEN" ]; then
+            case "$TOKEN" in
+              npm_*) echo "凭据：secrets.NPM_TOKEN，形态为 npm access token";;
+              ghp_*|github_pat_*) echo "这是 GitHub token——发到公共 npm 需要 npm 站点自己的 token（www.npmjs.com → Access Tokens），GH 的 token 对 npmjs 无效"; exit 1;;
+              *) echo "注意：前缀不是 npm_，请确认它确实是 npm 的 access token";;
+            esac
+            junk=$(printf %s "$TOKEN" | tr -d "A-Za-z0-9_-" | wc -c | tr -d " ")
+            if [ "$junk" != "0" ]; then
+              echo "凭据里混进了非 token 字符（引号、说明文字之类）——请只贴 npm_ 开头那一串，不要带引号"
+              exit 1
+            fi
+            echo "走法：静态 token"
+            exit 0
+          fi
+          # 没有静态 token 时只剩 OIDC 一条路：pnpm 12 内置 trusted publishing
+          # （crates/publish/src/oidc.rs），拿 Actions 的 id-token 去 registry 换凭据。
+          # 这一步原先是无条件 exit 1，于是「没配 NPM_TOKEN」会把 OIDC 那条路整个堵死，
+          # 而 permissions 上那句注释宣称的却是两条路并存。改成转去核对 OIDC 环境。
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "既没有 secrets.NPM_TOKEN，也没有 OIDC 环境（ACTIONS_ID_TOKEN_REQUEST_URL 为空）——两条路都不可用"
+            echo "补法二选一：① 在仓库 Secrets 里加 NPM_TOKEN；② 保留 permissions: id-token: write，"
+            echo "并在 npmjs.com 的 Trusted Publisher 里登记 JayYuen666/dsh-scrapling 与本 workflow"
+            exit 1
+          fi
+          echo "凭据：OIDC trusted publishing（未配 secrets.NPM_TOKEN）"
+          echo "走法：OIDC。身份由 registry 在交换时核验，本 workflow 不接触任何长期凭据"
+      - name: registry 预检（依赖库必须先公开）
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          TOKEN="$(printf '%s' "$NPM_TOKEN" | tr -d '\r\n[:space:]')"
+          if [ -n "$TOKEN" ]; then
+            echo "whoami: $(curl -s -H "Authorization: Bearer $TOKEN" "https://registry.npmjs.org/-/whoami")"
+          else
+            echo "whoami: 跳过（走 OIDC，没有静态 token 可问；身份由 registry 在交换时核验）"
+          fi
+          for pkg in "@jayyuen66%2fdsh-plugin-shared"; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "https://registry.npmjs.org/$pkg")
+            echo "读 $pkg：HTTP $code"
+            if [ "$code" != "200" ]; then
+              echo "判读：404 = 该依赖库还没发到 npmjs，先发它；本包是它的消费方，装不上依赖"
+              exit 1
+            fi
+          done
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run check
+      # test:py 的脚本用 PATH 上的 python3，而这里真正的解释器是上面那个 venv，所以直接点名它。
+      # 此前这一步根本不在 CI 里：84 条 sidecar 端到端用例只在本地跑，发布前它们一次都没参与过判定。
+      - name: Python sidecar 端到端
+        run: _env/.venv/bin/python py/tests/test_bridge.py
+      # prepack 会重建 host.js / client.js；产物不入库也发得出去。
+      # 凭据两条路：配了 NPM_TOKEN 就经 NODE_AUTH_TOKEN 注入；没配就交给 OIDC。
+      # setup-node 配了 registry-url 之后会设 NPM_CONFIG_USERCONFIG 指向它自己生成的那份
+      # .npmrc，npm 只读那一份，$HOME/.npmrc 会被完全忽略 —— 所以 token 必须以环境变量注入，
+      # 不能写文件。publish 那步的 if 也因此不能省：把 NODE_AUTH_TOKEN 设成空串会顶掉
+      # setup-node 注入的那一份，而 OIDC 那条路本来就不该看到它。
+      # --provenance：上面的 id-token: write 就是给它用的，不加等于白拿 OIDC；
+      # 消费方在 npm 页面就能看到这一版是从哪个仓库、哪次构建出来的。
+      # --publish-wait-timeout：等 registry 真正放出这个版本并对 tarball 回 HEAD，
+      # 于是「发出去了但装不上」在 workflow 里就红，而不是等用户报障才发现。
+      - name: 发布
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            export NODE_AUTH_TOKEN="$NPM_TOKEN"
+          fi
+          pnpm publish --no-git-checks --access public --provenance --publish-wait-timeout 600000

@@ -1,0 +1,48 @@
+autoInstallPeers: false
+catalog:
+  "@types/node": 26.6.3
+  "@types/react": 19.3.0
+  "@types/react-dom": 19.3.0
+  "@vitest/coverage-v8": 5.0.2
+  "eslint-plugin-sonarjs": 4.2.2
+  happy-dom: 20.14.5
+  oxfmt: 0.71.0
+  oxlint: 1.86.0
+  "oxlint-tsgolint": 7.0.2003
+  rolldown: 1.2.11
+  typescript: 7.0.2
+  vite: 8.3.1
+  vitest: 5.0.2
+overrides:
+  "@deepseek-ai/cordis": 4.0.5-alpha.1
+  "@deepseek-ai/cordis-plugin-include": 1.0.10-alpha.1
+  "@deepseek-ai/cordis-plugin-loader": 1.0.6-alpha.1
+  "@deepseek-ai/cordis-plugin-timer": 1.1.7-alpha.1
+  "@deepseek-ai/cosmokit": 1.8.6-alpha.1
+  "@deepseek-ai/dsh-client-locale": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-client-store": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-client-ui-layout": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-client-ui-plugin-manager": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-client-ui-primitives": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-client-ui-renderer": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-client-ui-settings": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-client-ui-slots": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-host-webserver": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-jobs": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-jobs-local": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-output-retention": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-package-manifest": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-ptc-runtime": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-sandbox": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-scope": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-session": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-settings": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-shell": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-subprocess": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-system-prompt": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-tools": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-user-approval": 0.2.1-alpha.1
+  "@deepseek-ai/dsh-web": 0.2.1-alpha.1
+  "@deepseek-ai/schemastery": 3.18.5-alpha.1
+allowBuilds: {}
+minimumReleaseAge: 0

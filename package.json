@@ -1,0 +1,136 @@
+{
+  "name": "@jayyuen66/dsh-scrapling",
+  "version": "0.0.1-rc.3",
+  "description": "Scrapling 网页抓取插件（dsh）：静态/浏览器/stealth 抓取 + CSS/XPath 结构化抽取 + 选择器自愈 + capture_xhr + Spider 爬虫，由常驻 Python 进程驱动。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "playwright",
+    "scrapling",
+    "ssrf",
+    "web-scraping"
+  ],
+  "homepage": "https://github.com/JayYuen666/dsh-scrapling#readme",
+  "bugs": {
+    "url": "https://github.com/JayYuen666/dsh-scrapling/issues"
+  },
+  "license": "MIT",
+  "author": "JayYuen",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JayYuen666/dsh-scrapling.git"
+  },
+  "files": [
+    "icon.svg",
+    "host.js",
+    "client.js",
+    "cordis.patch.yml",
+    "py/crawl.py",
+    "py/bridge.py",
+    "py/adapters.py",
+    "py/guard.py",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "type": "module",
+  "sideEffects": [
+    "./host.js",
+    "./client.js"
+  ],
+  "main": "host.js",
+  "exports": {
+    ".": "./host.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./py/*": "./py/*",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "build:client": "node build-client.ts",
+    "build": "node build-host.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
+    "lint": "oxlint .",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest",
+    "check": "npm run --loglevel=warn typecheck && npm run --loglevel=warn lint && npm run --loglevel=warn build:client && npm run --loglevel=warn build && npm run --loglevel=warn test && npm run --loglevel=warn fmt:check",
+    "prepack": "npm run --loglevel=warn build:client && npm run --loglevel=warn build",
+    "fmt:check": "oxfmt --check .",
+    "test:py": "python3 py/tests/test_bridge.py"
+  },
+  "dependencies": {
+    "ipaddr.js": "2.5.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@deepseek-ai/dsh-client-locale": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-store": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-layout": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-plugin-manager": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-host-webserver": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-jobs": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-jobs-local": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-output-retention": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-package-manifest": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-ptc-runtime": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-sandbox": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-scope": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-session": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-settings": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-shell": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-subprocess": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-tools": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-user-approval": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-web": "0.2.1-alpha.1",
+    "@deepseek-ai/schemastery": "3.18.5-alpha.1",
+    "@jayyuen66/dsh-plugin-shared": "^0.1.3",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@vitest/coverage-v8": "catalog:",
+    "eslint-plugin-sonarjs": "catalog:",
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "oxlint-tsgolint": "catalog:",
+    "react": "^19.3.0",
+    "rolldown": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-output-retention": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-tools": "0.2.1-alpha.1",
+    "@deepseek-ai/dsh-web": "0.2.1-alpha.1",
+    "@deepseek-ai/schemastery": "3.18.5-alpha.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "icon": "icon.svg",
+  "engines": {
+    "dsh": ">=0.2.1-alpha.1",
+    "node": ">=22.12.0"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
