@@ -1,0 +1,16 @@
+# dsh-scrapling：Scrapling 网页抓取插件（bundle）。
+# 11 个工具（scrapling_fetch / scrapling_extract / scrapling_render /
+# scrapling_capture_xhr / scrapling_stealth_fetch / scrapling_session_* /
+# scrapling_crawl / scrapling_answer），后端是常驻 Python 进程，经 ctx.subprocess 的 stdin/stdout
+# 跑 JSON-lines 协议（stdout 走协议、stderr 走日志）。
+# 每个工具一个 Config .volatile() 开关；关闭时连 systemPrompt 指引段也不注册。
+# 浏览器未就绪时不注册依赖浏览器的工具，并在设置卡给出安装指引。
+# 安全不变量：page_action / page_setup / selector_config / proxy 绝不进模型
+# schema —— 浏览器侧的 SSRF 守卫由 Python 侧自己注册，不接受模型传入的回调。
+#
+# 组合包层：本文件由 package.json 的 dsh.bundle.patch 指向，随
+# `dsh plugin --profile web add/remove @jayyuen66/dsh-scrapling` 维护。
+# 行按裸包名引用本包（client-modules 只扫描裸包名条目的 dsh.client 声明）。
+- insert:
+    - id: scrapling
+      name: "@jayyuen66/dsh-scrapling"

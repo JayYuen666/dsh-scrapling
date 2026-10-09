@@ -1,0 +1,11 @@
+{
+  "extends": "@jayyuen66/dsh-plugin-shared/config/tsconfig.base.json",
+  "include": [
+    "host.ts",
+    "lib/**/*.ts",
+    "test/**/*.ts",
+    "build-host.ts",
+    "build-client.ts",
+    "vitest.config.ts"
+  ]
+}

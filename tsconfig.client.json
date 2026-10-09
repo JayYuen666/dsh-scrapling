@@ -1,0 +1,4 @@
+{
+  "extends": "@jayyuen66/dsh-plugin-shared/config/tsconfig.client.base.json",
+  "include": ["src/**/*.ts"]
+}
