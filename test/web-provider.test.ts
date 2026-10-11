@@ -94,13 +94,29 @@ describe("fetch", () => {
     expect(result.truncated).toBe(true);
   });
 
-  it("回包缺字段时退回请求的 url，不抛", async () => {
+  it("回包不是对象时抛错，而不是补成一张空白的成功页", async () => {
+    // 补成 { statusCode: 0, content: "" } 的话，调用方会把 0 当成真实状态码、把空正文
+    // 当成「这个页面本来就没内容」—— 对端协议一坏，结果就是一片看着正常的空结果。
     const client = stubSidecar();
     Object.assign(client, { call: async (): Promise<unknown> => "not an object" });
-    const result = await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
-    expect(result.url).toBe("u");
-    expect(result.statusCode).toBe(0);
-    expect(result.body).toStrictEqual({ kind: "text", content: "" });
+    let caught: (Error & { code?: string }) | undefined;
+    try {
+      await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+    } catch (error) {
+      caught = error as Error & { code?: string };
+    }
+    expect(caught?.code).toBe("SCRAPLING_FETCH_FAILED");
+    expect(caught?.message).toContain("malformed");
+  });
+
+  it("回包缺 status / content 时同样抛错", async () => {
+    const client = stubSidecar();
+    Object.assign(client, {
+      call: async (): Promise<unknown> => ({ url: "u" }),
+    });
+    await expect(
+      createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" }),
+    ).rejects.toThrow(/malformed/u);
   });
 
   it("给了 signal 时会一并透传给 sidecar", async () => {

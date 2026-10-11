@@ -181,6 +181,22 @@ describe("地址判定", () => {
     expect(defaultPolicy().isPublicAddress("64:ff9b::5db8:d818")).toBe(true);
   });
 
+  it("ipv4-compatible（::/96）按内嵌 ipv4 重判，ipaddr 对这一段报的是 unicast", () => {
+    const policy = defaultPolicy();
+    // ::7f00:1 就是 ::127.0.0.1。不换算的话 ipaddr.js 把它当普通公网 IPv6，SSRF 直接绕过。
+    expect(policy.isPublicAddress("::7f00:1")).toBe(false);
+    expect(policy.isPublicAddress("::a00:1")).toBe(false);
+    expect(policy.isPublicAddress("::7f00:2")).toBe(false);
+    // 内嵌公网 IPv4 时仍然放行，不能把整段一刀切掉。
+    expect(policy.isPublicAddress("::5db8:d818")).toBe(true);
+  });
+
+  it(":: 与 ::1 仍按它们自己的 range 拒掉，换算不该误伤", () => {
+    const policy = defaultPolicy();
+    expect(policy.isPublicAddress("::")).toBe(false);
+    expect(policy.isPublicAddress("::1")).toBe(false);
+  });
+
   it("解析不了的字面量按不可抓处理", () => {
     expect(defaultPolicy().isPublicAddress("not-an-ip")).toBe(false);
   });
@@ -537,6 +553,25 @@ describe("合成段白名单的解析容错", () => {
     const policy = withRanges(["10.0.0.0/8/8", "300.1.1.1/16"]);
     const verdict = await policy.verify(TARGET_URL);
     expect(reasonOf(verdict)).toBe(PRIVATE);
+  });
+
+  it("带主机位的 CIDR 按网络地址算，不把放行范围悄悄放大", async () => {
+    // 10.0.0.1/16 的意思是 10.0.0.0–10.0.255.255。原先按写出来的地址算，会变成
+    // 10.0.0.1–10.0.255.254，边界跟着部署方随手写的那个数字走。
+    const wide = createUrlPolicy({
+      maxUrlLength: 2048,
+      resolve: resolverFrom({ [HOST]: ["10.0.0.1"] }),
+      syntheticRanges: ["10.0.0.1/16"],
+    });
+    expect(allowedUrl(await wide.verify(`http://${HOST}/`)).hostname).toBe(HOST);
+
+    const inside = createUrlPolicy({
+      maxUrlLength: 2048,
+      resolve: resolverFrom({ [HOST]: ["10.0.1.1"] }),
+      syntheticRanges: ["10.1.2.3/24"],
+    });
+    // 10.1.1.1 在 10.1.2.0/24 之外，不该被放行。
+    expect(reasonOf(await inside.verify(`http://${HOST}/`))).toBe(PRIVATE);
   });
 
   it("控制域名里出现 IPv6 时不学池，避免拿 IPv6 地址去比 IPv4 区间", async () => {

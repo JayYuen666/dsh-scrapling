@@ -2,6 +2,7 @@
 
 import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 import {
   decodeFrame,
@@ -11,6 +12,24 @@ import {
   pumpFrames,
 } from "../lib/jsonl.ts";
 import { FrameError } from "../lib/frame-error.ts";
+
+/** FrameError 里「不是合法 JSON」那一类的 kind，抽成常量免得重复字面量。 */
+const UNPARSABLE_JSON = "unparsable-json";
+
+/** 什么都不做的替身。 */
+const noop = (): void => undefined;
+
+/** 把转交过来的错误攒进一个数组。 */
+function collectErrors(sink: unknown[]): (error: unknown) => void {
+  return (error: unknown): void => {
+    sink.push(error);
+  };
+}
+
+/** 让出一个事件循环回合，等事件回调里同步排的活干完。 */
+async function tick(): Promise<void> {
+  await setImmediate();
+}
 
 /** 反复出现的样例帧，抽成常量免得重复字面量。 */
 const FRAME_A = '{"a":1}';
@@ -61,7 +80,7 @@ describe("encodeFrame", () => {
   it("序列化失败时立刻抛 FrameError，而不是拖到写管道时才炸", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic["self"] = cyclic;
-    expect(kindOf(() => encodeFrame(cyclic))).toBe("unparsable-json");
+    expect(kindOf(() => encodeFrame(cyclic))).toBe(UNPARSABLE_JSON);
   });
 });
 
@@ -71,7 +90,7 @@ describe("decodeFrame", () => {
   });
 
   it("非法 json 抛 unparsable-json", () => {
-    expect(kindOf(() => decodeFrame("not json"))).toBe("unparsable-json");
+    expect(kindOf(() => decodeFrame("not json"))).toBe(UNPARSABLE_JSON);
   });
 
   it("数组与标量都算 not-an-object", () => {
@@ -147,5 +166,95 @@ describe("pumpFrames", () => {
     });
     await finished(stream);
     expect(seen).toStrictEqual([FRAME_A]);
+  });
+});
+
+describe("frame splitter 上限", () => {
+  it("残片超过上限时抛 FrameError 而不是无界攒下去", () => {
+    const splitter = new FrameSplitter();
+    const kind = kindOf(() => {
+      for (let index = 0; index < 200; index += 1) {
+        splitter.push("x".repeat(64 * 1024));
+      }
+    });
+    expect(kind).toBe(UNPARSABLE_JSON);
+  });
+
+  it("超限后缓冲被丢弃，下一帧正常，不会永远卡在坏状态里", () => {
+    const splitter = new FrameSplitter();
+    expect(
+      kindOf(() => {
+        for (let index = 0; index < 200; index += 1) {
+          splitter.push("x".repeat(64 * 1024));
+        }
+      }),
+    ).toBe(UNPARSABLE_JSON);
+    expect(splitter.push(`${FRAME_B}\n`)).toStrictEqual([FRAME_B]);
+  });
+});
+
+describe("pumpFrames 的错误通道", () => {
+  it("流的 error 事件被转交给 onError，不会变成未捕获异常掀翻宿主", async () => {
+    const seen: unknown[] = [];
+    const stream = new Readable({ read: noop });
+    pumpFrames(stream, noop, collectErrors(seen));
+    stream.emit("error", new Error("pipe broke"));
+    await tick();
+    expect(seen).toHaveLength(1);
+    expect(String(seen[0])).toContain("pipe broke");
+  });
+
+  it("onFrame 抛错被吃掉并转交，不从 data 事件里逃出去", async () => {
+    const seen: unknown[] = [];
+    const stream = Readable.from([`${FRAME_A}\n`]);
+    pumpFrames(
+      stream,
+      () => {
+        throw new Error("consumer blew up");
+      },
+      collectErrors(seen),
+    );
+    await finished(stream);
+    await tick();
+    expect(seen).toHaveLength(1);
+    expect(String(seen[0])).toContain("consumer blew up");
+  });
+
+  it("收尾那一帧里回调抛错也走 onError", async () => {
+    const seen: unknown[] = [];
+    // 流以「没有尾随换行的半帧」结束，帧在 end 事件里由 flush() 吐出 —— 那时抛的错
+    // 同样不能从事件回调里逃出去。
+    const stream = Readable.from([`{"c":1`]);
+    pumpFrames(
+      stream,
+      () => {
+        throw new Error("flush consumer blew up");
+      },
+      collectErrors(seen),
+    );
+    await finished(stream);
+    await tick();
+    expect(seen).toHaveLength(1);
+    expect(String(seen[0])).toContain("flush consumer blew up");
+  });
+
+  it("onError 自己抛了也不会再往上抛 —— 此时已经在事件回调的栈上", async () => {
+    const stream = Readable.from([`${FRAME_A}\n`]);
+    pumpFrames(
+      stream,
+      () => {
+        throw new Error("first");
+      },
+      () => {
+        throw new Error("second");
+      },
+    );
+    await expect(finished(stream)).resolves.toBeUndefined();
+  });
+
+  it("不给 onError 时错误被安静丢弃，默认参数让旧调用点继续成立", async () => {
+    const stream = new Readable({ read: noop });
+    pumpFrames(stream, noop);
+    expect(() => stream.emit("error", new Error("x"))).not.toThrow();
   });
 });

@@ -37,12 +37,17 @@ export interface CappedText {
  */
 export function capText(text: string, budgetBytes: number, recovery: string): CappedText {
   const size = Buffer.byteLength(text, "utf8");
-  if (budgetBytes <= 0 || size <= budgetBytes) {
+  // Number.isFinite 一起判：NaN 与两个大小比较都返回 false，会一路穿到 TextRetainer 那里，
+  // 拿到的 headBytes / tailBytes 全是 NaN，截断结果无从预测。
+  if (!Number.isFinite(budgetBytes) || budgetBytes <= 0 || size <= budgetBytes) {
     return { text, truncated: false, notice: "" };
   }
   // 头 2/3、尾 1/3：抓取结果里结论通常在开头，表格尾行与免责声明在结尾。
-  const headBytes = Math.max(1, Math.floor((budgetBytes * 2) / 3));
-  const tailBytes = Math.max(1, budgetBytes - headBytes);
+  // 合计严格等于预算 —— 两段各取 max(1, …) 时，预算给到 1 或 2 字节反而会留下比预算
+  // 更长的正文。代价是极小预算下头部可能被压到 0（预算 1 字节时全部留给尾部），
+  // TextRetainer 对 0 的接受是经过验证的。
+  const headBytes = Math.min(Math.max(1, Math.floor((budgetBytes * 2) / 3)), budgetBytes - 1);
+  const tailBytes = budgetBytes - headBytes;
   const retainer = new TextRetainer({ kind: "headTail", headBytes, tailBytes });
   retainer.push(text);
   const kept = retainer.finish();
@@ -52,7 +57,7 @@ export function capText(text: string, budgetBytes: number, recovery: string): Ca
       strategy: "headTail",
       unit: "bytes",
       limit: { head: headBytes, tail: tailBytes },
-      kept: kept.text.length,
+      kept: Buffer.byteLength(kept.text, "utf8"),
       omitted: kept.omittedBytes,
     },
     () => recovery,

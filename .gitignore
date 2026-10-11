@@ -3,6 +3,10 @@ client.js
 .toolchain/
 host.js
 coverage/
+# 覆盖率数据文件：cov:py 的聚合结果，以及 py/ 下子进程留下的那一份。
+# 不忽略的话每次跑完覆盖率都多出几个未跟踪文件，还容易被误提交。
+.coverage
+.coverage.*
 *.tsbuildinfo
 .DS_Store
 

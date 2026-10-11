@@ -287,22 +287,29 @@ def read_loop() -> int:
         if frame.get("method") == "shutdown":
             emit(ok(frame.get("id"), {"stopping": True}))
             _drain_before_exit()
+            # 与 EOF 路径同一套收尾：浏览器会话是独立进程，不显式关掉就会活过 sidecar
+            # 本身。宿主的优雅关闭走的就是这一帧（见 lib/sidecar.ts 的 dispose）。
+            _shutdown_sessions()
             return 0
         # 顺序要紧：先入队再起 worker。反过来的话，新起的线程可能立刻醒来、
         # 看到空队列就退出，这一帧就永远没人处理 —— 且只在时序凑巧时才会复现。
+        busy_reply: dict[str, Any] | None = None
         with _QUEUE_LOCK:
             depth = len(_QUEUE)
             if depth >= MAX_QUEUE_DEPTH:
-                emit(
-                    fail(
-                        frame.get("id"),
-                        "BUSY",
-                        f"{depth} requests already queued (limit {MAX_QUEUE_DEPTH})",
-                    )
+                busy_reply = fail(
+                    frame.get("id"),
+                    "BUSY",
+                    f"{depth} requests already queued (limit {MAX_QUEUE_DEPTH})",
                 )
-                continue
-            _QUEUE.append(frame)
-            depth += 1
+            else:
+                _QUEUE.append(frame)
+                depth += 1
+        if busy_reply is not None:
+            # emit 在锁外：stdout 一旦阻塞（宿主读得慢），持锁写流会把全部 worker 的
+            # _drain 一起冻住 —— 回帧可以慢，队列不能停。
+            emit(busy_reply)
+            continue
         _ensure_worker(min(depth, MAX_INFLIGHT))
     log("stdin closed")
     _drain_before_exit()

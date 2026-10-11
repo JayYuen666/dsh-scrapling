@@ -132,12 +132,13 @@ export interface Config {
   /** sidecar 的工作目录；留空则用 ~/.dsh-scrapling。需要可写 —— adaptive 的库落这里。 */
   dataDir: Volatile<string>;
   /**
-   * 守卫额外放行的主机名（逗号分隔）。
+   * 一次爬虫的整体截止（秒）。部署级。
    *
-   * **安全相关**：指到内网地址等于主动放弃对那些目标的 SSRF 防护。默认空 = 最严。
-   * 抓自建/内网站点是真实需求（自建 CMS、内网 Git、预发环境），所以留了口子，
-   * 但必须由部署方显式设置并自行承担后果。
+   * 页数上限（crawlMaxItems）管不了慢站点：一页等一分钟的 1000 页爬取能跑十几个小时，
+   * 而爬虫跑在没人看的后台线程里，作业被 kill 也只停得住宿主的轮询。到点由 Python 侧
+   * 收尾，所以这一项是「爬虫最长能跑多久」的唯一硬闸。
    */
+  crawlMaxRuntimeSeconds: number;
   /** 是否注册成 ctx.web 的 fetch provider；默认关，打开还需部署侧配 fetchProvider。 */
   provideWebFetch: Volatile<boolean>;
   /** 是否注册成 ctx.web 的 search provider；默认关，打开还需部署侧配 searchProvider。 */
@@ -222,6 +223,9 @@ const configSchema = Schema.object({
   renderMaxOutputChars: Schema.natural().min(1).default(200_000).volatile(),
   xhrMaxOutputChars: Schema.natural().min(1).default(120_000).volatile(),
   crawlMaxItems: Schema.natural().min(1).default(1000).volatile(),
+  // 爬虫的整体截止（秒）。页数上限管不了「一页等一分钟」的慢站点，而这个工具是后台
+  // 作业：到点不收尾的话，它能跑多久只取决于站点有多慢。
+  crawlMaxRuntimeSeconds: Schema.natural().min(1).default(1800),
   // 内嵌 base64 图片是纯 token 噪音，默认剥掉；要读原始 data URI 的场景才关。
   stripInlineImages: Schema.boolean().default(true).volatile(),
 
@@ -277,7 +281,8 @@ export { configSchema as Config };
  * 登记本插件的作业类型。
  *
  * `JobKindMap` 是官方留的「可合并扩展」点：作业 id 的前缀也由它决定（`scrapling-1`）。
- * 不声明的话只能用内置的 bash/subagent，模型在 job_list 里会把爬虫误认成 shell 作业。
+ * 不声明的话只剩内置的 `bash` 一种 —— alpha.2 起 `subagent` 已从内置表里挪走 —— 模型在
+ * job_list 里就会把爬虫误认成 shell 作业。
  */
 declare module "@deepseek-ai/dsh-jobs" {
   interface JobKindMap {
@@ -564,8 +569,18 @@ async function ensureDataDir(dir: string): Promise<void> {
  *
  * 爬虫工具声明了不可并发，同一时刻最多一个作业 —— 用单个槽位即可，不需要任务队列。
  * sidecar 推来的进度事件没有 id，只能走事件通道，直接写进这个槽位。
+ *
+ * 槽位存的是**出口本身**，所以每次清理都要问一句「槽位里还是它吗」：作业正常结束时
+ * 出口必须让位，而两个作业交接的那一瞬间，旧作业的收尾也不该把新作业的槽位清空。
  */
 let currentCrawlSink: CrawlSink | undefined;
+
+/** 只有槽位里仍是这一个出口时才动它 —— 作业结束与取消都走这里。 */
+function clearCrawlSink(sink: CrawlSink): void {
+  if (currentCrawlSink === sink) {
+    currentCrawlSink = undefined;
+  }
+}
 
 /**
  * 把作业句柄包装成工具层要的输出出口。
@@ -622,26 +637,29 @@ function startCrawlJob(ctx: Context, label: string, run: CrawlJobRunner): Promis
       label,
       run: (job) => {
         const controller = new AbortController();
-        // 取消只置 signal：真正拆掉 Python 进程的是 sidecar 客户端收到 abort 后的自毁逻辑。
+        const sink = sinkOf(job, controller.signal);
+        // 取消只置 signal；真正拆掉 Python 进程的是 sidecar 客户端收到 abort 后的自毁逻辑。
         controller.signal.addEventListener(
           "abort",
           () => {
-            currentCrawlSink = undefined;
+            clearCrawlSink(sink);
           },
           { once: true },
         );
-        const sink = sinkOf(job, controller.signal);
         currentCrawlSink = sink;
         const done = (async (): Promise<JobOutcome> => {
+          // 成功路径原来不清槽位：作业结束后 sidecar 仍可能推来收尾帧，它们会被写进一个
+          // 已经结束的作业。清在这里，且带身份判断 —— 两个作业交接时不该由旧的清掉新的。
           try {
             await run(sink);
             return { status: "completed" };
           } catch (error: unknown) {
-            currentCrawlSink = undefined;
             return {
               status: "killed",
               detail: String(error),
             };
+          } finally {
+            clearCrawlSink(sink);
           }
         })();
         return {
@@ -660,17 +678,18 @@ function probeFailure(error: unknown): string {
 }
 
 /**
- * 插件入口。
+ * 取这次抓取要用的代理地址：设置卡上的 proxyUrl 优先，否则跟随环境的代理变量。
  *
- * 流程：建客户端 → 探测能力 → 按「开关 ∩ 能力」注册工具。工具本体的注册在后续阶段接上，
- * 这里先把接线与注册计划跑通。
+ * 浏览器引擎不认环境变量，所以显式配置是让 render / capture_xhr / stealth 走代理的唯一
+ * 办法；静态抓取由 curl_cffi 自行读环境，两者因此共用这一个来源。
  *
- * 能力探测会真的拉起一个 Python 进程（约 0.5 秒到 2 秒），所以 `apply` 是 async 的 ——
- * 官方也这么做（`packages/fs/tool-fs-search/src/index.ts:128`）。
- *
- * @param ctx - 宿主上下文
- * @param config - 已由 schemastery 填满默认值的配置
+ * @param config - 已解析的设置
+ * @returns 代理地址；留空表示跟随环境
  */
+function proxyOf(config: Config): string {
+  return config.proxyUrl.get().trim();
+}
+
 /**
  * Host 侧出站 URL 准入闸门：判否就地抛 `URL_BLOCKED`，请求根本不发出去。
  *
@@ -684,19 +703,6 @@ function probeFailure(error: unknown): string {
  * @param config - 已解析的设置
  * @returns 闸门函数；判否时 reject，通过时交回归一后的 URL
  */
-/**
- * 取这次抓取要用的代理地址：设置卡上的 proxyUrl 优先，否则跟随环境的代理变量。
- *
- * 浏览器引擎不认环境变量，所以显式配置是让 render / capture_xhr / stealth 走代理的唯一
- * 办法；静态抓取由 curl_cffi 自行读环境，两者因此共用这一个来源。
- *
- * @param config - 已解析的设置
- * @returns 代理地址；留空表示跟随环境
- */
-function proxyOf(config: Config): string {
-  return config.proxyUrl.get().trim();
-}
-
 export function createUrlGate(config: Config): (url: string) => Promise<string> {
   const nat64Prefixes = config.nat64Prefixes
     .get()
@@ -779,14 +785,21 @@ function registerFetchProvider(ctx: Context, sidecar: SidecarClient, config: Con
  * @param ctx - 宿主上下文
  * @param sidecar - 已握手的 sidecar 客户端
  * @param config - 已解析的设置
+ * @param urlGate - 出站 URL 闸门；与 sidecar 共用同一个，两侧才对同一个地址下结论
  */
-function registerSearchProvider(ctx: Context, sidecar: SidecarClient, config: Config): void {
+function registerSearchProvider(
+  ctx: Context,
+  sidecar: SidecarClient,
+  config: Config,
+  urlGate: (url: string) => Promise<string>,
+): void {
   const provider = createWebSearchProvider({
     sidecar,
     searchEndpoint: config.searchEndpoint,
     renderTopN: config.searchRenderTopN,
     maxOutputBytes: config.fetchMaxOutputChars.get(),
     timeoutMs: config.fetchTimeoutMs.get(),
+    urlGate,
   });
   if (!provider.available()) {
     ctx.logger.warn(
@@ -801,6 +814,18 @@ function registerSearchProvider(ctx: Context, sidecar: SidecarClient, config: Co
   );
 }
 
+/**
+ * 插件入口。
+ *
+ * 流程：建客户端 → 探测能力 → 按「开关 ∩ 能力」注册工具。工具本体的注册在后续阶段接上，
+ * 这里先把接线与注册计划跑通。
+ *
+ * 能力探测会真的拉起一个 Python 进程（约 0.5 秒到 2 秒），所以 `apply` 是 async 的 ——
+ * 官方也这么做（`packages/fs/tool-fs-search/src/index.ts:128`）。
+ *
+ * @param ctx - 宿主上下文
+ * @param config - 已由 schemastery 填满默认值的配置
+ */
 export async function apply(ctx: Context & SettingsFace, config: Config): Promise<void> {
   // 登记「本页由自带卡片编辑」。`auto: false` 是告诉宿主别再自动生成一份通用表单 ——
   // 自动那份会把 36 个字段摊成没有分组、没有说明的长列表，而真正在编辑这张卡的
@@ -814,6 +839,8 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
   const flags = snapshotFlags(config);
   const dataDir = resolveDataDir(config.dataDir.get());
   const bridgePath = path.join(import.meta.dirname, "py", "bridge.py");
+  // 闸门建一次、两处共用：sidecar 每次调用过它，search provider 的 sources 也过它。
+  const urlGate = createUrlGate(config);
   try {
     await ensureDataDir(dataDir);
   } catch (error) {
@@ -828,7 +855,9 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
     handshakeTimeoutMs: config.sidecarHandshakeTimeoutMs.get(),
     requestTimeoutMs: config.fetchTimeoutMs.get(),
     graceMs: config.sidecarGraceMs.get(),
-    urlGate: createUrlGate(config),
+    // search provider 与 sidecar 共用同一个闸门：两边必须对同一个地址下同一个结论，
+    // 否则「搜索结果里给了这个地址、抓它时又被拦下」。
+    urlGate,
     env: {
       DSH_SCRAPLING_ALLOWED_HOSTS: config.allowedHosts.get(),
       // 自建 NAT64 前缀必须送到 Python 侧，否则藏在里面的私网 IPv4 会被当公网放行。
@@ -907,6 +936,7 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
     requestTimeoutSeconds: config.requestTimeoutSeconds,
     blockAds: config.blockAds.get(),
     crawlMaxItems: config.crawlMaxItems.get(),
+    crawlMaxRuntimeSeconds: config.crawlMaxRuntimeSeconds,
     maxUrlLength: config.maxUrlLength,
     browserExecutablePath: config.browserExecutablePath,
     browserCdpUrl: config.browserCdpUrl,
@@ -930,7 +960,7 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
   }
 
   if (config.provideWebSearch.get()) {
-    registerSearchProvider(ctx, sidecar, config);
+    registerSearchProvider(ctx, sidecar, config, urlGate);
   }
 
   ctx.logger.info(

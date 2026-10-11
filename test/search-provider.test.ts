@@ -11,6 +11,7 @@ import {
 } from "../lib/search-provider.ts";
 import type { SearchProviderDeps } from "../lib/search-provider.ts";
 import type { SidecarClient } from "../lib/sidecar.ts";
+import { SidecarError } from "../lib/sidecar-error.ts";
 
 const ENDPOINT = "http://search.example/api";
 const PAGE_A = "https://a.test/1";
@@ -59,6 +60,24 @@ function deps(over?: Partial<SearchProviderDeps>): SearchProviderDeps {
     maxOutputBytes: 100_000,
     timeoutMs: 30_000,
     ...over,
+  };
+}
+
+/** 一个永远放行的闸门；调用被记下来，用于断言 sources 确实过了闸门。 */
+function passGate(seen: string[]): (url: string) => Promise<string | undefined> {
+  return async (url: string): Promise<string | undefined> => {
+    seen.push(url);
+    return undefined;
+  };
+}
+
+/** 一个按名单拦的闸门；命中即抛，模拟 URL_BLOCKED。 */
+function blockList(blocked: readonly string[]): (url: string) => Promise<string | undefined> {
+  return async (url: string): Promise<string | undefined> => {
+    if (blocked.includes(url)) {
+      throw new Error("URL_BLOCKED: private address");
+    }
+    return undefined;
   };
 }
 
@@ -222,6 +241,70 @@ describe("search provider", () => {
     expect(result.truncated).toBe(true);
   });
 
+  it("源地址全部过准入闸门：判否的条目不进 sources", async () => {
+    // 搜索后端的回包是外部输入，它尽可以回一条内网地址。不过闸门的话，那条地址就原样
+    // 出现在模型眼前，而本包对同一地址的抓取是会被拦下的 —— 一边给结果、一边说不可抓。
+    stubSearchJson({ results: [{ url: PAGE_A }, { url: PAGE_B }, { url: PAGE_C }] });
+    const result = await createWebSearchProvider(
+      deps({ renderTopN: 0, urlGate: blockList([PAGE_B]) }),
+    ).search({ query: "q" });
+    expect(result.sources.map((source) => source.url)).toStrictEqual([PAGE_A, PAGE_C]);
+  });
+
+  it("一条都不剩时报错，而不是回一次「成功但没有结果」的搜索", async () => {
+    stubSearchJson({ results: [{ url: PAGE_A }, { url: PAGE_B }] });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ renderTopN: 0, urlGate: blockList([PAGE_A, PAGE_B]) })).search(
+        { query: "q" },
+      ),
+    );
+    expect(error.code).toBe(SEARCH_FAILED);
+    expect(error.message).toContain("URL gate");
+  });
+
+  it("闸门归一过的地址，sources 与真正去抓的都是那一个", async () => {
+    // 判的与引用的必须是同一个串，否则归一化又成一条绕过面。
+    const normalized = "https://a.test/normalized";
+    stubSearchJson({ results: [{ url: PAGE_A }] });
+    const calls: SidecarCall[] = [];
+    const result = await createWebSearchProvider(
+      deps({
+        sidecar: fakeSidecar(calls),
+        renderTopN: 1,
+        urlGate: async (): Promise<string | undefined> => normalized,
+      }),
+    ).search({ query: "q" });
+    expect(result.sources[0]?.url).toBe(normalized);
+    expect(calls[0]?.url).toBe(normalized);
+  });
+
+  it("后端一条都没回时是正常的空搜索，不过闸也不报错", async () => {
+    stubSearchJson({ results: [] });
+    const seen: string[] = [];
+    const result = await createWebSearchProvider(
+      deps({ renderTopN: 1, urlGate: passGate(seen) }),
+    ).search({ query: "q" });
+    expect(result.sources).toStrictEqual([]);
+    expect(seen).toStrictEqual([]);
+    expect(result.content).toBeUndefined();
+  });
+
+  it("maxResults 不是正整数时直接判否，不夹成一条空结果", async () => {
+    // 夹成 0 的话，这次调用会变成一次「成功但一条结果都没有」的搜索：模型与用户都看不出
+    // 是入参不对，只会以为搜不到东西。
+    stubSearchJson({ results: [{ url: PAGE_A }] });
+    const codes = await Promise.all(
+      [0, -3, 2.5].map(async (maxResults) => {
+        const error = await failureOf(() =>
+          createWebSearchProvider(deps({ renderTopN: 1 })).search({ query: "q", maxResults }),
+        );
+        expect(error.message).toContain("maxResults");
+        return error.code;
+      }),
+    );
+    expect(codes).toStrictEqual([SEARCH_FAILED, SEARCH_FAILED, SEARCH_FAILED]);
+  });
+
   it("搜索后端非 2xx 时抛 provider 特有码，且 code 不是那段文案", async () => {
     stubSearchJson({}, false, 503);
     const error = await failureOf(() =>
@@ -229,6 +312,21 @@ describe("search provider", () => {
     );
     expect(error.code).toBe(SEARCH_FAILED);
     expect(error.message).toContain("503");
+  });
+
+  it("闸门扇出封顶：命中超过 100 条时只把前 100 条拿去过闸", async () => {
+    // 闸门每条一次 DNS：封顶必须落在过闸之前，一万条命中不该触发一万次解析。
+    // 上限值与 lib/search-provider.ts 的 MAX_SOURCES 对齐。
+    const hits = Array.from({ length: 150 }, (_unused, index) => ({
+      url: `https://h.test/${index}`,
+    }));
+    stubSearchJson({ results: hits });
+    const seen: string[] = [];
+    await createWebSearchProvider(deps({ renderTopN: 0, urlGate: passGate(seen) })).search({
+      query: "q",
+      maxResults: 3,
+    });
+    expect(seen).toHaveLength(100);
   });
 
   it("端点不是 http(s) 时拒绝，不去读本地文件", async () => {
@@ -272,7 +370,7 @@ describe("search provider 边界", () => {
     expect(result.sources[0]).toStrictEqual({ url: PAGE_A });
   });
 
-  it("sidecar 回的不是对象、或 content 非字符串时按无正文处理", async () => {
+  it("sidecar 回的不是对象、或 content 非字符串时整次搜索报错，而不是返回空成功", async () => {
     stubSearchJson({ results: [{ url: PAGE_A }] });
     const notObject = {
       alive: true,
@@ -285,17 +383,93 @@ describe("search provider 边界", () => {
       call: (): Promise<unknown> => Promise.resolve({ content: 12_345, status: 200 }),
     } as unknown as SidecarClient;
 
-    const fromNotObject = await createWebSearchProvider(
-      deps({ sidecar: notObject, renderTopN: 1 }),
-    ).search({ query: "q" });
-    const fromBadContent = await createWebSearchProvider(
-      deps({ sidecar: badContent, renderTopN: 1 }),
-    ).search({ query: "q" });
+    // 有 sources 却一条正文都没读到 = 故障，不是一次「成功但没内容」的搜索。
+    // 原因写进错误里：URL 被安全闸门拦下与后端超时是两种完全不同的故障，用户要分得清。
+    await expect(
+      createWebSearchProvider(deps({ sidecar: notObject, renderTopN: 1 })).search({ query: "q" }),
+    ).rejects.toThrow(/no body/u);
+    await expect(
+      createWebSearchProvider(deps({ sidecar: badContent, renderTopN: 1 })).search({ query: "q" }),
+    ).rejects.toThrow(/no body/u);
+  });
 
-    expect(fromNotObject.sources).toHaveLength(1);
-    expect(fromNotObject.content).toBeUndefined();
-    expect(fromBadContent.sources).toHaveLength(1);
-    expect(fromBadContent.content).toBeUndefined();
+  it("URL 全被安全闸门拦下时报错，原因里点名 URL_BLOCKED", async () => {
+    stubSearchJson({ results: [{ url: PAGE_A }] });
+    const blocked = {
+      alive: true,
+      capabilities: { scrapling: true, browser: false },
+      call: (): Promise<unknown> =>
+        Promise.reject(new SidecarError("URL_BLOCKED", "169.254.169.254: metadata")),
+    } as unknown as SidecarClient;
+    let caught: (Error & { code?: string }) | undefined;
+    try {
+      await createWebSearchProvider(deps({ sidecar: blocked, renderTopN: 1 })).search({
+        query: "q",
+      });
+    } catch (error) {
+      caught = error as Error & { code?: string };
+    }
+    expect(caught?.code).toBe("SCRAPLING_SEARCH_FAILED");
+    expect(caught?.message).toContain("URL_BLOCKED");
+  });
+
+  it("取消不被当成「这条链接死了」，整次调用照常抛出", async () => {
+    stubSearchJson({ results: [{ url: PAGE_A }] });
+    const controller = new AbortController();
+    const aborting = {
+      alive: true,
+      capabilities: { scrapling: true, browser: false },
+      call: (): Promise<unknown> => {
+        controller.abort();
+        return Promise.reject(new Error("aborted"));
+      },
+    } as unknown as SidecarClient;
+    await expect(
+      createWebSearchProvider(deps({ sidecar: aborting, renderTopN: 1 })).search(
+        { query: "q" },
+        controller.signal,
+      ),
+    ).rejects.toThrow(/aborted/u);
+  });
+
+  it("抓取途中被取消时，取消原样抛出而不是被包成搜索失败", async () => {
+    // 取消的语义是「这次调用作废」。包成 provider 失败码的话，seam 那头看到的就是一次
+    // 搜索失败，日志与用户提示都会指错方向。
+    stubSearchJson({ results: [{ url: PAGE_A }] });
+    const controller = new AbortController();
+    const aborting = {
+      alive: true,
+      capabilities: { scrapling: true, browser: false },
+      call: (): Promise<unknown> => {
+        controller.abort();
+        return Promise.reject(new Error("this call was aborted"));
+      },
+    } as unknown as SidecarClient;
+    const caught = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar: aborting, renderTopN: 1 })).search(
+        { query: "q" },
+        controller.signal,
+      ),
+    );
+    expect(caught.code).toBeUndefined();
+    expect(caught.message).toContain("aborted");
+  });
+
+  it("搜索后端那次请求本身被取消时，取消原样抛出", async () => {
+    // 与抓取途中被取消同一处理：取消不是 provider 故障，包上失败码会让日志指错方向。
+    const controller = new AbortController();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<() => Promise<unknown>>(() => {
+        controller.abort();
+        return Promise.reject(new Error("The operation was aborted"));
+      }),
+    );
+    const caught = await failureOf(() =>
+      createWebSearchProvider(deps({ renderTopN: 0 })).search({ query: "q" }, controller.signal),
+    );
+    expect(caught.code).toBeUndefined();
+    expect(caught.message).toContain("aborted");
   });
 
   it("signal 同时透给搜索后端与 sidecar 抓取", async () => {

@@ -109,6 +109,7 @@ const SETTINGS: ToolSettings = {
   blockAds: false,
   // 用 schema 默认值：这条夹具要验的是模型侧 maxPages 的缺省（20），不是部署天花板。
   crawlMaxItems: 1000,
+  crawlMaxRuntimeSeconds: 1800,
   maxUrlLength: 2048,
   browserExecutablePath: "",
   browserCdpUrl: "",
@@ -440,6 +441,66 @@ describe("scrapling_extract", () => {
     ]);
   });
 
+  it("请求里带着字符预算：limit 数条数，预算管总长度", async () => {
+    // 少了它就等于 matches 完全不封顶：一个 5MB 的 html 命中几万个节点时，整份会
+    // 原样进模型上下文 —— 那是本工具唯一没有上限的一路。
+    const fake = fakeSidecar({ count: 1, truncated: true, matches: [{ tag: "li", text: "A" }] });
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    await tool.execute({ html: "<ul><li>A</li></ul>", selector: "li", limit: 5000 }, exec);
+    expect(fake.calls[0]?.params).toStrictEqual({
+      html: "<ul><li>A</li></ul>",
+      selector: "li",
+      useXpath: false,
+      limit: 5000,
+      maxContentChars: SETTINGS.maxOutputBytes,
+    });
+  });
+
+  it("adaptive 与 url 原样透传；不给时这两个键不出现", async () => {
+    // 协议上 undefined 与「没给」同义，条件展开保证缺省载荷与旧版逐字节一致。
+    const fake = fakeSidecar({ count: 0, truncated: false, matches: [] });
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    await tool.execute(
+      { html: "<p>x</p>", selector: "p", adaptive: true, url: "https://a.test/" },
+      exec,
+    );
+    expect(fake.calls[0]?.params).toMatchObject({
+      adaptive: true,
+      url: "https://a.test/",
+    });
+    await tool.execute({ html: "<p>x</p>", selector: "p" }, exec);
+    expect(fake.calls[1]?.params).not.toHaveProperty("adaptive");
+    expect(fake.calls[1]?.params).not.toHaveProperty("url");
+  });
+
+  it("count / truncated 缺失或类型不对时报可读错误", async () => {
+    // count 缺的时候原先退回 matches.length，而 Python 报的 count 是**命中总数**，
+    // 不是返回条数 —— 拿后者当前者会把「还有 900 条没给」说成「一共就这些」。
+    const missing = fakeSidecar({ matches: [{ tag: "li", text: "A" }] });
+    const tool = createExtractTool({
+      sidecar: missing.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    await expect(tool.execute({ html: "x", selector: "li" }, exec)).rejects.toThrow(
+      /missing a non-negative integer field: count/u,
+    );
+  });
+
   it("渲染时没有匹配给 no matches，有匹配逐行列出", () => {
     const tool = createExtractTool({
       sidecar: fakeSidecar({}).client,
@@ -475,7 +536,9 @@ describe("scrapling_extract", () => {
     expect(tool.isConcurrencySafe?.({ html: "", selector: ".price" })).toBe(true);
   });
 
-  it("回包不是对象时给空列表而不是抛", async () => {
+  it("回包不是对象时报可读错误，而不是补成一次空搜索", async () => {
+    // 补成 { count: 0, matches: [] } 的话，模型看到的是「这个选择器一条都没命中」——
+    // 一个结论；而事实是协议坏了。两种事的后续动作完全不同。
     const fake = fakeSidecar("not an object");
     const tool = createExtractTool({
       sidecar: fake.client,
@@ -484,12 +547,9 @@ describe("scrapling_extract", () => {
       answer: fakeAnswer,
     });
     const exec = { signal: new AbortController().signal } as never;
-    const result = (await tool.execute({ html: "x", selector: "li" }, exec)) as {
-      count: number;
-      matches: unknown[];
-    };
-    expect(result.matches).toStrictEqual([]);
-    expect(result.count).toBe(0);
+    await expect(tool.execute({ html: "x", selector: "li" }, exec)).rejects.toThrow(
+      /missing an integer field: count/u,
+    );
   });
 
   it("match 里缺 tag/text 时补空串，不把 undefined 漏给模型", async () => {
@@ -511,7 +571,9 @@ describe("scrapling_extract", () => {
     expect(result.matches).toStrictEqual([{ tag: "", text: "" }]);
   });
 
-  it("status 不是非负整数时退回 0", async () => {
+  it("status 缺失或不是非负整数时报可读错误，而不是补成一个 0", async () => {
+    // 补成 0 的话，宿主与模型看到的是一条真实的状态码 0 —— 而对端协议其实已经坏了。
+    // 补齐让破损静默，报错才让人知道该去修 Python 那一侧。
     const fake = fakeSidecar({
       url: SAMPLE_URL,
       status: -1,
@@ -525,8 +587,43 @@ describe("scrapling_extract", () => {
       answer: fakeAnswer,
     });
     const exec = { signal: new AbortController().signal } as never;
-    const result = (await tool.execute({ url: SAMPLE_URL }, exec)) as { statusCode: number };
-    expect(result.statusCode).toBe(0);
+    await expect(tool.execute({ url: SAMPLE_URL }, exec)).rejects.toThrow(
+      /missing a non-negative integer field: status/u,
+    );
+  });
+
+  it("truncated 缺失或不是布尔时报可读错误，不补成 false", async () => {
+    const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "x", truncated: "no" });
+    const tool = createFetchTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    await expect(tool.execute({ url: SAMPLE_URL }, exec)).rejects.toThrow(
+      /missing a boolean field: truncated/u,
+    );
+  });
+
+  it("对端已经截过时，本地没超预算也照实标 truncated", async () => {
+    // 本地 capText 只看自己这一份：Python 按 maxContentChars 截过的正文，在 Host 侧往往
+    // 还在预算内。直接覆盖就等于告诉模型「这条是完整的」，而那正是它最该知道被截断的时刻。
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      status: 200,
+      content: "短正文",
+      truncated: true,
+    });
+    const tool = createFetchTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    const result = (await tool.execute({ url: SAMPLE_URL }, exec)) as { truncated: boolean };
+    expect(result.truncated).toBe(true);
   });
 });
 
@@ -1635,7 +1732,7 @@ describe("scrapling_crawl", () => {
     expect(result).not.toHaveProperty("crawlId");
     expect(fake.calls[0]).toStrictEqual({
       method: "crawl.run",
-      params: { url: SAMPLE_URL, maxPages: 3 },
+      params: { url: SAMPLE_URL, maxPages: 3, maxDurationMs: 1_800_000 },
     });
   });
 
@@ -1823,5 +1920,126 @@ describe("爬虫报错的传播", () => {
       signal: new AbortController().signal,
     } as never);
     expect(String(caught)).toContain("selector blew up");
+  });
+
+  it("到点收场的爬虫在输出里说明原因", async () => {
+    // 页数比 maxPages 少时，模型该能看出是「整体截止到了点」而不是站点就这么大。
+    const notes: string[] = [];
+    const fake = fakeSidecar({ crawlId: "c1" });
+    Object.assign(fake.client, {
+      call: async (method: string): Promise<unknown> => {
+        if (method === "crawl.run") {
+          return { crawlId: "c1" };
+        }
+        return {
+          running: false,
+          pages: [{ url: "https://x.test/1", title: "one", markdown: "m" }],
+          error: null,
+          expired: true,
+        };
+      },
+    });
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: async (_label, run) => {
+        await run({
+          append: (): void => undefined,
+          progress: (line: string): void => {
+            notes.push(line);
+          },
+          signal: new AbortController().signal,
+        });
+        return "job-1";
+      },
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL, maxPages: 20 }, {
+      signal: new AbortController().signal,
+    } as never);
+    const text = notes.join("\n");
+    expect(text).toContain("runtime budget");
+    expect(text).toContain("1 page(s) crawled");
+  });
+
+  it("轮询断了先去叫停 Python 侧那个爬虫，再把原因抛出去", async () => {
+    // 作业取消只活在 Node 侧，Python 里的 Spider 在自己的线程上跑，看不见它。
+    // 少这一帧的话，作业显示已杀、爬虫还在后台跑。
+    const methods: string[] = [];
+    const fake = fakeSidecar({ crawlId: "c1" });
+    const controller = new AbortController();
+    Object.assign(fake.client, {
+      call: async (method: string): Promise<unknown> => {
+        methods.push(method);
+        if (method === "crawl.run") {
+          return { crawlId: "c1" };
+        }
+        // 第一帧状态查询就被打断：模拟 job_kill / 本轮超时落在这里。
+        controller.abort();
+        throw new Error("aborted");
+      },
+    });
+    let caught: unknown;
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: async (_label, run) => {
+        try {
+          await run({
+            append: (): void => undefined,
+            progress: (): void => undefined,
+            signal: controller.signal,
+          });
+        } catch (error: unknown) {
+          caught = error;
+        }
+        return "job-1";
+      },
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL, maxPages: 1 }, {
+      signal: new AbortController().signal,
+    } as never);
+    expect(methods).toStrictEqual(["crawl.run", "crawl.status", "crawl.stop"]);
+    expect(String(caught)).toContain("aborted");
+  });
+
+  it("叫停失败不盖掉真正的失败原因", async () => {
+    // sidecar 可能已经崩了：那时 crawl.stop 只会换回一个错误，而它不该替换掉
+    // 调用方真正该看到的那一条。
+    const fake = fakeSidecar({ crawlId: "c1" });
+    Object.assign(fake.client, {
+      call: async (method: string): Promise<unknown> => {
+        if (method === "crawl.run") {
+          return { crawlId: "c1" };
+        }
+        if (method === "crawl.stop") {
+          throw new Error("sidecar is gone");
+        }
+        throw new Error("status poll failed");
+      },
+    });
+    let caught: unknown;
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: async (_label, run) => {
+        try {
+          await run({
+            append: (): void => undefined,
+            progress: (): void => undefined,
+            signal: new AbortController().signal,
+          });
+        } catch (error: unknown) {
+          caught = error;
+        }
+        return "job-1";
+      },
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL, maxPages: 1 }, {
+      signal: new AbortController().signal,
+    } as never);
+    expect(String(caught)).toContain("status poll failed");
   });
 });

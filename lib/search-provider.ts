@@ -22,6 +22,7 @@ import type {
 } from "@deepseek-ai/dsh-web";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import type { SidecarClient } from "./sidecar.ts";
+import { SidecarError } from "./sidecar-error.ts";
 
 /** 本 provider 在 ctx.web 的 search 接缝里的 id。 */
 export const SEARCH_PROVIDER_ID = "scrapling";
@@ -43,6 +44,16 @@ export interface SearchProviderDeps {
   readonly maxOutputBytes: number;
   /** 单次搜索的协同超时（毫秒）。 */
   readonly timeoutMs: number;
+  /**
+   * 出站 URL 的准入闸门；与 sidecar 用的是同一个实现（Host 侧那道 SSRF 防线）。
+   *
+   * `sources` 是回给模型去引用、去接着抓的 URL 清单。搜索后端的回包是**外部输入**，
+   * 它尽可以回一条内网地址过来；不过这道闸门的话，那些地址就原样出现在模型眼前，
+   * 而本包对同一地址的抓取请求是会被拦下的 —— 一边说「这是你的结果」、一边说「它不可抓」。
+   * 判否的条目不进 sources；通过时用它交回的那个串（闸门可能归一过），与 sidecar 发出
+   * 去的是同一个地址。
+   */
+  readonly urlGate?: ((url: string) => Promise<string | undefined>) | undefined;
 }
 
 /** 搜索后端返回的一条结果。 */
@@ -148,46 +159,117 @@ async function querySearchBackend(
     }
     return parseSearchResults(await response.json());
   } catch (error: unknown) {
+    // 取消不是故障：调用方改主意了，语义是「这次调用作废」。把它包成 provider 失败码，
+    // seam 那头看到的就成了一次搜索失败，日志与用户提示都会指错方向。原样抛出。
+    if (signal?.aborted === true) {
+      throw error;
+    }
     throw new WebError(String(error), "SCRAPLING_SEARCH_FAILED");
   }
 }
 
+/** 默认最多回多少条 source；上游不给 maxResults 时用它。 */
+const DEFAULT_MAX_RESULTS = 8;
+
 /**
- * 把一条命中归一成可引用的 source；URL 归一不出来时给空数组。
+ * 一次搜索最多把多少条命中拿去过闸。
+ *
+ * 每条命中都要过一次闸门，而闸门要解析 DNS —— 后端一次回一万条的话，那就是一万次
+ * 解析。所以封顶必须落在**过闸之前**：先截出前 MAX_SOURCES 条当候选，闸门的总耗时才
+ * 真正有上界（此前上限只裁剪最终输出，一万条命中照样过一万次闸，注释与实现各说各话）。
+ * 超出部分反正到不了结果里 —— maxResults 自身也被钉在同一个数上。
+ */
+const MAX_SOURCES = 100;
+
+/**
+ * 把上游给的 maxResults 收成一个可用的条数。
+ *
+ * 0 与负数必须**报错**而不是夹成 0：夹过去之后这次调用会变成一次「成功但一条结果都没有」
+ * 的搜索，模型与用户都看不出是入参不对，只会以为搜不到东西。上游的类型说明是
+ * 「Omitted = no bound」，所以缺省走默认值，给了就必须是正整数。
+ *
+ * @param raw - 上游给的条数
+ * @returns 归一后的条数
+ * @throws WebError - 给了但不是正整数
+ */
+function boundResults(raw: number | undefined): number {
+  if (raw === undefined) {
+    return DEFAULT_MAX_RESULTS;
+  }
+  if (!Number.isInteger(raw) || raw <= 0) {
+    throw new WebError(
+      `maxResults must be a positive integer, got ${raw}`,
+      "SCRAPLING_SEARCH_FAILED",
+    );
+  }
+  return Math.min(raw, MAX_SOURCES);
+}
+
+/**
+ * 把一条命中归一成可引用的 source；URL 归一不出来或被闸门拦下时给空数组。
+ *
+ * 闸门判否就**丢掉这一条**：它是本次搜索的输入，而输入能不能变成一条结果由部署方的安全
+ * 策略说了算。丢掉的条目不进 sources，于是模型不会引用一个它紧接着就抓不到的地址。
  *
  * @param hit - 后端返回的条目
  * @param endpoint - 搜索端点，相对 URL 的基准
+ * @param gate - 准入闸门；没给就不过闸（自定义 provider 的既有用法）
  * @returns 长度 0 或 1 的数组
  */
-function toSource(hit: ParsedSearchHit, endpoint: string): WebSearchSource[] {
+async function toSource(
+  hit: ParsedSearchHit,
+  endpoint: string,
+  gate: ((url: string) => Promise<string | undefined>) | undefined,
+): Promise<WebSearchSource[]> {
   const url = absolutize(hit.url, endpoint);
   if (url.length === 0) {
     return [];
   }
+  let citeable = url;
+  if (gate !== undefined) {
+    try {
+      const normalized = await gate(url);
+      // 闸门可能把 URL 归一过。判的和引用的必须是同一个串，否则归一化又成一条绕过面。
+      citeable = typeof normalized === "string" ? normalized : url;
+    } catch {
+      // 被安全闸门拦下（私网、元数据端点、非 http(s)…）：这一条不作为结果交出去。
+      return [];
+    }
+  }
   return [
     {
-      url,
+      url: citeable,
       ...(hit.title === undefined ? {} : { title: hit.title }),
       ...(hit.snippet === undefined ? {} : { snippet: hit.snippet }),
     },
   ];
 }
 
+/** 一条命中的读取结果：正文，或「为什么没正文」。 */
+interface FetchOutcome {
+  /** 读到的正文；读不到时是空串。 */
+  readonly body: string;
+  /** 读失败的原因。整场都失败时用它收场，免得「什么都没读到」被当成成功。 */
+  readonly reason: string;
+}
+
 /**
- * 真去抓一条并渲染，返回该条的小节正文。
+ * 真去抓一条，返回该条的小节正文或失败原因。
  *
- * 读不到时返回 undefined 而不是抛：搜索结果里混着失效链接是常态，不该让整次调用失败。
+ * 单条读不到时**不抛**：搜索结果里混着失效链接是常态，不该让整次调用失败。
+ * 但「读不到」的原因要留着 —— 全部条目都读不到时，那正是用户唯一能看到线索的地方，
+ * 尤其当原因是 URL 被安全闸门拦下时。
  *
  * @param source - 要读的 source
  * @param deps - provider 依赖
  * @param signal - 取消信号
- * @returns 小节正文；读不到时是空串
+ * @returns 正文与失败原因
  */
 async function fetchContent(
   source: WebSearchSource,
   deps: SearchProviderDeps,
   signal: AbortSignal | undefined,
-): Promise<string> {
+): Promise<FetchOutcome> {
   try {
     const raw: unknown = await deps.sidecar.call(
       deps.sidecar.capabilities?.browser === true ? "render" : "fetch",
@@ -203,32 +285,44 @@ async function fetchContent(
       { ...(signal === undefined ? {} : { signal }), timeoutMs: deps.timeoutMs },
     );
     const payload = isRecord(raw) ? raw : {};
-    return typeof payload["content"] === "string" ? payload["content"] : "";
-  } catch {
-    return "";
+    const { content } = payload;
+    return typeof content === "string" && content.length > 0
+      ? { body: content, reason: "" }
+      : { body: "", reason: "the page came back with no body" };
+  } catch (error: unknown) {
+    // 取消不归到「这条链接死了」：调用方按了取消，语义是整次调用作废，不是这一条没读到。
+    // 吞掉它，一次取消就会表现为「搜到了结果但正文全空」，用户无从判断发生了什么。
+    if (signal?.aborted === true) {
+      throw error;
+    }
+    // 带机器可读码的错误（URL_BLOCKED / SIDECAR_TIMEOUT …）把码也写进原因：用户看到的
+    // 是「被安全闸门拦下」还是「sidecar 超时」，这两件事要采取的行动完全不同，
+    // 而 String(error) 里只有一个错误类名和消息。
+    const code = error instanceof SidecarError ? `${error.code}: ` : "";
+    return { body: "", reason: `${code}${String(error)}` };
   }
 }
 
 /**
- * 把一条 source 渲染成 Markdown 小节；没有正文时返回 undefined。
+ * 把一条 source 渲染成 Markdown 小节。
  *
  * 读不到就跳过那一条：搜索结果里混着失效链接是常态，不该让整次调用失败。
  *
  * @param source - 要读的 source
  * @param deps - provider 依赖
  * @param signal - 取消信号
- * @returns 小节正文；读不到时是空串
+ * @returns 小节正文与失败原因
  */
 async function renderBody(
   source: WebSearchSource,
   deps: SearchProviderDeps,
   signal: AbortSignal | undefined,
-): Promise<string> {
-  const body = await fetchContent(source, deps, signal);
-  if (body.length === 0) {
-    return "";
+): Promise<FetchOutcome> {
+  const outcome = await fetchContent(source, deps, signal);
+  if (outcome.body.length === 0) {
+    return outcome;
   }
-  return `## ${source.title ?? source.url}\n\n${body}`;
+  return { body: `## ${source.title ?? source.url}\n\n${outcome.body}`, reason: "" };
 }
 
 /**
@@ -269,10 +363,25 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
       if (query.length === 0) {
         throw new WebError("empty query", "SCRAPLING_SEARCH_FAILED");
       }
-      const maxResults = request.maxResults ?? 8;
+      const maxResults = boundResults(request.maxResults);
 
       const hits = await querySearchBackend(endpoint, query, signal);
-      const sources = hits.flatMap((hit) => toSource(hit, endpoint));
+      // sources 也要过准入闸门：搜索后端的回包是外部输入，它尽可以回一条内网地址；
+      // 不过闸的话，那条地址就原样出现在模型眼前，而本包对同一地址的抓取会被拦下。
+      // 候选先截到 MAX_SOURCES 再过闸 —— 闸门每条一次 DNS，封顶必须落在过闸之前。
+      const candidates = hits.slice(0, MAX_SOURCES);
+      const gated = await Promise.all(
+        candidates.map((hit) => toSource(hit, endpoint, deps.urlGate)),
+      );
+      const sources = gated.flat();
+      // 一条都不剩时必须报错，而不是回一次「成功但没有结果」的搜索：后端只回了内网地址
+      // 与「搜不到东西」是两件完全不同的事，后者才是用户想看到的那一种。
+      if (sources.length === 0 && candidates.length > 0) {
+        throw new WebError(
+          `every one of the ${candidates.length} results was rejected by the URL gate`,
+          "SCRAPLING_SEARCH_FAILED",
+        );
+      }
       const bounded = sources.length > maxResults;
       const kept = bounded ? sources.slice(0, maxResults) : sources;
 
@@ -280,13 +389,28 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
       // render 走 Playwright 渲染后再抽，正好补上内置 web_fetch 读不到 SPA 的那块。
       // Promise.all 保序，所以并发不影响 sources 与正文小节的对应关系。
       const toRender = Math.max(0, Math.min(deps.renderTopN, kept.length));
-      const rendered = await Promise.all(
+      const outcomes = await Promise.all(
         kept.slice(0, toRender).map((source) => renderBody(source, deps, signal)),
       );
-      const bodies = rendered.filter((body) => body.length > 0);
+      const bodies = outcomes.filter((outcome) => outcome.body.length > 0);
+
+      // 有 sources 却一条正文都没读到时必须报错。原先一律返回「sources + 没有 content」，
+      // 于是全部链接被安全闸门拦下、sidecar 崩了、后端超时 —— 三种完全不同的故障都表现为
+      // 一次「成功但没有内容」的搜索。URL 被拦是最需要被看见的一种。
+      if (toRender > 0 && bodies.length === 0) {
+        // 正文为空的 outcome 一定带 reason（两条产出路径都写了），所以这里不再兜一层
+        // 「没有原因」的分支 —— 那种写法既走不到，真走到时也只会印出 undefined。
+        const reasons = outcomes.map((outcome) => outcome.reason);
+        throw new WebError(
+          `none of the first ${toRender} results could be read: ${reasons.join("; ")}`,
+          "SCRAPLING_SEARCH_FAILED",
+        );
+      }
 
       return {
-        ...(bodies.length > 0 ? { content: bodies.join("\n\n") } : {}),
+        ...(bodies.length > 0
+          ? { content: bodies.map((outcome) => outcome.body).join("\n\n") }
+          : {}),
         sources: kept,
         truncated: bounded,
       };

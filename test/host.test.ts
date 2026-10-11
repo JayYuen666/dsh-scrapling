@@ -164,6 +164,7 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     renderMaxOutputChars: pick("renderMaxOutputChars", 200_000),
     xhrMaxOutputChars: pick("xhrMaxOutputChars", 120_000),
     crawlMaxItems: pick("crawlMaxItems", 1000),
+    crawlMaxRuntimeSeconds: plain("crawlMaxRuntimeSeconds", 1800),
     stripInlineImages: pick("stripInlineImages", true),
     headless: pick("headless", true),
     networkIdle: pick("networkIdle", false),
@@ -615,6 +616,8 @@ const CRAWL_SETTINGS = {
   requestTimeoutSeconds: 120,
   blockAds: false,
   crawlMaxItems: 10,
+  // 爬虫用例跑本地站点，几十毫秒就结束；给一个宽到不会误触发的截止即可。
+  crawlMaxRuntimeSeconds: 600,
   maxUrlLength: 2048,
   browserExecutablePath: "",
   browserCdpUrl: "",

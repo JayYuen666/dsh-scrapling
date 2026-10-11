@@ -11,7 +11,9 @@ daemon 线程**跑 spider，主线程立刻返回 crawl id；进度通过「没�
 from __future__ import annotations
 
 import threading
+import time
 import uuid
+from contextlib import suppress
 from typing import Any
 from urllib.parse import urlparse
 
@@ -20,6 +22,11 @@ from guard import proxies_for, url_allowed
 # 正在跑的爬虫：crawl id -> {"thread": Thread, "crawl_id": str, "state": dict}
 _CRAWLS: dict[str, dict[str, Any]] = {}
 
+# bridge 有多个 worker 线程，crawl_run 会并发进来。判名额与登记必须原子，否则两个调用
+# 各自数到「还没满」再各自起一条 Spider，MAX_CONCURRENT_CRAWLS 就名存实亡。判定与登记
+# 之间隔着造 Spider（要建会话、可能要走网络），这个窗口足够宽。
+_CRAWL_LOCK = threading.Lock()
+
 # 同时能跑几个爬虫。爬虫是重量级后台任务且**立刻返回**，因此 bridge 的并发槽位对它无效
 # —— 不设上限的话连续几次 crawl.run 就会叠起多个 Spider 线程与 FetcherSession。
 MAX_CONCURRENT_CRAWLS = 2
@@ -27,6 +34,10 @@ MAX_CONCURRENT_CRAWLS = 2
 # 登记表最多留几个已结束的爬虫条目。crawl.status 是唯一能读走结果的入口，所以条目不能一
 # 结束就删；但全留着就是内存泄漏，所以留一个上限，按最旧的淘汰。
 MAX_REMEMBERED_CRAWLS = 16
+
+# 一次爬虫的整体截止（毫秒）。页数上限管不了「一页等一分钟」：1000 页的慢站点能跑几个
+# 小时，而爬虫跑在没人看的后台线程里，没有任何外部计时器会来叫停它。部署侧可按次调小。
+DEFAULT_MAX_RUNTIME_MS = 1_800_000
 
 
 def _clip_markdown(text: str, budget: int) -> str:
@@ -69,11 +80,34 @@ def _allowed_domains(url: str) -> set[str]:
     # 主机名与 host:port 都放进去：Scrapling 的域过滤可能按 hostname 比，也可能按
     # netloc 比。少放一个的表现是「只爬到第一页就停」，不报错，很难一眼看出原因。
     parsed = urlparse(url)
-    domains = {value for value in (parsed.hostname, parsed.netloc) if value}
-    return domains
+    return {value for value in (parsed.hostname, parsed.netloc) if value}
 
 
-def _make_spider(url: str, limit: int, crawl_id: str, state: dict[str, Any]) -> Any:
+def _within_allowed_domains(url: str, allowed: set[str]) -> bool:
+    """这个地址还在起始域里吗。
+
+    口径与 Scrapling 引擎的 ``_is_domain_allowed`` 逐字一致（netloc 相等，或落在某个
+    允许域的子域下）—— 链接发现那一侧本来就这么滤。但**它只管链接发现**：重定向是
+    curl_cffi 自己跟的，``follow_redirects="safe"`` 只拒绝跳向私网，站外公网跳转照跟。
+    所以最终落在哪个主机上，必须在收页之前自己复判一次。
+
+    :param url: 待判定的地址
+    :param allowed: 允许的域集合
+    :returns: 是否仍在起始域内
+    """
+    domain = urlparse(url).netloc.lower()
+    if not domain:
+        return False
+    return any(domain == entry or domain.endswith(f".{entry}") for entry in allowed)
+
+
+def _make_spider(
+    url: str,
+    limit: int,
+    crawl_id: str,
+    state: dict[str, Any],
+    domains: set[str],
+) -> Any:
     """动态造一个 spider 类。
 
     Spider 的 ``start_urls`` / ``allowed_domains`` / ``max_pages`` / ``output_dir``
@@ -84,6 +118,7 @@ def _make_spider(url: str, limit: int, crawl_id: str, state: dict[str, Any]) -> 
     :param limit: 最多爬多少页
     :param crawl_id: 爬虫 id，用于日志
     :param state: 结果槽；爬完写进它
+    :param domains: 起始域集合，链接发现与收页复核共用同一份
     :returns: spider 实例
     """
     from scrapling.spiders import SiteToMarkdownSpider
@@ -93,7 +128,7 @@ def _make_spider(url: str, limit: int, crawl_id: str, state: dict[str, Any]) -> 
 
         name = f"scrapling-{crawl_id}"
         start_urls = [url]
-        allowed_domains = _allowed_domains(url)
+        allowed_domains = domains
         max_pages = limit
         output_dir = None
 
@@ -135,9 +170,14 @@ def _make_spider(url: str, limit: int, crawl_id: str, state: dict[str, Any]) -> 
             if len(pages) >= limit:
                 return None
             page_url = str(item.get("url", ""))
-            # 收页前的最后一道：即使 safe 重定向放行了，这一页的最终 URL 仍可能落在私网上。
-            # 判否就不收 —— 内容已经在对端取过了，但至少不把它写进 state 流回模型上下文。
+            # 收页前的最后两道：
+            # 一是即使 safe 重定向放行了，这一页的最终 URL 仍可能落在私网上；
+            # 二是它可能被重定向去了**站外另一台公网主机** —— allowed_domains 只参与链接
+            # 发现，拦不住 curl_cffi 自己跟的那一跳。判否就不收：内容已经在对端取过了，
+            # 但至少不把它写进 state 流回模型上下文。
             allowed, reason = url_allowed(page_url)
+            if allowed and not _within_allowed_domains(page_url, domains):
+                allowed, reason = False, "left the start domain (redirect)"
             if not allowed:
                 _emit_event(
                     "crawlSkipped",
@@ -145,6 +185,19 @@ def _make_spider(url: str, limit: int, crawl_id: str, state: dict[str, Any]) -> 
                     url=page_url,
                     text=f"skipped {page_url}: {reason}",
                 )
+                return None
+            # 整体截止：页数上限管不了慢站点，而爬虫跑在没人看的后台线程里。到了点就按
+            # 引擎自己的停机通道退场 —— pause() 让引擎在在途请求收尾后停，不是撕进程。
+            if time.monotonic() >= state["deadline"]:
+                state["expired"] = True
+                _emit_event(
+                    "crawlSkipped",
+                    crawlId=crawl_id,
+                    url=page_url,
+                    text=f"crawl stopped: runtime budget of {state['budget_ms']}ms reached",
+                )
+                with suppress(RuntimeError):
+                    self.pause()
                 return None
             markdown = str(item.get("markdown", ""))
             # 与其余抓取路径同一口径：内嵌 base64 图片是纯 token 噪音，先剥再封顶 ——
@@ -192,11 +245,19 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
 
     url = _url(args)
     max_pages = _positive_int(args.get("maxPages"), "maxPages", 20)
-    max_content_chars = _positive_int(
-        args.get("maxContentChars"), "maxContentChars", DEFAULT_MAX_CONTENT_CHARS
-    )
+    max_content_chars = _positive_int(args.get("maxContentChars"), "maxContentChars", DEFAULT_MAX_CONTENT_CHARS)
+    budget_ms = _positive_int(args.get("maxDurationMs"), "maxDurationMs", DEFAULT_MAX_RUNTIME_MS)
     strip_inline_images = _strip_inline_images(args)
     crawl_id = uuid.uuid4().hex[:12]
+    state: dict[str, Any] = {
+        "error": None,
+        "pages": [],
+        "max_content_chars": max_content_chars,
+        "strip_inline_images": strip_inline_images,
+        "budget_ms": budget_ms,
+        "deadline": time.monotonic() + budget_ms / 1000,
+    }
+    domains = _allowed_domains(url)
 
     # Host 闸门判的是这条 URL，但协议层不该假设调用方一定判过：这道复核与浏览器路径上
     # 的 guard.url_allowed 是同一个实现，因此两侧同解。
@@ -204,27 +265,39 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
     if not allowed:
         raise AdapterError("URL_BLOCKED", f"{url}: {reason}")
 
-    _evict_finished_crawls()
-    running = [entry for entry in _CRAWLS.values() if entry["thread"].is_alive()]
-    if len(running) >= MAX_CONCURRENT_CRAWLS:
-        raise AdapterError(
-            "CRAWL_BUSY",
-            f"already {len(running)} crawls running; the limit is {MAX_CONCURRENT_CRAWLS}",
-        )
+    with _CRAWL_LOCK:
+        _evict_finished_crawls()
+        running = [entry for entry in _CRAWLS.values() if _is_running(entry)]
+        if len(running) >= MAX_CONCURRENT_CRAWLS:
+            raise AdapterError(
+                "CRAWL_BUSY",
+                f"already {len(running)} crawls running; the limit is {MAX_CONCURRENT_CRAWLS}",
+            )
+        # 先占位再回去造 Spider。占位条目的 thread 是 None，_is_running 把它算作在跑 ——
+        # 名额要在造 spider 的那几百毫秒里一直占着，否则并发调用会各自数到「还没满」。
+        # stop_requested 也在占位时就位：那期间到来的叫停不能丢。
+        _CRAWLS[crawl_id] = {
+            "thread": None,
+            "crawl_id": crawl_id,
+            "state": state,
+            "stop_requested": False,
+        }
 
-    state: dict[str, Any] = {
-        "error": None,
-        "pages": [],
-        "max_content_chars": max_content_chars,
-        "strip_inline_images": strip_inline_images,
-    }
     try:
-        spider = _make_spider(url, max_pages, crawl_id, state)
-    except Exception as error:  # noqa: BLE001
+        spider = _make_spider(url, max_pages, crawl_id, state, domains)
+    except BaseException as error:
+        with _CRAWL_LOCK:
+            _CRAWLS.pop(crawl_id, None)
+        if isinstance(error, AdapterError):
+            raise
         raise AdapterError("CRAWL_SETUP_FAILED", f"{type(error).__name__}: {error}") from error
 
     def worker() -> None:
         """后台线程体：跑爬虫并把异常收进 state，不让它悄悄消失。"""
+        with _CRAWL_LOCK:
+            if _CRAWLS.get(crawl_id, {}).get("stop_requested") is True:
+                # 线程还没跑就被叫停了（crawl_stop 在 spider 登记之前到）：一页都不抓。
+                return
         try:
             spider.start()
         except Exception as error:  # noqa: BLE001
@@ -232,19 +305,36 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
             _emit_event("crawlError", crawlId=crawl_id, text=str(error))
 
     thread = threading.Thread(target=worker, daemon=True, name=f"crawl-{crawl_id}")
-    _CRAWLS[crawl_id] = {"thread": thread, "crawl_id": crawl_id, "state": state}
+    with _CRAWL_LOCK:
+        # spider 也要登记：叫停时拿得到它，才调得动引擎的停机通道。
+        _CRAWLS[crawl_id]["spider"] = spider
+        _CRAWLS[crawl_id]["thread"] = thread
     thread.start()
     _emit_event("crawlStarted", crawlId=crawl_id, text=f"crawling {url} (max {max_pages} pages)")
     return {"crawlId": crawl_id}
+
+
+def _is_running(entry: dict[str, Any]) -> bool:
+    """这个登记条目算不算「正在跑」。
+
+    ``thread`` 为 ``None`` 表示 spider 还在构造中：它已经占了并发名额，所以算在跑。
+
+    :param entry: 登记条目
+    :returns: 是否占用名额
+    """
+    thread = entry.get("thread")
+    return thread is None or thread.is_alive()
 
 
 def _evict_finished_crawls() -> None:
     """把已结束且超出留存量上限的爬虫条目从登记表里淘汰。
 
     爬虫跑在 daemon 线程里，没法优雅中断；但**跑完的**条目只是一份没人再读的历史，
-    留久了就是纯内存占用。按插入顺序从最旧的开始丢。
+    留久了就是纯内存占用。按插入顺序从最旧的开始丢。构造中的条目不算已结束。
+
+    :func:`_evict_finished_crawls` 只在 :func:`crawl_run` 持锁时被调用。
     """
-    finished = [key for key, entry in _CRAWLS.items() if not entry["thread"].is_alive()]
+    finished = [key for key, entry in _CRAWLS.items() if not _is_running(entry)]
     overflow = len(_CRAWLS) - MAX_REMEMBERED_CRAWLS
     for key in finished[: max(0, overflow)]:
         del _CRAWLS[key]
@@ -271,17 +361,57 @@ def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
     """查一个爬虫的状态与已收结果。
 
     :param args: 协议参数
-    :returns: {crawlId, running, pages, error}
+    :returns: {crawlId, running, pages, error, expired}
     """
     entry = _get_crawl(args.get("crawlId"))
-    thread: threading.Thread = entry["thread"]
     state: dict[str, Any] = entry["state"]
+    # pages 是 spider 线程边跑边 append 的活列表，而回包要经 json.dumps 序列化。
+    # 进锁里复制一份：一边序列化一边追加，结果要么漏一页要么撞上 RuntimeError。
+    with _CRAWL_LOCK:
+        pages = list(state["pages"])
+        running = _is_running(entry)
     return {
         "crawlId": entry["crawl_id"],
-        "running": thread.is_alive(),
-        "pages": state["pages"],
+        # thread 为 None 表示 spider 还在构造中：没跑起来，但也没结束。
+        "running": running,
+        "pages": pages,
         "error": state["error"],
+        # 截止到点而停的爬虫带这个标记：模型能看出「为什么比 maxPages 少」。
+        "expired": state.get("expired") is True,
     }
+
+
+def crawl_stop(args: dict[str, Any]) -> dict[str, Any]:
+    """叫停一个爬虫。
+
+    为什么必须有这条：宿主的作业取消只活在 Node 侧，Python 里的 Spider 跑在自己的
+    线程上，看不见它。少了这一条，「作业显示已杀」之后爬虫还在后台跑，Python 进程也
+    一直被一个没人管的蜘蛛占着。三条路各管一段：已经在跑的由 ``Spider.pause()`` 立刻
+    收尾（引擎留给外部叫停的通道，等在途请求收尾后自己退出）；还没开始跑的把截止提前到
+    现在，并在抓到第一页之前退出。
+
+    已经跑完的爬虫叫不停（引擎已拆），那不是错误：调用的意图是「别跑了」，已经停了。
+
+    :param args: 协议参数
+    :returns: {crawlId, stopping}
+    :raises adapters.AdapterError: id 缺失或不存在
+    """
+    entry = _get_crawl(args.get("crawlId"))
+    state: dict[str, Any] = entry["state"]
+    # 截止提前到「现在」：构造中的蜘蛛、刚起线程还没抓到页的蜘蛛，都在收到第一页时停。
+    state["deadline"] = time.monotonic()
+    with _CRAWL_LOCK:
+        spider = entry.get("spider")
+        running = _is_running(entry)
+        if spider is None:
+            # 线程还没起：置个标志，worker 起手看见它就直接退出，一页都不抓。
+            entry["stop_requested"] = True
+    stopping = False
+    if spider is not None and running:
+        with suppress(RuntimeError):
+            spider.pause()
+        stopping = True
+    return {"crawlId": entry["crawl_id"], "stopping": stopping}
 
 
 def close_all_crawls() -> None:
@@ -296,4 +426,5 @@ def close_all_crawls() -> None:
 METHODS = {
     "crawl.run": crawl_run,
     "crawl.status": crawl_status,
+    "crawl.stop": crawl_stop,
 }

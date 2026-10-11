@@ -19,7 +19,6 @@ handler 里**；对应地，调用 Scrapling 时必须把 `block_ads` / `blocked
 from __future__ import annotations
 
 import ipaddress
-import re
 import socket
 from collections.abc import Iterable
 from typing import Any
@@ -30,11 +29,6 @@ ALLOWED_HOSTS: frozenset[str] = frozenset()
 
 # 额外放行的端口；空表示不限端口（与 dsh 内置 fetch provider 同取舍）。
 ALLOWED_PORTS: frozenset[int] = frozenset()
-
-# 「看起来是想写 IP 字面量」的主机名形态：只由数字、点、冒号、x 与十六进制字母组成。
-# 真正的域名至少含一个字母且形态更杂，所以不会误伤；反过来 0177.0.0.1 / 2852039166 /
-# 0x7f000001 都在内。IPv6 字面量带方括号，从别处进来。
-_IP_LITERAL_SHAPE = re.compile(r"\A[0-9a-fA-FxX.:]+\Z")
 
 # 允许额外放行主机名的环境变量。默认不设 ⇒ 放行集合为空 ⇒ 守卫最严。
 #
@@ -70,7 +64,7 @@ SYNTHETIC_NETWORKS: tuple[ipaddress.IPv4Network, ...] = ()
 #
 # 198.18.0.0/15 是 RFC 2544 基准测试段（clash / mihomo 默认），100.64.0.0/10 是 RFC 6598
 # CGNAT 段（部分 TUN 客户端）。私网、回环、链路本地一个都不在表内——那正是 SSRF 要打的。
-SYNTHETIC_POOLS: tuple[ipaddress.IPv4Network, ...] = (
+SYNTHETIC_POOLS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
     ipaddress.ip_network("198.18.0.0/15"),
     ipaddress.ip_network("100.64.0.0/10"),
 )
@@ -158,14 +152,20 @@ def configure_from_env() -> None:
 
     global SYNTHETIC_NETWORKS, PROXY_URL, PROXY_BYPASS, _BYPASS_ENTRIES  # noqa: PLW0603 —— 启动时定一次
     global _ENV_PROXIES, _ENV_BYPASS, _SYSTEM_PROXIES, _PAC_NOTICE  # noqa: PLW0603 —— 同上
-    networks = []
+    networks: list[ipaddress.IPv4Network] = []
     for item in os.environ.get(SYNTHETIC_RANGES_ENV, "").split(","):
         text = item.strip()
-        if text:
-            try:
-                networks.append(ipaddress.ip_network(text))
-            except ValueError:
-                continue
+        if not text:
+            continue
+        try:
+            network = ipaddress.ip_network(text)
+        except ValueError:
+            continue
+        # 只收 IPv4：合成落池没有 IPv6 形态（与 Host 侧 parseSyntheticRange 同一口径），
+        # 而这一份表只与 IPv4Address 比。收一个 IPv6 段进去，它永远命中不了，还会让
+        # 「配过了」的假象成立。
+        if isinstance(network, ipaddress.IPv4Network):
+            networks.append(network)
     SYNTHETIC_NETWORKS = tuple(networks)
     PROXY_URL = os.environ.get(PROXY_ENV, "").strip()
     PROXY_BYPASS = os.environ.get(PROXY_BYPASS_ENV, "").strip()
@@ -281,9 +281,7 @@ def parse_windows_proxy(entries: dict[str, str]) -> dict[str, str]:
     if not raw:
         return {}
     if "=" in raw:
-        parts = dict(
-            item.split("=", 1) for item in raw.split(";") if "=" in item
-        )
+        parts = dict(item.split("=", 1) for item in raw.split(";") if "=" in item)
     else:
         parts = {"http": raw, "https": raw}
     table: dict[str, str] = {}
@@ -329,7 +327,7 @@ def _windows_system_proxies() -> tuple[dict[str, str], str]:
     import os
     import re
 
-    root = os.environ.get("SystemRoot", "C:\\Windows")
+    root = os.environ.get("SYSTEMROOT", "C:\\Windows")
     blob = _run_readonly(
         [
             f"{root}\\System32\\reg.exe",
@@ -421,10 +419,7 @@ def proxy_for(url: str) -> str:
         return PROXY_URL
     key = _proxy_scheme_key(url)
     return (
-        _ENV_PROXIES.get(key)
-        or _ENV_PROXIES.get("all")
-        or _SYSTEM_PROXIES.get(key)
-        or _SYSTEM_PROXIES.get("all", "")
+        _ENV_PROXIES.get(key) or _ENV_PROXIES.get("all") or _SYSTEM_PROXIES.get(key) or _SYSTEM_PROXIES.get("all", "")
     )
 
 
@@ -455,10 +450,7 @@ def default_proxy() -> str:
     """
     if any(entry.strip() == "*" for entry in _BYPASS_ENTRIES):
         return ""
-    table = PROXY_URL or next(iter(_ENV_PROXIES.values()), "") or next(
-        iter(_SYSTEM_PROXIES.values()), ""
-    )
-    return table
+    return PROXY_URL or next(iter(_ENV_PROXIES.values()), "") or next(iter(_SYSTEM_PROXIES.values()), "")
 
 
 def split_proxy(raw: str) -> dict[str, str] | None:
@@ -548,11 +540,105 @@ def _embedded_ipv4(address: ipaddress.IPv6Address) -> ipaddress.IPv4Address | No
     return None
 
 
-def effective_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+def _ipv4_compatible(address: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """若地址落在 IPv4-compatible 段 ``::/96``，抽出内嵌的 IPv4。
+
+    ``::7f00:1`` 就是 ``::127.0.0.1``，写法合法，不少系统按它连 IPv4 回环。而
+    ``ipaddress`` 的 ``is_private`` 不把 ``::/96`` 算作私有段，所以 ``::127.0.0.1``
+    在这里会被当成普通公网 IPv6 放行 —— 与 Host 侧 ``lib/url-policy.ts`` 是同一个洞，
+    两边必须同解。
+
+    ``::/96`` 覆盖前六组，也就是 16 字节里的前 12 字节；内嵌 IPv4 在最后 4 字节。
+    ``::`` 与 ``::1`` 落在段外（前 12 字节不全为 0），各自另有私有判定。
+
+    :param address: IPv6 地址
+    :returns: 内嵌的 IPv4 地址；不落在该段时返回 ``None``
+    """
+    packed = address.packed
+    if any(packed[:12]):
+        return None
+    return ipaddress.IPv4Address(packed[12:16])
+
+
+def _ipv4_number(part: str) -> int | None:
+    """按 WHATWG 的 IPv4-number 规则读一段：0x 前缀按十六进制，前导 0 按八进制，其余十进制。
+
+    规格是 URL Standard 的「IPv4 number parser」：段为空记 0；出现不属于当前进制的
+    字符即失败（``08``、``de`` 都失败）。``int()`` 自己比规格宽 —— 它吃下划线分隔、
+    前后空白与非 ASCII 数字 —— 所以解析后还要回写比对，杜绝 ``1_0`` 这类溜进来。
+
+    :param part: 主机名按点切开的一段
+    :returns: 该段的数值；按 WHATWG 解析失败时为 None
+    """
+    if part[:2].lower() == "0x":
+        digits, radix = part[2:], 16
+    elif len(part) > 1 and part[0] == "0":
+        digits, radix = part[1:], 8
+    else:
+        digits, radix = part, 10
+    if not digits:
+        return 0
+    # int() 自己比规格宽：吃下划线分隔、前后空白与非 ASCII 数字。规格只要求「每个字符
+    # 都属于当前进制的数字表」，按字符校验而不是回写规范化 —— 八进制段内的前导零是
+    # 合法的（``00177`` 剥一个零后是 ``0177`` = 127），回写比对会把它错杀。
+    allowed = "0123456789abcdef" if radix == 16 else "01234567" if radix == 8 else "0123456789"
+    if any(char not in allowed for char in digits.lower()):
+        return None
+    return int(digits, radix)
+
+
+def _whatwg_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    """按 WHATWG（也就是 Chromium）的 host 规则把主机名解析成 IPv4 字面量；不是就给 None。
+
+    这一改为的是「浏览器按什么连，守卫就按什么判」：``0177.0.0.1``（八进制）、
+    ``2852039166``（整数）、``0x7f000001``（十六进制）Chromium 都按 IPv4 处理，而
+    Python 的 ipaddress 只认点分十进制，getaddrinfo 又随平台而变。此前的字符形态
+    正则虽能拦住这三类，但也会把 ``cafe.de``、``beef.be`` 这类**真实存在的纯十六进制
+    字母域名**一起误杀 —— 且 Host 侧（ipaddr.js 真解析）会放行，两层判定因此不同解。
+    规格见 URL Standard 的 host parser IPv4 分支：
+
+    - 只有「以数字结尾」才尝试 IPv4：末段全数字，或带 0x 前缀。``cafe.de`` 的末段
+      ``de`` 两者皆非，按域名走 DNS；
+    - 按点分段，结尾的空段忽略，段数超过 4 失败；
+    - 每段经 :func:`_ipv4_number` 读出，非末段 > 255 失败，末段 ≥ 256^(5-段数) 失败。
+
+    :param host: 主机名（不含方括号；IPv6 字面量在调用方更早的一步就被 ipaddress 接住）
+    :returns: 解析成功时给出 IPv4 地址；「不是 IPv4 字面量」或「以数字结尾但 WHATWG
+        解析失败」时为 None —— 后一类浏览器会直接判 URL 无效、根本不发起连接，
+        交回 DNS 路径只影响静态抓取对这类冷门名字的处理。
+    """
+    parts = host.split(".")
+    if len(parts) > 1 and parts[-1] == "":
+        parts.pop()
+    if not parts:
+        return None
+    last = parts[-1]
+    ends_in_number = (last.isascii() and last.isdigit()) or (len(last) > 2 and last[:2].lower() == "0x")
+    if not ends_in_number or len(parts) > 4:
+        return None
+    numbers: list[int] = []
+    for part in parts:
+        value = _ipv4_number(part)
+        if value is None:
+            return None
+        numbers.append(value)
+    if any(number > 255 for number in numbers[:-1]):
+        return None
+    if numbers[-1] >= 256 ** (5 - len(parts)):
+        return None
+    address = numbers[-1]
+    for index, number in enumerate(numbers[:-1]):
+        address += number * 256 ** (3 - index)
+    return ipaddress.IPv4Address(address)
+
+
+def effective_ip(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
     """把地址归约成「最终该按谁的属性判定」。
 
-    IPv4-mapped（::ffff:a.b.c.d）与 NAT64 藏着的 IPv4 都要换成内嵌 IPv4 再判，
-    否则 ``::ffff:127.0.0.1`` 会被当成普通 IPv6 公网放行。
+    IPv4-mapped（::ffff:a.b.c.d）、IPv4-compatible（::a.b.c.d）与 NAT64 藏着的 IPv4
+    都要换成内嵌 IPv4 再判，否则这些写法会被当成普通 IPv6 公网放行。
     """
     if isinstance(address, ipaddress.IPv6Address):
         if address.ipv4_mapped is not None:
@@ -560,6 +646,9 @@ def effective_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipad
         embedded = _embedded_ipv4(address)
         if embedded is not None:
             return embedded
+        compatible = _ipv4_compatible(address)
+        if compatible is not None:
+            return compatible
     return address
 
 
@@ -592,7 +681,8 @@ def detect_synthetic_resolver() -> bool:
         except OSError:
             _SYNTHETIC_RESOLVER = False
             return _SYNTHETIC_RESOLVER
-        resolved.extend(info[4][0] for info in infos)
+        # getaddrinfo 的答案元素是 str | int（sockaddr 的形状），而这里只要地址串。
+        resolved.extend(str(info[4][0]) for info in infos)
     if len(resolved) < len(CONTROL_HOSTS):
         _SYNTHETIC_RESOLVER = False
         return _SYNTHETIC_RESOLVER
@@ -655,13 +745,14 @@ def is_public_address(host: str, *, proxied: bool = False) -> bool:
     else:
         return effective_ip(parsed).is_global
 
-    # 形态判据：全由数字/点/十六进制字符组成的主机名一定是想写 IP 字面量（十进制、八进制、
-    # 分段十六进制这些老写法），而各家的读法并不一致。ipaddress 按十进制读，WHATWG
-    # （也就是 Chromium）把前导 0 当八进制：`0177.0.0.1` 在这里是 177.0.0.1，在浏览器里
-    # 就是 127.0.0.1 —— 守卫放行、浏览器连回环。ipaddress 既然解析不出来，就不交给
-    # getaddrinfo 去赌平台解析器的口径，直接判否。
-    if _IP_LITERAL_SHAPE.search(host) and not host.startswith("["):
-        return False
+    # WHATWG（也就是 Chromium）认得的 IPv4 字面量在这里精确复刻：浏览器按它连，守卫就
+    # 按它判 —— 八进制、整数与十六进制这些老写法解析出来的私网/回环地址在此现形
+    # （0177.0.0.1 → 127.0.0.1，2852039166 → 169.254.169.254，0x7f000001 → 127.0.0.1），
+    # 而纯十六进制字母的真实域名不再被误杀。以数字结尾但 WHATWG 解析失败的
+    # （1.2.3.4.5、08.0.0.1）浏览器根本不会发起连接，交回 DNS 路径按域名处理。
+    literal = _whatwg_ipv4(host)
+    if literal is not None:
+        return effective_ip(literal).is_global
     if "." not in host:
         return False
 
@@ -705,7 +796,7 @@ def url_allowed(url: str) -> tuple[bool, str]:
     return True, ""
 
 
-def install(page: object) -> None:
+def install(page: Any) -> None:
     """把守卫注册到 Playwright 的 page 上。
 
     用法是交给 Scrapling 的 ``page_setup=install``。选择器用 ``**/*`` 以覆盖主导航、
@@ -730,43 +821,43 @@ def install(page: object) -> None:
     :param page: Playwright 的 Page 对象（同步或异步 API 通用）
     """
 
-    def handler(route: object) -> None:  # noqa: ANN401 —— 拿不到 Playwright 的类型
-        request = route.request  # pyright: ignore[reportAttributeAccessIssue]
+    # 下面四个入参一律标 Any：Playwright 的对象形状只有运行期才知道，而本包刻意不依赖
+    # 它的类型（那会把 playwright/patchright 提成硬依赖）。两个检查器因此都不需要
+    # 逐行 ignore —— 一个类型决策写在一处，比散落的抑制标记好维护。
+    def handler(route: Any) -> None:
+        request = route.request
         allowed, reason = url_allowed(request.url)
         if allowed:
             fallback = getattr(route, "fallback", None)
             if callable(fallback):
                 fallback()
             else:
-                route.continue_()  # pyright: ignore[reportAttributeAccessIssue]
+                route.continue_()
         else:
             _log(f"blocked {request.url}: {reason}")
-            route.abort()  # pyright: ignore[reportAttributeAccessIssue]
+            route.abort()
 
-    def ws_handler(websocket: object) -> None:  # noqa: ANN401 —— 同上
+    def ws_handler(websocket: Any) -> None:
         url = getattr(websocket, "url", "")
         allowed, reason = url_allowed(url if isinstance(url, str) else "")
         if allowed:
             # 显式连一次而不是什么都不做：不连时 Playwright 自己放行，那条默认路径
             # 不经任何判定，显式连接才与 HTTP 侧摆在同一套逻辑里。
-            websocket.connect_to_server()  # pyright: ignore[reportAttributeAccessIssue]
+            websocket.connect_to_server()
         else:
             _log(f"blocked websocket {url}: {reason}")
-            websocket.close()  # pyright: ignore[reportAttributeAccessIssue]
+            websocket.close()
 
-    page.route("**/*", handler)  # pyright: ignore[reportAttributeAccessIssue]
+    page.route("**/*", handler)
 
     route_ws = getattr(page, "route_web_socket", None)
     if callable(route_ws):
-        route_ws("**/*", ws_handler)  # pyright: ignore[reportAttributeAccessIssue]
+        route_ws("**/*", ws_handler)
     else:
-        _log(
-            "this Playwright build has no route_web_socket; "
-            "WebSocket connections are not covered by the URL guard"
-        )
+        _log("this Playwright build has no route_web_socket; WebSocket connections are not covered by the URL guard")
 
 
-def websocket_guard_supported(page: object) -> bool:  # noqa: ANN401 —— 同上
+def websocket_guard_supported(page: Any) -> bool:
     """page 上挂得上 WebSocket 守卫与否；供能力报告如实说明覆盖面。
 
     :param page: Playwright 的 Page 对象

@@ -7,7 +7,9 @@
 // 投诉。
 //
 // 文案是中英双份而不是只写中文：设置卡的语言跟着宿主走，写死中文等于让英文界面的用户
-// 看不懂一半的标签。
+// 看不懂一半的标签。这份双份文案同时是 locale 字典的**唯一来源** —— 下面的
+// `localeDictionaries()` 把它摊成宿主 locale 服务要的扁平键，卡片只通过 `t()` 取字，
+// 于是「字段表」与「真正显示出来的文案」不可能各走各的。
 
 /** 一个字段的控件形态。 */
 export type FieldKind = "boolean" | "text" | "number" | "enum";
@@ -34,6 +36,14 @@ export interface FieldSpec {
   readonly fallback: string | number | boolean;
   /** 枚举字段的取值，取自 schema 的 union。 */
   readonly options?: readonly string[];
+  /**
+   * 值里可能带凭据，控件默认遮罩显示。
+   *
+   * 代理地址就是这种：``http://user:pass@host:port`` 是它文档里的合法写法，而明文摆在一个
+   * 输入框里等于把密码摊在屏幕上 —— 截图、屏幕共享、录屏、浏览器扩展都能原样读走。
+   * 遮罩只改**显示**：值本身仍是原串，编辑与保存语义一点不变。
+   */
+  readonly secret?: boolean;
 }
 
 /** 一组字段。 */
@@ -371,10 +381,11 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
       {
         key: "proxyUrl",
         kind: "text",
+        secret: true,
         label: { zh: "代理地址", en: "Proxy URL" },
         hint: {
-          zh: "如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890，可带 user:pass@。留空=依次跟随环境变量与系统代理设置；填了就压过那两者。",
-          en: "e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:7890, user:pass@ allowed. Empty follows the environment and then the OS proxy settings; setting it outranks both.",
+          zh: "如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890，可带 user:pass@。留空=依次跟随环境变量与系统代理设置；填了就压过那两者。值按密码遮罩显示，点「显示」可查看。",
+          en: "e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:7890, user:pass@ allowed. Empty follows the environment and then the OS proxy settings; setting it outranks both. Masked like a password; press Show to reveal it.",
         },
         fallback: "",
       },
@@ -480,3 +491,106 @@ export const SETTINGS_FIELDS: readonly FieldSpec[] = SETTINGS_GROUPS.flatMap(
 
 /** 字段键的清单，供与 schema 对账。 */
 export const SETTINGS_FIELD_KEYS: readonly string[] = SETTINGS_FIELDS.map((field) => field.key);
+
+/** 本包 Client 半注册的字典命名空间。 */
+export const LOCALE_NS = "dshScrapling";
+
+/** 宿主自带的两种语言。字典按语言逐份注册，键集必须完全一致。 */
+type BuiltInLang = "zh" | "en";
+
+/** 设置卡自身的文案：按钮、状态行与读屏提示。字段标签不在这里 —— 它们由字段表摊出来。 */
+const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = {
+  zh: {
+    save: "保存",
+    saving: "保存中…",
+    undo: "撤销",
+    reveal: "显示",
+    conceal: "隐藏",
+    revealHint: "这一项按密码遮罩显示",
+    statusLoading: "正在读取设置…",
+    statusReadonly: "这个连接以只读方式运行，设置改不了。",
+    statusClean: "没有未保存的改动",
+    statusChanged: "已改动 {count} 项，未保存",
+    statusInvalid: "有 {count} 项填的不是合法数字，改好后才能保存",
+    rejected: "保存被宿主拒绝了，设置未改动",
+    stale: "设置已经被别处改过，请重新打开这张卡再保存",
+    failed: "保存失败：{reason}",
+  },
+  en: {
+    save: "Save",
+    saving: "Saving…",
+    undo: "Undo",
+    reveal: "Show",
+    conceal: "Hide",
+    revealHint: "this field is masked like a password",
+    statusLoading: "Reading settings…",
+    statusReadonly: "This connection runs read-only; settings cannot be changed here.",
+    statusClean: "No unsaved changes",
+    statusChanged: "{count} change(s) not saved yet",
+    statusInvalid: "{count} field(s) are not valid numbers; fix them to save",
+    rejected: "The host refused the save; nothing changed",
+    stale: "Settings changed elsewhere; reopen this page before saving",
+    failed: "Save failed: {reason}",
+  },
+};
+
+/** 结果行那一行的文案：字段名与那一个「看详情」的入口。 */
+const ROW_CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = {
+  zh: {
+    "row.url": "URL",
+    "row.http": "HTTP",
+    "row.body": "正文",
+    "row.matched": "匹配",
+    "row.sessionCount": "会话数",
+    "row.session": "会话",
+    "row.type": "类型",
+    "row.start": "起始",
+    "row.pageCap": "上限",
+    "row.job": "作业",
+    "row.inspect": "在轨迹里查看",
+    "row.truncated": "已截断",
+  },
+  en: {
+    "row.url": "URL",
+    "row.http": "HTTP",
+    "row.body": "Body",
+    "row.matched": "Matched",
+    "row.sessionCount": "Sessions",
+    "row.session": "Session",
+    "row.type": "Type",
+    "row.start": "Start",
+    "row.pageCap": "Page cap",
+    "row.job": "Job",
+    "row.inspect": "Inspect this call",
+    "row.truncated": "Truncated",
+  },
+};
+
+/**
+ * 把字段表与卡面文案摊成宿主 locale 服务要的字典。
+ *
+ * 键的形状：字段是 `field.<key>.label` / `field.<key>.hint`，分组是
+ * `group.<id>.title` / `group.<id>.note`，卡面文案直接用自己的键。键从字段表推出来，
+ * 所以往表里加一个字段就自动多出两条词典项 —— 不需要在这里再抄一遍。
+ *
+ * @returns 语言 → 键值表；两份的键集相等
+ */
+export function localeDictionaries(): Record<BuiltInLang, Record<string, string>> {
+  const result: Record<BuiltInLang, Record<string, string>> = {
+    zh: { ...CHROME.zh, ...ROW_CHROME.zh },
+    en: { ...CHROME.en, ...ROW_CHROME.en },
+  };
+  for (const group of SETTINGS_GROUPS) {
+    result.zh[`group.${group.id}.title`] = group.title.zh;
+    result.zh[`group.${group.id}.note`] = group.note.zh;
+    result.en[`group.${group.id}.title`] = group.title.en;
+    result.en[`group.${group.id}.note`] = group.note.en;
+    for (const field of group.fields) {
+      result.zh[`field.${field.key}.label`] = field.label.zh;
+      result.zh[`field.${field.key}.hint`] = field.hint.zh;
+      result.en[`field.${field.key}.label`] = field.label.en;
+      result.en[`field.${field.key}.hint`] = field.hint.en;
+    }
+  }
+  return result;
+}

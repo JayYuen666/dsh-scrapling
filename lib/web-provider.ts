@@ -105,16 +105,28 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
         throw new WebError(String(error), "SCRAPLING_FETCH_FAILED");
       }
 
-      const payload = isRecord(raw) ? raw : {};
-      const url = typeof payload["url"] === "string" ? payload["url"] : request.url;
-      const statusCode = typeof payload["status"] === "number" ? payload["status"] : 0;
-      const content = typeof payload["content"] === "string" ? payload["content"] : "";
+      const payload = isRecord(raw) ? raw : undefined;
+      // 回包形状不对就报失败，而不是补成「一个空的 200 页面」交上去：调用方会把
+      // statusCode: 0 当成一个真实的状态码、把空正文当成「这个页面确实没有内容」，
+      // 于是对端协议一坏，结果就是一片看起来完全正常的空结果。
+      if (
+        payload === undefined ||
+        typeof payload["url"] !== "string" ||
+        typeof payload["status"] !== "number" ||
+        typeof payload["content"] !== "string"
+      ) {
+        throw new WebError(
+          `sidecar returned a malformed fetch reply: ${JSON.stringify(raw).slice(0, 120)}`,
+          "SCRAPLING_FETCH_FAILED",
+        );
+      }
+      const { content } = payload;
       // 两种截断都算：sidecar 自己截的，和我们自己按字节预算截的 ——
       // 对调用方而言语义一样，都是「正文没拿全」。
       const truncated =
         payload["truncated"] === true || Buffer.byteLength(content, "utf8") > deps.maxOutputBytes;
       const body: WebFetchBody = { kind: toBodyKind(extractionType), content };
-      return { url, statusCode, body, truncated };
+      return { url: payload["url"], statusCode: payload["status"], body, truncated };
     },
   };
 }

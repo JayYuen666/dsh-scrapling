@@ -59,7 +59,11 @@ cookie，浏览器引擎要保留页面池，`adaptive` 要保留 SQLite 指纹�
 这些东西全都会丢。
 
 `scrapling_crawl` **立刻返回作业 id** 而不是阻塞：一次爬取是分钟级的，而工具调用有超时。
-用 `job_list` 看进度、`job_output` 读结果、`job_kill` 中断。
+用 `job_list` 看进度、`job_output` 读结果、`job_kill` 中断。爬虫另有总时长上限
+（`crawlMaxRuntimeSeconds`），且不会爬出起始域。礼貌性由部署方定夺，这里如实声明：
+沿用了 Scrapling spider 的默认值 —— **不遵守** robots.txt、每域延迟为 0、最多 4 个请求
+并发。爬取被锁在起始域内，不会向无关站点扩散；需要更温和行为的站点，请在部署侧套一层
+限速。
 
 ## 环境要求
 
@@ -163,7 +167,9 @@ Scrapling 的 Markdown 输出报成 `text`，内置渲染路径显示完全正�
 - `*MaxOutputChars` —— 各工具的输出封顶。宿主侧的封顶只影响进模型上下文的那一段，
   真正的字节上限在 Python 侧（`maxContentChars`）。`crawlMaxItems` 是部署侧给模型可传的
   `maxPages` 封的顶；越界的 `maxPages`（0、负数、NaN）**原样透传**，让 sidecar 报参数错误，
-  而不是由本插件悄悄夹成一个看起来合法的值。
+  而不是由本插件悄悄夹成一个看起来合法的值。`crawlMaxRuntimeSeconds` 是爬虫的**墙上时钟**
+  上限：页数上限管不了一页等一分钟的站点，而爬虫是没人看的后台线程。到点由蜘蛛走引擎自己
+  的停机通道收尾，而不是等站点自己没得爬。
 - `stripInlineImages` —— 默认**开**：剥掉正文里内嵌的 `data:` URI 图片，只留 alt 文本。
   这类图片对模型是纯 token 噪音 —— 一段 base64 SVG 编码进上下文要按字符计费，而模型从里面
   读不出任何图形信息。**不含内联图的页面逐字节不变**；含内联的页面省掉的量取决于内联图有多少 ——
@@ -184,7 +190,7 @@ Scrapling 的 Markdown 输出报成 `text`，内置渲染路径显示完全正�
 
 **部署级旋钮**（不在设置卡上，只走 [`cordis.patch.yml`](./cordis.patch.yml) 的 `config:`
 块）：`requestTimeoutSeconds`、`maxUrlLength`、`browserExecutablePath`、`browserCdpUrl`、
-`searchEndpoint`、`searchRenderTopN`。
+`searchEndpoint`、`searchRenderTopN`、`crawlMaxRuntimeSeconds`。
 其中 `browserExecutablePath` 与 `browserCdpUrl` 是强能力 —— 前者等于让 Chromium 执行指定文件，
 后者等于把浏览器交给指定调试端点 —— 所以它们只从部署配置来，模型入参到不了。
 
@@ -298,11 +304,12 @@ PAC 是唯一还需要手工填一次的形态：求值 PAC 要下载脚本并�
     会被当成普通公网 IPv6 放行。反过来，自建前缀一旦声明就**对所有 IPv6 生效**，不限于
     落在 RFC 6052 段里的那些。
   - **没有端口白名单**（默认不限端口），与 dsh 内置 fetch provider 的取舍一致。
-  - **`scrapling_crawl` 已有自己的地址复核，但重定向目标仍只靠域名一致性。** 起点 URL 过
+  - **`scrapling_crawl` 已有自己的地址复核，但起点那一关仍是第一道。** 起点 URL 过
     `guard.url_allowed`（与浏览器路径同一个实现，两侧同解），爬虫会话设了
-    `follow_redirects="safe"` 让 curl_cffi 拒绝跳向私网的跳转，每一页收进结果前再复判一次
-    最终 URL。但 Scrapling 的 `allow_domains` 是字符串比较，只管页面里发现的链接、不管重定向
-    目标 —— 重定向这条缝上真正的防线仍只有 Host 闸门起点那一道。
+    `follow_redirects="safe"` 让 curl_cffi 拒绝跳向私网的跳转，每一页收进结果前再复判
+    **两次**：一次过守卫（最终 URL 仍可能落在私网上），一次过起始域 —— Scrapling 的
+    `allow_domains` 是字符串比较，只管页面里发现的链接、不管重定向目标，所以跳向站外
+    公网主机的那一跳必须在这里拦住。
   - **WebSocket 覆盖依赖 Playwright 版本。** 守卫用 `route_web_socket` 拦握手；更老的
     Playwright 没有这个方法，那种情况下 WebSocket 不在守卫范围内，插件会往日志与能力报告
     里如实标出，不会静默降级。
@@ -310,7 +317,9 @@ PAC 是唯一还需要手工填一次的形态：求值 PAC 要下载脚本并�
     指向它们等于交出「执行这个文件」与「把浏览器交给这个调试端点」。
 
   Host 侧那道策略由 `SidecarClient.call` 统一执行，因此覆盖每一个工具，也覆盖
-  `web_fetch` provider；判否时抛 `URL_BLOCKED`，请求根本不会写进管道。
+  `web_fetch` provider；判否时抛 `URL_BLOCKED`，请求根本不会写进管道。`web_search` provider
+  也对它准备交回的 URL 跑同一道闸门：被闸门判否的命中不会成为可引用的 source，模型因此不会
+  拿到一个「下一次抓取必然被拒」的地址。
 
 - **浏览器引擎不认代理环境变量。** Playwright 不读 `HTTP_PROXY` / `HTTPS_PROXY`，所以
   `scrapling_render` / `scrapling_capture_xhr` / `scrapling_stealth_fetch` 即使在整台机器

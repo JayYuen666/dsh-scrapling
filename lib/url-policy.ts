@@ -230,6 +230,31 @@ function embeddedV4(parsed: ipaddr.IPv6, table: readonly Nat64Prefix[]): Nat64Ma
 }
 
 /**
+ * 剥出 IPv4-compatible（`::/96`）里藏着的 IPv4。
+ *
+ * `::7f00:1` 就是 `::127.0.0.1`，写法合法、不少系统按它连 IPv4 回环。ipaddr.js 的
+ * SpecialRanges 里没有这一段，所以它对这些地址报 `unicast` —— 不换算就是直接放行。
+ *
+ * `::` 与 `::1` 不在内嵌 IPv4 判定的范围内：前六组不全是 0，落在段外，它们各自另有
+ * range 名称（`unspecified` / `loopback`），照样被拒。
+ *
+ * @param parsed - 已确认是 IPv6 的地址
+ * @returns 藏有 IPv4 时给出其地址与 range，否则 null
+ */
+function ipv4Compatible(parsed: ipaddr.IPv6): Nat64Match | null {
+  const packed = parsed.toByteArray();
+  // `::/96` 覆盖的是**前六组**，也就是 16 字节里的前 12 字节；内嵌 IPv4 在最后 4 字节。
+  // 偏移取错会让 `::5db8:d818` 读成 0.0.93.184 —— 仍然是私网，于是公网那一侧被误拒。
+  if (packed.slice(0, 12).some((byte) => byte !== 0)) {
+    return null;
+  }
+  const inner = ipaddr.fromByteArray(packed.slice(12, 16));
+  /* v8 ignore next 1 —— 4 字节输入恒为 IPv4，这一支只为让 TS 从联合类型收窄 */
+  const ipv4 = inner instanceof ipaddr.IPv4 ? inner : inner.toIPv4Address();
+  return { address: ipv4.toString(), range: ipv4.range() };
+}
+
+/**
  * 把地址归约成「最终按谁的 range 判定」。
  *
  * ipaddr.js 对 IPv4-mapped 与 NAT64 地址报的 range 分别是 `ipv4Mapped` 与 `rfc6052`，
@@ -256,6 +281,10 @@ function effectiveRange(address: string, table: readonly Nat64Prefix[]): string 
     const inner = embeddedV4(value, table);
     if (inner !== null) {
       return inner.range;
+    }
+    const compat = ipv4Compatible(value);
+    if (compat !== null) {
+      return compat.range;
     }
   }
   return value.range();
@@ -359,8 +388,12 @@ function parseSyntheticRange(entry: string): SyntheticRange | null {
   if (!(parsed instanceof ipaddr.IPv4) || bits > 32) {
     return null;
   }
-  const first = ipv4ToLong(parsed);
-  return { first, last: first + 2 ** (32 - bits) - 1 };
+  // 区间按**网络地址**算，不按写出来的那个地址算：parseCIDR 原样返回 `10.1.2.3`，
+  // 于是 `10.1.2.3/24` 会被算成 10.1.2.3–10.1.3.254，比部署方写的范围大了一圈。
+  // 用户写 CIDR 的意思是那一段，边界就该是那一段。
+  const span = 2 ** (32 - bits);
+  const first = Math.floor(ipv4ToLong(parsed) / span) * span;
+  return { first, last: first + span - 1 };
 }
 
 /** 检测合成解析器时用的控制域名：与用户的目标无关，答案只反映解析器本身的行为。 */

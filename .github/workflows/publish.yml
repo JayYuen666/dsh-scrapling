@@ -40,6 +40,16 @@ jobs:
           _env/.venv/bin/python -m pip install --upgrade pip
           _env/.venv/bin/python -m pip install "scrapling[rag]>=0.4.15,<0.5"
           _env/.venv/bin/python -c "import scrapling; print('scrapling', scrapling.__version__)"
+      # Python 侧的静态检查。版本在 py/requirements-dev.txt 里精确钉：规则集随版本漂移，
+      # 不钉的话「升级 ruff」与「新写一处违规」在门禁上长得一模一样。
+      # 缺这一步时 check:py 会以 "No module named ruff" 硬失败 —— 刻意不跳过。
+      # 顺手把 venv 顶上 PATH：pnpm run check 里的 check:py / test:py 走 PATH 上的 python3，
+      # CI 上那默认是 hostedtoolcache 的解释器（没有 ruff，也没有 scrapling）——这正是
+      # 首次跑发布时 check 步骤失败的原因。GITHUB_PATH 对后续步骤生效。
+      - name: 备 Python 检查工具
+        run: |
+          _env/.venv/bin/python -m pip install -r py/requirements-dev.txt
+          echo "${GITHUB_WORKSPACE}/_env/.venv/bin" >> "$GITHUB_PATH"
       # 首次发布必须先有 token：Trusted Publisher 只能在 npmjs.com 的**包设置页**配置，而那个页面
       # 只有包已发布后才存在（registry 上查不到本包时，配置入口根本无处可点）。因此顺序是：
       # ① 配 secrets.NPM_TOKEN，发第一版；② 到包设置页登记 Trusted Publisher；
@@ -97,10 +107,28 @@ jobs:
           done
       - run: pnpm install --frozen-lockfile
       - run: pnpm run check
-      # test:py 的脚本用 PATH 上的 python3，而这里真正的解释器是上面那个 venv，所以直接点名它。
+      # 下面三步都直接点名 venv 里的解释器：check 脚本里的 python3 走 PATH，而 CI 上真正的
+      # 解释器是上面那个 venv（PATH 上的没有 scrapling、也没有 ruff/mypy）。点名它还顺带
+      # 让 ruff 与 mypy 看得见 scrapling 的类型 —— 那是 mypy 能报出真问题的前提。
+      # mypy 与 coverage 不进门禁：前者报的是「标注与实现不一致」，后者是要先知道缺口在哪。
+      - name: Python 静态检查（ruff check + format）
+        run: _env/.venv/bin/python -m ruff check py/ && _env/.venv/bin/python -m ruff format --check py/
+      # mypy 的失败记录在 CI 日志里但不拦发布 —— 它报的是「标注与实现不一致」，不是编译
+      # 失败（pyproject.toml 的 [tool.mypy] 写了完整理由）。continue-on-error 让红灯可见
+      # 而不阻塞；没有这一行，step 一红发布就停，与「暂不阻塞」的声明相反。
+      - name: Python 类型检查（mypy，记录用，不阻塞）
+        run: _env/.venv/bin/python -m mypy py/
+        continue-on-error: true
       # 此前这一步根本不在 CI 里：84 条 sidecar 端到端用例只在本地跑，发布前它们一次都没参与过判定。
       - name: Python sidecar 端到端
         run: _env/.venv/bin/python py/tests/test_bridge.py
+      # Python 覆盖率先只做记录：四个随包发布的模块此前没有任何覆盖数字，而它们跑在用户
+      # 机器上。数字进日志而不进门禁，等缺口摸清再谈阈值。
+      - name: Python 覆盖率（记录用，不阻塞）
+        run: |
+          DSH_PY_COVERAGE=1 _env/.venv/bin/python -m coverage run --parallel-mode py/tests/test_bridge.py
+          _env/.venv/bin/python -m coverage combine
+          _env/.venv/bin/python -m coverage report -m
       # prepack 会重建 host.js / client.js；产物不入库也发得出去。
       # 凭据两条路：配了 NPM_TOKEN 就经 NODE_AUTH_TOKEN 注入；没配就交给 OIDC。
       # setup-node 配了 registry-url 之后会设 NPM_CONFIG_USERCONFIG 指向它自己生成的那份

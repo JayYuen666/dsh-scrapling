@@ -65,6 +65,8 @@ interface FakeBehaviour {
   failExit?: boolean;
   /** 让 done 以 reject 落地，模拟进程异常退出。 */
   crashOnExit?: boolean;
+  /** 在 spawn 之前卡住一段时间，用来把 dispose 挤进启动途中那个窗口。 */
+  spawnDelayMs?: number;
 }
 
 const fakeCtx = (
@@ -72,7 +74,12 @@ const fakeCtx = (
   spawned: { count: number; last?: FakeHandle },
 ): unknown => ({
   subprocess: {
-    resolveExecutable: async (command: string): Promise<string> => command,
+    resolveExecutable: async (command: string): Promise<string> => {
+      if (behaviour.spawnDelayMs !== undefined) {
+        await delay(behaviour.spawnDelayMs);
+      }
+      return command;
+    },
     spawn: (): FakeHandle => {
       spawned.count += 1;
       const stdout = new Readable({ read: noop });
@@ -486,6 +493,62 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
+  it("取消一个请求不会拆掉常驻进程，也不会连累并行的其它请求", async () => {
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      // slow 那个故意不回，等它被取消；ping 正常回，才看得出取消没有连累它。
+      fakeCtx(
+        {
+          reply: (id: string, method: string) =>
+            method === "slow" ? null : { id, ok: true, result: { pong: true } },
+        },
+        spawned,
+      ) as never,
+      options({ requestTimeoutMs: 5000 }),
+    );
+    await client.ensureStarted();
+    const controller = new AbortController();
+    const cancelled = client.call("slow", {}, { signal: controller.signal });
+    const kept = client.call("ping");
+    await delay(20);
+    controller.abort();
+    await expect(cancelled).rejects.toThrow(/aborted/u);
+    // 取消的语义是「这一次调用作废」，不是「整个进程报废」。抓取工具声明并发安全，
+    // 取消一个本该只作废一个。
+    expect(client.alive).toBe(true);
+    // 被放弃的那个请求的迟到回帧按 id 配对，配不上就只是没人认领 —— 不该连累它之后
+    // 那个正经请求。
+    await expect(kept).resolves.toStrictEqual({ pong: true });
+    await client.dispose();
+  });
+
+  it("超时仍回收进程 —— 超时的含义是对端可能已经不响应了", async () => {
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      // 不回任何帧：请求会一直挂着直到超时。
+      fakeCtx({ reply: () => null }, spawned) as never,
+      options({ requestTimeoutMs: 60 }),
+    );
+    await client.ensureStarted();
+    await expect(client.call("ping")).rejects.toThrow(/timed out/u);
+    expect(client.alive).toBe(false);
+    await client.dispose();
+  });
+
+  it("卸载正好落在启动途中时，刚出生的进程立刻被收掉，不留孤儿", async () => {
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      // resolveExecutable 上卡 40ms，dispose 就在这 40ms 里跑完 —— 那时 #handle 还是空，
+      // #teardown 拆不到任何东西。这条用例守的就是「别让这个进程活下来没人管」。
+      fakeCtx({ spawnDelayMs: 40 }, spawned) as never,
+      options(),
+    );
+    const starting = client.ensureStarted();
+    await client.dispose();
+    await expect(starting).rejects.toThrow(/disposed/u);
+    expect(spawned.count).toBe(1);
+  });
+
   it("provider 没给出管道时明确报不可用", async () => {
     const spawned: { count: number; last?: FakeHandle } = { count: 0 };
     const client = new SidecarClient(fakeCtx({ noStdio: true }, spawned) as never, options());
@@ -533,6 +596,48 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
+  it("stdout 管道报错时按 crashed 拆掉进程，少一个 error 监听就会掀翻宿主", async () => {
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      fakeCtx({}, spawned) as never,
+      options({ requestTimeoutMs: 5000 }),
+    );
+    await client.ensureStarted();
+    const pending = client.call("ping");
+    await delay(20);
+    // EventEmitter 的 'error' 没有监听者时会变成未捕获异常：这条监听就是防它的。
+    spawned.last?.stdout?.emit("error", new Error("stdout pipe broke"));
+    await expect(pending).rejects.toThrow(SidecarError);
+    await client.dispose();
+  });
+
+  it("stderr 管道报错同样被接住", async () => {
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      fakeCtx({}, spawned) as never,
+      options({ requestTimeoutMs: 5000 }),
+    );
+    await client.ensureStarted();
+    spawned.last?.stderr.emit("error", new Error("stderr pipe broke"));
+    await delay(20);
+    await expect(client.call("ping")).rejects.toThrow(SidecarError);
+    await client.dispose();
+  });
+
+  it("stdin 写端报错同样被接住", async () => {
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      fakeCtx({}, spawned) as never,
+      options({ requestTimeoutMs: 5000 }),
+    );
+    await client.ensureStarted();
+    const pending = client.call("ping");
+    await delay(20);
+    spawned.last?.stdin?.emit("error", new Error("stdin pipe broke"));
+    await expect(pending).rejects.toThrow(SidecarError);
+    await client.dispose();
+  });
+
   it("销毁进程时在途请求被作废，而不是永远挂着", async () => {
     const spawned: { count: number; last?: FakeHandle } = { count: 0 };
     const client = new SidecarClient(
@@ -561,6 +666,31 @@ describe("sidecar client 与假 runtime", () => {
     await client.ensureStarted();
     await client.dispose();
     await expect(client.call("ping")).rejects.toThrow(SidecarError);
+    await expect(client.dispose()).resolves.toBeUndefined();
+  });
+
+  it("宽限期内进程没退就强杀，done 稍后以 reject 落地也不影响收场", async () => {
+    // crashOnExit 让 done 在 stdout 结束后走 reject 分支：优雅路径里挂在 done 上的
+    // 两个出口（resolve / reject）都必须执行到 —— 少一个就是没验证过的分支。
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(fakeCtx({ crashOnExit: true }, spawned) as never, options());
+    await client.ensureStarted();
+    await expect(client.dispose()).resolves.toBeUndefined();
+  });
+
+  it("dispose 时写管道同步抛错（EPIPE）也走完收场", async () => {
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(fakeCtx({ reply: okReply }, spawned) as never, options());
+    await client.ensureStarted();
+    // 管道刚断的瞬间写帧会同步抛：dispose 必须吞掉它继续走等待/强杀，而不是把
+    // 卸载流程本身炸掉。
+    Object.assign(spawned.last!, {
+      stdin: {
+        write: (): void => {
+          throw new Error("EPIPE");
+        },
+      } as unknown as Writable,
+    });
     await expect(client.dispose()).resolves.toBeUndefined();
   });
 });
@@ -657,5 +787,29 @@ describe("sidecar client 与真实 python 进程", () => {
     );
     expect(answers).toHaveLength(8);
     await client.dispose();
+  });
+
+  it.runIf(available)("dispose 走优雅关闭：进程自己退干净而不是被杀", async () => {
+    // 优雅路径发 shutdown 帧，bridge 应答、清会话、自己退出 —— exit code 0；
+    // 强杀路径死于信号，exit code 是 null。断言的是前者。
+    const outcomes: Promise<{ exitCode: number | null; signal: null }>[] = [];
+    const ctx = {
+      subprocess: {
+        resolveExecutable: realCtx.subprocess.resolveExecutable,
+        spawn: (spec: Parameters<typeof realCtx.subprocess.spawn>[0]): FakeHandle => {
+          const handle = realCtx.subprocess.spawn(spec);
+          outcomes.push(handle.done as Promise<{ exitCode: number | null; signal: null }>);
+          return handle;
+        },
+      },
+    };
+    const client = new SidecarClient(
+      ctx as never,
+      options({ pythonBin: LOCAL_PYTHON, requestTimeoutMs: 30_000, graceMs: 5000 }),
+    );
+    await client.ensureStarted();
+    await client.dispose();
+    const settled = await Promise.all(outcomes);
+    expect(settled[0]?.exitCode).toBe(0);
   });
 });

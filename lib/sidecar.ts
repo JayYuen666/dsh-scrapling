@@ -35,6 +35,9 @@ function noop(): void {
 /** 协议版本；与 py/bridge.py 的 PROTOCOL_VERSION 对齐。 */
 export const PROTOCOL_VERSION = 1;
 
+/** dispose 发出的优雅关闭帧的 id。它不在 pending 表里，bridge 的应答会按「无主帧」落地。 */
+const DISPOSE_FRAME_ID = "dispose";
+
 /** Python 侧上报的能力。决定宿主注册哪些工具。 */
 export interface SidecarCapabilities {
   /** Scrapling 是否可导入。 */
@@ -292,9 +295,15 @@ export class SidecarClient {
         if (index !== -1) {
           this.#readyWaiters.splice(index, 1);
         }
-        reject(
-          new SidecarError("SIDECAR_HANDSHAKE_FAILED", `no ready frame within ${timeoutMs}ms`),
-        );
+        // 握手超时要**先拆进程再拒**：子进程此刻还活着且没人管它，而 #capabilities 仍是
+        // undefined，下一次 ensureStarted 会再 spawn 一个 —— 每次启动失败漏一个 Python
+        // 进程。紧跟着的协议不匹配分支本来就这么做，这里只是漏了。
+        const reason = `no ready frame within ${timeoutMs}ms`;
+        // 拆完再拒：调用方拿到的拒绝理由要与已经发生的回收对得上。
+        void (async (): Promise<void> => {
+          await this.#teardown(reason, "SIDECAR_HANDSHAKE_FAILED");
+          reject(new SidecarError("SIDECAR_HANDSHAKE_FAILED", reason));
+        })();
       }, timeoutMs);
       waiter.resolve = (frame) => {
         clearTimeout(timer);
@@ -331,9 +340,26 @@ export class SidecarClient {
       await this.#teardown("sidecar stdio pipes were not created", "SIDECAR_UNAVAILABLE");
       throw new SidecarError("SIDECAR_UNAVAILABLE", "sidecar stdio pipes were not created");
     }
-    this.#stopPump = pumpFrames(stdout, (line) => {
-      this.#onFrame(line);
-    });
+    // dispose() 可能正好落在 resolveExecutable 的 await 上跑完了：那时 #handle 还是空，
+    // #teardown 拆不到任何东西，而这个进程刚出生就没人管了。补一道判定并立刻收掉它 ——
+    // 否则每次「启动途中卸载」都会漏一个 Python 进程。
+    if (this.#stopped) {
+      child.terminate();
+      await child.waitForExit();
+      this.#handle = undefined;
+      throw new SidecarError("SIDECAR_UNAVAILABLE", "sidecar client has been disposed");
+    }
+    this.#stopPump = pumpFrames(
+      stdout,
+      (line) => {
+        this.#onFrame(line);
+      },
+      // 管道报错、帧超限或帧处理抛错都归到这里。少一个 error 监听时这些都是未捕获异常，
+      // 会直接掀翻宿主进程，所以这里把 sidecar 拆掉，并让在途请求以一个明确的错误收场。
+      (error: unknown) => {
+        void this.#teardown(`sidecar stream failed: ${String(error)}`, "SIDECAR_CRASHED");
+      },
+    );
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: unknown) => {
       for (const line of String(chunk).split("\n")) {
@@ -341,6 +367,13 @@ export class SidecarClient {
           this.#log(`[sidecar] ${line}`);
         }
       }
+    });
+    // stderr 与 stdin 同理：它们也是子进程管道，报错同样会变成未捕获异常。
+    child.stderr?.on("error", (error: unknown) => {
+      void this.#teardown(`sidecar stderr failed: ${String(error)}`, "SIDECAR_CRASHED");
+    });
+    stdin.on("error", (error: unknown) => {
+      void this.#teardown(`sidecar stdin failed: ${String(error)}`, "SIDECAR_CRASHED");
     });
     void child.done.catch((error: unknown) => {
       void this.#teardown(`sidecar exited: ${String(error)}`, "SIDECAR_CRASHED");
@@ -429,22 +462,34 @@ export class SidecarClient {
 
       const { signal } = options;
 
-      const abort = (code: SidecarErrorCode, message: string): void => {
+      // 只作废这一个请求：调用方取消的是「这一次调用」，不是整个常驻进程。原先这里也走
+      // #teardown，于是取消一个 web_fetch 会把同一进程上所有并行的抓取一起带走 ——
+      // 而抓取工具声明的是 isConcurrencySafe: true，并发是常态。
+      //
+      // 被放弃的请求在对端仍可能跑完；它的回帧按 id 配对，而那个 id 已从表里摘掉，
+      // 于是那一帧只是无人认领地落地，不会串到别的请求上。
+      const failRequest = (code: SidecarErrorCode, message: string): void => {
         this.#pending.delete(id);
         SidecarClient.#settle(entry, new SidecarError(code, message));
-        void this.#teardown(message, code);
       };
 
       // null = 本次不设超时（爬虫这类量级不定的任务）。写成 `timeoutMs ?? 0` 会立刻超时。
       if (timeoutMs !== null) {
         entry.timer = setTimeout(() => {
-          abort("SIDECAR_TIMEOUT", `${method} timed out after ${timeoutMs}ms`);
+          // 超时仍走拆进程：超时的含义是「这个常驻进程可能已经不响应了」，回收它才有
+          // 自愈。与取消分开，正是因为「超时」与「用户改主意」是两回事。
+          this.#pending.delete(id);
+          SidecarClient.#settle(
+            entry,
+            new SidecarError("SIDECAR_TIMEOUT", `${method} timed out after ${timeoutMs}ms`),
+          );
+          void this.#teardown(`${method} timed out after ${timeoutMs}ms`, "SIDECAR_TIMEOUT");
         }, timeoutMs);
       }
 
       if (signal !== undefined) {
         const onAbort = (): void => {
-          abort("SIDECAR_ABORTED", `${method} was aborted`);
+          failRequest("SIDECAR_ABORTED", `${method} was aborted`);
         };
         if (signal.aborted) {
           onAbort();
@@ -469,12 +514,53 @@ export class SidecarClient {
     return settled;
   }
 
-  /** 终止进程并等待受管区间清空。 */
+  /**
+   * 停掉 sidecar：先给一次优雅收场的机会，等不到再强杀。
+   *
+   * 优雅路径向 stdin 写一帧 ``shutdown``：bridge 先应答、再等在途请求收尾、然后显式
+   * 关掉全部会话 —— 浏览器是独立进程，不显式关就会活过 sidecar 本身，全靠「进程树随
+   * 父进程消亡」兜底是拿不到确定的。宽限期内没退（进程卡死、管道已断）才走 terminate。
+   * 崩溃路径的 #teardown 不走这套：出错时进程多半已经没救，快速击杀优先。
+   */
   public async dispose(): Promise<void> {
     if (this.#stopped) {
       return;
     }
     this.#stopped = true;
+    const child = this.#handle;
+    if (child?.stdin !== undefined) {
+      try {
+        child.stdin.write(
+          `${encodeFrame({ id: DISPOSE_FRAME_ID, method: "shutdown", params: {} })}\n`,
+        );
+      } catch {
+        // 管道已断（进程刚死）：写不进去就算了，下面的等待会立刻见分晓。
+      }
+      // done 对「正常退出」与「被信号杀死」都 resolve，reject 只留给 spawn 失败 ——
+      // 两边都按「进程没了」处理，退出形态由调用方（测试）另行断言。
+      const exited = child.done.then(
+        () => true,
+        () => true,
+      );
+      let timer: NodeJS.Timeout | undefined;
+      const grace = new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(false);
+        }, this.#options.graceMs);
+      });
+      const finished = await Promise.race([exited, grace]);
+      clearTimeout(timer);
+      if (finished) {
+        // 进程自己退了：补齐与 #teardown 相同的簿记，但不再对已死的进程 terminate。
+        this.#stopPump?.();
+        this.#stopPump = undefined;
+        this.#handle = undefined;
+        this.#capabilities = undefined;
+        this.#starting = undefined;
+        this.#rejectAll(new SidecarError("SIDECAR_CLOSED", "client disposed"));
+        return;
+      }
+    }
     await this.#teardown("client disposed", "SIDECAR_CLOSED");
   }
 }

@@ -16,6 +16,7 @@ import type { ToolDefinition, ToolRunContext } from "@deepseek-ai/dsh-tools";
 import { setTimeout as sleep } from "node:timers/promises";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { capText } from "./output.ts";
+import type { CappedText } from "./output.ts";
 import type { AnswerRequest, AnswerResult } from "./answer.ts";
 import type { SidecarClient } from "./sidecar.ts";
 
@@ -49,6 +50,13 @@ export interface ToolSettings {
   readonly blockAds: boolean;
   /** crawl 一次最多抓多少条。 */
   readonly crawlMaxItems: number;
+  /**
+   * 一次爬虫的整体截止（秒）。
+   *
+   * 页数上限管不了慢站点：1000 页、每页等一分钟的爬取能跑十几个小时，而爬虫是没人看的
+   * 后台线程。到点由 Python 侧按引擎自己的停机通道收尾，不需要谁来杀它。
+   */
+  readonly crawlMaxRuntimeSeconds: number;
   /** URL 长度上限（字符）；与 dsh 内置 web_fetch 的默认同值。 */
   readonly maxUrlLength: number;
   /** 浏览器二进制路径；空表示用 Playwright 自带的。部署级，模型改不了。 */
@@ -128,32 +136,48 @@ function textOf(value: unknown, field: string): string {
 /**
  * 从回包里挑一个非负整数。
  *
+ * sidecar 是另一个语言实现的进程，载荷形状不该被直接断言 —— 这里逐字段校验，
+ * 缺失就报可读错误，而不是让 `undefined` 流进模型上下文。回退值在这里没有位置：
+ * 把缺失的 `status` 补成 0，宿主与模型看到的是一条真实的状态码 0，而协议其实已经坏了。
+ *
  * @param value - 回包里的 result
  * @param field - 字段名
- * @param fallback - 缺失或非法时给的值
  * @returns 整数
  */
-function intOf(value: unknown, field: string, fallback: number): number {
+function intOf(value: unknown, field: string): number {
   if (!isRecord(value)) {
-    return fallback;
+    throw new Error(`sidecar result is missing an integer field: ${field}`);
   }
   const raw = value[field];
-  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : fallback;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+    throw new Error(`sidecar result is missing a non-negative integer field: ${field}`);
+  }
+  return raw;
 }
 
 /**
  * 从回包里挑一个布尔。
+ *
+ * 同 {@link intOf}：缺失即协议破损。把缺失的 `truncated` 补成 false，等于告诉模型
+ * 「正文没被截断」，而它其实被对端截过。
  *
  * @param value - 回包里的 result
  * @param field - 字段名
  * @returns 布尔值
  */
 function boolOf(value: unknown, field: string): boolean {
-  return isRecord(value) && value[field] === true;
+  // 单条件而不是先判 isRecord 再判类型：抓取载荷里 url/content 两个必填字符串排在前面，
+  // 非对象时它们已经抛过了，这里再分一支只会得到一条永远走不到的分支。
+  if (!isRecord(value) || typeof value[field] !== "boolean") {
+    throw new TypeError(`sidecar result is missing a boolean field: ${field}`);
+  }
+  return value[field];
 }
 
 /**
  * 把 sidecar 的 result 归一成抓取类工具的载荷。
+ *
+ * `status` 与 `truncated` 一律必填：见 {@link intOf} / {@link boolOf}。
  *
  * @param raw - 回包里的 result
  * @param extractionType - 本次请求的抽取形态
@@ -162,12 +186,28 @@ function boolOf(value: unknown, field: string): boolean {
 function toFetchResult(raw: unknown, extractionType: string): FetchResult {
   return {
     url: textOf(raw, "url"),
-    statusCode: intOf(raw, "status", 0),
+    statusCode: intOf(raw, "status"),
     extractionType,
     content: textOf(raw, "content"),
     truncated: boolOf(raw, "truncated"),
     notice: "",
   };
+}
+
+/**
+ * 把对端报的截断与本地封顶叠成一个标记。
+ *
+ * 两件事对模型是同一件事（正文没拿全），但发生在一进一出两个位置：Python 侧按
+ * `maxContentChars` 截过一次，Host 侧按字节预算还可能再截一次。原先直接用本地那把
+ * 覆盖，于是「对端已经截过、而本地没超预算」时 `truncated` 报 false —— 模型看到一条
+ * 声称完整的正文，那正是它最需要知道被截断的时刻。
+ *
+ * @param upstream - 对端报的截断标记
+ * @param capped - 本地封顶的结果
+ * @returns 合并后的标记
+ */
+function truncationOf(upstream: boolean, capped: CappedText): boolean {
+  return upstream || capped.truncated;
 }
 
 /** 被截断时告诉模型怎么把内容再拿回来。 */
@@ -352,7 +392,7 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
       return {
         ...result,
         content: capped.text,
-        truncated: capped.truncated,
+        truncated: truncationOf(result.truncated, capped),
         notice: capped.notice,
       };
     },
@@ -389,7 +429,9 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
     name: "scrapling_extract",
     description:
       "用 CSS 选择器或 XPath 从一段 HTML 里取出结构化内容（匹配数、元素标签、文本）。" +
-      "不发网络请求 —— HTML 通常来自 scrapling_fetch 的结果。要从 URL 开始，就先抓再抽取。",
+      "不发网络请求 —— HTML 通常来自 scrapling_fetch 的结果。要从 URL 开始，就先抓再抽取。" +
+      "站点改版导致选择器失配时，用 adaptive 按上一次命中留下的指纹重新定位元素" +
+      "（指纹按注册域分桶，跨调用复用请带上同一站点的 url）。",
     parameters: {
       html: { type: "string", required: true, description: "要抽取的 HTML 源码。" },
       selector: {
@@ -398,7 +440,18 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
         description: "CSS 选择器，例如 'table tr td.price'。",
       },
       useXpath: { type: "boolean", description: "把 selector 当作 XPath 解析，默认 false。" },
-      limit: { type: "integer", description: "最多返回多少条匹配，默认 200。" },
+      adaptive: {
+        type: "boolean",
+        description: "自愈选择器：命中成功时记下元素指纹，命中失败时按指纹重定位。默认 false。",
+      },
+      url: {
+        type: "string",
+        description: "HTML 来源页的地址；仅 adaptive 用它给指纹分桶，缺省时所有指纹共用一个桶。",
+      },
+      limit: {
+        type: "integer",
+        description: "最多返回多少条匹配，默认 200；总长度受「抽取结果上限」约束。",
+      },
     },
     output: {
       schema: {
@@ -432,13 +485,21 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
           html: args["html"],
           selector: args["selector"],
           useXpath: args["useXpath"] === true,
+          // adaptive 与 url 原样透传：undefined 与「没给」同义，Python 侧按缺省处理。
+          ...(args["adaptive"] === true ? { adaptive: true } : {}),
+          ...(typeof args["url"] === "string" && args["url"].length > 0
+            ? { url: args["url"] }
+            : {}),
           limit: args["limit"] ?? 200,
+          // 抽取结果也有预算：limit 数的是条数，而十条十万字的正文照样能把上下文撑爆。
+          // 与抓取类工具同一份预算（extractMaxOutputChars），在 Python 侧逐条累计封顶。
+          maxContentChars: settings.maxOutputBytes,
         },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
       );
       const matches: Match[] = toMatches(raw);
       return {
-        count: intOf(raw, "count", matches.length),
+        count: intOf(raw, "count"),
         truncated: boolOf(raw, "truncated"),
         matches,
       };
@@ -648,7 +709,7 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
       const result: BrowserResult = {
         ...base,
         content: capped.text,
-        truncated: capped.truncated,
+        truncated: truncationOf(base.truncated, capped),
         notice: capped.notice,
         // 只在 schema 声明了 xhr 的那个工具上才产出它：schema 是
         // additionalProperties: false，无条件带上会让 render 每一次都被判非法。
@@ -777,7 +838,12 @@ export function createStealthFetchTool(deps: ToolDeps): ToolDefinition {
       );
       const base = toFetchResult(raw, String(payload.params["extractionType"]));
       const capped = capText(base.content, settings.maxOutputBytes, RECOVERY_HINT);
-      return { ...base, content: capped.text, truncated: capped.truncated, notice: capped.notice };
+      return {
+        ...base,
+        content: capped.text,
+        truncated: truncationOf(base.truncated, capped),
+        notice: capped.notice,
+      };
     },
     presentCall: (args) => ({ card: "generic", title: args["url"], kind: "fetch" }),
   });
@@ -899,7 +965,7 @@ export function createAnswerTool(deps: ToolDeps): ToolDefinition {
         rendered,
         provider: answered.provider,
         model: answered.model,
-        truncated: capped.truncated,
+        truncated: truncationOf(base.truncated, capped),
         notice: capped.notice,
       };
     },
@@ -1046,7 +1112,7 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
       return {
         ...base,
         content: capped.text,
-        truncated: capped.truncated,
+        truncated: truncationOf(base.truncated, capped),
         notice: capped.notice,
         sessionId: args["sessionId"],
       };
@@ -1251,21 +1317,33 @@ function pageToText(page: Record<string, unknown>): string {
 /* v8 ignore stop */
 
 /**
- * 把一个跑着的爬虫的页面增量写进作业输出环，直到它结束。
+ * 叫停 Python 侧那个爬虫。
  *
- * 轮询而不是等一个大回包：一次爬取可能几分钟，作业的输出环是给模型增量看的，
- * 等全部跑完再一次性吐出来等于没有进度可言。
+ * 尽力而为：进程可能已经退了（那一次 job_kill 把 sidecar 一起拆了），这一帧只会换回
+ * 一个错误。错误绝不能往外抛 —— 它要盖掉的是调用方真正关心的那个失败原因。
  *
- * 写成递归而不是循环：每一步都要等上一次 sidecar 往返，顺序不能并行；
- * 递归也让「顺序等待」这件事在代码结构上显形，不用靠注释说明为什么不能并发。
+ * @param sidecar - sidecar 客户端
+ * @param crawlId - 爬虫 id
+ */
+async function stopCrawl(sidecar: SidecarClient, crawlId: string): Promise<void> {
+  try {
+    await sidecar.call("crawl.stop", { crawlId });
+  } catch {
+    // 已经没人可停了：sidecar 拆掉时爬虫线程跟着退出，这里无事可做。
+  }
+}
+
+/**
+ * 轮询一次爬虫状态并吐出新增页面；还在跑就等一拍再来。
  *
  * @param sidecar - sidecar 客户端
  * @param crawlId - 爬虫 id
  * @param sink - 输出出口
  * @param signal - 取消信号
  * @param seen - 已经输出过多少页，跨轮次累积
+ * @returns 结束时一共输出过多少页
  */
-async function drainCrawl(
+async function drainOnce(
   sidecar: SidecarClient,
   crawlId: string,
   sink: CrawlSink,
@@ -1288,12 +1366,51 @@ async function drainCrawl(
     sink.append(pageToText(page));
   }
   /* v8 ignore stop */
+  if (status["running"] !== true && status["expired"] === true) {
+    // 只在收尾那一拍说：页数比 maxPages 少的原因是整体截止到了点，不是站点就这么大。
+    sink.progress("crawl stopped at its runtime budget; the page cap was not reached");
+  }
   sink.progress(`${pages.length} page(s) crawled`);
   if (status["running"] !== true) {
     return pages.length;
   }
   await sleep(CRAWL_POLL_MS, undefined, { signal });
-  return drainCrawl(sidecar, crawlId, sink, signal, pages.length);
+  // 自己递归而不是回调 drainCrawl：叫停只在最外层那一个 try 里做一次，
+  // 每层各停一遍会让一次 job_kill 打出 N 帧 crawl.stop。
+  return drainOnce(sidecar, crawlId, sink, signal, pages.length);
+}
+
+/**
+ * 把一个跑着的爬虫的页面增量写进作业输出环，直到它结束。
+ *
+ * 轮询而不是等一个大回包：一次爬取可能几分钟，作业的输出环是给模型增量看的，
+ * 等全部跑完再一次性吐出来等于没有进度可言。
+ *
+ * 写成递归而不是循环：每一步都要等上一次 sidecar 往返，顺序不能并行；
+ * 递归也让「顺序等待」这件事在代码结构上显形，不用靠注释说明为什么不能并发。
+ *
+ * @param sidecar - sidecar 客户端
+ * @param crawlId - 爬虫 id
+ * @param sink - 输出出口
+ * @param signal - 取消信号
+ * @param seen - 已经输出过多少页，跨轮次累积
+ */
+async function drainCrawl(
+  sidecar: SidecarClient,
+  crawlId: string,
+  sink: CrawlSink,
+  signal: AbortSignal,
+  seen: number,
+): Promise<number> {
+  try {
+    return await drainOnce(sidecar, crawlId, sink, signal, seen);
+  } catch (error: unknown) {
+    // 轮询断了（job_kill、本轮超时、sidecar 崩了）不等于爬虫停了：Python 侧的 Spider 跑在
+    // 自己的线程里，Node 侧的取消它根本看不见。先叫停再抛，否则作业显示已杀、爬虫还在
+    // 后台跑，Python 进程也一直被一个没人管的蜘蛛占着。
+    await stopCrawl(sidecar, crawlId);
+    throw error;
+  }
 }
 
 /** 爬虫工具的输出。 */
@@ -1366,7 +1483,7 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
         const signal = anySignal([sink.signal, exec.signal]);
         const started = await sidecar.call(
           "crawl.run",
-          { url, maxPages },
+          { url, maxPages, maxDurationMs: settings.crawlMaxRuntimeSeconds * 1000 },
           {
             signal,
             // 爬多久不固定，不能套用工具的默认超时。

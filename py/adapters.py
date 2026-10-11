@@ -17,10 +17,15 @@ css/xpath。所有浏览器引擎都是**一次性 session**：每次调用开�
 
 from __future__ import annotations
 
+import concurrent.futures
+import contextlib
+import queue
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import guard
 
@@ -29,7 +34,8 @@ import guard
 try:  # pragma: no cover —— 取决于运行环境是否装了 scrapling
     from scrapling.fetchers import DynamicFetcher, Fetcher, StealthyFetcher
 except ImportError:  # pragma: no cover
-    Fetcher = DynamicFetcher = StealthyFetcher = None  # type: ignore[assignment]
+    # 两个 ignore 各管一件事：misc 是「不能给类型赋值」，assignment 是「None 不是类」。
+    Fetcher = DynamicFetcher = StealthyFetcher = None  # type: ignore[misc,assignment]
 
 SCRAPLING_AVAILABLE = Fetcher is not None
 
@@ -38,6 +44,10 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_TIMEOUT_MS = 30_000
 DEFAULT_MAX_CONTENT_CHARS = 200_000
 EXTRACTION_TYPES = ("markdown", "html", "text")
+# adaptive 指纹库的文件名。**相对路径**：bridge 由宿主以部署侧的 dataDir 为工作目录拉起
+# （见 host.ts 的 sidecar env），相对路径正好把库落进 dataDir —— Scrapling 自己的默认值
+# 是包目录内的绝对路径，那在只读的 site-packages 里写不了，也不是用户该找的地方。
+ADAPTIVE_STORAGE_FILE = "elements_storage.db"
 
 
 class AdapterError(RuntimeError):
@@ -53,8 +63,7 @@ def _require(engine: object) -> None:
     if engine is None:
         raise AdapterError(
             "SCRAPLING_MISSING",
-            'Scrapling is not importable in this Python environment. '
-            'Install it with: pip install "scrapling[rag]"',
+            'Scrapling is not importable in this Python environment. Install it with: pip install "scrapling[rag]"',
         )
 
 
@@ -110,16 +119,122 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+# 查询串里这些名字的参数装的是凭据而不是筛选条件。XHR 摘要是**给模型看的**——它进会话
+# 上下文、进日志、进第三方 provider——而真实站点把 access token、会话 id、签名都放在
+# 查询串里。抓到一条就等于把凭据抄进上下文，而模型既用不上它、也拦不住它被复述出来。
+# 值的部分一律换成固定占位符：定位接口靠的是路径与参数名，不是那个 token。
+_SECRET_QUERY_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth",
+        "auth_token",
+        "authorization",
+        "code",
+        "credential",
+        "id_token",
+        "key",
+        "password",
+        "pwd",
+        "refresh_token",
+        "secret",
+        "session",
+        "sessionid",
+        "session_id",
+        "sig",
+        "signature",
+        "sign",
+        "token",
+    }
+)
+
+
+def _redacted_query(text: str) -> str:
+    """把一段查询串里像凭据的参数值换成占位符；没有命中时原样返回。
+
+    与 :func:`redact_url_secrets` 同一套参数名判据，片段也复用它 —— OAuth2 隐式流程把
+    令牌放在 ``#access_token=`` 里，那同样是「给模型看就等于抄进上下文」的凭据。
+
+    :param text: 查询串（或片段的查询部分）
+    :returns: 脱敏后的文本
+    """
+    if not text:
+        return text
+    pairs: list[tuple[str, str]] = []
+    changed = False
+    for name, value in parse_qsl(text, keep_blank_values=True):
+        if name.strip().lower() in _SECRET_QUERY_KEYS:
+            pairs.append((name, "<redacted>"))
+            changed = True
+        else:
+            pairs.append((name, value))
+    if not changed:
+        return text
+    return urlencode(pairs)
+
+
+def _redacted_fragment(fragment: str) -> str:
+    """把片段里像查询串的那一段脱敏；没有命中时原样返回。
+
+    片段有两种藏令牌的写法：OAuth2 隐式流程把整个片段当查询串（``#access_token=…``），
+    单页应用的路由则是先路径后查询（``#!/list?token=…``）。两种都要覆盖。
+
+    :param fragment: URL 的 fragment 段
+    :returns: 脱敏后的 fragment
+    """
+    head, separator, query = fragment.partition("?")
+    if separator:
+        return f"{head}?{_redacted_query(query)}"
+    return _redacted_query(fragment)
+
+
+def redact_url_secrets(raw: str) -> str:
+    """把 URL 里像凭据的部分替换成占位符。
+
+    三处各藏一类凭据：查询串与片段的查询部分按**参数名**判（真实站点把 access token、
+    会话 id、签名放在那里），authority 里的 ``user:pass@`` 整段丢掉（代理与 Basic 认证
+    的接口都爱这么写）。值的部分一律换成固定占位符：定位接口靠的是路径与参数名，不是
+    那个 token。
+
+    只按参数名判断、不看值 —— 值本身无法可靠判定（短 token 与普通 id 长得一样）。
+    认不出来的参数原样保留：把 ``?page=2`` 也涂掉只会让摘要失去意义，而那不是凭据。
+
+    :param raw: 原始 URL
+    :returns: 已脱敏的 URL；解析不出或没有可脱敏的部分时原样返回
+    """
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    # rpartition 取最后一段：IPv6 字面量与端口都留在主机那一侧，只把用户信息摘掉。
+    netloc = parsed.netloc.rpartition("@")[2]
+    query = _redacted_query(parsed.query)
+    fragment = _redacted_fragment(parsed.fragment)
+    if netloc == parsed.netloc and query == parsed.query and fragment == parsed.fragment:
+        return raw
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
+
+
 def _xhr_summary(responses: Any) -> list[dict[str, Any]]:
     """把 ``captured_xhr`` 压成轻量摘要。
 
     XHR 响应体可能很大，全量塞回 Host 会把模型上下文撑爆；这里只给 URL、状态码与
     字节数，模型自己决定要不要再对其中某个 URL 发一次抓取。
+
+    URL 里的凭据型查询参数在这一层就脱敏：这份摘要是给模型看的，而模型用不上一个
+    access token 却会把整条 URL 原样复述出去。
     """
     summary: list[dict[str, Any]] = []
     for item in responses or ():
         try:
-            summary.append({"url": item.url, "status": item.status, "bytes": len(item.body)})
+            summary.append(
+                {
+                    "url": redact_url_secrets(str(item.url)),
+                    "status": item.status,
+                    "bytes": len(item.body),
+                }
+            )
         except Exception:  # noqa: BLE001 —— 单条摘要失败不该拖垮整次抓取
             continue
     return summary
@@ -177,8 +292,11 @@ def _strip_active_content(page: Any) -> None:
         attrib = getattr(element, "attrib", None)
         if attrib is None or not hasattr(attrib, "keys"):
             continue
-        # meta refresh 能把浏览器导航到内网地址；base 同样只影响解析、不贡献内容。
-        if tag in ("meta", "base") and "http-equiv" in attrib:
+        # meta refresh 能把浏览器导航到内网地址；base 的 href 指挥相对地址怎么解析、
+        # 同样只影响解析而不贡献内容，两者都整段清掉属性。meta 只清带了 http-equiv 的
+        # （charset 声明无害且有用），base 不看属性名 —— <base href> 没有 http-equiv，
+        # 按属性名判它就永远清不到。
+        if tag == "base" or (tag == "meta" and "http-equiv" in attrib):
             attrib.clear()
             continue
         for name in [
@@ -238,6 +356,23 @@ def drop_data_uris(text: str, *, html: bool = False) -> str:
     return "\n".join(out)
 
 
+def _scoped_pages(page: Any, css_selector: str | None) -> list[Any]:  # noqa: ANN401 —— 同上
+    """按 ``css_selector`` 把清洗过的树收窄成若干棵子树；没给选择器就是整棵。
+
+    口径与 Scrapling 自家 ``Convertor._extract_content`` 一致：命中 0 个元素就是空表，
+    三条提取路径都据此产出空正文 —— **不回退成整页**。此前只有 markdown 那条路径
+    （``Response.markdown``）吃选择器，html/text 拿到它却悄悄忽略、返回整页，模型无从
+    发现自己要的东西没被收窄。
+
+    :param page: 已清洗的页面树
+    :param css_selector: 收窄用的 CSS 选择器；None 或空串表示不收窄
+    :returns: 待提取的元素列表
+    """
+    if not css_selector:
+        return [page]
+    return list(page.css(css_selector))
+
+
 def to_payload(
     response: Any,
     *,
@@ -256,12 +391,15 @@ def to_payload(
     if extraction_type == "html":
         page = _sanitized_page(response, main_content_only=main_content_only)
         _strip_active_content(page)
-        content = page.html_content
+        content = "\n".join(element.html_content for element in _scoped_pages(page, css_selector))
     elif extraction_type == "text":
         page = _sanitized_page(response, main_content_only=main_content_only)
-        content = page.get_all_text(
-            strip=True,
-            ignore_tags=("script", "style", "noscript", "svg", "iframe"),
+        content = "\n".join(
+            element.get_all_text(
+                strip=True,
+                ignore_tags=("script", "style", "noscript", "svg", "iframe"),
+            )
+            for element in _scoped_pages(page, css_selector)
         )
     else:
         content = response.markdown(css_selector=css_selector, main_content_only=main_content_only)
@@ -313,9 +451,7 @@ def _static_params(args: dict[str, Any], url: str) -> dict[str, Any]:
     按自己的 trust_env 读环境 —— 与本包不介入时逐字节一致。
     """
     params: dict[str, Any] = {
-        "timeout": _positive_number(
-            args.get("timeoutSeconds"), "timeoutSeconds", DEFAULT_TIMEOUT_SECONDS
-        ),
+        "timeout": _positive_number(args.get("timeoutSeconds"), "timeoutSeconds", DEFAULT_TIMEOUT_SECONDS),
         "follow_redirects": "safe",
         "retries": _positive_int(args.get("retries"), "retries", 3),
     }
@@ -375,6 +511,27 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _xhr_pattern(args: dict[str, Any]) -> str | None:
+    """取 XHR 捕获正则，并确认它编译得过。
+
+    这个串由 :mod:`scrapling` 塞进响应处理器，对**每个**响应跑一次 ``re.search``。
+    写错一个字符时若不在这里拦下，报错会发生在浏览器的事件回调里 —— 表现是「页面抓到了，
+    但整次抓取冒出一串看不懂的错」，而用户看不出根因是自己正则写错了。
+
+    :param args: 协议参数
+    :returns: 正则文本；没给或为空串时给 None（Scrapling 据此不捕获）
+    :raises AdapterError: 正则编译不过
+    """
+    raw = args.get("captureXhrPattern")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        re.compile(raw)
+    except re.error as error:
+        raise AdapterError("BAD_ARGS", f"captureXhrPattern is not a valid regex: {error}") from error
+    return raw
+
+
 def _browser_params(args: dict[str, Any], url: str) -> dict[str, Any]:
     """浏览器抓取的公共参数。
 
@@ -417,11 +574,15 @@ def _browser_params(args: dict[str, Any], url: str) -> dict[str, Any]:
         ("useragent", "useragent"),
         ("locale", "locale"),
         ("timezoneId", "timezone_id"),
-        ("captureXhrPattern", "capture_xhr"),
     ):
         value = args.get(key)
         if isinstance(value, str) and value:
             params[name] = value
+    # XHR 捕获正则单独走一道：它是用户手写的正则，编译不过要在发车前就报出来，
+    # 而不是等它在浏览器的事件回调里炸。
+    xhr_pattern = _xhr_pattern(args)
+    if xhr_pattern is not None:
+        params["capture_xhr"] = xhr_pattern
     # 浏览器二进制路径与 CDP 端点只从 deployment 命名空间取，不在上面的模型可见透传表里：
     # executable_path 等于「让 Chromium 去执行这个文件」，cdp_url 等于「把浏览器交给这个
     # 调试端点」，两者都是部署级的强能力，但绝不能由模型入参驱动。Host 侧对应的两枚设置
@@ -521,6 +682,15 @@ def select(args: dict[str, Any]) -> dict[str, Any]:
 
     这正是 dsh 内置 ``web_fetch`` 结构上做不到的那部分：它只能给一整块 Markdown，
     这里给的是选择器命中的具体内容。
+
+    ``adaptive`` 打开时走 Scrapling 的自愈选择器：命中成功就把首个元素的指纹存库，
+    站点改版后同一个选择器直接命中失败时，按指纹重定位。存储文件固定在 sidecar 的
+    工作目录（部署侧的 ``dataDir``），键按 ``url`` 的注册域分桶 —— 所以重定位还要求
+    给 ``url``；不给就全落在 ``default`` 桶里，跨站点共用一份指纹。
+
+    ``maxContentChars`` 是这条路径的预算，与抓取类工具同源：``limit`` 数的是**条数**，
+    而十条十万字的正文照样能把模型上下文撑爆。所以逐条累计字符，超了就地截断并置
+    ``truncated`` —— 总条数与单条长度是两根独立的轴，只压一根等于没压。
     """
     from scrapling.parser import Selector
 
@@ -533,25 +703,61 @@ def select(args: dict[str, Any]) -> dict[str, Any]:
     attribute = args.get("attribute")
     if attribute is not None and not isinstance(attribute, str):
         raise AdapterError("BAD_ARGS", "attribute must be a string or null")
+    adaptive = bool(args.get("adaptive", False))
+    url = args.get("url")
+    if url is not None and not isinstance(url, str):
+        raise AdapterError("BAD_ARGS", "url must be a string or null")
 
-    page = Selector(html)
-    nodes = page.xpath(selector) if bool(args.get("useXpath", False)) else page.css(selector)
+    if adaptive:
+        # storage_args 必须把 url 一起带上：Scrapling 对「给了部分 storage_args」是整体
+        # 替换而不是补齐，漏了 url 全部指纹都会落进 default 桶。url 为空时也显式传空串，
+        # 存储层把它归入 default 桶（StorageSystemMixin 对空值有兜底）。
+        page = Selector(
+            html,
+            url=url or "",
+            adaptive=True,
+            storage_args={"storage_file": ADAPTIVE_STORAGE_FILE, "url": url or ""},
+        )
+    else:
+        page = Selector(html)
+
+    # 命中成功时 auto_save 存指纹，命中失败且 adaptive 打开时按存过的指纹重定位 ——
+    # 两个开关都必须在**调用**上再打开一次：Scrapling 的 adaptive 是构造器与调用两级
+    # 开关，只开构造器的话，重定位会被静默跳过。
+    use_xpath = bool(args.get("useXpath", False))
+    if use_xpath:
+        nodes = page.xpath(selector, adaptive=adaptive, auto_save=adaptive)
+    else:
+        nodes = page.css(selector, adaptive=adaptive, auto_save=adaptive)
     limit = _positive_int(args.get("limit"), "limit", 200)
+    budget = _positive_int(args.get("maxContentChars"), "maxContentChars", DEFAULT_MAX_CONTENT_CHARS)
     include_attributes = bool(args.get("includeAttributes", False))
 
     matches: list[dict[str, Any]] = []
-    for node in nodes[:limit]:
+    spent = 0
+    clipped = False
+    for node in nodes:
+        if len(matches) >= limit:
+            break
         item: dict[str, Any] = {"tag": node.tag}
-        if attribute:
-            item["value"] = str(node.attrib.get(attribute, ""))
-        else:
-            item["text"] = str(node.get_all_text(strip=True))
+        field = "value" if attribute else "text"
+        item[field] = str(node.attrib.get(attribute, "")) if attribute else str(node.get_all_text(strip=True))
         if include_attributes:
             item["attributes"] = {str(key): str(value) for key, value in node.attrib.items()}
+        # 先按剩余额度截再计入已花：一条超长正文不该把整份预算吃光，也不该在预算只剩
+        # 一位时还能整条通过。
+        room = max(0, budget - spent)
+        if len(item[field]) > room:
+            item[field] = item[field][:room]
+            clipped = True
+        spent += len(item[field])
         matches.append(item)
+        if spent >= budget:
+            clipped = True
+            break
     return {
         "count": len(nodes),
-        "truncated": len(nodes) > len(matches),
+        "truncated": clipped or len(nodes) > len(matches),
         "matches": _jsonable(matches),
     }
 
@@ -654,8 +860,17 @@ _SESSION_CLASSES = {
 }
 
 # 会话注册表。sidecar 是常驻进程，这里就是它的内存；进程退出时全部随之消失。
-# 值里存 {"session": <对象>, "type": <str>, "created_at": <iso8601>}
+# 值里存 {"session": <对象>, "type": <str>, "created_at": <iso8601>, "lock": Lock,
+# "worker": _SessionWorker | None}；正在构造中的条目只有
+# {"pending": True, "type": <str>, "lock": Lock}，那样它就已经占了名额。
+# lock 从占位那一刻就存在，所以构造期与使用期是同一把锁；worker 只在 browser/stealth
+# 上出现（见下），static 为 None。
 _SESSIONS: dict[str, dict[str, Any]] = {}
+
+# bridge 有多个 worker 线程，注册表从它们手里并发读写。判重与判名额必须原子，否则并发
+# 的 session_open 会各自判完再各自开出一个会话 —— id 重复时后者覆盖前者（漏一个已经在
+# 跑的 Chromium），名额判完再开等于没判。
+_SESSION_LOCK = threading.Lock()
 
 # 同开几个会话。browser/stealth 每开一个就是一个真实的 Chromium 进程，而 sessionType 是
 # **模型可选**的参数 —— 不设上限的话，「开 → 不关」重复几次就能把机器的内存吃光。
@@ -663,6 +878,56 @@ _SESSIONS: dict[str, dict[str, Any]] = {}
 MAX_SESSIONS = 8
 # 其中最多几个可以是吃内存的那两种。static 只是连接池，便宜得多。
 MAX_BROWSER_SESSIONS = 3
+
+
+class _SessionWorker:
+    """一个会话的**专属执行线程**：这份会话上的全部远端调用都在它上面排队执行。
+
+    为什么必须有它：Playwright 的同步 API 靠 greenlet 与创建线程绑定 —— sync 对象上
+    任何一次远端调用都必须发生在 ``sync_playwright()`` 所在的那个 OS 线程，换线程直接
+    ``greenlet.error: cannot switch to a different thread``。而 bridge 的 worker 是
+    「谁抢到帧谁处理」，还会空闲 50ms 就退出换新线程：会话在 A 线程里开、下一个请求
+    几乎必然落在 B 线程。按会话加锁只能保证「不同时用」，保证不了「同一线程用」——
+    所以每个 browser/stealth 会话配一条专用线程，open/fetch/close 全部投递到它，
+    串行执行；调用线程原地等结果。static（curl_cffi）没有线程亲和，不走这套。
+    """
+
+    def __init__(self) -> None:
+        self._jobs: "queue.SimpleQueue[tuple[Callable[[], Any], concurrent.futures.Future[Any]] | None]"
+        self._jobs = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="session-worker")
+        self._thread.start()
+
+    def _loop(self) -> None:
+        """取任务、执行、回填结果；收到哨兵就退出。
+
+        每个任务的异常原样塞回 Future：调用方在 ``run`` 里等到的就是它自己那次调用的错。
+        """
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            fn, done = job
+            try:
+                done.set_result(fn())
+            except BaseException as error:  # noqa: BLE001 —— 任务异常必须回到调用方线程
+                done.set_exception(error)
+
+    def run(self, fn: Callable[[], Any]) -> Any:  # noqa: ANN401 —— 会话调用的返回形态由引擎定
+        """把 fn 投递到属主线程执行，并阻塞调用线程直到它结束。
+
+        :param fn: 要在属主线程上执行的调用
+        :returns: fn 的返回值
+        :raises BaseException: fn 抛什么这里就抛什么
+        """
+        done: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        self._jobs.put((fn, done))
+        return done.result()
+
+    def stop(self) -> None:
+        """发哨兵收线程。队列里的任务会先跑完，所以 close 之后 stop 是安全的。"""
+        self._jobs.put(None)
+        self._thread.join(timeout=5.0)
 
 
 def _new_session_id() -> str:
@@ -714,7 +979,7 @@ def _make_session(kind: str, args: dict[str, Any]) -> Any:
         common["proxy"] = proxy
         common["extra_flags"] = [guard.WEBRTC_NO_LEAK_FLAG]
     if kind == "browser":
-        session = DynamicSession(**common)
+        session: DynamicSession | StealthySession = DynamicSession(**common)
     else:
         session = StealthySession(
             **common,
@@ -765,44 +1030,78 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
     session_id = args.get("sessionId") or _new_session_id()
     if not isinstance(session_id, str) or not session_id:
         raise AdapterError("BAD_ARGS", "sessionId must be a string")
-    if session_id in _SESSIONS:
-        raise AdapterError("BAD_ARGS", f"session already exists: {session_id}")
-    _enforce_session_limits(kind)
 
+    # 「判重复 + 判名额 + 占位」三步必须原子。sidecar 有多个 worker 线程：并发的
+    # session_open 各自判完再各自开 —— 于是 id 重复时后者覆盖前者（漏一个已经在跑的
+    # Chromium），名额判完再开等于没判（开满 8 个之后还能继续开）。开一个浏览器要几百
+    # 毫秒，这个窗口足够宽。所以先在锁里占位，真正的构造放在锁外。
+    with _SESSION_LOCK:
+        if session_id in _SESSIONS:
+            raise AdapterError("BAD_ARGS", f"session already exists: {session_id}")
+        _enforce_session_limits(kind)
+        # 锁在占位时就建好：构造期占用的也是它，所以「造到一半」与「用着」互斥。
+        placeholder = {"pending": True, "type": kind, "lock": threading.Lock()}
+        _SESSIONS[session_id] = placeholder
+    entry_lock = placeholder["lock"]
+
+    # browser/stealth 先起属主线程，构造（含 sync_playwright 的启动）整个发生在它上面
+    # —— greenlet 绑定从此指向这条线程，之后每次 fetch/close 都投递回来。static 没有
+    # 线程亲和，留在调用线程即可。
+    worker: _SessionWorker | None = None
     try:
-        usable, closer = _make_session(kind, args)
-    except AdapterError:
-        raise
-    except Exception as error:  # noqa: BLE001
+        if kind == "static":
+            usable, closer = _make_session(kind, args)
+        else:
+            worker = _SessionWorker()
+            usable, closer = worker.run(lambda: _make_session(kind, args))
+    except BaseException as error:
+        if worker is not None:
+            worker.stop()
+        with _SESSION_LOCK:
+            _SESSIONS.pop(session_id, None)
+        if isinstance(error, AdapterError):
+            raise
         raise AdapterError("SESSION_OPEN_FAILED", f"{type(error).__name__}: {error}") from error
 
-    _SESSIONS[session_id] = {
-        "session": usable,  # 真正发请求的对象
-        "closer": closer,  # 关它用的对象（static 是 wrapper，浏览器是自身）
-        "type": kind,
-        # 浏览器会话是否带着代理；stealth 的 block_webrtc 要在每次 fetch 时跟着它走。
-        "proxied": kind != "static" and guard.default_proxy() != "",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    with _SESSION_LOCK:
+        _SESSIONS[session_id] = {
+            "session": usable,  # 真正发请求的对象
+            "closer": closer,  # 关它用的对象（static 是 wrapper，浏览器是自身）
+            "type": kind,
+            # 浏览器会话是否带着代理；stealth 的 block_webrtc 要在每次 fetch 时跟着它走。
+            "proxied": kind != "static" and guard.default_proxy() != "",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            # 同一把锁：占位时建的那把，盖回来而不是新建 —— 新建会让构造期与使用期各锁各的。
+            "lock": entry_lock,
+            # browser/stealth 的专属执行线程；static 为 None（见 _SessionWorker 的说明）。
+            "worker": worker,
+        }
+        created_at = _SESSIONS[session_id]["created_at"]
     return {
         "sessionId": session_id,
         "sessionType": kind,
-        "createdAt": _SESSIONS[session_id]["created_at"],
+        "createdAt": created_at,
     }
 
 
 def _get_session(session_id: Any) -> dict[str, Any]:
     """按 id 取已登记的会话。
 
+    正在构造中的条目也占着 id，所以「存在」不等于「可用」：拿到这种条目时明确报错，
+    而不是让调用方在 entry["session"] 上撞 KeyError。
+
     :param session_id: 会话 id
     :returns: 登记条目
-    :raises AdapterError: id 缺失或不存在
+    :raises AdapterError: id 缺失、不存在，或该 id 还在构造中
     """
     if not isinstance(session_id, str) or not session_id:
         raise AdapterError("BAD_ARGS", "sessionId is required")
-    entry = _SESSIONS.get(session_id)
-    if entry is None:
-        raise AdapterError("NO_SUCH_SESSION", f"no such session: {session_id}")
+    with _SESSION_LOCK:
+        entry = _SESSIONS.get(session_id)
+        if entry is None:
+            raise AdapterError("NO_SUCH_SESSION", f"no such session: {session_id}")
+        if entry.get("pending") is True:
+            raise AdapterError("NO_SUCH_SESSION", f"session {session_id} is still being created; retry shortly")
     return entry
 
 
@@ -818,12 +1117,17 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
     extraction_type, css_selector, main_content_only, limit = _extraction(args)
     url = _url(args)
 
+    # 一份会话同一时刻只服务一个请求：static 靠 entry 锁，browser/stealth 靠属主线程
+    # 天然串行。两种实现也都对「多线程同时用同一份会话」零容忍 —— Playwright 的同步
+    # API 靠 greenlet 一次只服务一个线程，curl_cffi 的 Session 文档原话是「一个时刻一个
+    # 会话」。表现是看不懂的崩溃，甚至是上下文串台 —— 所以在结构上就不给这个可能。
     try:
         if entry["type"] == "static":
-            response = session.get(url, **_static_params(args, url))
+            with entry["lock"]:
+                response = session.get(url, **_static_params(args, url))
         else:
-            # 浏览器会话的代理在开场时就定死了（见 _make_session），这里不再逐 URL 覆盖 ——
-            # 覆盖的做法是新建 context，cookie 与登录态会随之清空。
+            # 浏览器会话的代理在开场时就定死了（见 _make_session），这里不再逐 URL
+            # 覆盖 —— 覆盖的做法是新建 context，cookie 与登录态会随之清空。
             params = _browser_params(args, url)
             params.pop("proxy", None)
             params.pop("extra_flags", None)
@@ -831,11 +1135,14 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
             if entry["type"] == "stealth":
                 params["solve_cloudflare"] = bool(args.get("solveCloudflare", False))
                 params["hide_canvas"] = bool(args.get("hideCanvas", False))
-                params["block_webrtc"] = bool(args.get("blockWebrtc", False)) or bool(
-                    entry["proxied"]
-                )
+                params["block_webrtc"] = bool(args.get("blockWebrtc", False)) or bool(entry["proxied"])
                 params["allow_webgl"] = bool(args.get("allowWebgl", True))
-            response = session.fetch(url, **params)
+            # 投递到属主线程执行：greenlet 绑定在那里（见 _SessionWorker）。排队期间调用
+            # 线程原地等 —— 并发的 fetch 因此天然串行，entry 锁对浏览器会话是多余的。
+            worker: _SessionWorker | None = entry["worker"]
+            if worker is None:  # pragma: no cover —— browser/stealth 条目必有属主线程
+                raise AdapterError("NO_SUCH_SESSION", "session has no owner thread")
+            response = worker.run(lambda: session.fetch(url, **params))
     except AdapterError:
         raise
     except Exception as error:  # noqa: BLE001
@@ -859,30 +1166,57 @@ def session_list(_args: dict[str, Any]) -> dict[str, Any]:
     :param _args: 协议参数，本方法不用
     :returns: 会话列表
     """
-    return {
-        "sessions": [
+    # 字典遍历期间被别的线程插入/删除会抛 RuntimeError，而那正是 bridge 多 worker 下的
+    # 常态。进锁里把清单复制出来，遍历就与并发改写无关。
+    with _SESSION_LOCK:
+        rows = [
             {
                 "sessionId": session_id,
                 "sessionType": entry["type"],
-                "createdAt": entry["created_at"],
+                # 构造中的条目还没有创建时间；报空串而不是 KeyError。
+                "createdAt": entry.get("created_at", ""),
             }
             for session_id, entry in _SESSIONS.items()
         ]
-    }
+    return {"sessions": rows}
 
 
-def _close_entry(session_id: str) -> None:
+def _release_entry(entry: dict[str, Any]) -> None:
+    """把一个已构造好的会话条目关掉。
+
+    :param entry: 登记条目
+    """
+    # suppress 而不是 try/except/pass：关不掉也不能让桥接层挂掉，而那正是 suppress 的
+    # 既有语义 —— 少一层缩进，意图也一样清楚。
+    with contextlib.suppress(Exception):
+        entry["closer"].close() if entry["type"] != "static" else entry["closer"].__exit__(None, None, None)
+
+
+def _close_entry(session_id: Any) -> None:
     """关掉一个会话并从注册表移除。
 
-    :param session_id: 会话 id
+    :param session_id: 会话 id；JSON 载荷里来的，也可能是登记表的键
     """
-    entry = _SESSIONS.pop(session_id, None)
+    with _SESSION_LOCK:
+        entry = _SESSIONS.pop(session_id, None)
     if entry is None:
         return
-    try:
-        entry["closer"].close() if entry["type"] != "static" else entry["closer"].__exit__(None, None, None)
-    except Exception:  # noqa: BLE001 —— 关不掉也不能让桥接层挂掉
-        pass
+    if entry.get("pending") is True:
+        # 还没构造完：构造方自己会在成功时覆盖这一条，或在失败时把它摘掉。这里不能碰
+        # closer —— 它还不存在。
+        return
+    worker: _SessionWorker | None = entry.get("worker")
+    if worker is not None:
+        # 浏览器会话的 close 是一次 Playwright 远端调用，必须在属主线程上做；投递进去
+        # 还天然排在在途 fetch 之后 —— 「抓取进行中收到 close」会等抓取落地再关，而
+        # 不是把一次正在跑的抓取从底下抽走。
+        worker.run(lambda: _release_entry(entry))
+        worker.stop()
+        return
+    # static 没有属主线程，用 entry 锁：否则「抓取进行中收到 close」会把一次正在跑的
+    # 抓取从底下抽走，而 close 那一侧看到的是一个已经拆掉的会话。
+    with entry["lock"]:
+        _release_entry(entry)
 
 
 def session_close(args: dict[str, Any]) -> dict[str, Any]:
@@ -892,6 +1226,8 @@ def session_close(args: dict[str, Any]) -> dict[str, Any]:
     :returns: 关闭结果
     """
     session_id = args.get("sessionId")
+    # _get_session 已确认它是非空字符串；这里直接用它，而 _close_entry 的入参标 Any 是因为
+    # 两个调用来源不同 —— 本条路径来自 JSON 载荷，close_all_sessions 来自登记表的键。
     _get_session(session_id)
     _close_entry(session_id)
     return {"sessionId": session_id, "closed": True}

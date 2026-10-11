@@ -68,7 +68,13 @@ would throw all of that away.
 
 `scrapling_crawl` returns a **job id immediately** rather than blocking: a crawl takes
 minutes, a tool call has a timeout. Watch it with `job_list`, read it with
-`job_output`, stop it with `job_kill`.
+`job_output`, stop it with `job_kill`. A crawl also has a wall-clock ceiling
+(`crawlMaxRuntimeSeconds`) and never leaves the start domain. Politeness is the
+deployment's call, stated in the open: Scrapling's spider defaults are kept as-is —
+robots.txt is **not** obeyed, per-domain delay is 0, and up to 4 requests run in
+parallel. The crawl is confined to the start domain, so it never fans out across
+unrelated sites; a target that needs gentler behaviour should sit behind a rate
+limiter on the deployment side.
 
 ## Requirements
 
@@ -174,6 +180,10 @@ Notable switches:
   ceiling over the model-supplied `maxPages`; an out-of-range `maxPages` (0, negative,
   NaN) is passed through unchanged so the sidecar reports the parameter error rather
   than this plugin silently clamping it into a legal-looking value.
+  `crawlMaxRuntimeSeconds` is the crawl's wall-clock ceiling: the page cap says nothing
+  about a site that takes a minute per page, and a crawl is a background thread nobody
+  is watching. On expiry the spider winds down through its own stop channel instead of
+  running until the site runs out.
 - `stripInlineImages` - **on** by default: inline `data:` URI images are dropped from
   the body and only their alt text is kept. Such an image is pure token noise - a
   base64 SVG costs characters in the context while the model cannot read a shape out
@@ -223,8 +233,8 @@ Notable switches:
 
 **Deployment-grade knobs** (not on the settings card; set them in the `config:` block of
 `cordis.patch.yml`): `requestTimeoutSeconds`, `maxUrlLength`, `browserExecutablePath`,
-`browserCdpUrl`, `searchEndpoint`, `searchRenderTopN`. The first two of the browser pair are
-strong capabilities - one hands Chromium a file
+`browserCdpUrl`, `searchEndpoint`, `searchRenderTopN`, `crawlMaxRuntimeSeconds`. The first
+two of the browser pair are strong capabilities - one hands Chromium a file
 to execute, the other hands the browser to a debugger endpoint - so they come only from
 deployment config and are unreachable from model input.
 
@@ -369,14 +379,15 @@ JSON endpoint.
     address, not only the ones inside the RFC 6052 segment.
   - **No port allowlist** (any port allowed by default), matching dsh's own built-in
     fetch provider.
-  - **`scrapling_crawl` re-checks addresses itself, but redirect targets still rest on
-    domain consistency alone.** The start URL goes through `guard.url_allowed` (the same
-    implementation the browser path uses, so both layers agree), the crawl session sets
-    `follow_redirects="safe"` so curl_cffi refuses to follow a jump into a private range, and
-    each page's final URL is re-checked before it enters the result set. Scrapling's
-    `allow_domains`, though, is a string comparison that covers links found in the page and
-    not redirect targets - so on that seam the host gate's start-URL check is still the only
-    defence.
+  - **`scrapling_crawl` re-checks addresses itself, but the start-URL gate is still the
+    first line.** The start URL goes through `guard.url_allowed` (the same implementation
+    the browser path uses, so both layers agree), the crawl session sets
+    `follow_redirects="safe"` so curl_cffi refuses to follow a jump into a private range,
+    and each page is re-checked **twice** before it enters the result set: once against
+    the guard (the final URL may still have landed somewhere private) and once against the
+    start domain - Scrapling's `allow_domains` is a string comparison that covers links
+    found in the page and not redirect targets, so an off-site jump on a public host has to
+    be caught here.
   - **WebSocket coverage depends on the Playwright version.** The guard intercepts
     handshakes via `route_web_socket`. Older builds lack that method, WebSocket is then
     outside the guard, and the plugin says so in the log and in the capability report
@@ -387,7 +398,9 @@ JSON endpoint.
 
   The host-side policy is enforced by `SidecarClient.call`, so it covers every tool and
   the `web_fetch` provider alike; a rejection throws `URL_BLOCKED` before the request is
-  written to the pipe.
+  written to the pipe. The `web_search` provider runs the same gate over the URLs it is
+  about to hand back: a hit the gate rejects never becomes a citeable source, so the model
+  is never offered an address the next fetch would refuse.
 - **Browser engines ignore proxy environment variables.** Playwright does not read
   `HTTP_PROXY` / `HTTPS_PROXY`, so `scrapling_render` / `scrapling_capture_xhr` /
   `scrapling_stealth_fetch` connect **directly** even when the rest of the system is
@@ -415,10 +428,40 @@ JSON endpoint.
 
 ```sh
 pnpm install          # install dependencies
-pnpm run check        # typecheck + lint + build + test + format check
+pnpm run check        # typecheck + lint + build + test + format check, TS *and* Python
 pnpm run build        # bundles host.ts / src/client-entry.ts into host.js / client.js
 pnpm run test:py      # end-to-end check of the Python sidecar (needs _env/.venv)
 ```
+
+**The Python half is gated too.** The four `.py` files ship with this package
+(`package.json`'s `files` lists them one by one) and run on the user's machine, so they
+get the same treatment as `host.ts`: `pnpm run check` runs `ruff check` and
+`ruff format --check` over `py/`, and fails hard when the tools are missing rather than
+skipping quietly. Install them into whichever interpreter `python3` resolves to:
+
+```sh
+pip install -r py/requirements-dev.txt
+```
+
+Two more commands measure rather than gate:
+
+```sh
+pnpm run typecheck:py # mypy over py/ (currently clean; why it stays advisory is below)
+pnpm run cov:py       # coverage for the four shipped modules + the test script
+```
+
+Run both with an interpreter that has Scrapling installed (the same one `test:py` uses).
+That is not decoration: mypy's findings depend on it. From an interpreter without
+Scrapling every Scrapling type degrades to `Any` and the check reports nothing at all.
+
+`mypy` stays advisory because this side is duck-typed on purpose — Playwright's `page`,
+`route` and `websocket` have no shape until runtime — and a strict profile would buy a
+pile of `ignore` comments that exist only to silence it. `cov:py` is advisory because its
+honest number needs the subprocess wired in: `bridge.py` and the `adapters` methods live
+in the sidecar child, so `test_bridge.py` spawns that child under `coverage run` when
+`DSH_PY_COVERAGE=1`. Without it the report reads `adapters.py` 20% while none of its fetch
+paths have been counted at all — a number that measures nothing. Current shape:
+`adapters` 65%, `bridge` 37%, `crawl` 89%, `guard` 85%.
 
 Sources are all TypeScript. `host.js` and `client.js` are **build artifacts** and are
 deliberately `.js`: Node refuses to strip types for packages inside `node_modules`,
