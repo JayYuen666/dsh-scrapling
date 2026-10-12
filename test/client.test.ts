@@ -24,6 +24,10 @@ const NO_VALUE = (): undefined => undefined;
 /** 什么都不做的替身。 */
 const NO_OP = (): void => undefined;
 
+// cordis 的 effect 会**立刻**执行函数体并持有它的返回值，测试替身必须照做：少了这一步，
+// effect 里的注册一次都不会发生。
+const RUN_EFFECT_IMMEDIATELY = (run: () => unknown): unknown => run();
+
 describe("buildRow", () => {
   it("抓取类展示 URL 与 HTTP 状态", () => {
     const row = buildRow(
@@ -151,8 +155,22 @@ describe("readArgs", () => {
 const BUNDLE_CONFIG_SLOT = "plugins.bundle.config";
 const TOOLVIEW_SLOT = "tool.call.toolview";
 
-/** 一个够用的假 ctx：locale 与 configForms 都在，inject 直接同步执行。 */
-function harness(): {
+/** 本包会从 ctx 上读的服务名；替身按 harness 收到的清单决定放行哪几枚。 */
+const SERVICE_NAMES = ["slots", "locale", "configForms"];
+
+/**
+ * 造一个够用的假宿主。
+ *
+ * `names` 是本包声明给宿主的 inject 清单，ctx 只放行清单里的名字：这就是 cordis 上下文
+ * 代理的真行为（@deepseek-ai/cordis lib/index.js:671-697 —— 没注入的名字抛
+ * `cannot get property "<name>" without inject`，而抛出落在 `ctx.effect` 体内时只被记进
+ * logger，同文件 :1261）。替身要是像早先那样把整套服务无条件摆在 ctx 上，「清单里少写一枚
+ * configForms」这种错在 Node 下什么都测不出来，真浏览器里的症状却是整张设置卡连同全部结果
+ * 行一起静默消失 —— 这个 bug 就是这样躲在替身与宿主的差别里的。
+ *
+ * @param names - 本包声明注入的服务名
+ */
+function harness(names: readonly string[] = ["slots", "configForms", "locale"]): {
   ctx: unknown;
   registered: { name: string; key?: string; locale?: string }[];
   renderers: Map<string, (props: unknown) => unknown>;
@@ -163,33 +181,44 @@ function harness(): {
   const dictionaries: { ns: string; locale: string }[] = [];
   const asked: string[] = [];
   const renderers = new Map<string, (props: unknown) => unknown>();
-  const slots = {
-    inject: (_slot: string, register: () => void): void => {
-      register();
+  // 宿主那一版配置：引用恒定（useSyncExternalStore 就靠这一点判「有没有变」），
+  // 且整张替身只有一份 —— 与本包对值面的用法一致。
+  const hostState = { status: "ready" as const, value: {}, revision: 7, writable: true };
+  const listeners: (() => void)[] = [];
+  const source = {
+    getSnapshot: () => hostState,
+    subscribe: (listener: () => void): (() => void) => {
+      listeners.push(listener);
+      return (): void => {
+        const at = listeners.indexOf(listener);
+        if (at !== -1) {
+          listeners.splice(at, 1);
+        }
+      };
     },
-    register: (
-      options: { name: string; key?: string; locale?: string },
-      render: (props: never) => unknown,
-    ): (() => void) => {
-      registered.push(options);
-      renderers.set(options.name, render as (props: unknown) => unknown);
-      return NO_OP;
+    mutate: async (): Promise<boolean> => {
+      // 宿主收下这笔写入后会替换快照并通知订阅者 —— 卡片靠这一步把新值画上。
+      // 先拷一份再遍历：监听者可能在通知里退订，直接遍历会跳过下一个。
+      const pending = [...listeners];
+      for (const notify of pending) {
+        notify();
+      }
+      return true;
     },
   };
-  const disposers: (() => void)[] = [];
-  const face = {
-    slots,
-    // cordis 的 effect 会**立刻**执行函数体并持有它的返回值，测试替身必须照做：
-    // 少了这一步，effect 里的注册一次都不会发生。
-    effect: (run: () => unknown): unknown => {
-      const dispose = run();
-      if (typeof dispose === "function") {
-        const undo = dispose as () => void;
-        disposers.push(() => {
-          undo();
-        });
-      }
-      return dispose;
+  const services: Record<string, unknown> = {
+    slots: {
+      inject: (_slot: string, register: () => void): void => {
+        register();
+      },
+      register: (
+        options: { name: string; key?: string; locale?: string },
+        render: (props: never) => unknown,
+      ): (() => void) => {
+        registered.push(options);
+        renderers.set(options.name, render as (props: unknown) => unknown);
+        return NO_OP;
+      },
     },
     locale: {
       register: (ns: string, locale: string): (() => void) => {
@@ -201,37 +230,63 @@ function harness(): {
         (key: string): string =>
           key,
     },
+    // 宿主的订阅是引用比较：换了函数就重建订阅。所以值面在注册时造一次，
+    // 不能每渲染一次新建一个 —— 下面 configFormsSource 用 source 变量把这点固定住。
     configForms: {
       get: (entryId: string) => {
         asked.push(entryId);
-        return {
-          getSnapshot: () => ({
-            status: "ready" as const,
-            value: {},
-            revision: 7,
-            writable: true,
-          }),
-          mutate: async () => true,
-        };
+        return source;
       },
     },
-    inject: (_deps: readonly string[], run: (ctx: unknown) => void): void => {
-      run(face);
-    },
   };
-  return { ctx: face, registered, renderers, dictionaries, asked };
+  // ctx 只放行清单里的名字，其余名字留一个会炸的 getter，抛的串与宿主逐字相同。
+  // effect 不算「注入的服务」—— 它是 cordis 混进每个 ctx 的方法面（lib/index.js:743）。
+  const ctx: Record<string, unknown> = { effect: RUN_EFFECT_IMMEDIATELY };
+  for (const name of SERVICE_NAMES) {
+    if (names.includes(name)) {
+      ctx[name] = services[name];
+    } else {
+      Object.defineProperty(ctx, name, {
+        get: (): never => {
+          throw new Error(`cannot get property "${name}" without inject`);
+        },
+      });
+    }
+  }
+  return { ctx, registered, renderers, dictionaries, asked };
 }
 
 describe("apply", () => {
-  it("注入清单里只有 slots，可选服务走 ctx.inject 才不会拖垮缺它们的 profile", async () => {
+  it("注入清单交齐 slots、configForms 与 locale：少一枚，卡片与结果行都注册不上", async () => {
     const { ctx, registered } = harness();
     resetApplyFlag();
     const { apply, inject } = await import("../src/client-entry.ts");
     apply(ctx as never);
-    expect(inject).toStrictEqual(["slots"]);
+    // 清单与本包实际读用的服务必须逐字相等 —— 这条断言替我们把宿主那条硬规则钉住。
+    expect([...inject].toSorted()).toStrictEqual(["configForms", "locale", "slots"]);
     expect(
       registered.filter((entry) => entry.name === TOOLVIEW_SLOT).map((entry) => entry.key),
     ).toStrictEqual(ROW_TOOLS);
+  });
+
+  it("少注入 configForms 时 apply 抛错且卡片消失 —— 宿主里这声抛只进 logger", async () => {
+    const { ctx, registered } = harness(["slots", "locale"]);
+    resetApplyFlag();
+    const { apply } = await import("../src/client-entry.ts");
+    expect(() => {
+      apply(ctx as never);
+    }).toThrow('cannot get property "configForms" without inject');
+    expect(registered.filter((entry) => entry.name === BUNDLE_CONFIG_SLOT)).toStrictEqual([]);
+  });
+
+  it("少注入 locale 时连结果行一起丢，不只是卡", async () => {
+    const { ctx, registered } = harness(["slots", "configForms"]);
+    resetApplyFlag();
+    const { apply } = await import("../src/client-entry.ts");
+    expect(() => {
+      apply(ctx as never);
+    }).toThrow('cannot get property "locale" without inject');
+    expect(registered.filter((entry) => entry.name === TOOLVIEW_SLOT)).toStrictEqual([]);
   });
 
   it("结果行清单覆盖 host.ts 注册的每个工具，少一个就少画一行", () => {
@@ -280,15 +335,38 @@ describe("apply", () => {
     }
     // 插件管理器渲染 bundle 页时 owner props 只有 view 与 locale 席位给的 t。
     const element = render({ view: "page", t: (key: string): string => key }) as {
-      props: { form?: { state: unknown } };
+      props: {
+        form?: { getSnapshot?: () => unknown; subscribe?: unknown; mutate?: unknown };
+      };
     };
-    expect(element.props.form).toBeDefined();
-    expect(element.props.form?.state).toStrictEqual({
+    expect(element.props.form?.getSnapshot?.()).toStrictEqual({
       status: "ready",
       value: {},
       revision: 7,
       writable: true,
     });
+    // subscribe 与 mutate 由卡片直接用，缺一个卡就变成只读且永不更新。
+    expect(element.props.form?.subscribe).toBeTypeOf("function");
+    expect(element.props.form?.mutate).toBeTypeOf("function");
+  });
+
+  it("值面在注册时造一次：每帧换一个新对象等于每帧重建订阅，会漏掉宿主的变更通知", async () => {
+    const { ctx, renderers } = harness();
+    resetApplyFlag();
+    const { apply } = await import("../src/client-entry.ts");
+    apply(ctx as never);
+    const render = renderers.get(BUNDLE_CONFIG_SLOT);
+    if (render === undefined) {
+      throw new Error("设置卡没有注册");
+    }
+    const face = (): unknown => {
+      const element = render({ view: "page", t: (key: string): string => key }) as {
+        props: { form?: unknown };
+      };
+      return element.props.form;
+    };
+    // useSyncExternalStore 比的是 subscribe 的引用，所以两帧必须拿到同一个对象。
+    expect(face()).toBe(face());
   });
 
   it("结果行的 render 也接上了真实 owner props，而不是渲染一个空壳", async () => {

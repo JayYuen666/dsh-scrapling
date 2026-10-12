@@ -8,9 +8,16 @@
 // · **bundle 页不传 form。** 插件管理器渲染 bundle 页时 owner props 只有 `{ view }`；
 //   row 页与官方插件页才有 `form`（一个 bundle 页可能同时坐着几个 entry，宿主没有单一的
 //   form 可给）。所以设置卡的 form 由本文件从 `ctx.configForms` 取 —— 见 apply()。
-// · **configForms 与 locale 都是可选服务。** 把它们写进 inject 会让缺了这些服务的 profile
-//   连结果行一起丢掉，所以走 `ctx.inject([...])`：缺 settings 的 profile 照样有结果行，只是
-//   插件页上不出现那张卡。
+// · **ctx 只认它自己声明过的那些服务。** cordis 的上下文代理对没进 `inject` 的名字直接
+//   抛 `cannot get property "<name>" without inject`（@deepseek-ai/cordis
+//   lib/index.js:671-697 的 ReflectService.handler.get），而这个抛出发生在 `ctx.effect`
+//   的函数体里时只会被记进 logger（同文件 :1261），界面上看不出任何异常。所以
+//   `ctx.locale` / `ctx.configForms` 必须写进下面的 inject 清单 —— 少写一个，症状就是
+//   整张设置卡与全部结果行一起静默消失。六个同类插件与官方的
+//   dsh-experimental-client-ui-voice-input 都声明 `["slots", "configForms", "locale"]`。
+//   「可选服务改用 ctx.inject 嵌套去取」这条路这里不走：locale 服务自己就依赖 configForms
+//   （dsh-client-locale/lib/client.js:1491），能拿到 locale 的 profile 必然有 configForms，
+//   嵌套只是把一次编译期可见的错误换成运行时的静默失败。
 // · **结果行读的是 owner props，不是 buildRow 当初假定的入参。** 参数要经宿主给的
 //   `block.args`（惰性 PartialArguments 视图）读，结果侧的投影在 `block.meta`。
 //
@@ -29,7 +36,14 @@ import {
   localeDictionaries,
 } from "./settings-fields.ts";
 import { SettingsCard, browserDocument, installStyle, installStyles } from "./settings-card.ts";
-import type { CardProps, DocumentFace, FormState, PathOp, Translate } from "./settings-card.ts";
+import type {
+  CardProps,
+  DocumentFace,
+  FormSource,
+  FormState,
+  PathOp,
+  Translate,
+} from "./settings-card.ts";
 
 /** 一行要展示的一项信息。label 是字典键而不是文案本身：可见文字统一走 locale 服务。 */
 export interface RowField {
@@ -282,15 +296,16 @@ function RowView(props: ToolViewProps & { readonly t: Translate }): ReactNode {
   );
 }
 
-/** 本 Client 半注入的服务。 */
-const inject = ["slots"];
+/** 本 Client 半注入的服务。三个都得在这儿 —— 见文件头第二条。 */
+const inject = ["slots", "configForms", "locale"];
 
 /**
  * Client 侧只声明用到的成员。
  *
  * 不直接用官方的 Context：客户端 ctx 的完整类型带几十个服务，而本包只需要 slots、effect
- * （后者是 claimApply 的入参要求），以及两个可选服务 configForms / locale。注入清单里只留
- * slots —— 注入未就绪的 key 会让整个模块静默不加载，写多了反而危险。
+ * （两者都是 claimApply 与注册路径的要求），以及 configForms 与 locale 这两个卡片要用的。
+ * 三个服务名同时出现在上面的 inject 清单里 —— 这个接口只是类型投影，运行时能不能取到由
+ * cordis 按那份清单决定，两边必须一致。
  */
 interface ClientFace {
   readonly slots: {
@@ -303,6 +318,7 @@ interface ClientFace {
   readonly configForms: {
     get: (entryId: string) => {
       readonly getSnapshot: () => FormState;
+      readonly subscribe: (listener: () => void) => () => void;
       readonly mutate: (ops: readonly PathOp[], expectedRevision?: number) => Promise<boolean>;
     };
   };
@@ -311,21 +327,20 @@ interface ClientFace {
     bind: (ns: string) => Translate;
   };
   readonly effect: Context["effect"];
-  readonly inject: (deps: readonly string[], apply: (ctx: ClientFace) => void) => void;
 }
 
 /**
  * 给每个需要专用结果行的工具登记一行视图。
  *
- * @param scoped - 已就绪 slots 与 locale 的子上下文
+ * @param ctx - 已就绪 slots 与 locale 的上下文
  * @returns 注销全部登记的函数
  */
-function registerToolViews(scoped: ClientFace): () => void {
-  const t = scoped.locale.bind(LOCALE_NS);
+function registerToolViews(ctx: ClientFace): () => void {
+  const t = ctx.locale.bind(LOCALE_NS);
   const disposers: (() => void)[] = [];
   for (const tool of ROW_TOOLS) {
     disposers.push(
-      scoped.slots.register(
+      ctx.slots.register(
         { name: "tool.call.toolview", key: tool, locale: LOCALE_NS },
         (props: ToolViewProps) => createElement(RowView, { ...props, t }),
       ),
@@ -363,54 +378,49 @@ function apply(ctx: ClientFace): void {
     };
   }, "dsh-scrapling: client styles");
 
-  ctx.inject(["locale"], (scoped) => {
-    // 字典整个插件只注册一份：结果行与设置卡共用同一个命名空间、各自 bind，
-    // 两处各注册一次会让后一次悄悄盖掉前一次。
-    scoped.effect(() => {
-      const dictionaries = localeDictionaries();
-      const disposers = [
-        ctx.locale.register(LOCALE_NS, "zh", dictionaries.zh),
-        ctx.locale.register(LOCALE_NS, "en", dictionaries.en),
-      ];
-      let disposeRows: (() => void) | undefined;
-      scoped.slots.inject("tool.call.toolview", () => {
-        disposeRows = registerToolViews(scoped);
-      });
-      return (): void => {
-        disposeRows?.();
-        for (const dispose of disposers) {
-          dispose();
-        }
-      };
-    }, "dsh-scrapling: dictionaries and tool rows");
-
-    // 设置卡还要 configForms：bundle 页给的 owner props 里没有 form，得自己取。
-    scoped.inject(["configForms"], (withForms) => {
-      withForms.effect(() => {
-        const form = ctx.configForms.get(SETTINGS_ENTRY_ID);
-        const t = ctx.locale.bind(LOCALE_NS);
-        let disposeCard: (() => void) | undefined;
-        scoped.slots.inject("plugins.bundle.config", () => {
-          disposeCard = scoped.slots.register(
-            { name: "plugins.bundle.config", key: BUNDLE_PACKAGE_NAME, locale: LOCALE_NS },
-            (props: CardProps) =>
-              createElement(SettingsCard, {
-                ...props,
-                t,
-                // 宿主给 row/item 页准备的那一份 form，bundle 页没有，这里补上。
-                form: {
-                  state: form.getSnapshot(),
-                  mutate: (operations, revision) => form.mutate(operations, revision),
-                },
-              }),
-          );
-        });
-        return (): void => {
-          disposeCard?.();
-        };
-      }, "dsh-scrapling: settings card");
+  // 字典整个插件只注册一份：结果行与设置卡共用同一个命名空间、各自 bind，
+  // 两处各注册一次会让后一次悄悄盖掉前一次。
+  ctx.effect(() => {
+    const dictionaries = localeDictionaries();
+    const disposers = [
+      ctx.locale.register(LOCALE_NS, "zh", dictionaries.zh),
+      ctx.locale.register(LOCALE_NS, "en", dictionaries.en),
+    ];
+    let disposeRows: (() => void) | undefined;
+    ctx.slots.inject("tool.call.toolview", () => {
+      disposeRows = registerToolViews(ctx);
     });
-  });
+    return (): void => {
+      disposeRows?.();
+      for (const dispose of disposers) {
+        dispose();
+      }
+    };
+  }, "dsh-scrapling: dictionaries and tool rows");
+
+  // 设置卡还要 configForms：bundle 页给的 owner props 里没有 form，得自己取。
+  ctx.effect(() => {
+    const form = ctx.configForms.get(SETTINGS_ENTRY_ID);
+    const t = ctx.locale.bind(LOCALE_NS);
+    // 宿主给 row/item 页准备的那一份 form，bundle 页没有，这里补上。值面在注册体之外造
+    // 一次：卡片的 useSyncExternalStore 比的是 subscribe 的引用，每帧换一个新的就会每帧重建
+    // 订阅，而重建那一拍可能漏掉一次宿主通知。宿主那份表单本身长活，所以这一份也长活。
+    const source: FormSource = {
+      getSnapshot: (): FormState => form.getSnapshot(),
+      subscribe: (listener: () => void): (() => void) => form.subscribe(listener),
+      mutate: (operations, revision) => form.mutate(operations, revision),
+    };
+    let disposeCard: (() => void) | undefined;
+    ctx.slots.inject("plugins.bundle.config", () => {
+      disposeCard = ctx.slots.register(
+        { name: "plugins.bundle.config", key: BUNDLE_PACKAGE_NAME, locale: LOCALE_NS },
+        (props: CardProps) => createElement(SettingsCard, { ...props, t, form: source }),
+      );
+    });
+    return (): void => {
+      disposeCard?.();
+    };
+  }, "dsh-scrapling: settings card");
 }
 
 export { apply, inject };

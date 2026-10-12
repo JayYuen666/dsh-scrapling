@@ -18,7 +18,7 @@
 // 写入用**第一笔改动落地时**读到的 revision 作围栏，而不是点击保存那一刻的最新值 ——
 // 后者会让宿主的冲突检测失效，把别处刚写下的值无声覆盖掉。
 
-import { createElement, useState } from "react";
+import { createElement, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { SETTINGS_FIELDS, SETTINGS_GROUPS } from "./settings-fields.ts";
 import type { FieldSpec, GroupSpec } from "./settings-fields.ts";
@@ -39,17 +39,45 @@ export interface FormState {
   readonly writable: boolean;
 }
 
+/**
+ * 本卡读写的宿主配置表单。
+ *
+ * 三个成员都按「一次注册里只造一个对象」的要求传进来：`useSyncExternalStore` 每次渲染都
+ * 比较 `subscribe` 的引用，换了就重建订阅，而重建的那一拍可能漏掉一次通知（官方表单
+ * 契约见 dsh-client-ui-settings/lib/types/client/config-form-types.d.ts —— 宿主给的
+ * `ConfigForm` 本身就是长活的，包一层只有注册时造一次才不丢语义）。
+ */
+export interface FormSource {
+  /** @returns 宿主当前那一版值。两次变更之间必须是同一个引用。 */
+  readonly getSnapshot: () => FormState;
+  /**
+   * @param listener - 每次快照被替换时调用
+   * @returns 摘掉本次订阅的函数
+   */
+  readonly subscribe: (listener: () => void) => () => void;
+  /** @returns 宿主是否收下这笔写入 */
+  readonly mutate: (ops: readonly PathOp[], expectedRevision?: number) => Promise<boolean>;
+}
+
 /** slot 渲染函数的入参。宿主对 `summary` 视图也会调它，那种情况下 form 不给。 */
 export interface CardProps {
   readonly view: "summary" | "page";
   /** 由 slot 注册的 `locale` 席位注入；bundle 页自己不给，卡片也没有别的取字途径。 */
   readonly t: Translate;
-  readonly form?:
-    | {
-        readonly state: FormState;
-        readonly mutate: (ops: readonly PathOp[], expectedRevision?: number) => Promise<boolean>;
-      }
-    | undefined;
+  readonly form?: FormSource | undefined;
+}
+
+/** 没给值面时读到的那一版：既不在线也不可写，于是卡片画出一张锁住的空表。 */
+const LOADING_STATE: FormState = { status: "loading", writable: false };
+
+/** 值面缺席时的 getSnapshot：永远返回同一个引用，订阅因此不会被反复重建。 */
+function loadingSnapshot(): FormState {
+  return LOADING_STATE;
+}
+
+/** 值面缺席时的 subscribe：永远不通知，回收是空操作。 */
+function loadingSubscribe(): () => void {
+  return (): void => undefined;
 }
 
 /** 把任意设置值转成控件能显示的字符串；结构值给空串而不是 `[object Object]`。 */
@@ -497,12 +525,20 @@ export function SettingsCard(props: CardProps): ReactNode {
   const [saving, setSaving] = useState(false);
   // 已被用户点开「显示」的凭据型字段。默认空 —— 页面上一眼能看到的仍然是圆点。
   const [revealed, setRevealed] = useState<readonly string[]>([]);
+  // 宿主那边改了值（别处保存、或本卡这笔写完之后回读）要把卡跟着换掉。
+  // ⚠ 这条 hook 必须留在下面那个早退之前：React 按调用顺序配对 hook，早退把 useStates
+  // 之外的这一枚跳掉，下一次渲染就错位了。
+  // 值面缺席时（官方插件页的 summary 视图）退到「正在读取」那一版：两个入参都换成
+  // 模块级常量，引用恒定，于是既不会重建订阅也不会通知。
+  const state = useSyncExternalStore(
+    form === undefined ? loadingSubscribe : form.subscribe,
+    form === undefined ? loadingSnapshot : form.getSnapshot,
+  );
   // 摘要视图不画表单；宿主只在官方插件的卡片上才用这个视图，本包是 bundle 走不到，真走到
   // 时返回一个空 div 也好过抛错把整张卡顶掉。
   if (props.view !== "page" || form === undefined) {
     return createElement("div", { className: "dss-card" });
   }
-  const { state } = form;
   const editable = state.writable && state.status === "ready";
   const ops = buildOps(draft.values);
   const save = async (): Promise<void> => {
