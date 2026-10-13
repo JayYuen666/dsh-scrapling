@@ -110,9 +110,11 @@ const SETTINGS: ToolSettings = {
   // 用 schema 默认值：这条夹具要验的是模型侧 maxPages 的缺省（20），不是部署天花板。
   crawlMaxItems: 1000,
   crawlMaxRuntimeSeconds: 1800,
-  maxUrlLength: 2048,
   browserExecutablePath: "",
   browserCdpUrl: "",
+  // 开着的：这一份夹具要覆盖写方法那条支路（参数面与帧上都得带着 method/body）。
+  // 关的那一支在下面 `scrapling_fetch 的写方法闸门` 那一组里逐条钉。
+  allowWriteMethods: true,
   stripInlineImages: true,
 };
 
@@ -370,6 +372,8 @@ describe("scrapling_fetch", () => {
       answer: fakeAnswer,
     });
     expect(tool.timeoutMs).toBe(SETTINGS.timeoutMs);
+    // 这份夹具把 allowWriteMethods 开着，但这一次调用是 GET：并发判定是**按参数**问的，
+    // 读的那一次照旧可并发。写请求那一支在下面 `scrapling_fetch 的写方法闸门` 里钉。
     expect(tool.isConcurrencySafe?.({ url: SAMPLE_URL })).toBe(true);
   });
 
@@ -412,6 +416,133 @@ describe("scrapling_fetch", () => {
       },
     );
     expect(JSON.stringify(blocks)).toContain("(Content truncated.)");
+  });
+});
+
+/**
+ * 按一档闸门配置造一个 fetch 工具，并带回它收到的帧。
+ *
+ * @param allowWriteMethods - 部署有没有开放写方法
+ * @returns 工具定义与帧记录
+ */
+function gated(allowWriteMethods: boolean): {
+  tool: ReturnType<typeof createFetchTool>;
+  calls: { method: string; params: unknown }[];
+} {
+  const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "ok", truncated: false });
+  return {
+    tool: createFetchTool({
+      sidecar: fake.client,
+      settings: { ...SETTINGS, allowWriteMethods },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    }),
+    calls: fake.calls,
+  };
+}
+
+/**
+ * 取工具声明给模型的参数名。
+ *
+ * @param tool - 工具定义
+ * @returns 参数名列表
+ */
+function parameterNames(tool: ReturnType<typeof createFetchTool>): string[] {
+  const compiled = tool.parameters as { properties?: Record<string, unknown> } | undefined;
+  return Object.keys(compiled?.properties ?? {});
+}
+
+/**
+ * 问一次「这一档闸门下、这一次调用能不能并发」。
+ *
+ * @param allowWriteMethods - 部署有没有开放写方法
+ * @param args - 这一次调用的参数
+ * @returns 工具的并发判定
+ */
+function concurrencySafe(allowWriteMethods: boolean, args: Record<string, unknown>): boolean {
+  return gated(allowWriteMethods).tool.isConcurrencySafe?.(args) ?? true;
+}
+
+describe("scrapling_fetch 的写方法闸门", () => {
+  /** 一次工具调用用的执行上下文。 */
+  const exec = { signal: new AbortController().signal } as never;
+
+  it("闸门关着时，method/body 根本不在参数面里（而不是给了再拦）", () => {
+    const names = parameterNames(gated(false).tool);
+    expect(names).not.toContain("method");
+    expect(names).not.toContain("body");
+    // 只读那一半不受影响：带凭据的 GET 是正常用法，闸门管的是「到了之后干什么」。
+    expect(names).toContain("headers");
+    expect(names).toContain("cookies");
+  });
+
+  it("闸门开着时两个键都摆出来", () => {
+    const names = parameterNames(gated(true).tool);
+    expect(names).toContain("method");
+    expect(names).toContain("body");
+  });
+
+  it("关着时帧上不带 method/body，普通 GET 照常上网线", async () => {
+    const { tool, calls } = gated(false);
+    await tool.execute({ url: SAMPLE_URL }, exec);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.params).not.toHaveProperty("method");
+    expect(calls[0]?.params).not.toHaveProperty("body");
+  });
+
+  it("关着时手搓的 method 被就地拒绝，而不是悄悄发成 GET", async () => {
+    // 上游的参数校验是**开放根对象**：未声明的键不报错也不剥离，原样进 execute
+    // （tools.spec.ts 里那条 "allows extra keys"）。所以「参数面里没有 method」只拦得住
+    // 模型，拦不住重放的旧调用或代发的调用。把写请求改成 GET 是最坏的失败形态：调用方以为
+    // 写成功了，对端什么都没发生，而且没有一行日志能看出这件事。
+    const { tool, calls } = gated(false);
+    await expect(
+      tool.execute({ url: SAMPLE_URL, method: "POST", body: "x" }, exec),
+      "写意图必须被拒，请求不该发出去",
+    ).rejects.toThrow(/allowWriteMethods/u);
+    // 码要是机器可读的那一个：调用方（如 search provider）是按码决定要不要重试或降级的。
+    await expect(tool.execute({ url: SAMPLE_URL, method: "POST" }, exec)).rejects.toMatchObject({
+      code: "WRITE_DISABLED",
+    });
+    expect(calls, "被拒的调用一帧都不该发出去").toStrictEqual([]);
+  });
+
+  it("关着时只给 body（没给 method）同样被拒", async () => {
+    // 带着 body 的 GET 在关着的时候只有一种解释：调用方想写。
+    const { tool, calls } = gated(false);
+    await expect(tool.execute({ url: SAMPLE_URL, body: { field: "value" } }, exec)).rejects.toThrow(
+      /allowWriteMethods/u,
+    );
+    expect(calls).toStrictEqual([]);
+  });
+
+  it("关着时 method=GET 且不带 body 不被误拒", async () => {
+    const { tool, calls } = gated(false);
+    await tool.execute({ url: SAMPLE_URL, method: "get" }, exec);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("开着时不给 method 就按 GET 上网线", async () => {
+    const { tool, calls } = gated(true);
+    await tool.execute({ url: SAMPLE_URL }, exec);
+    expect(calls[0]?.params).toMatchObject({ method: "GET", body: null });
+  });
+
+  it("开着时模型给的写方法与请求体原样转发", async () => {
+    const { tool, calls } = gated(true);
+    await tool.execute({ url: SAMPLE_URL, method: "put", body: { field: "value" } }, exec);
+    expect(calls[0]?.params).toMatchObject({ method: "put", body: { field: "value" } });
+  });
+
+  it("并发判定按这一次调用的动词走：写请求串行，读请求照旧可并发", () => {
+    // 上游把这一档做成按参数问的，所以开了写方法的部署不必让所有静态抓取都排队 —— 而并行
+    // 的写请求就是重复提交（重试再叠上去，对端会收到两次），那一档必须串起来。
+    expect(concurrencySafe(false, { url: SAMPLE_URL })).toBe(true);
+    expect(concurrencySafe(false, { url: SAMPLE_URL, method: "POST" })).toBe(true);
+    expect(concurrencySafe(true, { url: SAMPLE_URL })).toBe(true);
+    expect(concurrencySafe(true, { url: SAMPLE_URL, method: "get" })).toBe(true);
+    expect(concurrencySafe(true, { url: SAMPLE_URL, method: "POST" })).toBe(false);
+    expect(concurrencySafe(true, { url: SAMPLE_URL, method: "delete" })).toBe(false);
   });
 });
 
@@ -458,7 +589,37 @@ describe("scrapling_extract", () => {
       selector: "li",
       useXpath: false,
       limit: 5000,
+      attribute: null,
+      includeAttributes: false,
       maxContentChars: SETTINGS.maxOutputBytes,
+    });
+  });
+
+  it("取属性时回 value 而不是 text，includeAttributes 时连属性表一起回", async () => {
+    // 这两个入参在 Python 侧早就实现了，缺的只是 Host 没给入口：模型只能拿到正文，
+    // 拿不到 href/data-* 这类真正结构化的东西。
+    const fake = fakeSidecar({
+      count: 1,
+      truncated: false,
+      matches: [{ tag: "a", value: "/p/1", attributes: { href: "/p/1", class: "x" } }],
+    });
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    const result = (await tool.execute(
+      { html: "<a href='/p/1'>x</a>", selector: "a", attribute: "href", includeAttributes: true },
+      exec,
+    )) as { matches: Record<string, unknown>[] };
+    expect(fake.calls[0]?.params).toMatchObject({ attribute: "href", includeAttributes: true });
+    // 回包里不该同时出现 text：取属性时 Python 只给 value。
+    expect(result.matches[0]).toStrictEqual({
+      tag: "a",
+      value: "/p/1",
+      attributes: { href: "/p/1", class: "x" },
     });
   });
 
@@ -518,6 +679,28 @@ describe("scrapling_extract", () => {
       { count: 1, truncated: false, matches: [{ tag: "li", text: "A" }] },
     );
     expect(JSON.stringify(some)).toContain("<li> A");
+    // 取属性那一档的渲染：正文缺席、只有 value 与 attributes 时也要看得见，
+    // 否则模型从卡片上读不出「这条匹配给的是属性值」。
+    const attrs = tool.output.render(
+      { html: "", selector: "a", attribute: "href", includeAttributes: true },
+      {
+        count: 1,
+        truncated: false,
+        matches: [{ tag: "a", value: "/p/1", attributes: { href: "/p/1" } }],
+      },
+    );
+    const rendered = JSON.stringify(attrs);
+    expect(rendered).toContain("<a> /p/1");
+    // 属性表以 JSON 形式跟在行尾：断言键与值都在，不去逐字符钉转义形式。
+    expect(rendered).toContain("href");
+    expect(rendered).toContain("/p/1");
+    // text 与 value 在 schema 里都是可选的，所以「两个都没有」是一份合法回包：渲染要给出
+    // 标签行而不是 undefined —— 归一逻辑保证不到这一层（render 收的是已校验的回包）。
+    const neither = tool.output.render(
+      { html: "", selector: "li" },
+      { count: 1, truncated: false, matches: [{ tag: "li" }] },
+    );
+    expect(JSON.stringify(neither)).toContain("<li> ");
   });
 
   it("pending 卡片用 generic 且标为 search", () => {
@@ -1504,7 +1687,30 @@ describe("会话工具", () => {
     };
     expect(fake.calls[0]).toStrictEqual({
       method: "session.open",
-      params: { sessionType: "static", headless: true, solveCloudflare: false },
+      // 这四枚旋钮只有「开场」这一个生效位置：会话内每次 fetch 传过去会被上游
+      // validate_fetch 静默丢掉。之前 session.open 只发 sessionType/headless/solveCloudflare，
+      // 于是设置卡上的页面超时、广告拦截、XHR 正则、浏览器二进制路径与 CDP 端点对浏览器
+      // 会话完全不生效，而且一行日志都没有。
+      params: {
+        sessionType: "static",
+        headless: true,
+        solveCloudflare: false,
+        // 身份与区域这几枚只有开场生效（会话内 fetch 传会被上游丢掉），所以入口开在这里。
+        useragent: "",
+        locale: "",
+        timezoneId: "",
+        impersonate: "",
+        hideCanvas: false,
+        blockWebrtc: false,
+        allowWebgl: true,
+        timeoutMs: SETTINGS.pageTimeoutMs,
+        blockAds: SETTINGS.blockAds,
+        captureXhrPattern: SETTINGS.captureXhrPattern,
+        deployment: {
+          browserExecutablePath: SETTINGS.browserExecutablePath,
+          browserCdpUrl: SETTINGS.browserCdpUrl,
+        },
+      },
     });
     expect(result.sessionId).toBe("s1");
     expect(result.sessionType).toBe("static");

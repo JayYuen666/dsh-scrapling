@@ -93,7 +93,11 @@ class Sidecar:
     做，否则一个不响应的 sidecar 会把工具调用一起拖住。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, extra_env: dict[str, str] | None = None) -> None:
+        """拉起 sidecar。
+
+        :param extra_env: 追加/覆盖的环境变量，用来跑「同一份代码、不同部署表态」那类对照
+        """
         self.proc = subprocess.Popen(  # noqa: S603
             _sidecar_argv(),
             stdin=subprocess.PIPE,
@@ -104,7 +108,14 @@ class Sidecar:
             bufsize=1,
             # 本地测试服务器就在 127.0.0.1 上，而守卫（正确地）默认拒绝回环地址。
             # 所以这条用例必须显式放行 —— 这也顺带证明了守卫的放行开关是接通的。
-            env={**os.environ, "DSH_SCRAPLING_ALLOWED_HOSTS": "127.0.0.1,localhost"},
+            # 写方法这一档默认**开着**：`run_write_verbs` 要让真 curl_cffi 真发一次 POST，
+            # 而那需要部署表态。关的那一支由 run_write_gate 用第二个 sidecar 走。
+            env={
+                **os.environ,
+                "DSH_SCRAPLING_ALLOWED_HOSTS": "127.0.0.1,localhost",
+                "DSH_SCRAPLING_ALLOW_WRITE_METHODS": "1",
+                **(extra_env or {}),
+            },
         )
         self.counter = 0
         self.write_lock = threading.Lock()
@@ -183,16 +194,54 @@ class Sidecar:
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    """只回 SPA 外壳；其余路径回一张占位图片。"""
+    """只回 SPA 外壳；其余路径回一张占位图片；写方法把请求本身回显成 JSON。"""
 
     def do_GET(self) -> None:  # noqa: N802 —— BaseHTTPRequestHandler 的命名约定
-        """回一个页面或一张图。"""
+        """回一个页面或一张图；`/echo` 那一条回显请求本身（GET 带 body 时该被丢掉）。"""
+        if self.path == "/echo":
+            self._echo()
+            return
         body, ctype = (PAGE, "text/html; charset=utf-8") if self.path == "/" else (b"\x89PNG", "image/png")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _echo(self) -> None:
+        """把「这个服务端到底收到了什么」回成 JSON。
+
+        写方法的判据只能是对端收到的东西：本包的 body/headers/cookies 拼错一个词名时，
+        请求照样发出去、照样 200，只有对端能说明它到没到。
+        """
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        body = json.dumps(
+            {
+                "method": self.command,
+                "path": self.path,
+                "received": raw.decode(errors="replace"),
+                "marker": self.headers.get("X-Contract"),
+                "cookie": self.headers.get("Cookie"),
+            },
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802 —— BaseHTTPRequestHandler 的命名约定
+        """回显这次 POST。"""
+        self._echo()
+
+    def do_PUT(self) -> None:  # noqa: N802 —— 同上
+        """回显这次 PUT。"""
+        self._echo()
+
+    def do_DELETE(self) -> None:  # noqa: N802 —— 同上
+        """回显这次 DELETE。"""
+        self._echo()
 
     def log_message(self, *args: Any) -> None:
         """静默默认的逐请求日志。"""
@@ -918,10 +967,110 @@ def run_crawl_guards() -> None:
     guard.configure(allowed_hosts=frozenset({"127.0.0.1", "localhost", "a.test", "b.test"}))
     try:
         _run_page_confinement(crawl)
+        _run_crawl_happy_path(crawl)
         _run_crawl_stop(crawl)
     finally:
         crawl.close_all_crawls()
         guard.configure(allowed_hosts=frozenset())
+
+
+class _SiteHandler(http.server.BaseHTTPRequestHandler):
+    """一个三页互链的站点：爬虫的链接发现与去重都要有真链接可走。"""
+
+    PAGES = {
+        "/": (
+            "<html><head><title>Home</title></head><body><h1>HOME</h1>"
+            "<a href='/p1'>1</a><a href='/p2'>2</a></body></html>"
+        ),
+        "/p1": (
+            "<html><head><title>P1</title></head><body><h1>P1BODY</h1>"
+            "<a href='/p2'>2</a><a href='/p1'>self</a></body></html>"
+        ),
+        "/p2": "<html><head><title>P2</title></head><body><h1>P2BODY</h1><p>second page</p></body></html>",
+    }
+
+    def do_GET(self) -> None:  # noqa: N802 —— BaseHTTPRequestHandler 的约定方法名
+        """回一页；未知路径回 404。"""
+        body = self.PAGES.get(self.path, "").encode()
+        self.send_response(200 if self.path in self.PAGES else 404)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: Any) -> None:
+        """静默默认的逐请求日志。"""
+
+
+def _await_crawl_done(crawl: Any, crawl_id: str, timeout: float) -> dict[str, Any]:
+    """有界地等一场爬虫**正常跑完**，返回最后一份状态。
+
+    与 :func:`_await_crawl_end` 的区别是这里要把 ``error`` 一起判掉：等一个「线程退了但
+    因为异常退了」的爬虫，会把蜘蛛起不来这件事读成「一页都没抓到」。
+    """
+    deadline = time.monotonic() + timeout
+    status = crawl.crawl_status({"crawlId": crawl_id})
+    while time.monotonic() < deadline:
+        if not status["running"]:
+            return status
+        time.sleep(0.05)
+        status = crawl.crawl_status({"crawlId": crawl_id})
+    return status
+
+
+def _run_crawl_happy_path(crawl: Any) -> None:
+    """真实站点上把爬虫的主路径走通一遍。
+
+    为什么这条必须存在：此前爬虫侧只有「起步前叫停，一页都没抓」那种断言 —— 一只**根本
+    收不到页**的蜘蛛同样能通过全部用例。Spider 的 item 字段名、``on_scraped_item`` 的
+    async 契约、``configure_sessions`` 的会话注册、链接发现的域过滤，全都要靠「真的抓到页」
+    才验得到。
+    """
+    server, base = _serve(_SiteHandler)
+    events: list[dict[str, Any]] = []
+    emit = crawl._emit_event
+    try:
+        crawl._emit_event = lambda event, **fields: events.append({"event": event, **fields})
+        crawl_id = crawl.crawl_run({"url": f"{base}/", "maxPages": 5})["crawlId"]
+        status = _await_crawl_done(crawl, crawl_id, 60)
+
+        check("主路径不报错", status["error"] is None, str(status["error"]))
+        check("跑完了", status["running"] is False, "")
+        titles = sorted(page["title"] for page in status["pages"])
+        check("链接发现把三页都走到了", titles == ["Home", "P1", "P2"], repr(titles))
+        bodies = " ".join(page["markdown"] for page in status["pages"])
+        check("正文是真的（不是空壳）", all(word in bodies for word in ("HOME", "P1BODY", "second page")), bodies[:80])
+        check("每页都带最终 URL", all(page["url"].startswith(base) for page in status["pages"]), "")
+        check("自链被去重了，没有重复页", len({page["url"] for page in status["pages"]}) == len(status["pages"]), "")
+        # 事件替身挂在**模块级**属性上：这一节装着它的时候，任何还在跑的蜘蛛都会往里写。
+        # 所以按 crawlId 过滤，只认自己这一场 —— CI 上不过滤就被两只没停干净的蜘蛛冲成
+        # 5 vs 3（本地它们跑得完，看不出问题）。
+        mine = [item for item in events if item.get("crawlId") == crawl_id]
+        progress = [item for item in mine if item["event"] == "progress"]
+        check("起了头一条 crawlStarted", bool(mine) and mine[0]["event"] == "crawlStarted", repr(mine[:1]))
+        check("每收一页报一次进度", len(progress) == len(status["pages"]), f"{len(progress)} vs {len(status['pages'])}")
+        check("进度的 done 逐页递增", [item["done"] for item in progress] == list(range(1, len(progress) + 1)), "")
+
+        # maxPages 是**页数**闸门：再多链接也不许多收。
+        capped_id = crawl.crawl_run({"url": f"{base}/", "maxPages": 1})["crawlId"]
+        capped = _await_crawl_done(crawl, capped_id, 60)
+        check("maxPages 真的封顶", len(capped["pages"]) <= 1, str(len(capped["pages"])))
+
+        # README 明写「不遵守 robots.txt、每域延迟 0、最多 4 个并发」——那条声明挂在
+        # Spider 基类的默认值上。这里钉住它，默认值哪天被上游改掉，README 会立刻变成错的文档。
+        spider = crawl._make_spider(f"{base}/", 5, "defaults", {"pages": [], "deadline": 0}, {"127.0.0.1"})
+        for attr, wanted in (
+            ("robots_txt_obey", False),
+            ("autothrottle_enabled", False),
+            ("download_delay", 0.0),
+            ("concurrent_requests", 4),
+        ):
+            check(f"文档默认值：{attr}", getattr(spider, attr) == wanted, repr(getattr(spider, attr)))
+        check("不落盘（output_dir 未设）", spider.output_dir is None, repr(spider.output_dir))
+    finally:
+        crawl._emit_event = emit
+        crawl.close_all_crawls()
+        server.shutdown()
 
 
 def _serve(handler: type[http.server.BaseHTTPRequestHandler]) -> tuple[http.server.ThreadingHTTPServer, str]:
@@ -1758,20 +1907,36 @@ def run_concurrency_guards() -> None:
     adapters._SESSIONS.clear()
 
     # 爬虫名额同理：并发判、占位登记都要在锁内。
+    #
+    # 起点用本地服务而不是外网：外网在 CI 上可能压根不通，那时 busy 里一个 "ok" 都没有，
+    # 「名额不超发」就退化成 0 <= 2 的恒真式 —— 而那种绿看起来与真跑过一模一样。
+    import guard
+
     crawl._CRAWLS.clear()
+    guard.configure(allowed_hosts=frozenset({"127.0.0.1"}))
+    server, slow_base = _serve(_SlowHandler)
     busy: list[str] = []
+    started: list[str] = []
     busy_lock = threading.Lock()
 
     def run_crawl() -> None:
         try:
-            crawl.crawl_run({"url": "https://example.com/"})
+            crawl_id = crawl.crawl_run({"url": f"{slow_base}/", "maxPages": 50})["crawlId"]
             with busy_lock:
                 busy.append("ok")
+                started.append(crawl_id)
         except Exception as error:  # noqa: BLE001
             code = getattr(error, "code", type(error).__name__)
             with busy_lock:
                 busy.append(str(code))
 
+    # 事件帧走 stdout，而这一节的蜘蛛是被**故意**叫停的：它们的 crawlStarted / crawlSkipped
+    # 混进测试输出只会让人以为漏了替身。装一个吞掉事件的替身，收尾时还原。
+    # 必须收 **kwargs：_emit_event 的调用一律带关键字字段（crawlId=…、text=…），只写 *args
+    # 的替身会在第一次发帧时抛 TypeError —— 而那还会把占位名额漏在登记表里，后面几条全变
+    # CRAWL_BUSY（这一版就是这么炸的）。
+    emit = crawl._emit_event
+    crawl._emit_event = lambda *args, **kwargs: None
     crawl_threads = [threading.Thread(target=run_crawl) for _ in range(crawl.MAX_CONCURRENT_CRAWLS + 3)]
     for thread in crawl_threads:
         thread.start()
@@ -1782,7 +1947,31 @@ def run_concurrency_guards() -> None:
         busy.count("ok") <= crawl.MAX_CONCURRENT_CRAWLS,
         repr(busy),
     )
-    crawl.close_all_crawls()
+    check("确实起过爬虫（否则上一条只是 0 <= 2 的恒真式）", busy.count("ok") >= 1, repr(busy))
+
+    # 收尾必须**真的停掉**这些蜘蛛：它们跑在 daemon 线程上，而 close_all_crawls 只清登记表、
+    # 不停线程。留着它们，后面任何一节装上的 _emit_event 替身都会收到它们的进度事件 —— CI 上
+    # 正是这样把爬虫正例的「每收一页报一次进度」冲成 5 vs 3 的（两只还在跑的蜘蛛各报了一页，
+    # 而本地跑得快、它们在正例开始前就结束了，所以看不出来）。
+    spider_threads: list[threading.Thread | None] = [(crawl._CRAWLS.get(item) or {}).get("thread") for item in started]
+    try:
+        for crawl_id in started:
+            crawl.crawl_stop({"crawlId": crawl_id})
+        # 引擎要等在途请求收尾（_SlowHandler 每页睡 0.4s），所以是有界地等而不是随缘 sleep。
+        deadline = time.monotonic() + 30
+        for spider in spider_threads:
+            if spider is not None:
+                spider.join(timeout=max(0.0, deadline - time.monotonic()))
+        check(
+            "叫停之后没有蜘蛛活到下一节（否则它会往别人的事件替身里写）",
+            all(spider is None or not spider.is_alive() for spider in spider_threads),
+            repr([spider is not None and spider.is_alive() for spider in spider_threads]),
+        )
+    finally:
+        crawl._emit_event = emit
+        crawl.close_all_crawls()
+        server.shutdown()
+        guard.configure(allowed_hosts=frozenset())
 
 
 def run_xhr_secret_redaction() -> None:
@@ -1847,6 +2036,319 @@ def run_xhr_secret_redaction() -> None:
     check("没给正则时不塞这个词", "capture_xhr" not in adapters._browser_params({}, "http://127.0.0.1:1/"))
 
 
+def run_write_verbs(sidecar: Sidecar, base: str) -> None:
+    """写方法与请求件的端到端验证：判据是**对端到底收到了什么**。
+
+    为什么这条必须存在：本包把 method/body/headers/cookies/impersonate/retries 接成了模型可见
+    入参，而 `py/tests/contract_probe.py` 把三套引擎换成了记录器 —— 它只回答「adapters 把哪个
+    键交给了上游」，网络层一次都没跑过。词名拼错（`json=` 写成 `data=`）、上游根本不收某个键、
+    或者非 GET 走岔了分支，在那套判据里同样是全绿。这里让真 curl_cffi 打真 HTTP 服务。
+    """
+    url = f"{base}/echo"
+
+    def echo(params: dict[str, Any]) -> dict[str, Any]:
+        """发一次 fetch，把服务端回显的请求件解出来。
+
+        :param params: 这次抓取的协议参数（url 已含在内或不含都行，这里由调用方给全）
+        :returns: 对端收到的 JSON；不是 JSON 时带上原始正文与错误帧
+        """
+        frame = sidecar.call("fetch", params)
+        content = frame.get("result", {}).get("content", "")
+        try:
+            parsed = json.loads(content)
+        except (ValueError, TypeError):
+            return {"_raw": content, "_frame": frame}
+        return parsed if isinstance(parsed, dict) else {"_raw": content, "_frame": frame}
+
+    common = {"url": url, "extractionType": "text", "maxContentChars": 4000}
+
+    posted = echo(
+        {**common, "method": "POST", "body": {"k": "v"}, "headers": {"X-Contract": "ct1"}, "cookies": {"c": "1"}}
+    )
+    check("POST 真的以 POST 到达对端", posted.get("method") == "POST", repr(posted)[:160])
+    check(
+        "对象型 body 按 JSON 发出（对端解得出来）",
+        json.loads(str(posted.get("received", "{}"))) == {"k": "v"},
+        repr(posted)[:200],
+    )
+    check("headers 落地", posted.get("marker") == "ct1", repr(posted)[:200])
+    check("cookies 落地", posted.get("cookie") == "c=1", repr(posted)[:200])
+
+    plain = echo({**common, "method": "PUT", "body": "a=1"})
+    check("PUT 到达对端", plain.get("method") == "PUT", repr(plain)[:160])
+    check("字符串型 body 原样发出（没被强行 JSON 化）", plain.get("received") == "a=1", repr(plain)[:200])
+
+    gone = echo({**common, "method": "DELETE"})
+    check("DELETE 到达对端", gone.get("method") == "DELETE", repr(gone)[:160])
+
+    # 请求体不是对象也不是字符串时（数组、数字），JSON 体照样要发出去。此前这一类被静默丢掉：
+    # 请求照发、对端收到空体、回包上没有一行能看出这件事。
+    listed = echo({**common, "method": "POST", "body": [1, 2]})
+    check(
+        "数组型 body 按 JSON 发出（不是被丢掉）",
+        json.loads(str(listed.get("received", "null"))) == [1, 2],
+        repr(listed)[:200],
+    )
+    scalar = echo({**common, "method": "POST", "body": 42})
+    check("数字型 body 也按 JSON 发出", json.loads(str(scalar.get("received", "null"))) == 42, repr(scalar)[:200])
+
+    lower = echo({**common, "method": "post", "body": "x"})
+    check("方法名大小写不敏感", lower.get("method") == "POST", repr(lower)[:160])
+
+    with_body_get = echo({**common, "method": "GET", "body": "ignored"})
+    check("GET 仍是 GET", with_body_get.get("method") == "GET", repr(with_body_get)[:160])
+    check(
+        "GET 不带请求体（body 只在非 GET 时发，免得对端把 GET 当坏请求）",
+        with_body_get.get("received") == "",
+        repr(with_body_get)[:200],
+    )
+
+    retried = echo({**common, "method": "POST", "body": "1", "retries": 1, "impersonate": "chrome"})
+    check(
+        "retries 与 impersonate 能被上游收下（写方法同样吃这两个词）",
+        retried.get("method") == "POST",
+        repr(retried)[:200],
+    )
+
+    bad = echo({**common, "method": "PATCH"})
+    code = bad.get("_frame", {}).get("error", {}).get("code")
+    check("不支持的方法被明确拒绝（而不是悄悄发成 GET）", code == "BAD_ARGS", repr(bad)[:200])
+    check(
+        "拒绝理由点名了那个方法",
+        "PATCH" in str(bad.get("_frame", {}).get("error", {}).get("message", "")),
+        repr(bad)[:200],
+    )
+
+
+def run_session_param_guards() -> None:
+    """会话入参的分支验证：static 专属的键给浏览器会话时必须**报错**，不能静默无效。
+
+    这条不需要真浏览器：判在投递到属主线程之前，所以登记一个类型对、worker 为空的条目就能
+    走到那一句。真起浏览器来验一个参数校验，测的就不是校验而是 Chromium 了。
+    """
+    sys.path.insert(0, str(PY_DIR))
+    import adapters
+
+    def probe(kind: str, extra: dict[str, Any]) -> tuple[str, str]:
+        """按会话类型跑一次 session_fetch，返回 (错误码, 错误消息)。
+
+        :param kind: 会话类型
+        :param extra: 这次 fetch 的额外参数
+        :returns: 错误码与消息；没报错时两者为空串
+        """
+        # 直接填登记表而不是 session_open：这里要验的是**入参分支**，而真会话要么起浏览器
+        # 要么建 curl_cffi 连接。收尾也不能走 close_all_sessions —— 那条会去 release 这个
+        # 假 session 对象（`object()` 没有 close），报错与本条断言无关。
+        adapters._SESSIONS.pop("p", None)  # noqa: SLF001 —— 直填登记表，跳过真会话的创建
+        adapters._SESSIONS["p"] = {  # noqa: SLF001
+            "sessionId": "p",
+            "type": kind,
+            "session": object(),
+            "lock": threading.Lock(),
+            "worker": None,
+            "pending": False,
+        }
+        try:
+            adapters.session_fetch({"sessionId": "p", "url": "https://contract.test/", **extra})
+        except adapters.AdapterError as error:
+            return error.code, str(error)
+        except Exception as error:  # noqa: BLE001
+            return "OTHER", f"{type(error).__name__}: {error}"
+        return "", ""
+
+    # 浏览器会话的请求头走 extra_headers（会话构造期或本次 fetch 都认），retries 则是构造期参数。
+    for kind in ("browser", "stealth"):
+        for key, hint in (("headers", "extraHeaders"), ("retries", "scrapling_session_open")):
+            code, message = probe(kind, {key: ({"A": "b"} if key == "headers" else 2)})
+            check(f"{kind} 会话收到 {key} 时报错", code == "BAD_ARGS", f"{code} / {message}")
+            check(
+                f"{kind} 会话的 {key} 报错给出可用的替代",
+                hint in message,
+                message,
+            )
+        # 没给那两个键时不该被这条判据拦下（往下走到投递那一步才失败）。
+        code, message = probe(kind, {})
+        check(f"{kind} 会话不给 headers/retries 时不被误拦", code != "BAD_ARGS", f"{code} / {message}")
+
+        # 空表也不是写意图：模型「不带请求头」时传的就是 `{}`（Host 侧 `?? null` 之外的一种
+        # 合法形态），为它报一条错等于把无害的调用说成非法，而模型看不出差别在哪。
+        code, message = probe(kind, {"headers": {}, "retries": None})
+        check(f"{kind} 会话给空 headers 时不被误拦", code != "BAD_ARGS", f"{code} / {message}")
+
+    # static 会话是这两个键的合法去处：那里它们真生效（_static_params），所以这条判据不该管。
+    code, message = probe("static", {"headers": {"A": "b"}, "retries": 2})
+    check(
+        "static 会话的 headers/retries 不被这条判据拦下",
+        "only applies to static" not in message,
+        f"{code} / {message}",
+    )
+    adapters._SESSIONS.pop("p", None)  # noqa: SLF001
+
+
+def run_webrtc_guards() -> None:
+    """stealth 会话的 WebRTC 强制开启必须与**会话真正拿到的代理**同源。
+
+    `_browser_params` 里那条 `or "proxy" in params` 判的是 `browser_proxy("")`，而空 URL 没有
+    主机名，绕过清单里任何主机名条目都命中不了它 —— 只有 `default_proxy()` 认的「整台机器
+    直连」那个 `*` 例外。于是 `proxyBypass=*` 时前者算出「有代理」并把 block_webrtc 钉成真，
+    而会话其实是直连的：模型明确填了 blockWebrtc=false 也会被静默盖掉。这正是本包在消灭的
+    「拧了没反应」，所以两条都要钉：强制开启跟着真代理走，而显式入参仍然算数。
+    """
+    sys.path.insert(0, str(PY_DIR))
+    import adapters
+    import guard
+    import scrapling.fetchers as fetchers
+
+    captured: dict[str, dict[str, Any]] = {}
+
+    def stub(tag: str) -> Any:  # noqa: ANN401 —— 替身会话类，签名就是要录的那份 kwargs
+        """造一个只记构造参数的会话替身。"""
+
+        class _Stub:
+            """替身：记下 kwargs，`start` 什么都不做。"""
+
+            def __init__(self, **kwargs: Any) -> None:
+                captured[tag] = kwargs
+
+            def start(self) -> None:
+                """不起浏览器。"""
+
+        return _Stub
+
+    originals = (fetchers.DynamicSession, fetchers.StealthySession)
+    saved = (guard.PROXY_URL, guard._BYPASS_ENTRIES)  # noqa: SLF001 —— 与本文件其它代理用例同一口径
+    try:
+        fetchers.DynamicSession = stub("browser")  # type: ignore[misc,assignment]
+        fetchers.StealthySession = stub("stealth")  # type: ignore[misc,assignment]
+
+        guard.PROXY_URL = "http://127.0.0.1:7890"
+        guard._BYPASS_ENTRIES = ()  # noqa: SLF001
+
+        adapters._make_session("stealth", {"sessionId": "w"})  # noqa: SLF001
+        stealth = captured["stealth"]
+        check("配了代理时 stealth 会话真的挂上代理", stealth.get("proxy") is not None, repr(stealth)[:200])
+        check(
+            "走代理时 block_webrtc 强制为真（不看模型入参）",
+            stealth.get("block_webrtc") is True,
+            repr(stealth)[:200],
+        )
+
+        adapters._make_session("browser", {"sessionId": "w"})  # noqa: SLF001
+        browser = captured["browser"]
+        check(
+            "Playwright 侧走代理时用那两条等价 flag（没有 block_webrtc 开关可传）",
+            set(guard.WEBRTC_NO_LEAK_FLAGS) <= set(browser.get("extra_flags") or []),
+            repr(browser.get("extra_flags"))[:200],
+        )
+
+        guard._BYPASS_ENTRIES = ("*",)  # noqa: SLF001 —— 「整台机器直连」
+        check("绕过清单写着 * 时会话按直连开", guard.default_proxy() == "", "")
+        check(
+            "同一个 * 对空 URL 的 per-URL 判定却不生效（这就是两条判据的分歧点）",
+            guard.browser_proxy("") is not None,
+            repr(guard.browser_proxy(""))[:120],
+        )
+
+        adapters._make_session("stealth", {"sessionId": "w"})  # noqa: SLF001
+        direct = captured["stealth"]
+        check("直连的 stealth 会话不挂代理", direct.get("proxy") is None, repr(direct)[:200])
+        check(
+            "直连时 blockWebrtc=false 不再被静默盖掉（本条在修之前是 True）",
+            direct.get("block_webrtc") is False,
+            repr(direct)[:200],
+        )
+
+        adapters._make_session("stealth", {"sessionId": "w", "blockWebrtc": True})  # noqa: SLF001
+        check("显式要求屏蔽 WebRTC 时照办", captured["stealth"].get("block_webrtc") is True, "")
+
+        adapters._make_session("browser", {"sessionId": "w"})  # noqa: SLF001
+        check(
+            "直连的 Playwright 会话不再被塞进那两条 flag",
+            "extra_flags" not in captured["browser"],
+            repr(captured["browser"].get("extra_flags"))[:200],
+        )
+
+        guard.PROXY_URL = ""
+        guard._BYPASS_ENTRIES = ()  # noqa: SLF001
+        adapters._make_session("stealth", {"sessionId": "w"})  # noqa: SLF001
+        clean = captured["stealth"]
+        check(
+            "干净环境下直连且不动 WebRTC",
+            clean.get("proxy") is None and clean.get("block_webrtc") is False,
+            repr(clean)[:200],
+        )
+    finally:
+        fetchers.DynamicSession, fetchers.StealthySession = originals  # type: ignore[misc,assignment]
+        guard.PROXY_URL, guard._BYPASS_ENTRIES = saved  # noqa: SLF001
+        guard.configure_from_env()
+
+
+def run_write_gate(base: str) -> None:
+    """写方法闸门的端到端验证：部署没表态开放时，POST 出不去，而 GET 照常。
+
+    用**第二个 sidecar**而不是在第一个上改环境：这一档是启动时快照进进程环境的（与代理、
+    放行清单同一族），进程活着就改不动 —— 而这恰恰是它作为安全默认的意义。
+    """
+    sys.path.insert(0, str(PY_DIR))
+    import adapters
+    import guard
+
+    print("\n== 写方法闸门（默认关）==")
+    closed = Sidecar(extra_env={guard.ALLOW_WRITE_METHODS_ENV: "0"})
+    try:
+        ready = closed.read_frame()
+        caps = ready.get("capabilities", {})
+        check("能力帧如实标出写方法关着", caps.get("writeMethods") is False, repr(caps)[:160])
+
+        got = closed.call("fetch", {"url": f"{base}/echo", "extractionType": "text"})
+        check("关着时 GET 照常（闸门只管写，不管读）", got.get("ok") is True, repr(got)[:160])
+
+        written = closed.call("fetch", {"url": f"{base}/echo", "method": "POST", "body": "x"})
+        error = written.get("error", {})
+        check("关着时 POST 被拒（而不是发出去）", error.get("code") == "WRITE_DISABLED", repr(written)[:200])
+        check("拒绝理由点名了该设的那枚配置", "allowWriteMethods" in str(error.get("message", "")), repr(error)[:200])
+    finally:
+        closed.close()
+
+    # 环境变量的读法：一个安全开关的「认不出来」必须落在紧的那一侧。拼错的 "ture" 若被
+    # `bool(非空)` 读成开，部署方会以为自己关了。
+    saved = os.environ.get(guard.ALLOW_WRITE_METHODS_ENV)
+    try:
+        for raw, wanted in (("1", True), ("on", True), ("0", False), ("ture", False), ("", False)):
+            os.environ[guard.ALLOW_WRITE_METHODS_ENV] = raw
+            guard.configure_from_env()
+            check(
+                f"环境里写 {raw!r} 读成 {wanted}",
+                guard.ALLOW_WRITE_METHODS is wanted,
+                repr(guard.ALLOW_WRITE_METHODS),
+            )
+    finally:
+        if saved is None:
+            os.environ.pop(guard.ALLOW_WRITE_METHODS_ENV, None)
+        else:
+            os.environ[guard.ALLOW_WRITE_METHODS_ENV] = saved
+        guard.configure_from_env()
+
+    # configure() 传 None 必须**沿用当前值**：它是「启动时按设置收紧」的入口，把 None 当
+    # 「关掉」等于每次收紧放行名单时顺手把写方法也关了，而那没人要求过。
+    keep = guard.ALLOW_WRITE_METHODS
+    guard.configure(allow_write_methods=None)
+    check("configure 不给这一档时沿用当前值", guard.ALLOW_WRITE_METHODS is keep, repr(guard.ALLOW_WRITE_METHODS))
+    guard.configure(allow_write_methods=not keep)
+    check("configure 显式给值时改写它", guard.ALLOW_WRITE_METHODS is (not keep), repr(guard.ALLOW_WRITE_METHODS))
+
+    # 进程内那一侧的硬拒（第二个 sidecar 验的是同一段逻辑的跨语言形状，这里验它抛得对）。
+    guard.configure(allow_write_methods=False)
+    try:
+        adapters.fetch({"url": "https://contract.test/", "method": "DELETE"})
+        check("adapters.fetch 自己也会拒绝写方法", False, "没抛异常")
+    except adapters.AdapterError as error:
+        check("adapters.fetch 自己也会拒绝写方法", error.code == "WRITE_DISABLED", error.code)
+    except Exception as error:  # noqa: BLE001
+        check("adapters.fetch 自己也会拒绝写方法", False, f"{type(error).__name__}: {error}")
+    guard.configure(allow_write_methods=keep)
+
+
 def main() -> int:
     """入口。
 
@@ -1862,8 +2364,13 @@ def main() -> int:
         caps = ready.get("capabilities", {})
         check("报告了 scrapling 可用性", "scrapling" in caps, repr(caps)[:140])
         check("报告了浏览器可用性", "browser" in caps, repr(caps)[:140])
+        check("能力帧如实标出写方法这一档（本次部署为开）", caps.get("writeMethods") is True, repr(caps)[:160])
         print(f"     capabilities = {json.dumps(caps, ensure_ascii=False)}")
         run(sidecar, base, caps)
+        print("\n== 写方法与请求件（对端收到了什么）==")
+        run_write_verbs(sidecar, base)
+        # 闸门那一半必须**关掉写方法**再起一个 sidecar（同一个服务地址能复用）。
+        run_write_gate(base)
     finally:
         sidecar.close()
         server.shutdown()
@@ -1873,6 +2380,12 @@ def main() -> int:
 
     print("\n== 代理判定 ==")
     run_proxy()
+
+    print("\n== 会话入参分支（static 专属的键不给浏览器会话）==")
+    run_session_param_guards()
+
+    print("\n== stealth 的 WebRTC 强制开启与会话代理同源 ==")
+    run_webrtc_guards()
 
     print("\n== 输出形态（内嵌图片剥离） ==")
     run_output_shape()
@@ -1886,7 +2399,7 @@ def main() -> int:
     print("\n== 并发名额 ==")
     run_concurrency_guards()
 
-    print("\n== 爬虫边界（站外重定向 / 叫停 / select 预算）==")
+    print("\n== 爬虫边界（真站点收页 / 站外重定向 / 叫停 / select 预算）==")
     run_crawl_guards()
 
     print("\n== XHR 摘要脱敏 ==")

@@ -477,6 +477,7 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
 
     :param args: 协议参数
     :returns: 归一后的载荷
+    :raises AdapterError: 方法不支持、部署未开放写方法，或抓取失败
     """
     _require(Fetcher)
     url = _url(args)
@@ -493,12 +494,22 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
     method = str(args.get("method", "GET")).upper()
     if method not in ("GET", "POST", "PUT", "DELETE"):
         raise AdapterError("BAD_ARGS", f"unsupported method: {method}")
+    if method != "GET" and not guard.ALLOW_WRITE_METHODS:
+        # 这一侧是硬拒，不依赖 Host 有没有把入参摆出来：手搓一帧 stdin 也写不出去。
+        raise AdapterError(
+            "WRITE_DISABLED",
+            f"{method} changes state on the remote side; the deployment must set "
+            f"allowWriteMethods (env {guard.ALLOW_WRITE_METHODS_ENV}) to allow it",
+        )
     if method != "GET":
         body = args.get("body")
-        if isinstance(body, dict):
-            params["json"] = _jsonable(body)
-        elif isinstance(body, str):
+        if isinstance(body, str):
             params["data"] = body
+        elif body is not None:
+            # 数组、数字、布尔也是合法的 JSON 请求体（curl_cffi 的 ``json=`` 照收）。此前只有
+            # dict 走 json、str 走 data，其余**静默丢弃** —— 模型发一个 `body: [1, 2]`，请求照
+            # 发、对端收到空体，而回包上没有一行能看出这件事。
+            params["json"] = _jsonable(body)
 
     response = getattr(Fetcher, method.lower())(url, **params)
     return to_payload(
@@ -532,8 +543,71 @@ def _xhr_pattern(args: dict[str, Any]) -> str | None:
     return raw
 
 
-def _browser_params(args: dict[str, Any], url: str) -> dict[str, Any]:
+# ``DynamicSession.fetch`` / ``StealthySession.fetch`` 只认这份名单（上游
+# ``engines/_browsers/_validators.py`` 的 ``_fetch_params`` 字段，外加实现自己 ``pop``
+# 出来的 ``proxy``）。名单之外的键**不报错、不生效**：``validate_fetch`` 只从 kwargs 里挑
+# 认识的字段，其余原样丢掉。
+#
+# 所以会话路径上必须按层级分家：这些键在 fetch 层传了等于没传，唯一生效的地方是会话构造
+# （``DynamicSession(...)`` / ``StealthySession(...)``）。``py/tests/contract_probe.py``
+# 会拿真实上游校验这张表与 ``_fetch_params`` 是否仍然一致。
+FETCH_LEVEL_KEYS = frozenset(
+    {
+        "blocked_domains",
+        "disable_resources",
+        "extra_headers",
+        "google_search",
+        "load_dom",
+        "network_idle",
+        "page_action",
+        "page_setup",
+        "proxy",
+        "selector_config",
+        "solve_cloudflare",
+        "timeout",
+        "wait",
+        "wait_selector",
+        "wait_selector_state",
+    }
+)
+
+# 只有会话构造才吃的那些键：从 fetch 层传过去必然被静默丢弃，因此要么在这里进会话，
+# 要么就根本别发。
+#
+# 这张表是**上游的事实**而不是本包的透传清单：`max_pages` / `retries` / `retry_delay` 上游
+# 确实是构造期参数，但本包一个都不发（各自的部署设置在 Config 里没有对应字段），所以它们在
+# `_browser_params` 的产物里根本不出现 —— 过滤器对它们是无操作，留着是为了让
+# `py/tests/contract_probe.py` 能拿整张表与上游字段面比对，而不是只比对我们用到的那几项。
+SESSION_ONLY_KEYS = frozenset(
+    {
+        "block_ads",
+        "capture_xhr",
+        "cdp_url",
+        "executable_path",
+        "headless",
+        "locale",
+        "max_pages",
+        "retries",
+        "retry_delay",
+        "timezone_id",
+        "useragent",
+    }
+)
+
+
+def _browser_params(args: dict[str, Any], url: str, *, stealth: bool = False, level: str = "session") -> dict[str, Any]:
     """浏览器抓取的公共参数。
+
+    ``level`` 决定这份参数**送给哪一层**：一次性抓取（``DynamicFetcher.fetch``）与会话构造
+    收的是完整的会话级参数面；而会话内每次 fetch 只认 ``FETCH_LEVEL_KEYS`` 那十几个键，其余
+    一律被上游静默丢弃（见上面那张表的注释）。所以 ``level="fetch"`` 时按名单过滤 ——
+    宁可少发一个键，也不要发一个「看起来在生效其实没生效」的键：后者的排查成本是整条链路。
+
+    ``extra_flags`` 只在非 stealth 那一套上加：上游 ``_base.py`` 算启动参数时
+    ``config.extra_flags`` **优先于**内部递进来的 53 条 ``STEALTH_ARGS``，于是给
+    ``StealthyFetcher`` / ``StealthySession`` 传这条会把整套反检测参数换掉，连
+    ``block_webrtc`` 自己那两条也一起没。stealth 侧的 WebRTC 防泄露走 ``block_webrtc``
+    开关本身（两条 flag 由上游下），Playwright 侧没有这个开关，只能进 ``extra_flags``。
 
     ``block_ads`` 由部署设置决定，可以打开：它并不会与 SSRF 守卫抢 handler。
     上游把 ``block_ads`` 折进**同一个** ``blocked_domains``（engines/_browsers/
@@ -551,6 +625,12 @@ def _browser_params(args: dict[str, Any], url: str) -> dict[str, Any]:
     ``StealthyFetcher.fetch`` 时它落进**会话**配置（fetchers/*.py 里是
     ``DynamicSession(**kwargs)``），进 ``launch_persistent_context`` 的 context 选项 ——
     所以是一次抓取一个 context，与一次性会话的既有形态一致，且不会丢 cookie。
+
+    :param args: 协议参数
+    :param url: 本次抓取的地址，用来定代理
+    :param stealth: 走的是 patchright 那一套吗
+    :param level: ``session``（会话级全量）或 ``fetch``（只发 fetch 层认得的键）
+    :returns: 引擎参数
     """
     params: dict[str, Any] = {
         "headless": bool(args.get("headless", True)),
@@ -563,9 +643,10 @@ def _browser_params(args: dict[str, Any], url: str) -> dict[str, Any]:
     if proxy is not None:
         params["proxy"] = proxy
         # WebRTC 能绕过代理直接发 UDP，页面里一句 STUN 就能问出访客的真实出口 IP。
-        # 走代理时那条信息本就不该泄露，所以两套引擎都上对应的开关：patchright 有
-        # block_webrtc，Playwright 没有，只能用 Chromium 的启动 flag。
-        params["extra_flags"] = [guard.WEBRTC_NO_LEAK_FLAG]
+        # 走代理时那条信息本就不该泄露：patchright 有 block_webrtc 开关（上游自己下两条
+        # flag），Playwright 没有，只能从启动参数进去 —— 见上面 extra_flags 的说明。
+        if not stealth:
+            params["extra_flags"] = list(guard.WEBRTC_NO_LEAK_FLAGS)
     if args.get("networkIdle"):
         params["network_idle"] = True
     for key, name in (
@@ -602,7 +683,42 @@ def _browser_params(args: dict[str, Any], url: str) -> dict[str, Any]:
     extra_headers = _string_map(args.get("extraHeaders"), "extraHeaders")
     if extra_headers is not None:
         params["extra_headers"] = extra_headers
+    if stealth:
+        # 这四条只在 stealth 的参数面里（StealthSession / StealthFetchParams 只认
+        # solve_cloudflare），所以一次性抓取与会话构造都从这里进，避免两处写法漂移。
+        params["solve_cloudflare"] = bool(args.get("solveCloudflare", False))
+        params["hide_canvas"] = bool(args.get("hideCanvas", False))
+        # 走代理时强制为真，不看模型入参：WebRTC 泄露的是访客的真实出口 IP，而访客用这个
+        # 插件正是为了不泄露它。
+        params["block_webrtc"] = bool(args.get("blockWebrtc", False)) or "proxy" in params
+        params["allow_webgl"] = bool(args.get("allowWebgl", True))
+    if level == "fetch":
+        return {key: value for key, value in params.items() if key in FETCH_LEVEL_KEYS}
     return params
+
+
+def _session_browser_params(args: dict[str, Any], *, stealth: bool) -> dict[str, Any]:
+    """会话构造期的浏览器参数：只收**只有开场才生效**的那些键。
+
+    会话内每次 fetch 传 ``capture_xhr`` / ``block_ads`` / ``executable_path`` / ``cdp_url`` /
+    ``locale`` / ``timezone_id`` / ``useragent`` / ``headless`` 都会被 ``validate_fetch``
+    丢掉，于是设置卡上这些旋钮对会话路径完全不生效 —— 而且不报错。这里把它们挪到唯一
+    生效的位置。
+
+    代理不在这张表里：会话的代理在开场时按 ``default_proxy()`` 定一次（中途换代理要新建
+    context，等于丢掉 cookie 与登录态，而那正是会话存在的理由），见 :func:`_make_session`。
+
+    :param args: 协议参数
+    :param stealth: 走的是 patchright 那一套吗
+    :returns: 会话构造参数
+    """
+    # url 只用来定代理，而会话级代理另在 _make_session 里定，这里给空串即可。
+    full = _browser_params(args, "", stealth=stealth)
+    # timeout 在两层都认，会话构造必须带上它，否则整个会话回落到上游的 30s 页面超时。
+    keep = SESSION_ONLY_KEYS | {"timeout"}
+    if stealth:
+        keep |= {"allow_webgl", "hide_canvas", "block_webrtc", "solve_cloudflare"}
+    return {key: value for key, value in full.items() if key in keep}
 
 
 def render(args: dict[str, Any], *, stealth: bool) -> dict[str, Any]:
@@ -617,16 +733,8 @@ def render(args: dict[str, Any], *, stealth: bool) -> dict[str, Any]:
     url = _url(args)
     extraction_type, css_selector, main_content_only, limit = _extraction(args)
 
-    params = _browser_params(args, url)
+    params = _browser_params(args, url, stealth=stealth)
     params["page_setup"] = page_setup
-    if stealth:
-        params["solve_cloudflare"] = bool(args.get("solveCloudflare", False))
-        params["hide_canvas"] = bool(args.get("hideCanvas", False))
-        # 走代理时强制为真，不看模型入参：WebRTC 泄露的是访客的真实出口 IP，而访客用这个
-        # 插件正是为了不泄露它。
-        params["block_webrtc"] = bool(args.get("blockWebrtc", False)) or "proxy" in params
-        params["allow_webgl"] = bool(args.get("allowWebgl", True))
-
     response = engine.fetch(url, **params)
     return to_payload(
         response,
@@ -817,6 +925,9 @@ def capabilities() -> dict[str, Any]:
         "extract": SCRAPLING_AVAILABLE,
         "browser": False,
         "stealth": False,
+        # 写方法这一档**与 scrapling 在不在无关**：它是部署表态，而排障的人得能一眼看出
+        # 「这台到底许不许写」，而不是等到发 POST 被拒才发现环境里少一个变量。
+        "writeMethods": guard.ALLOW_WRITE_METHODS,
     }
     if not SCRAPLING_AVAILABLE:
         return report
@@ -969,25 +1080,33 @@ def _make_session(kind: str, args: dict[str, Any]) -> Any:
 
     from scrapling.fetchers import DynamicSession, StealthySession
 
-    headless = bool(args.get("headless", True))
-    timeout_ms = _positive_int(args.get("timeoutMs"), "timeoutMs", DEFAULT_TIMEOUT_MS)
-    common: dict[str, Any] = {"headless": headless, "timeout": timeout_ms}
+    stealth = kind == "stealth"
+    # 只有开场才生效的那些设置（capture_xhr / block_ads / headless / locale /
+    # timezone_id / useragent / executable_path / cdp_url / timeout）必须在这里进会话：
+    # fetch 层传过去会被 validate_fetch 静默丢掉（见 FETCH_LEVEL_KEYS）。
+    common: dict[str, Any] = _session_browser_params(args, stealth=stealth)
     # 会话开的时候还不知道要访问哪个主机，所以按「配了代理就用代理」定档；显式填过
     # proxyBypass 的主机在会话里也跟着走代理 —— 见上面的取舍说明。
     proxy = guard.split_proxy(guard.default_proxy())
     if proxy is not None:
         common["proxy"] = proxy
-        common["extra_flags"] = [guard.WEBRTC_NO_LEAK_FLAG]
-    if kind == "browser":
-        session: DynamicSession | StealthySession = DynamicSession(**common)
-    else:
-        session = StealthySession(
-            **common,
-            solve_cloudflare=bool(args.get("solveCloudflare", False)),
-            hide_canvas=bool(args.get("hideCanvas", False)),
-            block_webrtc=bool(args.get("blockWebrtc", False)) or proxy is not None,
-            allow_webgl=bool(args.get("allowWebgl", True)),
-        )
+        if not stealth:
+            # Playwright 那边没有 block_webrtc 开关，只能从启动参数进去。stealth 侧**不能**
+            # 走这条路：上游算 flag 时 config.extra_flags 优先于内部那 53 条 STEALTH_ARGS，
+            # 传了就整段替换（连 block_webrtc 自己的两条也一起没），见 _browser_params。
+            common["extra_flags"] = list(guard.WEBRTC_NO_LEAK_FLAGS)
+    if stealth:
+        # 走代理时强制为真，不看模型入参：WebRTC 泄露的是访客的真实出口 IP，而访客用这个
+        # 插件正是为了不泄露它。
+        #
+        # 判据**只能**是这里算出的那份 proxy：`_session_browser_params` 里那条是按
+        # `browser_proxy("")` 定的，而空 URL 没有主机名，绕过清单里的任何主机名条目都命中
+        # 不了它 —— 只有 `default_proxy()` 认的那个「整台机器直连」的 `*` 例外。于是
+        # `proxyBypass=*` 时上面那条会算出「有代理」并把 block_webrtc 钉成真，而会话其实
+        # 是直连的：模型明确填了 blockWebrtc=false 也会被静默盖掉（正是本轮在消灭的那类毛病）。
+        # 这里整体重写，不继承那份结论。
+        common["block_webrtc"] = bool(args.get("blockWebrtc")) or proxy is not None
+    session: DynamicSession | StealthySession = StealthySession(**common) if stealth else DynamicSession(**common)
     session.start()
     return session, session
 
@@ -1068,8 +1187,6 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
             "session": usable,  # 真正发请求的对象
             "closer": closer,  # 关它用的对象（static 是 wrapper，浏览器是自身）
             "type": kind,
-            # 浏览器会话是否带着代理；stealth 的 block_webrtc 要在每次 fetch 时跟着它走。
-            "proxied": kind != "static" and guard.default_proxy() != "",
             "created_at": datetime.now(timezone.utc).isoformat(),
             # 同一把锁：占位时建的那把，盖回来而不是新建 —— 新建会让构造期与使用期各锁各的。
             "lock": entry_lock,
@@ -1110,7 +1227,7 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
 
     :param args: 协议参数
     :returns: 归一后的载荷
-    :raises AdapterError: 会话不存在 / 类型不支持 / 抓取失败
+    :raises AdapterError: 会话不存在 / 类型不支持 / 抓取失败 / 把 static 专属的键给了浏览器会话
     """
     entry = _get_session(args.get("sessionId"))
     session = entry["session"]
@@ -1128,15 +1245,34 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
         else:
             # 浏览器会话的代理在开场时就定死了（见 _make_session），这里不再逐 URL
             # 覆盖 —— 覆盖的做法是新建 context，cookie 与登录态会随之清空。
-            params = _browser_params(args, url)
+            #
+            # level="fetch" 是这条路径的关键：会话内每次 fetch 只认 FETCH_LEVEL_KEYS，
+            # 其余键（capture_xhr / block_ads / headless / locale / timezone_id /
+            # useragent / executable_path / cdp_url，以及 stealth 的 hide_canvas /
+            # block_webrtc / allow_webgl）会被 validate_fetch **静默丢掉**。那些设置已经
+            # 在 session.open 时经 _session_browser_params 进过会话了，这里再发一遍只会
+            # 制造「拧了没反应」的假象。
+            params = _browser_params(args, url, stealth=entry["type"] == "stealth", level="fetch")
             params.pop("proxy", None)
-            params.pop("extra_flags", None)
             params["page_setup"] = page_setup
             if entry["type"] == "stealth":
+                # solve_cloudflare 是 stealth 会话 fetch 唯一还认的 stealth 键（其余两条
+                # flag 类设置在构造期定死），所以仍然按本次入参给。
                 params["solve_cloudflare"] = bool(args.get("solveCloudflare", False))
-                params["hide_canvas"] = bool(args.get("hideCanvas", False))
-                params["block_webrtc"] = bool(args.get("blockWebrtc", False)) or bool(entry["proxied"])
-                params["allow_webgl"] = bool(args.get("allowWebgl", True))
+            # headers / retries 只有 static 那条路读得懂（_static_params）：浏览器会话的请求头
+            # 是 extra_headers，重试则是会话构造期的 config.retries。传错了不生效，而上游连
+            # 一声都不抱怨 —— 这里替它抱怨，因为「拧了没反应」正是本包在消灭的那类故障，而
+            # 一句 "use extraHeaders" 是模型自己能纠正的。判在参数算完之后再抛：那个顺序让
+            # py/tests/contract_probe.py 的读取记录保持完整（它按「读过哪些键」出结论）。
+            #
+            # 空的没给（`{}` / `[]` / null）不算写意图：模型「不带任何请求头」时传的就是空表，
+            # 为它报一条错等于把一个无害的调用说成非法。
+            for key, hint in (("headers", "extraHeaders"), ("retries", "scrapling_session_open")):
+                if args.get(key) not in (None, {}, []):
+                    raise AdapterError(
+                        "BAD_ARGS",
+                        f"{key} only applies to static sessions; use {hint} for a {entry['type']} session",
+                    )
             # 投递到属主线程执行：greenlet 绑定在那里（见 _SessionWorker）。排队期间调用
             # 线程原地等 —— 并发的 fetch 因此天然串行，entry 锁对浏览器会话是多余的。
             worker: _SessionWorker | None = entry["worker"]

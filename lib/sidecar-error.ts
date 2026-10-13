@@ -14,6 +14,14 @@ export type SidecarErrorCode =
   | "SIDECAR_CLOSED"
   /** Host 侧 URL 准入闸门判否（lib/url-policy.ts）；请求根本没发出去。 */
   | "URL_BLOCKED"
+  /**
+   * 部署没开放写方法（`allowWriteMethods`，默认关）却有人要求 POST/PUT/DELETE。
+   *
+   * 两侧都会给这个码：Host 侧在把请求送出去之前就拒 —— 上游的参数校验是**开放根对象**，
+   * 未声明的键不报错也不剥离，照样透传进 `execute`，所以「模型看不见 method」不等于
+   * 「没人能发 method」；Python 侧再对手搓的帧拒一次。
+   */
+  | "WRITE_DISABLED"
   /** 部署配置非法，插件拒绝加载（当前只有 nat64Prefixes 会走到这里）。 */
   | "CONFIG_INVALID"
   /** 这个 profile 没有作业后端，scrapling_crawl 无法挂后台作业。 */

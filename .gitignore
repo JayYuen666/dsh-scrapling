@@ -10,6 +10,13 @@ coverage/
 *.tsbuildinfo
 .DS_Store
 
+# Scrapling 的 adaptive 指纹库三件套。sidecar 以部署的 dataDir 为工作目录时才该落在
+# 用户机器上；一旦有测试或探针以仓库根为 cwd 跑 select(adaptive=True)，SQLite 就会在
+# 这里建库 —— 那是运行时状态，不是源码，而且会把用户的选择器指纹误提交出去。
+elements_storage.db
+elements_storage.db-wal
+elements_storage.db-shm
+
 # Python 字节码缓存（构建产物）
 py/__pycache__/
 __pycache__/

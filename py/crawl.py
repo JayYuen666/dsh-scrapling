@@ -309,8 +309,18 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
         # spider 也要登记：叫停时拿得到它，才调得动引擎的停机通道。
         _CRAWLS[crawl_id]["spider"] = spider
         _CRAWLS[crawl_id]["thread"] = thread
-    thread.start()
+    # crawlStarted 必须在 start() **之前**发。反过来有两处会出错：一是快蜘蛛可能在这一帧落地
+    # 之前就先推了 progress，宿主侧「第一条是 crawlStarted」的读法于是变成随缘；二是万一这一帧
+    # 发不出去（stdout 断了、序列化炸了），异常抛给调用方时蜘蛛已经在跑 —— 调用方拿不到
+    # crawlId，就叫不停它，那个名额要一直占到进程退出。
     _emit_event("crawlStarted", crawlId=crawl_id, text=f"crawling {url} (max {max_pages} pages)")
+    try:
+        thread.start()
+    except RuntimeError:
+        # 起不了线程（资源耗尽）：把占位摘掉，名额立刻还回去，别留一条永远不跑的登记。
+        with _CRAWL_LOCK:
+            _CRAWLS.pop(crawl_id, None)
+        raise
     return {"crawlId": crawl_id}
 
 
@@ -419,6 +429,10 @@ def close_all_crawls() -> None:
 
     爬虫跑在 daemon 线程里：sidecar 退出时它们跟着退出，所以这里只清登记，
     不需要（也没法）去优雅中断一个正在跑的 spider。
+
+    **它不停线程**：调用之后仍在跑的蜘蛛会继续往 stdout 推事件帧（进度、跳过、报错）。
+    进程退出时这无所谓，但任何「清完登记表就以为场上没蜘蛛了」的调用方都会被这件事咬到
+    —— 要停就按 id 逐只 :func:`crawl_stop`，再等 ``thread`` 退出。
     """
     _CRAWLS.clear()
 

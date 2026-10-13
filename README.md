@@ -41,7 +41,7 @@ turn on a tool that was guaranteed to fail.
 
 | Tool | Backend | Needs a browser | Concurrency |
 |---|---|---|---|
-| `scrapling_fetch` | `Fetcher` (curl_cffi) | no | safe |
+| `scrapling_fetch` | `Fetcher` (curl_cffi) | no | safe; a write verb is serialised once `allowWriteMethods` is on (parallel writes are duplicate submissions) |
 | `scrapling_extract` | `Selector` + CSS/XPath + `adaptive` | no | safe |
 | `scrapling_render` | `DynamicFetcher` (Playwright) | yes | serialised |
 | `scrapling_capture_xhr` | `capture_xhr` | yes | serialised |
@@ -233,17 +233,22 @@ Notable switches:
 
 **Deployment-grade knobs** (not on the settings card; set them in the `config:` block of
 `cordis.patch.yml`): `requestTimeoutSeconds`, `maxUrlLength`, `browserExecutablePath`,
-`browserCdpUrl`, `searchEndpoint`, `searchRenderTopN`, `crawlMaxRuntimeSeconds`. The first
-two of the browser pair are strong capabilities - one hands Chromium a file
+`browserCdpUrl`, `searchEndpoint`, `searchRenderTopN`, `crawlMaxRuntimeSeconds`,
+`allowWriteMethods` (default `false`). The first two of the browser pair are strong
+capabilities - one hands Chromium a file
 to execute, the other hands the browser to a debugger endpoint - so they come only from
-deployment config and are unreachable from model input.
+deployment config and are unreachable from model input. `allowWriteMethods` is off by default
+for the same kind of reason: it decides whether the model may change state on a remote host.
 
 > **Settings changes need a dsh restart.** The gate policy and the sidecar environment are
 > snapshotted once when the plugin is applied; edits on the settings card take effect on the
 > next start.
 
 Disabling a tool also removes its system-prompt guidance, so the model is never told
-about a capability that is not registered.
+about a capability that is not registered. The guidance is re-read at each prompt
+assembly against the tools that scope can actually see, so a machine without a browser
+loses the render/stealth lines, and a sidecar that never came up loses all of them -
+advice to call a missing tool costs a round trip and a confusing `UNKNOWN_TOOL`.
 
 ## Proxies
 
@@ -317,12 +322,43 @@ Details worth knowing:
 - **WebRTC leaks are closed when proxied.** Chromium's WebRTC can send UDP around an
   HTTP/SOCKS proxy, so one STUN call in a page is enough to learn the visitor's real exit
   address. patchright gets `block_webrtc`; Playwright has no equivalent switch, so it goes
-  in as a Chromium launch flag.
+  in as a Chromium launch flag - the same *pair* of flags upstream uses for `block_webrtc`,
+  and it must stay on the Playwright side only: Scrapling gives `config.extra_flags`
+  priority over the 53 anti-detection flags it computes itself, so passing `extra_flags` to
+  the stealth engine silently replaces the whole stealth stack (that was a real bug, found
+  by reflecting the launch args back out of the upstream session).
+- **`captureXhrPattern` applies to browser and stealth sessions too.** Those keys only take
+  effect when the session is constructed - `validate_fetch` drops anything else on a
+  per-request call - so they are sent at `scrapling_session_open`, and
+  `scrapling_session_fetch` returns the captured endpoints alongside the page. The capture
+  itself is per page, not a session-wide history: upstream builds a fresh container for
+  every fetch, so five pages never replay page one's endpoints five times.
+- **`headers` and `retries` on `scrapling_session_fetch` are static-session only, and a
+  browser session says so.** Upstream reads neither for Playwright/patchright sessions
+  (request headers there are `extraHeaders`, retries is a construction-time setting) and
+  does not complain when they are passed, so `session_fetch` refuses them with `BAD_ARGS`
+  naming the knob to use instead - a silent no-op is the failure mode this plugin is trying
+  to eliminate.
 - **A browser session picks its proxy once, at `session_open`**, and the whole session
   shares it. The bypass list therefore does not apply per URL inside a browser session:
   Playwright's proxy lives on the BrowserContext, and switching it means a new context,
   which throws away the session's cookies and login state - precisely the reason a
   session exists. Static sessions have no such limit and decide per request.
+- **Write verbs are off by default, and the gates do not cover them anyway.**
+  `allowWriteMethods` (deployment-level, `cordis.patch.yml` only - not on the settings card)
+  decides whether `scrapling_fetch` even shows `method` (POST/PUT/DELETE) and `body` to the
+  model. Off - the default - those two parameters are not in the tool's surface at all, and
+  the sidecar independently refuses a non-GET with `WRITE_DISABLED`, so a hand-built frame
+  cannot write either. The two halves do not rely on each other. Turn it on only where the
+  task really is to submit data: prompt-injected page text can ask for a POST, and the SSRF
+  gate, the proxy decision and `follow_redirects="safe"` bound *where* a request goes, not
+  *what it does once there*. `headers` and `cookies` stay available either way - a credentialed
+  GET against a host you allow-listed is the normal case - but note that anything handed to
+  them lands in the model context by design. `fetchEnabled` remains the coarse kill switch.
+- **Browser identity knobs live on the tools that can actually apply them.** `useragent` /
+  `locale` / `timezoneId` / `headless` are model-visible on the one-shot browser tools and on
+  `scrapling_session_open` - those take effect at session construction, because passing them
+  on a per-request session call is silently dropped upstream.
 - **Credentials never reach a log or the capability frame.** The capability report echoes
   `scheme://host:port` only, and its `source` field names which rung answered
   (`settings` / `environment` / `system` / `none`) - that column is the first thing to look

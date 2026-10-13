@@ -118,6 +118,15 @@ export interface Config {
   /** 交互式同步 API 的 url 长度上限；与 dsh 内置 web_fetch 的 2048 对齐。 */
   maxUrlLength: number;
   /**
+   * 是否把**写方法**（POST/PUT/DELETE 与 `body`）开放给模型。默认关。
+   *
+   * **安全相关**：闸门管的是请求**去哪里**，而写方法管的是它到了之后**干什么**。被注入的
+   * 页面文字完全可以要求发一个改状态的请求，而那次写入落在对端就收不回来。关的时候
+   * `scrapling_fetch` 的参数面里根本没有 `method`/`body`（模型看不见一个用了也没用的旋钮），
+   * Python 侧再独立硬拒一次 —— 两道判断各管一侧，不依赖对方。
+   */
+  allowWriteMethods: boolean;
+  /**
    * 浏览器二进制路径；留空表示用 Playwright 自带的 chromium。
    *
    * **安全相关**：等于让 Chromium 执行这个文件。只从部署配置来，模型入参到不了这里。
@@ -248,6 +257,10 @@ const configSchema = Schema.object({
   // config: 块。消费处也就不调 .get()，保持裸值语义。
   requestTimeoutSeconds: Schema.natural().min(1).default(120),
   maxUrlLength: Schema.natural().min(1).default(2048),
+  // 写方法默认关：读网页是这个插件的本职，改对端状态不是。要开得在 cordis.patch.yml 的
+  // config: 块里明确表态 —— 刻意不进设置卡，因为设置卡是模型之外的人共享的界面，而这一档
+  // 表态属于「这台部署允许什么」，属于部署方而不是某次会话。
+  allowWriteMethods: Schema.boolean().default(false),
   // 浏览器二进制路径：给装在非标准位置的企业镜像 / 便携版 Chromium 用的。
   browserExecutablePath: Schema.string().default(""),
   // CDP 端点：让浏览器连到一个已在运行的实例（如带着登录态的调试浏览器）。留空表示由
@@ -314,6 +327,29 @@ interface SettingsFace {
   };
 }
 
+/**
+ * Host 半真正用到的那一点 systemPrompt 服务面。
+ *
+ * 与 `SettingsFace` 同一个理由：`Context["systemPrompt"]` 挂在
+ * `@deepseek-ai/dsh-system-prompt` 的模块增强上，本包不 import 它就进不了类型图。这里只声明
+ * 用到的那两个方法。
+ *
+ * `text` 按上游的 `AssembleContext` 收「带 `scope` 的上下文」：上游每次装配都按调用方的 scope
+ * 求值，而本包要按那个 scope **实际看得见哪些工具**来决定说哪几句 —— 与上游 `web_fetch` 的
+ * 写法同一条（packages/web/tool-web/src/fetch.ts）。`scope` 在上游是 `ScopeKey = object`，
+ * 本包不解读它，只是原样转交给 `ctx.tools.get`。
+ */
+interface SystemPromptFace {
+  readonly systemPrompt: {
+    getSectionOrder: (name: string) => number;
+    section: (section: {
+      name: string;
+      order: number;
+      text: string | ((context: { scope?: object }) => string);
+    }) => () => void;
+  };
+}
+
 /** 每工具开关的**快照**。 */
 export interface ToolFlags {
   fetch: boolean;
@@ -348,9 +384,37 @@ export function snapshotFlags(config: Config): ToolFlags {
   };
 }
 
+/**
+ * 每个工具一段「什么时候换到它」的指引。
+ *
+ * 键与 :type:`ToolFlags` 同构，于是 `Record<keyof ToolFlags, string>` 让「加了一个工具却
+ * 忘了写指引」变成编译错误 —— 这份对应关系以前只靠注释维持。
+ *
+ * **一行只准点自己那组工具的全名**（别的开关下的工具用「静态抓取」「浏览器抓取」这类说法带过）。
+ * :func:`guidanceFor` 按「这句话点名的工具此刻是不是真注册着」决定说不说，所以跨组的点名会让
+ * 一段本来还有用的指引跟着别组一起消失 —— 例如没装 Chromium 的机器上，连「先用静态抓取」这句
+ * 都没人说了。简称（`_fetch`）也扫不出来，等于那句话继续教模型去调一个不存在的工具。
+ */
+const GUIDANCE: Record<keyof ToolFlags, string> = {
+  fetch:
+    "- 读一个网页的正文优先用 scrapling_fetch：静态、快、不吃内存。页面靠脚本渲染、它只取回空壳时再换浏览器类工具。",
+  extract:
+    "- 手上已经有一段 HTML（别的工具给的、本地文件读的）时用 scrapling_extract，不要为它发一次网络请求。",
+  render:
+    "- scrapling_render 把页面跑完再取正文，比静态抓取慢一个数量级也更吃内存；只有确认内容靠脚本渲染出来才用它。",
+  captureXhr:
+    "- 页面数据来自 JSON 接口而不是 DOM 时，用 scrapling_capture_xhr 先找到那个接口，再对接口 URL 单独抓一次。",
+  stealth:
+    "- 站点对自动化痕迹敏感、普通浏览器抓取拿不到内容时才用 scrapling_stealth_fetch，它更慢也更吃内存。",
+  session:
+    "- 需要登录态、或要连着取同一站点的多个页面时，用 scrapling_session_open / scrapling_session_fetch / scrapling_session_close 复用会话，别一次次重新抓取。",
+  crawl: "- 要整站而不是单页时用 scrapling_crawl；它是后台作业，边跑边出进度，且只遵守起始域。",
+  answer:
+    "- 想让模型基于某个页面作答时用 scrapling_answer，它把正文当数据处理，不会照搬页面里的指令。",
+};
+
 /** 一个工具对运行环境的最低要求。 */
 export type ToolRequirement = "scrapling" | "browser" | "stealth";
-
 /** 工具构造器：名字到「给定依赖造一个工具定义」的映射。 */
 type ToolBuilder = (deps: ToolDeps) => ToolDefinition;
 
@@ -430,6 +494,40 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     build: createAnswerTool,
   },
 ];
+
+/**
+ * 按当前开关**和这个 scope 真注册着的工具**拼出指引文本。
+ *
+ * 两道判据缺一不可：
+ *
+ * - 开关：README 承诺「关掉某个工具时它的指引段一并消失」。
+ * - 注册状态：注册还要过 `planTools` 的环境要求（没装 Chromium 时 render/stealth 整组不注册），
+ *   而 Python 起不来时 `failFastOnMissingPython=false` 那条降级路会**一个工具都不注册**。
+ *   只看开关的话，这些机器上模型会读到一串点了就报 UNKNOWN_TOOL 的建议 —— 上游 `web_fetch`
+ *   也是按 `ctx.tools.get(name, scope)` 现判的。
+ *
+ * 写在 `TOOL_SPECS` 之后是因为它按那张表判可见性：那句 `scrapling_render` 有没有真的注册，
+ * 只能从同一份登记表问（放在表之前会读到一个还没初始化的常量）。
+ *
+ * @param flags - 每工具开关的快照
+ * @param isAvailable - 这个 scope 看不看得见那个工具
+ * @returns 拼好的指引文本；一句都不剩时为空串（上游据此把整段视作没有内容）
+ */
+export function guidanceFor(flags: ToolFlags, isAvailable: (tool: string) => boolean): string {
+  // 摊成按键可选的表再取：`Object.entries(GUIDANCE)` 给的是 string 键，而这张表的完整性
+  // 已经由 `Record<keyof ToolFlags, string>` 在编译期钉住了，这里只需要把值取出来。
+  const enabled: Record<string, boolean | undefined> = { ...flags };
+  const lines: string[] = [];
+  for (const [flag, text] of Object.entries(GUIDANCE)) {
+    // 同组的工具要**全部**到位：会话那一句点了 open/fetch/close 三个名字，只注册了两个
+    // 就等于让模型去调一个不存在的东西。
+    const named = TOOL_SPECS.filter((spec) => spec.flag === flag || text.includes(spec.name));
+    if (enabled[flag] === true && named.every((spec) => isAvailable(spec.name))) {
+      lines.push(text);
+    }
+  }
+  return lines.join("\n");
+}
 
 /**
  * 一个工具的输出预算取自哪枚设置项。
@@ -826,7 +924,10 @@ function registerSearchProvider(
  * @param ctx - 宿主上下文
  * @param config - 已由 schemastery 填满默认值的配置
  */
-export async function apply(ctx: Context & SettingsFace, config: Config): Promise<void> {
+export async function apply(
+  ctx: Context & SettingsFace & SystemPromptFace,
+  config: Config,
+): Promise<void> {
   // 登记「本页由自带卡片编辑」。`auto: false` 是告诉宿主别再自动生成一份通用表单 ——
   // 自动那份会把 36 个字段摊成没有分组、没有说明的长列表，而真正在编辑这张卡的
   // client.js 已经按用途分了组、补了「改了会怎样」。
@@ -867,6 +968,9 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
       DSH_SCRAPLING_SYNTHETIC_RANGES: config.syntheticDnsRanges.get(),
       DSH_SCRAPLING_PROXY: proxyOf(config),
       DSH_SCRAPLING_PROXY_BYPASS: config.proxyBypass.get(),
+      // 写方法这一档同样两侧各判一次：这一份送过去让 Python 硬拒，而 Host 这边直接不把
+      // method/body 摆到模型面前。给 "0" 而不是留空，是为了在进程环境里一眼读得出表态。
+      DSH_SCRAPLING_ALLOW_WRITE_METHODS: config.allowWriteMethods ? "1" : "0",
     },
     log: (line) => {
       ctx.logger.debug(line);
@@ -937,9 +1041,9 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
     blockAds: config.blockAds.get(),
     crawlMaxItems: config.crawlMaxItems.get(),
     crawlMaxRuntimeSeconds: config.crawlMaxRuntimeSeconds,
-    maxUrlLength: config.maxUrlLength,
     browserExecutablePath: config.browserExecutablePath,
     browserCdpUrl: config.browserCdpUrl,
+    allowWriteMethods: config.allowWriteMethods,
     stripInlineImages: config.stripInlineImages.get(),
   };
   const ready = new Set(plan.ready);
@@ -954,6 +1058,23 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
       ctx.tools.register(spec.build({ sidecar, settings, startCrawlJob: startJob, answer }));
     }
   }
+
+  // 指引段按**装配时**的开关与「这个 scope 真注册着哪些工具」现取文本：设置卡关掉某个工具，
+  // 或这台机器没装 Chromium（planTools 把 render/stealth 整组跳过了），下一次装配就没有那
+  // 一段 —— README 里「关掉某个工具时它的 system prompt 指引段一并消失」说的就是这里。
+  // 只判开关不够：降级路径上一个工具都没注册，而模型仍会读到一串点了就报 UNKNOWN_TOOL 的建议。
+  // placement 借 TOOL_WEB_FETCH：本插件正是内置 web_fetch 的那一套替代/补充品，读的人
+  // 应当在自己的抓取工具旁边看到它，而不是在 prompt 末尾。
+  ctx.effect(
+    () =>
+      ctx.systemPrompt.section({
+        name: "scrapling-usage",
+        order: ctx.systemPrompt.getSectionOrder("TOOL_WEB_FETCH"),
+        text: ({ scope }) =>
+          guidanceFor(snapshotFlags(config), (tool) => ctx.tools.get(tool, scope) !== undefined),
+      }),
+    "scrapling: system prompt guidance",
+  );
 
   if (config.provideWebFetch.get()) {
     registerFetchProvider(ctx, sidecar, config);

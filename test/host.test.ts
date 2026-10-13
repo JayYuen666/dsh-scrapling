@@ -12,6 +12,7 @@ import { once } from "node:events";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { createCrawlTool } from "../lib/tools.ts";
@@ -22,6 +23,7 @@ import {
   Config as configSchema,
   apply,
   createUrlGate,
+  guidanceFor,
   inject,
   name,
   outputBudgetOf,
@@ -72,6 +74,19 @@ const ALL_OFF: ToolFlags = {
   crawl: false,
   answer: false,
 };
+
+/** 指引判据的另一半：所有工具都看得见（只看开关那一档时用这份）。 */
+const EVERYWHERE = (): boolean => true;
+
+/**
+ * 造一份「除了 `absent` 都看得见」的可见性判据。
+ *
+ * @param absent - 当成没注册的那个工具名
+ * @returns 可直接交给 guidanceFor 的判据
+ */
+function exceptTool(absent: string): (tool: string) => boolean {
+  return (tool: string) => tool !== absent;
+}
 
 /** 全能力就绪。 */
 const FULL_CAPS: SidecarCapabilities = {
@@ -129,6 +144,58 @@ function settingsStub(registrations: string[] = []): unknown {
   };
 }
 
+/** 注册过的一段 system prompt。 */
+interface PromptRecord {
+  name: string;
+  order: number;
+  /** 静态文本，或上游那种「每次装配现取」的函数；`scope` 本包只转交给 `ctx.tools.get`。 */
+  text: string | ((context: { scope?: object }) => string);
+}
+
+/** 假 systemPrompt 收到的段。 */
+const SECTIONS: PromptRecord[] = [];
+
+/**
+ * 假 ctx 的 systemPrompt 面。
+ *
+ * apply 会注册一段用量指引，所以每个跑 apply 的用例都得给它挂上这个面 —— 缺了它，症状不是
+ * 「指引段没注册」而是整个 apply 抛，那会把一堆无关用例一起带走，报错还不指向真正的原因。
+ *
+ * @param into - 收到的段推进这里
+ * @returns 可直接挂进假 ctx 的对象
+ */
+function promptStub(into: PromptRecord[] = SECTIONS): unknown {
+  return {
+    getSectionOrder: (): number => 2100,
+    section: (section: PromptRecord): (() => void) => {
+      into.push(section);
+      return (): void => undefined;
+    },
+  };
+}
+
+/**
+ * 假 tools 面：`register` 把名字登记下来，`get` 按那份登记回答。
+ *
+ * 指引段的文本是**装配时**现算的，而它问的是「这个 scope 看得见哪些工具」。这里必须让 `get`
+ * 给真答案：只给 `register` 的话 `ctx.tools.get` 是 undefined 方法、text() 直接抛，或者更糟——
+ * 夹具把 get 写成恒返回 undefined，指引于是恒为空串，而「空串」恰是它该有的失败形状，那条
+ * 门禁就静默失效了。
+ */
+function toolsStub(): { names: string[]; face: unknown } {
+  const names: string[] = [];
+  return {
+    names,
+    face: {
+      register: (definition: { name: string }): (() => void) => {
+        names.push(definition.name);
+        return (): void => undefined;
+      },
+      get: (tool: string): unknown => (names.includes(tool) ? { name: tool } : undefined),
+    },
+  };
+}
+
 /**
  * 造一份与宿主同形的配置：volatile 字段是引用，部署级字段是真值。
  *
@@ -146,6 +213,10 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
   // 部署级字符串字段同理：宿主交下来的是裸字符串，包成引用会让「与默认值比较」恒为 false。
   const plainText = (key: string, fallback: string): string =>
     (overrides[key] as string | undefined) ?? fallback;
+  // 部署级布尔档（allowWriteMethods）也一样是裸值：包成引用会让 `config.x ? "1" : "0"`
+  // 恒走真值那一支，于是「默认关」这条安全承诺在测试里根本没被验到。
+  const plainFlag = (key: string, fallback: boolean): boolean =>
+    (overrides[key] as boolean | undefined) ?? fallback;
   return {
     pythonBin: pick("pythonBin", ""),
     failFastOnMissingPython: pick("failFastOnMissingPython", true),
@@ -178,6 +249,7 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     maxUrlLength: plain("maxUrlLength", 2048),
     browserExecutablePath: plainText("browserExecutablePath", ""),
     browserCdpUrl: plainText("browserCdpUrl", ""),
+    allowWriteMethods: plainFlag("allowWriteMethods", false),
     nat64Prefixes: pick("nat64Prefixes", ""),
     dataDir: pick("dataDir", ""),
     provideWebFetch: pick("provideWebFetch", false),
@@ -252,6 +324,9 @@ describe("config schema", () => {
     const config = asRecord(configSchema({}));
     expect(config["maxUrlLength"]).toBe(2048);
     expect(config["requestTimeoutSeconds"]).toBe(120);
+    // 写方法默认关，而且是**裸值**：包成引用的话 `config.allowWriteMethods ? "1" : "0"`
+    // 恒走真值那一支，这条安全承诺就永远测不到。
+    expect(config["allowWriteMethods"]).toBe(false);
   });
 });
 
@@ -385,6 +460,92 @@ describe("每个工具的输出预算各走各的旋钮", () => {
   });
 });
 
+describe("system prompt 指引段", () => {
+  it("全开且工具都在时八段指引都在，只开一条时就只剩一条", () => {
+    // 判据是**行数与开关数一一对应**，而不是逐行文本内容：指引写的是给人读的话，措辞会变，
+    // 而「关掉一个工具就少一段」这个不变式不会变。
+    expect(guidanceFor(ALL_ON, EVERYWHERE).split("\n")).toHaveLength(Object.keys(ALL_ON).length);
+    const onlyFetch = guidanceFor({ ...ALL_OFF, fetch: true }, EVERYWHERE);
+    expect(onlyFetch.split("\n")).toHaveLength(1);
+    expect(onlyFetch).toContain("scrapling_fetch");
+  });
+
+  it("全关时文本是空串（README 说的「一并消失」就是这个形状）", () => {
+    expect(guidanceFor(ALL_OFF, EVERYWHERE)).toBe("");
+  });
+
+  it("开关开着但工具没注册时，那句指引也不说（这是同一个不变式的另一半）", () => {
+    // 注册还要过 planTools 的环境要求：没装 Chromium 时 render/stealth 整组不注册，而
+    // Python 起不来（failFastOnMissingPython=false）时**一个都不注册**。只看开关就会给模型
+    // 一串点了就报 UNKNOWN_TOOL 的建议 —— 与「少一段指引」是同一种故障的两个方向。
+    for (const spec of TOOL_SPECS) {
+      const text = guidanceFor(ALL_ON, exceptTool(spec.name));
+      expect(text, `${spec.name} 没注册时不该被点名（这是那条降级路径的真实后果）`).not.toContain(
+        spec.name,
+      );
+    }
+    // 反向保底：全注册时每一句都在 —— 少了这条，「恒为空串」的实现也能骗过上面那一组断言。
+    expect(guidanceFor(ALL_ON, EVERYWHERE).split("\n")).toHaveLength(Object.keys(ALL_ON).length);
+  });
+
+  it("指引段按**装配时**的开关与注册状态现取文本，而不是注册那一刻定死", async () => {
+    // 这条同时钉四件事：① apply 确实注册了一段；② 文本是**函数**（装配时现取），不是
+    // 注册那一刻算好的死字符串 —— 否则设置卡关掉工具，指引不会跟着消失；③ 那段文本问的是
+    // ctx.tools.get(名字, 装配 scope)，而不是我们自己攒的注册表；④ ctx.effect 的工厂被宿主
+    // 调用过，disposer 真的产出（上游规则「注册即 effect」要求回收路径被验证）。
+    SECTIONS.length = 0;
+    const factories: (() => unknown)[] = [];
+    const tools = toolsStub();
+    const ctx = {
+      get: (): undefined => undefined,
+      subprocess: {
+        resolveExecutable: async (): Promise<string> => {
+          throw new Error(INTERPRETER_UNUSABLE);
+        },
+        spawn: (): never => {
+          throw new Error(SHOULD_NOT_REACHED);
+        },
+      },
+      logger: {
+        info: (): void => undefined,
+        warn: (): void => undefined,
+        debug: (): void => undefined,
+      },
+      settings: settingsStub(),
+      systemPrompt: promptStub(),
+      tools: tools.face,
+      effect: (factory: () => unknown): void => {
+        factories.push(factory);
+      },
+    } as unknown as never;
+    await apply(ctx, makeConfig({ pythonBin: "", failFastOnMissingPython: false }));
+
+    // settings 那条与 sidecar 回收那条之外，指引段自己也占一个 effect。
+    expect(factories.length).toBeGreaterThanOrEqual(3);
+    for (const factory of factories) {
+      factory();
+    }
+    const section = SECTIONS.at(-1);
+    expect(section?.name).toBe("scrapling-usage");
+    expect(section?.text).toBeTypeOf("function");
+    const read = (): string => (typeof section?.text === "function" ? section.text({}) : "");
+
+    // 解释器不可用 → 一个工具都没注册 → 指引必须整段为空。这一格以前是「默认档里 stealth/crawl
+    // 关着所以那两段不出现」，而那在注册表为空时同样成立，看不出真正的因果。
+    expect(tools.names).toStrictEqual([]);
+    expect(read()).toBe("");
+
+    // 注册上两条，指引就只说这两条：默认档里 stealth/crawl 是关的，所以即便有人注册了它们
+    // 也不该出现（开关那一半仍然管着）。
+    tools.names.push("scrapling_fetch", "scrapling_render", "scrapling_stealth_fetch");
+    const text = read();
+    expect(text).toContain("scrapling_fetch");
+    expect(text).toContain("scrapling_render");
+    expect(text).not.toContain("scrapling_stealth_fetch");
+    expect(text).not.toContain("scrapling_crawl");
+  });
+});
+
 describe("apply", () => {
   it("数据目录建不出来时只 warn 并提前返回，不去 spawn", async () => {
     const warnings: string[] = [];
@@ -406,6 +567,7 @@ describe("apply", () => {
         debug: (): void => undefined,
       },
       settings: settingsStub(),
+      systemPrompt: promptStub(),
       effect: (): void => undefined,
     } as unknown as never;
     // 指向一个不可能建出来的路径：父级是文件而不是目录。
@@ -433,6 +595,7 @@ describe("apply", () => {
         debug: (): void => undefined,
       },
       settings: settingsStub(),
+      systemPrompt: promptStub(),
       effect: (): void => undefined,
     } as unknown as never;
     // failFastOnMissingPython 默认 true：Python 起不来就拒绝加载，不静默降级成
@@ -463,12 +626,81 @@ describe("apply", () => {
       },
       logger,
       settings: settingsStub(),
+      systemPrompt: promptStub(),
       effect: (): void => undefined,
     } as unknown as never;
     await expect(
       apply(ctx, makeConfig({ pythonBin: "", failFastOnMissingPython: false })),
     ).resolves.toBeUndefined();
     expect(warnings.some((line) => line.includes("未能启动"))).toBe(true);
+  });
+
+  it("写方法这一档作为明确表态送到 Python 侧（两侧各判一次的前提）", async () => {
+    // 关着的时候 Host 不给参数面，Python 那边还得独立硬拒一次；这一条钉的是两侧读到
+    // **同一份**表态。给 "0" 而不是留空：留空时「部署显式关」与「忘了配」在进程环境里
+    // 长得一模一样，而 Python 的默认恰好也是关 —— 那种巧合最难查。
+    const seen: Record<string, string | undefined>[] = [];
+
+    /**
+     * 造一个只把 spawn 的 spec.env 记下来的假 ctx。
+     *
+     * @returns 可直接交给 apply 的 ctx
+     */
+    function capturingCtx(): never {
+      return {
+        get: (): undefined => undefined,
+        subprocess: {
+          resolveExecutable: async (command: string): Promise<string> => command,
+          spawn: (spec: { env?: Record<string, string> }): unknown => {
+            seen.push(spec.env ?? {});
+            return {
+              stdin: new PassThrough(),
+              stdout: new PassThrough(),
+              stderr: new PassThrough(),
+              // 立刻"退出"：握手由 5ms 的超时先裁掉，这里要的是别留一个永不落定的 promise。
+              done: Promise.resolve({ exitCode: null, signal: null }),
+              terminate: (): void => undefined,
+              waitForExit: async (): Promise<boolean> => true,
+            };
+          },
+        },
+        logger: {
+          info: (): void => undefined,
+          warn: (): void => undefined,
+          debug: (): void => undefined,
+        },
+        tools: { register: (): (() => void) => (): void => undefined },
+        settings: settingsStub(),
+        systemPrompt: promptStub(),
+        effect: (): void => undefined,
+      } as unknown as never;
+    }
+
+    /**
+     * 跑一次 apply，取送回 sidecar 的那一枚环境变量。
+     *
+     * @param allowWriteMethods - 这一档部署的表态
+     * @returns 送过去的环境变量值
+     */
+    async function sentFlag(allowWriteMethods: boolean): Promise<string | undefined> {
+      seen.length = 0;
+      await apply(
+        capturingCtx(),
+        makeConfig({
+          pythonBin: "python3",
+          failFastOnMissingPython: false,
+          sidecarHandshakeTimeoutMs: 5,
+          allowWriteMethods,
+        }),
+      );
+      return seen[0]?.["DSH_SCRAPLING_ALLOW_WRITE_METHODS"];
+    }
+
+    await expect(sentFlag(true), "开放写方法时要送明确的表态").resolves.toBe("1");
+    await expect(
+      sentFlag(false),
+      "关着时也要送明确的表态，而不是留空 —— 留空与「忘了配」在进程环境里读起来一样",
+    ).resolves.toBe("0");
   });
 
   it.runIf(HAS_LOCAL_PYTHON)("真的拉起 sidecar 时能走通握手与注册计划", async () => {
@@ -530,6 +762,7 @@ describe("apply", () => {
       // 早先这里把工厂直接当 disposer 存下，于是真正的清理函数一次都没跑过 ——
       // 断言「disposers 有 2 条」照样通过，回收路径却完全没被验证。
       settings: settingsStub(settingsRegistrations),
+      systemPrompt: promptStub(),
       effect: (factory: () => () => unknown): void => {
         disposers.push(factory());
       },
@@ -589,9 +822,9 @@ describe("apply", () => {
     );
     expect(infos.some((line) => line.includes("(none)"))).toBe(true);
     expect(registered).toStrictEqual([]);
-    // 两次 apply，每次登记两个 disposer：一个是「这一页由自带卡片编辑」的页面策略，
-    // 一个是 sidecar 回收。
-    expect(disposers).toHaveLength(4);
+    // 两次 apply，每次登记三个 disposer：「这一页由自带卡片编辑」的页面策略、sidecar 回收，
+    // 以及 system prompt 指引段 —— 注册就是 effect，回收路径也要被数到。
+    expect(disposers).toHaveLength(6);
     expect(settingsRegistrations).toStrictEqual(["false", "false"]);
     // 卸载插件要能回收进程 —— disposer 把 promise 交回来，宿主会 await 它。
     await Promise.all(disposers.map((disposer) => disposer()));
@@ -618,9 +851,11 @@ const CRAWL_SETTINGS = {
   crawlMaxItems: 10,
   // 爬虫用例跑本地站点，几十毫秒就结束；给一个宽到不会误触发的截止即可。
   crawlMaxRuntimeSeconds: 600,
-  maxUrlLength: 2048,
   browserExecutablePath: "",
   browserCdpUrl: "",
+  // 爬虫这一组与写方法无关，按 schema 默认档给关：夹具跟着默认走，才不至于把闸门开着
+  // 这件事悄悄当成前提。
+  allowWriteMethods: false,
   stripInlineImages: true,
 } satisfies ToolSettings;
 
@@ -717,6 +952,7 @@ describe("apply 的爬虫作业接线", () => {
       },
       tools: { register: (): (() => void) => (): void => undefined },
       settings: settingsStub(),
+      systemPrompt: promptStub(),
       effect: (): void => undefined,
       // 可选服务按文档用 ctx.get(name) 取，所以夹具要同时提供 get 与 jobs。
       get: (service: string): unknown => (service === "jobs" ? jobsStub : undefined),
@@ -881,6 +1117,7 @@ describe("apply 到爬虫作业的完整链路", () => {
         },
       },
       settings: settingsStub(),
+      systemPrompt: promptStub(),
       effect: (): void => undefined,
       get: (service: string): unknown => (service === "jobs" ? jobsStub : undefined),
       jobs: jobsStub,
@@ -1000,6 +1237,7 @@ function makeJobHarness({ withoutJobs = false }: { withoutJobs?: boolean } = {})
     },
     // ctx.effect 收的是**工厂**：宿主会调用它拿到真正的 disposer 再登记。
     settings: settingsStub(),
+    systemPrompt: promptStub(),
     effect: (factory: () => () => unknown): void => {
       disposers.push(factory());
     },
@@ -1372,6 +1610,7 @@ describe("接管 ctx.web 的两个接缝", () => {
         registerSearchProvider: vi.fn<(provider: { id: string }) => () => void>(),
       },
       settings: settingsStub(),
+      systemPrompt: promptStub(),
       effect: (): void => undefined,
     } as unknown as never;
     await apply(

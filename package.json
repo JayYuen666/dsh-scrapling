@@ -1,6 +1,6 @@
 {
   "name": "@jayyuen66/dsh-scrapling",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Scrapling 网页抓取插件（dsh）：静态/浏览器/stealth 抓取 + CSS/XPath 结构化抽取 + 选择器自愈 + capture_xhr + Spider 爬虫，由常驻 Python 进程驱动。",
   "keywords": [
     "dsh",
@@ -70,6 +70,8 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@deepseek-ai/cordis-plugin-include": "^1.0.9",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.5",
     "@deepseek-ai/dsh-client-locale": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-client-store": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-client-ui-layout": "0.2.1-alpha.2",
@@ -78,6 +80,7 @@
     "@deepseek-ai/dsh-client-ui-settings": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-client-ui-slots": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-host-webserver": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-http-proxy": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-jobs": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-jobs-local": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-output-retention": "0.2.1-alpha.2",

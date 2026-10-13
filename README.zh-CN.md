@@ -36,7 +36,7 @@ HTML 转 Markdown 用 turndown。作为默认档这没问题，但代价是：
 
 | 工具 | 后端 | 需要浏览器 | 并发 |
 |---|---|---|---|
-| `scrapling_fetch` | `Fetcher`（curl_cffi） | 否 | 可并发 |
+| `scrapling_fetch` | `Fetcher`（curl_cffi） | 否 | 可并发；开了 `allowWriteMethods` 之后写动词转串行（并行写就是重复提交） |
 | `scrapling_extract` | `Selector` + CSS/XPath + `adaptive` | 否 | 可并发 |
 | `scrapling_render` | `DynamicFetcher`（Playwright） | 是 | 串行 |
 | `scrapling_capture_xhr` | `capture_xhr` | 是 | 串行 |
@@ -190,15 +190,18 @@ Scrapling 的 Markdown 输出报成 `text`，内置渲染路径显示完全正�
 
 **部署级旋钮**（不在设置卡上，只走 [`cordis.patch.yml`](./cordis.patch.yml) 的 `config:`
 块）：`requestTimeoutSeconds`、`maxUrlLength`、`browserExecutablePath`、`browserCdpUrl`、
-`searchEndpoint`、`searchRenderTopN`、`crawlMaxRuntimeSeconds`。
+`searchEndpoint`、`searchRenderTopN`、`crawlMaxRuntimeSeconds`、`allowWriteMethods`（默认 `false`）。
 其中 `browserExecutablePath` 与 `browserCdpUrl` 是强能力 —— 前者等于让 Chromium 执行指定文件，
 后者等于把浏览器交给指定调试端点 —— 所以它们只从部署配置来，模型入参到不了。
+`allowWriteMethods` 同理：它决定模型能不能改对端的状态，因此默认关，也只从部署配置来。
 
 > **改完设置要重启 dsh。** 闸门策略与 sidecar 的环境变量都在插件 `apply()` 时取一次快照，
 > 设置卡上的改动要等下次启动才生效。
 
 关掉某个工具时，它的 system prompt 指引段**也一并消失**，
-不会出现「工具没了但提示词还在」的割裂。
+不会出现「工具没了但提示词还在」的割裂。指引每次装配都按「那个 scope 真看得见哪些工具」
+现取，所以没装浏览器的机器会少掉 render/stealth 那几句，sidecar 没起来的机器则一句都不说 ——
+叫模型去调一个不存在的工具，代价是一轮往返加一个看不懂的 `UNKNOWN_TOOL`。
 
 ## 代理
 
@@ -256,11 +259,33 @@ PAC 是唯一还需要手工填一次的形态：求值 PAC 要下载脚本并�
   这类）三条**照旧拒**。
 - **走代理时会关掉 WebRTC 泄露。** Chromium 的 WebRTC 能绕过 HTTP/SOCKS 代理直接发 UDP，页面
   里一句 STUN 就能问出访客的真实出口 IP。patchright 用 `block_webrtc`，Playwright 没有对应
-  开关，走 Chromium 的启动 flag。
+  开关，走 Chromium 的启动 flag —— 用的是上游为 `block_webrtc` 下的**那两条**，而且只能加在
+  Playwright 那一侧：上游算启动参数时让 `config.extra_flags` 优先于它自己算出的 53 条反检测
+  flag，所以往 stealth 引擎传 `extra_flags` 会把整套反检测静默换掉（这是一条真实缺陷，靠把
+  参数送回上游、再把最终下发的 flag 读回来才照得出来）。
+- **`captureXhrPattern` 对浏览器与反检测会话同样生效。** 这些键只在**会话构造**时被读：
+  会话内每次 fetch 传过去会被 `validate_fetch` 丢掉，所以它们在 `scrapling_session_open`
+  那一帧上发出，而 `scrapling_session_fetch` 会把抓到的接口摘要与正文一并返回。摘要本身是
+  **逐页**的：上游每次 fetch 都新建一个收集容器，所以连着取五页不会把第一页的接口回五遍。
+- **`scrapling_session_fetch` 的 `headers` 与 `retries` 只属于 static 会话，给浏览器会话会直接报错。**
+  浏览器那侧的请求头是 `extraHeaders`，重试则是会话构造期的设置；上游对这两个键一声不吭地
+  丢掉，所以本包替它报错（`BAD_ARGS` 并点名该改用哪个旋钮）——「拧了没反应」正是这个插件要
+  消灭的那类故障。
 - **浏览器会话的代理在 `session_open` 时定一次**，之后整个会话共用。绕过清单因此对浏览器会话
   不逐 URL 生效——Playwright 的代理挂在 BrowserContext 上，中途换只能新建 context，而新建就
   等于丢掉这个会话攒下的 cookie 与登录态，那恰恰是会话存在的理由。静态会话没有这个限制，
   每个请求各自判一次。
+- **写方法默认关，而且闸门本来就管不到它。** `allowWriteMethods` 是部署级设置（只走
+  `cordis.patch.yml`，不进设置卡），它决定 `scrapling_fetch` 要不要把 `method`（POST/PUT/DELETE）
+  与 `body` 摆到模型面前。关着（默认）时这两个入参**根本不在参数面里**，而 sidecar 那侧还会独立
+  硬拒一次非 GET（`WRITE_DISABLED`），手搓一帧也写不出去 —— 两道判断不互相依赖。只有任务确实是
+  「提交数据」时才打开：被注入的页面文字完全可以要求发一个 POST，而 SSRF 闸门、代理判定、
+  `follow_redirects="safe"` 管的是请求**去哪里**，不是**到了之后干什么**。`headers` 与 `cookies`
+  两档都照旧可见——给你放行名单里的主机发一个带凭据的 GET 是正常用法——但要清楚交给它们的凭据
+  按设计就会进模型上下文。`fetchEnabled` 仍是粗粒度总闸。
+- **浏览器身份类的旋钮只开在真能用上它的工具上。** `useragent` / `locale` / `timezoneId` /
+  `headless` 摆在一次性的浏览器工具与 `scrapling_session_open` 上——它们只在**会话构造期**生效，
+  会话内每次抓取传过去会被上游静默丢掉。
 - **凭据不会出现在任何日志或能力协商帧里。** 能力上报只回显 `scheme://host:port`，并用 `source`
   标出代理来自 `settings` / `environment` / `system` / `none` 哪一档——用户报「抓不到东西」时，
   这一栏就是第一眼的答案。

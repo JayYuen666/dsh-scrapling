@@ -56,6 +56,19 @@ SYNTHETIC_RANGES_ENV = "DSH_SCRAPLING_SYNTHETIC_RANGES"
 PROXY_ENV = "DSH_SCRAPLING_PROXY"
 PROXY_BYPASS_ENV = "DSH_SCRAPLING_PROXY_BYPASS"
 
+# 是否把 POST/PUT/DELETE 这类**写方法**开放给模型。默认不设 ⇒ 关 ⇒ 最严。
+#
+# 与放行清单那一族是不同的安全问题：闸门管的是请求**去哪里**，而写方法管的是它到了之后
+# **干什么**。被注入的页面文字完全可以要求发一个改状态的请求，SSRF 判定会放行（地址是公网
+# 白名单里的），而那次写入落在对端就收不回来。所以默认关，要开得部署方明确表态。
+#
+# 两侧各自判一次，不依赖对方：Host 侧按同一个设置决定要不要把 `method`/`body` 摆到模型面前
+# （关的时候模型根本看不见这两个入参），这一侧则是硬拒 —— 手搓一帧 stdin 也写不出去。
+ALLOW_WRITE_METHODS_ENV = "DSH_SCRAPLING_ALLOW_WRITE_METHODS"
+
+# 当前是否允许写方法；由 :func:`configure_from_env` 按上面那枚变量填。
+ALLOW_WRITE_METHODS: bool = False
+
 # 手动追加的合成段（CIDR）。默认空 —— 自动检测是主路径。
 SYNTHETIC_NETWORKS: tuple[ipaddress.IPv4Network, ...] = ()
 
@@ -101,10 +114,17 @@ _PROXY_SCHEMES = ("http", "https", "socks4", "socks5", "socks5h")
 _BROWSER_PROXY_SCHEMES = ("http", "https", "socks4", "socks5")
 
 # Chromium 的 WebRTC 会绕过 HTTP/SOCKS 代理直接发 UDP，于是页面里一句 STUN 就能问出
-# 访客的真实出口 IP —— 对「我要走代理」的部署方来说，那等于代理白配。这条 flag 让
-# 非代理 UDP 一律不走；Playwright 不暴露对应开关（patchright 那边有 block_webrtc），
-# 只能从启动参数进去。
-WEBRTC_NO_LEAK_FLAG = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+# 访客的真实出口 IP —— 对「我要走代理」的部署方来说，那等于代理白配。这对 flag 让非代理
+# UDP 一律不走；Playwright 不暴露对应开关（patchright 那边有 block_webrtc），只能从启动
+# 参数进去。
+#
+# **两条一起**才是等价物：上游 `block_webrtc=True` 下的就是这两条（_base.py
+# `__generate_stealth_options`）—— 只带 `--force-...=disable_non_proxied_udp` 那一条时
+# 策略并未强制生效。之前这里只有一条，与它想替代的开关并不等价。
+WEBRTC_NO_LEAK_FLAGS = (
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--force-webrtc-ip-handling-policy",
+)
 
 # 额外的 NAT64 前缀（CIDR 字符串）。IPv6 地址命中其中之一时，会抽出内嵌 IPv4 复判；
 # 运营商自建前缀必须在这里声明，否则藏在 IPv6 里的私网 IPv4 会被当成公网放行。
@@ -114,7 +134,7 @@ EXTRA_NAT64_PREFIXES: tuple[str, ...] = ()
 _NAT64_EMBEDDED_OFFSET: dict[int, int] = {96: 12, 64: 9, 56: 7, 48: 6, 40: 5, 32: 4}
 
 
-def configure(allowed_hosts=None, allowed_ports=None, nat64_prefixes=None) -> None:
+def configure(allowed_hosts=None, allowed_ports=None, nat64_prefixes=None, allow_write_methods=None) -> None:
     """按部署配置收紧或放宽放行集合。
 
     只应由宿主侧在启动时调用一次，参数来自用户显式设置，而不是模型入参。
@@ -122,18 +142,21 @@ def configure(allowed_hosts=None, allowed_ports=None, nat64_prefixes=None) -> No
     :param allowed_hosts: 额外放行的主机名；None 表示沿用当前值
     :param allowed_ports: 额外放行的端口；None 表示沿用当前值
     :param nat64_prefixes: 额外的 NAT64 前缀（CIDR）；None 表示沿用当前值
+    :param allow_write_methods: 是否开放写方法；None 表示沿用当前值
     """
-    global ALLOWED_HOSTS, ALLOWED_PORTS, EXTRA_NAT64_PREFIXES  # noqa: PLW0603 —— 模块级策略常量，需整体替换
+    global ALLOWED_HOSTS, ALLOWED_PORTS, EXTRA_NAT64_PREFIXES, ALLOW_WRITE_METHODS  # noqa: PLW0603 —— 模块级策略常量，需整体替换
     if allowed_hosts is not None:
         ALLOWED_HOSTS = allowed_hosts
     if allowed_ports is not None:
         ALLOWED_PORTS = allowed_ports
     if nat64_prefixes is not None:
         EXTRA_NAT64_PREFIXES = nat64_prefixes
+    if allow_write_methods is not None:
+        ALLOW_WRITE_METHODS = allow_write_methods
 
 
 def configure_from_env() -> None:
-    """从环境变量读放行主机名、额外 NAT64 前缀、合成段与代理设置，供启动时调用。
+    """从环境变量读放行主机名、额外 NAT64 前缀、合成段、代理设置与写方法开关，供启动时调用。
 
     变量都是逗号分隔；未设置或为空则保持最严。环境里的代理变量与 NO_PROXY 在这里快照成
     模块级状态（:func:`proxy_for` 每个请求都要读一次，不适合每次现扫环境）。
@@ -150,7 +173,7 @@ def configure_from_env() -> None:
     if prefixes:
         configure(nat64_prefixes=prefixes)
 
-    global SYNTHETIC_NETWORKS, PROXY_URL, PROXY_BYPASS, _BYPASS_ENTRIES  # noqa: PLW0603 —— 启动时定一次
+    global SYNTHETIC_NETWORKS, PROXY_URL, PROXY_BYPASS, ALLOW_WRITE_METHODS, _BYPASS_ENTRIES  # noqa: PLW0603 —— 启动时定一次
     global _ENV_PROXIES, _ENV_BYPASS, _SYSTEM_PROXIES, _PAC_NOTICE  # noqa: PLW0603 —— 同上
     networks: list[ipaddress.IPv4Network] = []
     for item in os.environ.get(SYNTHETIC_RANGES_ENV, "").split(","):
@@ -169,6 +192,9 @@ def configure_from_env() -> None:
     SYNTHETIC_NETWORKS = tuple(networks)
     PROXY_URL = os.environ.get(PROXY_ENV, "").strip()
     PROXY_BYPASS = os.environ.get(PROXY_BYPASS_ENV, "").strip()
+    # 写方法开关只认那几种明确写法：拼错的值（"ture"）必须落在「关」那一侧，而不是被
+    # `bool("非空")` 读成开 —— 一个安全开关的默认失败方向是收紧。
+    ALLOW_WRITE_METHODS = os.environ.get(ALLOW_WRITE_METHODS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
     _ENV_PROXIES, _ENV_BYPASS = _snapshot_env_proxies()
     _SYSTEM_PROXIES, _PAC_NOTICE = _read_system_proxies()
     _BYPASS_ENTRIES = (
