@@ -113,19 +113,6 @@ _BYPASS_ENTRIES: tuple[str, ...] = ()
 _PROXY_SCHEMES = ("http", "https", "socks4", "socks5", "socks5h")
 _BROWSER_PROXY_SCHEMES = ("http", "https", "socks4", "socks5")
 
-# Chromium 的 WebRTC 会绕过 HTTP/SOCKS 代理直接发 UDP，于是页面里一句 STUN 就能问出
-# 访客的真实出口 IP —— 对「我要走代理」的部署方来说，那等于代理白配。这对 flag 让非代理
-# UDP 一律不走；Playwright 不暴露对应开关（patchright 那边有 block_webrtc），只能从启动
-# 参数进去。
-#
-# **两条一起**才是等价物：上游 `block_webrtc=True` 下的就是这两条（_base.py
-# `__generate_stealth_options`）—— 只带 `--force-...=disable_non_proxied_udp` 那一条时
-# 策略并未强制生效。之前这里只有一条，与它想替代的开关并不等价。
-WEBRTC_NO_LEAK_FLAGS = (
-    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-    "--force-webrtc-ip-handling-policy",
-)
-
 # 额外的 NAT64 前缀（CIDR 字符串）。IPv6 地址命中其中之一时，会抽出内嵌 IPv4 复判；
 # 运营商自建前缀必须在这里声明，否则藏在 IPv6 里的私网 IPv4 会被当成公网放行。
 EXTRA_NAT64_PREFIXES: tuple[str, ...] = ()
@@ -338,7 +325,7 @@ def _run_readonly(argv: list[str]) -> str:
             timeout=3,
             check=False,
         )
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except OSError, ValueError, subprocess.SubprocessError:
         return ""
     return done.stdout
 

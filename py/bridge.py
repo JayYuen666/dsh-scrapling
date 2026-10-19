@@ -41,6 +41,30 @@ import time
 import traceback
 from typing import Any, Callable
 
+MIN_PYTHON = (3, 14)
+
+
+def check_python(version_info: tuple[int, ...] = tuple(sys.version_info[:3])) -> str | None:
+    """低于 3.14 地板时返回给用户的消息，达标返回 None。
+
+    :param version_info: 要判定的版本；默认当前解释器的前三段，调用方可注入。
+    """
+    if (version_info[0], version_info[1]) >= MIN_PYTHON:
+        return None
+    current = ".".join(str(part) for part in version_info[:3])
+    return (
+        f"dsh-scrapling 需要 Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+，当前 {current}。"
+        "插件用的是 PATH 上的 python3（设置页留空即该解释器），请升级它，或在设置里填 3.14+ 的绝对路径。"
+    )
+
+
+_gate_message = check_python()
+if _gate_message is not None:
+    # 走 stderr：stdout 是协议帧通道，往它写一行散文会把整条 JSON-lines 流打坏。
+    print(_gate_message, file=sys.stderr)
+    raise SystemExit(78)
+
+
 # 让 py/ 目录里的 guard 能被 adapters 用 `from guard import install` 找到。
 _HERE = __file__.rsplit("/", 1)[0] or "."
 if _HERE not in sys.path:
@@ -143,7 +167,7 @@ def handle(frame: dict[str, Any]) -> dict[str, Any]:
                 request_id,
                 "DEPENDENCY_MISSING",
                 f"缺少可选依赖 {missing}，这次调用无法执行。本插件的默认 extractionType 是 "
-                f'markdown，需要 scrapling 的 rag extra：pip install "scrapling[rag]>=0.4.15,<0.5"',
+                f'markdown，需要 scrapling 的 rag extra：pip install "scrapling[rag]>=0.5,<0.6"',
             )
         except Exception as error:  # noqa: BLE001 —— 任何异常都要变成一帧错误，不能让线程死掉
             log(f"{method} failed: {type(error).__name__}: {error}")

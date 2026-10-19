@@ -9,22 +9,24 @@
 //   row 页与官方插件页才有 `form`（一个 bundle 页可能同时坐着几个 entry，宿主没有单一的
 //   form 可给）。所以设置卡的 form 由本文件从 `ctx.configForms` 取 —— 见 apply()。
 // · **ctx 只认它自己声明过的那些服务。** cordis 的上下文代理对没进 `inject` 的名字直接
-//   抛 `cannot get property "<name>" without inject`（@deepseek-ai/cordis
-//   lib/index.js:671-697 的 ReflectService.handler.get），而这个抛出发生在 `ctx.effect`
-//   的函数体里时只会被记进 logger（同文件 :1261），界面上看不出任何异常。所以
+//   抛 `cannot get property "<name>" without inject`（@deepseek-ai/cordis 里
+//   `ReflectService.handler.get`），而这个抛出发生在 `ctx.effect` 的函数体里时只会被记进
+//   logger，界面上看不出任何异常。所以
 //   `ctx.locale` / `ctx.configForms` 必须写进下面的 inject 清单 —— 少写一个，症状就是
 //   整张设置卡与全部结果行一起静默消失。六个同类插件与官方的
 //   dsh-experimental-client-ui-voice-input 都声明 `["slots", "configForms", "locale"]`。
-//   「可选服务改用 ctx.inject 嵌套去取」这条路这里不走：locale 服务自己就依赖 configForms
-//   （dsh-client-locale/lib/client.js:1491），能拿到 locale 的 profile 必然有 configForms，
+//   「可选服务改用 ctx.inject 嵌套去取」这条路这里不走：locale 服务自己就 inject 了 configForms
+//   （@deepseek-ai/dsh-client-locale 的 client 侧），能拿到 locale 的 profile 必然有 configForms，
 //   嵌套只是把一次编译期可见的错误换成运行时的静默失败。
-// · **结果行读的是 owner props，不是 buildRow 当初假定的入参。** 参数要经宿主给的
-//   `block.args`（惰性 PartialArguments 视图）读，结果侧的投影在 `block.meta`。
+// · **结果行读的是 owner props，而阶段写在顶层。** 宿主给的是 `ToolCallViewProps`：
+//   `phase` 与 `block` 是并列的两位，`block` 按阶段变形；参数经 `block.args`（惰性
+//   PartialArguments 视图）读，结果侧的投影只在 `phase === "result"` 那一支的 `block.meta` 上。
 //
 // 只用具名导出：构建脚本把产物包进 window.__ModuleLoader__.load({ id, factory })，
 // 同时给具名与 default 会触发 rolldown 的 MIXED_EXPORTS 警告。
 
 import type { Context } from "@deepseek-ai/cordis";
+import type { ToolCallViewProps } from "@deepseek-ai/dsh-client-ui-tool/client";
 import { createElement } from "react";
 import type { ReactNode } from "react";
 import { claimApply } from "@jayyuen66/dsh-plugin-shared/lib/card-apply";
@@ -213,18 +215,15 @@ export function readArgs(args: ArgsFace | undefined): Record<string, unknown> {
   return values;
 }
 
-/** `tool.call.toolview` 这张 slot 交给本包的那几个 owner prop。 */
-interface ToolViewProps {
-  /** 线缆上的工具名，也就是本行的 keyed dispatch 值。 */
-  readonly toolName: string;
-  /** 当前阶段；结果侧的投影只在 result 阶段才有。 */
-  readonly block: {
-    readonly phase: "preparing" | "start" | "result";
-    readonly args: ArgsFace;
-    readonly meta?: unknown;
-  };
-  /** 有值时给一个「在轨迹里看这次调用」的入口。 */
-  readonly inspect?: (() => void) | undefined;
+/**
+ * 结果侧投影只在 `phase === "result"` 那一支上有：宿主的 toolview props 把阶段写在**顶层**，
+ * `block` 是按阶段变形的联合（preparing / start / result 各一种节点），meta 只挂在落定的那一支。
+ *
+ * @param props - 宿主给的 owner props
+ * @returns 结果侧投影；没落定时是 undefined
+ */
+export function resultMetaOf(props: ToolCallViewProps): unknown {
+  return props.phase === "result" ? props.block.meta : undefined;
 }
 
 /** 结果行自己的样式。跟着宿主的语义色走，明暗两套主题都成立。 */
@@ -243,12 +242,12 @@ const ROW_CSS = `
 /**
  * 一行结果的渲染。
  *
- * 入参走 `block.args`，结果侧的投影走 `block.meta`；两者都按「可能还没到」处理 —— 调用刚发出
- * 时既没有 meta 也没有完整入参，这一行就只画标题。
+ * 入参走 `block.args`，结果侧的投影走顶层 `phase` 选出的 `block.meta`；两者都按「可能还没到」处理 ——
+ * 调用刚发出时既没有 meta 也没有完整入参，这一行就只画标题。
  */
-function RowView(props: ToolViewProps & { readonly t: Translate }): ReactNode {
+function RowView(props: ToolCallViewProps & { readonly t: Translate }): ReactNode {
   const { toolName, block, inspect, t } = props;
-  const meta = block.phase === "result" ? block.meta : undefined;
+  const meta = resultMetaOf(props);
   const spec = buildRow(toolName, readArgs(block.args), meta);
   const children: ReactNode[] = [
     createElement("div", { className: "dsh-scrapling-rowTitle", key: "title" }, spec.title),
@@ -342,7 +341,7 @@ function registerToolViews(ctx: ClientFace): () => void {
     disposers.push(
       ctx.slots.register(
         { name: "tool.call.toolview", key: tool, locale: LOCALE_NS },
-        (props: ToolViewProps) => createElement(RowView, { ...props, t }),
+        (props: ToolCallViewProps) => createElement(RowView, { ...props, t }),
       ),
     );
   }

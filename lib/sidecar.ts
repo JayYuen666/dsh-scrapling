@@ -46,10 +46,8 @@ export interface SidecarCapabilities {
   readonly static: boolean;
   /** 离线抽取是否可用。 */
   readonly extract: boolean;
-  /** Playwright 浏览器是否就绪。 */
+  /** patchright 浏览器是否就绪。0.5 起浏览器抓取只剩这一套，所以只有这一项。 */
   readonly browser: boolean;
-  /** patchright stealth 浏览器是否就绪。 */
-  readonly stealth: boolean;
   /** Scrapling 版本号。 */
   readonly version?: string;
 }
@@ -142,7 +140,6 @@ export function parseCapabilities(value: unknown): SidecarCapabilities {
     static: flag("static"),
     extract: flag("extract"),
     browser: flag("browser"),
-    stealth: flag("stealth"),
     ...(typeof version === "string" ? { version } : {}),
   };
 }

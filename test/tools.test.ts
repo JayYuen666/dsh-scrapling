@@ -21,8 +21,10 @@ import {
   createSessionCloseTool,
   createSessionFetchTool,
   createSessionListTool,
+  createSessionNetworkTool,
   createSessionOpenTool,
-  createStealthFetchTool,
+  createSessionStateLoadTool,
+  createSessionStateSaveTool,
 } from "../lib/tools.ts";
 import type { CrawlJobRunner, CrawlSink, ToolSettings } from "../lib/tools.ts";
 import type { AnswerRequest, AnswerResult } from "../lib/answer.ts";
@@ -104,7 +106,7 @@ const SETTINGS: ToolSettings = {
   networkIdle: false,
   pageTimeoutMs: 30_000,
   waitSelectorState: "attached",
-  captureXhrPattern: ".*",
+  pierceShadow: false,
   requestTimeoutSeconds: 120,
   blockAds: false,
   // 用 schema 默认值：这条夹具要验的是模型侧 maxPages 的缺省（20），不是部署天花板。
@@ -112,6 +114,18 @@ const SETTINGS: ToolSettings = {
   crawlMaxRuntimeSeconds: 1800,
   browserExecutablePath: "",
   browserCdpUrl: "",
+  browserInitScript: "",
+  browserRealChrome: false,
+  browserDnsOverHttps: false,
+  recordRequests: false,
+  maxRecordedRequests: 100,
+  sessionStateDir: "",
+  crawlRespectRobots: false,
+  crawlDownloadDelayMs: 0,
+  crawlConcurrentRequests: 4,
+  crawlAutothrottle: false,
+  crawlStrategy: "bfs",
+  crawlCheckpointDir: "",
   // 开着的：这一份夹具要覆盖写方法那条支路（参数面与帧上都得带着 method/body）。
   // 关的那一支在下面 `scrapling_fetch 的写方法闸门` 那一组里逐条钉。
   allowWriteMethods: true,
@@ -1107,6 +1121,35 @@ describe("scrapling_render", () => {
     expect(tool.isConcurrencySafe?.({ url: SAMPLE_URL })).toBe(false);
   });
 
+  it("只有被显式拧过的反检测参数才上网线（allowWebgl=false 也只在显式给时发）", async () => {
+    // 没给就交给 Python 的默认值（hide_canvas=False、allow_webgl=True、block_webrtc 由有没有
+    // 代理决定）：发一个默认值等于把「部署没表态」写死成一次表态。
+    const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "ok", truncated: false });
+    const tool = createRenderTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    await tool.execute(
+      {
+        url: SAMPLE_URL,
+        solveCloudflare: true,
+        hideCanvas: true,
+        blockWebrtc: true,
+        allowWebgl: false,
+      },
+      exec,
+    );
+    expect(fake.calls[0]?.params).toMatchObject({
+      solveCloudflare: true,
+      hideCanvas: true,
+      blockWebrtc: true,
+      allowWebgl: false,
+    });
+  });
+
   it("render 的渲染文本不带 XHR 段", () => {
     const tool = createRenderTool({
       sidecar: fakeSidecar({}).client,
@@ -1399,11 +1442,11 @@ describe("scrapling_capture_xhr", () => {
     });
     const exec = { signal: new AbortController().signal } as never;
     const result = (await tool.execute({ url: SAMPLE_URL }, exec)) as {
-      xhr: { url: string; status: number; bytes: number }[];
+      xhr: { url: string; status: number; bytes: number; method: string; resourceType: string }[];
     };
     expect(result.xhr).toStrictEqual([
-      { url: SAMPLE_API, status: 200, bytes: 1234 },
-      { url: "https://api.test/user", status: 500, bytes: 12 },
+      { url: SAMPLE_API, status: 200, bytes: 1234, method: "GET", resourceType: "" },
+      { url: "https://api.test/user", status: 500, bytes: 12, method: "GET", resourceType: "" },
     ]);
   });
 
@@ -1423,9 +1466,11 @@ describe("scrapling_capture_xhr", () => {
     });
     const exec = { signal: new AbortController().signal } as never;
     const result = (await tool.execute({ url: SAMPLE_URL }, exec)) as {
-      xhr: { url: string; status: number; bytes: number }[];
+      xhr: { url: string; status: number; bytes: number; method: string; resourceType: string }[];
     };
-    expect(result.xhr).toStrictEqual([{ url: "", status: 0, bytes: 0 }]);
+    expect(result.xhr).toStrictEqual([
+      { url: "", status: 0, bytes: 0, method: "GET", resourceType: "" },
+    ]);
   });
 
   it("没有 XHR 时给空数组", async () => {
@@ -1457,7 +1502,7 @@ describe("scrapling_capture_xhr", () => {
         content: "body",
         truncated: false,
         notice: "",
-        xhr: [{ url: SAMPLE_API, status: 200, bytes: 99 }],
+        xhr: [{ url: SAMPLE_API, status: 200, bytes: 99, method: "GET", resourceType: "fetch" }],
       },
     );
     const text = JSON.stringify(blocks);
@@ -1469,62 +1514,302 @@ describe("scrapling_capture_xhr", () => {
 /** 会话工具用例共用的执行上下文；放在 describe 外避免每次重建。 */
 const sessionExec = (): never => ({ signal: new AbortController().signal }) as never;
 
-describe("scrapling_stealth_fetch", () => {
-  it("把 stealth 开关透传给 sidecar", async () => {
-    const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "ok", truncated: false });
-    const tool = createStealthFetchTool({
+describe("scrapling_session_network", () => {
+  it("把会话 id 与四个筛选参数发给 sidecar，并把回包的 count 原样带出", async () => {
+    const fake = fakeSidecar({ sessionId: "s1", count: 7, matches: [] });
+    const tool = createSessionNetworkTool({
       sidecar: fake.client,
       settings: SETTINGS,
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
     });
-    const exec = { signal: new AbortController().signal } as never;
-    await tool.execute({ url: SAMPLE_URL, solveCloudflare: true }, exec);
-    expect(fake.calls[0]?.method).toBe("stealth_fetch");
-    expect(fake.calls[0]?.params).toMatchObject({ url: SAMPLE_URL, solveCloudflare: true });
+    const result = (await tool.execute(
+      {
+        sessionId: "s1",
+        urlPattern: "/api/",
+        includeBody: true,
+        networkLimit: 5,
+        maxBodyChars: 50,
+      },
+      sessionExec(),
+    )) as { sessionId: string; count: number; matches: unknown[] };
+    expect(fake.calls[0]).toStrictEqual({
+      method: "session.network",
+      params: {
+        sessionId: "s1",
+        urlPattern: "/api/",
+        includeBody: true,
+        networkLimit: 5,
+        maxBodyChars: 50,
+      },
+    });
+    expect(result.sessionId).toBe("s1");
+    // count 取自回包自己的那一格，不是数出来的条目数（两者此处故意不同）。
+    expect(result.count).toBe(7);
+    expect(result.matches).toStrictEqual([]);
   });
 
-  it("内容超预算时照样封顶", async () => {
+  it("不传筛选参数时四个键按缺省 null/false 发出", async () => {
+    const fake = fakeSidecar({ sessionId: "s1", count: 0, matches: [] });
+    const tool = createSessionNetworkTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute({ sessionId: "s1" }, sessionExec());
+    expect(fake.calls[0]?.params).toMatchObject({
+      sessionId: "s1",
+      urlPattern: null,
+      includeBody: false,
+      networkLimit: null,
+      maxBodyChars: null,
+    });
+    expect(tool.isConcurrencySafe?.({ sessionId: "s1" })).toBe(false);
+  });
+
+  it("回包条目带 bodyNote / body / bodyTruncated 时，三个可选字段都留在归一结果里", async () => {
     const fake = fakeSidecar({
-      url: SAMPLE_URL,
-      status: 200,
-      content: "y".repeat(9000),
-      truncated: false,
+      sessionId: "s1",
+      count: 1,
+      matches: [
+        {
+          url: SAMPLE_API,
+          status: 200,
+          bytes: 1234,
+          method: "POST",
+          resourceType: "xhr",
+          bodyNote: "upstream did not store a body for this one",
+          body: '{"a":1}',
+          bodyTruncated: true,
+        },
+      ],
     });
-    const tool = createStealthFetchTool({
+    const tool = createSessionNetworkTool({
       sidecar: fake.client,
       settings: SETTINGS,
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
     });
-    const exec = { signal: new AbortController().signal } as never;
-    const result = (await tool.execute({ url: SAMPLE_URL }, exec)) as {
-      truncated: boolean;
-      content: string;
+    const result = (await tool.execute({ sessionId: "s1" }, sessionExec())) as {
+      matches: Record<string, unknown>[];
     };
-    expect(result.truncated).toBe(true);
-    expect(result.content.length).toBeLessThan(9000);
+    expect(result.matches).toStrictEqual([
+      {
+        url: SAMPLE_API,
+        status: 200,
+        bytes: 1234,
+        method: "POST",
+        resourceType: "xhr",
+        bodyNote: "upstream did not store a body for this one",
+        body: '{"a":1}',
+        bodyTruncated: true,
+      },
+    ]);
   });
 
-  it("卡片元数据与 render 同形", () => {
-    const tool = createStealthFetchTool({
+  it("render 把四种条目形态各渲染成它该有的那一行", () => {
+    const tool = createSessionNetworkTool({
       sidecar: fakeSidecar({}).client,
       settings: SETTINGS,
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
     });
-    const meta = tool.output.presentationMeta?.(
-      { url: SAMPLE_URL },
+    const blocks = tool.output.render(
+      { sessionId: "s1" },
       {
-        url: SAMPLE_URL,
-        statusCode: 200,
-        extractionType: "markdown",
-        content: "",
-        truncated: false,
-        notice: "",
+        sessionId: "s1",
+        count: 4,
+        matches: [
+          // 上游存不下正文时给原因 —— 那一行要说清「没有正文」是哪来的。
+          {
+            url: "https://a.test/1",
+            status: 200,
+            bytes: 10,
+            method: "GET",
+            resourceType: "xhr",
+            bodyNote: "no body stored upstream",
+          },
+          // 既没有 bodyNote 也没有正文：只有一行摘要，resourceType 为空时不该多出逗号段。
+          { url: "https://a.test/2", status: 404, bytes: 0, method: "GET", resourceType: "" },
+          // 正文被截断：标签要标明这一点，正文照原样展开。
+          {
+            url: "https://a.test/3",
+            status: 200,
+            bytes: 20,
+            method: "POST",
+            resourceType: "fetch",
+            body: '{"x":2}',
+            bodyTruncated: true,
+          },
+          // 完整正文：标签就是 body。
+          {
+            url: "https://a.test/4",
+            status: 200,
+            bytes: 30,
+            method: "GET",
+            resourceType: "document",
+            body: "<html>",
+          },
+        ],
       },
     );
-    expect(meta).toStrictEqual({ url: SAMPLE_URL, statusCode: 200, truncated: false });
+    expect(blocks).toStrictEqual([
+      {
+        type: "text",
+        text:
+          "session s1 — 4 XHR/fetch:\n" +
+          "- GET https://a.test/1 (HTTP 200, 10B, xhr) — no body: no body stored upstream\n" +
+          "- GET https://a.test/2 (HTTP 404, 0B)\n" +
+          '- POST https://a.test/3 (HTTP 200, 20B, fetch) — body (truncated):\n{"x":2}\n' +
+          "- GET https://a.test/4 (HTTP 200, 30B, document) — body:\n<html>",
+      },
+    ]);
+  });
+
+  it("render 在一条历史都没有时明说是空", () => {
+    const tool = createSessionNetworkTool({
+      sidecar: fakeSidecar({}).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const blocks = tool.output.render(
+      { sessionId: "s9" },
+      { sessionId: "s9", count: 0, matches: [] },
+    );
+    expect(blocks).toStrictEqual([
+      { type: "text", text: "session s9 recorded no XHR/fetch (0 matches)" },
+    ]);
+  });
+
+  it("pending 卡片标成读历史", () => {
+    const tool = createSessionNetworkTool({
+      sidecar: fakeSidecar({}).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    expect(tool.presentCall?.({ sessionId: "s1" })).toStrictEqual({
+      card: "generic",
+      title: "s1",
+      kind: "search",
+    });
+  });
+
+  it("回包不是对象时，count 退回归一后的条目数而不是编一个数", async () => {
+    const fake = fakeSidecar("nope");
+    const tool = createSessionNetworkTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ sessionId: "s1" }, sessionExec())) as {
+      sessionId: string;
+      count: number;
+      matches: unknown[];
+    };
+    // 回包不是对象 → 没有 count 可读，于是退回归一后的条目数（这里归一出来是 0）。
+    expect(result).toStrictEqual({ sessionId: "s1", count: 0, matches: [] });
+  });
+});
+
+describe("scrapling_session_state_save / _load", () => {
+  /** 登录态存取用例共用的部署目录。 */
+  const STATE_DIR = "/tmp/scrapling-state";
+
+  it("存登录态：发给 sidecar 的帧带上纯文件名与部署状态目录", async () => {
+    const fake = fakeSidecar({
+      sessionId: "s1",
+      path: `${STATE_DIR}/login.json`,
+      saved: true,
+    });
+    const tool = createSessionStateSaveTool({
+      sidecar: fake.client,
+      settings: { ...SETTINGS, sessionStateDir: STATE_DIR },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ sessionId: "s1", name: "login" }, sessionExec())) as {
+      sessionId: string;
+      path: string;
+      saved: boolean;
+    };
+    expect(fake.calls[0]).toStrictEqual({
+      method: "session.state_save",
+      params: {
+        sessionId: "s1",
+        name: "login",
+        deployment: { sessionStateDir: STATE_DIR },
+      },
+    });
+    expect(result).toStrictEqual({
+      sessionId: "s1",
+      path: `${STATE_DIR}/login.json`,
+      saved: true,
+    });
+    expect(JSON.stringify(tool.output.render({}, result))).toContain("saved to");
+  });
+
+  it("取登录态：走 session.state_load，回包缺字段时退回入参", async () => {
+    const fake = fakeSidecar({});
+    const tool = createSessionStateLoadTool({
+      sidecar: fake.client,
+      settings: { ...SETTINGS, sessionStateDir: STATE_DIR },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ sessionId: "s1", name: "login" }, sessionExec())) as {
+      sessionId: string;
+      path: string;
+      saved: boolean;
+    };
+    expect(fake.calls[0]?.method).toBe("session.state_load");
+    // 回包没有 path 时退回空串；saved 这一格按「取」这一支的口径为真（见 lib/tools.ts 的
+    // toStateResult：保存时看回包，取时恒为真）。
+    expect(result).toStrictEqual({ sessionId: "s1", path: "", saved: true });
+    expect(JSON.stringify(tool.output.render({}, result))).toContain("loaded from");
+  });
+
+  it("两个登录态工具都声明不可并发、pending 卡片都指向会话", () => {
+    // 参数必须**齐全**：`defineTool` 的 isConcurrencySafe 包装在校验不过时直接短路返回 false，
+    // 那时工具自己的表态根本不会被调用 —— 只传 `{}` 就会把这条断言测成「包装的短路」。
+    const save = createSessionStateSaveTool({
+      sidecar: fakeSidecar({}).client,
+      settings: { ...SETTINGS, sessionStateDir: STATE_DIR },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const load = createSessionStateLoadTool({
+      sidecar: fakeSidecar({}).client,
+      settings: { ...SETTINGS, sessionStateDir: STATE_DIR },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    expect(save.isConcurrencySafe?.({ sessionId: "s1", name: "login" })).toBe(false);
+    expect(load.isConcurrencySafe?.({ sessionId: "s1", name: "login" })).toBe(false);
+    const pending = { card: "generic", title: "s1", kind: "search" };
+    expect(save.presentCall?.({ sessionId: "s1", name: "login" })).toStrictEqual(pending);
+    expect(load.presentCall?.({ sessionId: "s1", name: "login" })).toStrictEqual(pending);
+  });
+
+  it("回包不是对象时，归一那一侧退回空表并据此判「没存下」", async () => {
+    const fake = fakeSidecar("nope");
+    const tool = createSessionStateSaveTool({
+      sidecar: fake.client,
+      settings: { ...SETTINGS, sessionStateDir: STATE_DIR },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ sessionId: "s1", name: "login" }, sessionExec())) as {
+      sessionId: string;
+      path: string;
+      saved: boolean;
+    };
+    // 回包不是对象 → 归一那一侧的 record 退回空表；path 退回空串；保存时回包没说 saved
+    // 就按「没存下」判（取那一支才是恒为真）。
+    expect(result).toStrictEqual({ sessionId: "s1", path: "", saved: false });
   });
 });
 
@@ -1630,42 +1915,6 @@ describe("会话工具的渲染", () => {
     const blocks = tool.output.render({ sessionId: "s1" }, { sessionId: "s1", closed: true });
     expect(JSON.stringify(blocks)).toContain("session s1 closed");
   });
-
-  it("stealth 的渲染与 fetch 同形，且不可并发", () => {
-    const tool = createStealthFetchTool({
-      sidecar: fakeSidecar({}).client,
-      settings: SETTINGS,
-      startCrawlJob: fakeJobStarter,
-      answer: fakeAnswer,
-    });
-    const blocks = tool.output.render(
-      { url: SAMPLE_URL },
-      {
-        url: SAMPLE_URL,
-        statusCode: 200,
-        extractionType: "markdown",
-        content: "body",
-        truncated: false,
-        notice: "",
-      },
-    );
-    expect(JSON.stringify(blocks)).toContain(`Fetched ${SAMPLE_URL}`);
-    expect(tool.isConcurrencySafe?.({ url: SAMPLE_URL })).toBe(false);
-  });
-
-  it("stealth 的 pending 卡片标为 fetch", () => {
-    const tool = createStealthFetchTool({
-      sidecar: fakeSidecar({}).client,
-      settings: SETTINGS,
-      startCrawlJob: fakeJobStarter,
-      answer: fakeAnswer,
-    });
-    expect(tool.presentCall?.({ url: SAMPLE_URL })).toStrictEqual({
-      card: "generic",
-      title: SAMPLE_URL,
-      kind: "fetch",
-    });
-  });
 });
 
 describe("会话工具", () => {
@@ -1687,9 +1936,9 @@ describe("会话工具", () => {
     };
     expect(fake.calls[0]).toStrictEqual({
       method: "session.open",
-      // 这四枚旋钮只有「开场」这一个生效位置：会话内每次 fetch 传过去会被上游
+      // 这几枚旋钮只有「开场」这一个生效位置：会话内每次 fetch 传过去会被上游
       // validate_fetch 静默丢掉。之前 session.open 只发 sessionType/headless/solveCloudflare，
-      // 于是设置卡上的页面超时、广告拦截、XHR 正则、浏览器二进制路径与 CDP 端点对浏览器
+      // 于是设置卡上的页面超时、广告拦截、浏览器二进制路径、注入脚本与网络记录开关对浏览器
       // 会话完全不生效，而且一行日志都没有。
       params: {
         sessionType: "static",
@@ -1703,12 +1952,17 @@ describe("会话工具", () => {
         hideCanvas: false,
         blockWebrtc: false,
         allowWebgl: true,
+        recordNetwork: false,
         timeoutMs: SETTINGS.pageTimeoutMs,
         blockAds: SETTINGS.blockAds,
-        captureXhrPattern: SETTINGS.captureXhrPattern,
         deployment: {
           browserExecutablePath: SETTINGS.browserExecutablePath,
           browserCdpUrl: SETTINGS.browserCdpUrl,
+          browserInitScript: SETTINGS.browserInitScript,
+          browserRealChrome: SETTINGS.browserRealChrome,
+          browserDnsOverHttps: SETTINGS.browserDnsOverHttps,
+          recordRequests: SETTINGS.recordRequests,
+          maxRecordedRequests: SETTINGS.maxRecordedRequests,
         },
       },
     });
@@ -1890,12 +2144,14 @@ describe("会话工具", () => {
   });
 
   it("除 list 外的会话工具都声明不可并发", () => {
-    // 开/抓/关会话都会占住一份浏览器或连接，只有 list 是纯内存读，可以并发。
+    // 开/抓/读历史/存取状态/关会话都会占住一份浏览器或连接，只有 list 是纯内存读，可以并发。
     const builders = [
       createSessionOpenTool,
       createSessionFetchTool,
+      createSessionNetworkTool,
+      createSessionStateSaveTool,
+      createSessionStateLoadTool,
       createSessionCloseTool,
-      createStealthFetchTool,
     ];
     for (const build of builders) {
       const tool = build({
@@ -1938,7 +2194,21 @@ describe("scrapling_crawl", () => {
     expect(result).not.toHaveProperty("crawlId");
     expect(fake.calls[0]).toStrictEqual({
       method: "crawl.run",
-      params: { url: SAMPLE_URL, maxPages: 3, maxDurationMs: 1_800_000 },
+      params: {
+        url: SAMPLE_URL,
+        maxPages: 3,
+        maxDurationMs: 1_800_000,
+        // 站点的礼貌与顺序整套走 deployment 命名空间：模型入参到不了这里，Python 只从
+        // deployment 读。夹具跟着 SETTINGS 的部署档走，串档立刻暴露。
+        deployment: {
+          crawlRespectRobots: SETTINGS.crawlRespectRobots,
+          crawlDownloadDelayMs: SETTINGS.crawlDownloadDelayMs,
+          crawlConcurrentRequests: SETTINGS.crawlConcurrentRequests,
+          crawlAutothrottle: SETTINGS.crawlAutothrottle,
+          crawlStrategy: SETTINGS.crawlStrategy,
+          crawlCheckpointDir: SETTINGS.crawlCheckpointDir,
+        },
+      },
     });
   });
 

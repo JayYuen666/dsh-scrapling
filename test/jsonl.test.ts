@@ -4,13 +4,7 @@ import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 import { setImmediate } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
-import {
-  decodeFrame,
-  encodeFrame,
-  FrameSplitter,
-  isFrameObject,
-  pumpFrames,
-} from "../lib/jsonl.ts";
+import { decodeFrame, encodeFrame, FrameSplitter, pumpFrames } from "../lib/jsonl.ts";
 import { FrameError } from "../lib/frame-error.ts";
 
 /** FrameError 里「不是合法 JSON」那一类的 kind，抽成常量免得重复字面量。 */
@@ -96,15 +90,6 @@ describe("decodeFrame", () => {
   it("数组与标量都算 not-an-object", () => {
     for (const line of ["[]", "123", '"x"', "null", "true"]) {
       expect(kindOf(() => decodeFrame(line))).toBe("not-an-object");
-    }
-  });
-});
-
-describe("isFrameObject", () => {
-  it("只接受普通对象", () => {
-    expect(isFrameObject({})).toBe(true);
-    for (const value of [[], null, 1, "x", undefined]) {
-      expect(isFrameObject(value)).toBe(false);
     }
   });
 });

@@ -52,13 +52,25 @@ const SETTINGS: ToolSettings = {
   networkIdle: true,
   pageTimeoutMs: 30_000,
   waitSelectorState: "visible",
-  captureXhrPattern: "/api/",
+  pierceShadow: true,
   requestTimeoutSeconds: 120,
   blockAds: true,
   crawlMaxItems: 1000,
   crawlMaxRuntimeSeconds: 1800,
   browserExecutablePath: "/tmp/chromium",
   browserCdpUrl: "",
+  browserInitScript: "/tmp/init.js",
+  browserRealChrome: false,
+  browserDnsOverHttps: true,
+  recordRequests: true,
+  maxRecordedRequests: 100,
+  sessionStateDir: "/tmp/scrapling-state",
+  crawlRespectRobots: false,
+  crawlDownloadDelayMs: 0,
+  crawlConcurrentRequests: 4,
+  crawlAutothrottle: false,
+  crawlStrategy: "bfs",
+  crawlCheckpointDir: "",
   // 对表要跑**满参数面**：写方法开放时 method/body 才在参数面与线路上，两侧才逐键对得上。
   // 关掉那一档的形状由 test/tools.test.ts 单独钉（那里判的是「参数面里根本没有这两个键」）。
   allowWriteMethods: true,
@@ -208,11 +220,25 @@ const FETCH_REPLY = {
 const REPLIES: Record<string, unknown> = {
   fetch: FETCH_REPLY,
   render: FETCH_REPLY,
-  stealth_fetch: FETCH_REPLY,
   extract: FETCH_REPLY,
   select: { count: 1, truncated: false, matches: [{ tag: "h1", text: "hi" }] },
   "session.open": { sessionId: "s-1", sessionType: "static", createdAt: "2020-01-01T00:00:00Z" },
   "session.fetch": { ...FETCH_REPLY, sessionId: "s-1" },
+  "session.network": {
+    sessionId: "s-1",
+    count: 1,
+    matches: [
+      {
+        url: "https://example.com/api/a",
+        status: 200,
+        bytes: 12,
+        method: "GET",
+        resourceType: "xhr",
+      },
+    ],
+  },
+  "session.state_save": { sessionId: "s-1", path: "/tmp/s.json", saved: true },
+  "session.state_load": { sessionId: "s-1", path: "/tmp/s.json", saved: false },
   "session.list": { sessions: [] },
   "session.close": { sessionId: "s-1", closed: true },
   "crawl.run": { crawlId: "c-1" },
@@ -310,7 +336,7 @@ async function pythonSide(): Promise<PythonSide> {
 const KNOWN_UNREACHABLE: Record<string, string[]> = {
   // sidecar 的 `extract`（离线 HTML -> 正文）至今没有任何工具在调：scrapling_extract 走的是
   // `select`。它读的 status 因此不是「忘接线」，而是整个方法没有入口 —— 那是一条产品决定，
-  // 不该由测试替它做。剩下 22 个键已全部接成模型可见入参。
+  // 不该由测试替它做。其余键已全部接成模型可见入参。
   extract: ["status"],
 };
 
@@ -466,16 +492,18 @@ describe("两侧对表：线路上的键必须一一对得上", () => {
   });
 
   it("会话开场把部署级浏览器设置发过去（那些键只在构造期生效）", async () => {
-    // capture_xhr / block_ads / executable_path 只在会话构造期被读；fetch 层传一律被丢弃
-    // （见 contract-scrapling）。所以它们必须出现在 session.open 这一帧上，否则设置卡上的
-    // 旋钮对浏览器会话永远无效。
+    // block_ads / executable_path / init_script / record_requests / max_recorded_requests 只在
+    // 会话构造期被读；fetch 层传一律被丢弃（见 contract-scrapling）。所以它们必须出现在
+    // session.open 这一帧上，否则设置卡上的旋钮对浏览器会话永远无效。
     const observations = await driveTools();
     const keys = keysOf(observations["scrapling_session_open"]?.calls ?? []);
     for (const wanted of [
-      "captureXhrPattern",
       "blockAds",
       "timeoutMs",
       "deployment.browserExecutablePath",
+      "deployment.browserInitScript",
+      "deployment.recordRequests",
+      "deployment.maxRecordedRequests",
     ]) {
       expect(keys.has(wanted), `session.open 没发 ${wanted}`).toBe(true);
     }

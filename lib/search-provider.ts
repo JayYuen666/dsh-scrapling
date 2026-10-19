@@ -10,9 +10,9 @@
 // 能换的只有执行后端。这条缝是 dsh-web 官方提供的 —— tool-web 只管模型侧 schema 与排版，
 // provider 选择与网络访问都在 ctx.web 里。
 //
-// 为什么不默认开启：注册了第二个「可用」的 search provider 而部署侧没配 searchProvider，
-// 内置 web_search 会直接不可用（WEB_PROVIDER_AMBIGUOUS）。所以 provideWebSearch 默认 false，
-// 且 available() 在没配搜索端点时返回 false —— 两道闸都留着。
+// 为什么 available() 要看搜索端点：注册了第二个「可用」的 search provider 而部署侧没配
+// searchProvider，内置 web_search 会直接不可用（WEB_PROVIDER_AMBIGUOUS）。所以 provideWebSearch
+// 虽然默认开，available() 在没配搜索端点时仍返回 false —— 只开开关不会误接管 web_search。
 import { WebError } from "@deepseek-ai/dsh-web";
 import type {
   WebSearchProvider,

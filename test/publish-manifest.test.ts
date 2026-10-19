@@ -33,7 +33,7 @@ const pkgDir = path.join(import.meta.dirname, "..");
  * 本文件自己也不举日期样例 —— 门禁扫的就是全部源码注释，在这里举例等于让自己红。
  *
  * 「轮次编号」仍然不进门禁。本仓的 `本轮` / `第 N 轮` 指的是**会话轮次**这个产品概念
- * （首轮消息不支持 fork、gate 的「下一轮重新计数」），而不是写下注释时的工轮次。两种含义
+ * （首轮消息不支持 fork、gate 的「下一轮重新计数」），而不是写下注释时的工作轮次。两种含义
  * 在中文里同形，机器分不开；要禁只能靠逐条人工判断，那不是门禁能做到的事。
  */
 const FORBIDDEN_IN_COMMENTS: readonly RegExp[] = [
@@ -336,7 +336,7 @@ describe("构建产物可载入", () => {
 
   it("产物里的真实逻辑还能跑（压缩改形状时这条会红）", async () => {
     // 产物是压缩过的：标识符改名、注释剥掉。只断言「导出一个叫 apply 的函数」太弱，
-    // 压缩把内部逻辑改坏它照样绿。这里让**产物自己**跑一遍注册计划：十一个工具、两条
+    // 压缩把内部逻辑改坏它照样绿。这里让**产物自己**跑一遍注册计划：十三个工具、两条
     // 分支都要给出正确结果。任何依赖名字（constructor.name 之类）或模块级状态的压缩
     // 手法，都会在这里露出来，而不是等到装进 dsh 才发现。
     const artifact = (await import(pathToFileURL(path.join(pkgDir, "host.js")).href)) as {
@@ -349,31 +349,26 @@ describe("构建产物可载入", () => {
       };
     };
     // 开关取的是每一项自己的 flag，而不是工具名的后缀：会话类四条共用一个 flag，
-    // capture_xhr 的 flag 是 captureXhr，按名字拼出来的键对不上任何一项。
+    // capture_xhr 的 flag 是 captureXhr，网络历史与登录态存取各自有独立的 flag，
+    // 按名字拼出来的键对不上任何一项。
     const allOn = Object.fromEntries(artifact.TOOL_SPECS.map((spec) => [spec.flag, true]));
     const full = {
       scrapling: true,
-      fetch: true,
+      static: true,
       extract: true,
       browser: true,
-      stealth: true,
-      version: "0.4.15",
+      version: "0.5",
     };
-    expect(artifact.TOOL_SPECS).toHaveLength(11);
+    expect(artifact.TOOL_SPECS).toHaveLength(13);
     const { ready } = artifact.planTools(allOn, full);
-    // 有浏览器时十一个全注册；会话类四条各自独立，所以总数与工具数相等。
-    expect(ready).toHaveLength(11);
-    // 关掉浏览器的分支同样要成立，且恰好少掉那三个依赖浏览器的工具。写成差集而不是
+    // 有浏览器时十三个全注册；会话类各自独立，所以总数与工具数相等。
+    expect(ready).toHaveLength(13);
+    // 关掉浏览器的分支同样要成立，且恰好少掉那两个依赖浏览器的工具。写成差集而不是
     // 写死个数：以后往登记表里加工具，这个断言仍然成立，而不会因为数字对不上而失败。
-    const BROWSER_TOOLS = new Set([
-      "scrapling_render",
-      "scrapling_capture_xhr",
-      "scrapling_stealth_fetch",
-    ]);
+    const BROWSER_TOOLS = new Set(["scrapling_render", "scrapling_capture_xhr"]);
     const { ready: withoutBrowser } = artifact.planTools(allOn, {
       ...full,
       browser: false,
-      stealth: false,
     });
     expect(withoutBrowser).toStrictEqual(ready.filter((name) => !BROWSER_TOOLS.has(name)));
     expect(BROWSER_TOOLS.has("scrapling_render")).toBe(true);

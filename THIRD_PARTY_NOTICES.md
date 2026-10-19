@@ -29,16 +29,16 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包通过它们的
 - 上游项目：`Scrapling`
 - 上游仓库：https://github.com/D4Vinci/Scrapling
 - 上游许可：BSD 3-Clause，Copyright (c) 2024 Karim Shoair
-- 验证版本：0.4.15
+- 验证版本：0.5
 
 本包**使用**而非**包含**以下接口：
 
 | 接口 | 用途 |
 | --- | --- |
-| `Fetcher` / `DynamicFetcher` / `StealthyFetcher` / `Selector` / `Spider` / `SessionManager` | 各工具的抓取与抽取实现 |
+| `Fetcher` / `StealthyFetcher` / `FetcherSession` / `StealthySession` / `Selector` / `Spider` / `SessionManager` | 各工具的抓取与抽取实现 |
 | `Convertor._strip_noise_tags`、`Convertor._sanitize_for_ai` | 反注入清洗；`html` 路径的输出不再是字节级原始文档，代价在此 |
 
-这些都不是稳定 API 面。README 把 Scrapling 版本上界钉在 `0.5` 之前，正是为了守住这一组接口：
+这些都不是稳定 API 面。README 把 Scrapling 版本上界钉在 `0.6` 之前，正是为了守住这一组接口：
 装到范围外时守卫照常运行，但反注入清洗与爬虫链路可能不按文档描述工作。
 
 ## 运行期依赖
@@ -47,12 +47,12 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包通过它们的
 
 | 依赖 | 版本 | 许可 | 引入方 |
 | --- | --- | --- | --- |
-| `scrapling` | 0.4.15 | BSD-3-Clause | Python sidecar |
-| `playwright` | 1.63.0 | Apache-2.0（Microsoft） | 浏览器渲染与网络守卫 |
-| `patchright` | 1.63.0 | Apache-2.0（Microsoft，patch 由 Kaliiiiiiiiii-Vinyzu 提供） | stealth 抓取 |
+| `scrapling` | 0.5 | BSD-3-Clause | Python sidecar |
+| `playwright` | 1.63.0 | Apache-2.0（Microsoft） | 网络守卫 |
+| `patchright` | 1.63.0 | Apache-2.0（Microsoft，patch 由 Kaliiiiiiiiii-Vinyzu 提供） | 浏览器渲染与网络守卫 |
 | `ipaddr.js` | 2.5.0 | MIT | Host 侧 URL 策略的地址分类 |
 
 `patchright` 是 Playwright 的补丁分支，与 `playwright` 并存安装：两者是不同的 Python 包，
-本包按能力探测分别判断，缺哪个就不注册依赖它的工具。
+本包按能力探测判断浏览器抓取能不能用。
 
 dsh 宿主包（`@deepseek-ai/dsh` 及其子包）是 peer 依赖，由宿主提供、不随本包分发。

@@ -12,8 +12,9 @@
 //
 // 注册 provider 不等于接管。ctx.web 的选择规则：配了 id 就用它；没配置而「恰好一个」可用
 // provider 时自动选；多个可用 provider 且没配置 id 就报 `WEB_PROVIDER_AMBIGUOUS`，内置的
-// web_fetch 会直接不可用。所以本插件默认**不注册**（provideWebFetch 默认 false）；要接管
-// 必须两件事同时做：打开这个开关，且在部署配置里写 `fetchProvider: "scrapling"`。
+// web_fetch 会直接不可用。所以本插件默认**注册**（provideWebFetch 默认 true）；要真正接管
+// 仍必须两件事同时做：开关开着，且在部署配置里写 `fetchProvider: "scrapling"` —— 只开开关
+// 时 base bundle 那条 `fetchProvider: http` 仍然赢。
 
 import { WebError } from "@deepseek-ai/dsh-web";
 import type {

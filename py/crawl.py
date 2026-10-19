@@ -39,6 +39,46 @@ MAX_REMEMBERED_CRAWLS = 16
 # 小时，而爬虫跑在没人看的后台线程里，没有任何外部计时器会来叫停它。部署侧可按次调小。
 DEFAULT_MAX_RUNTIME_MS = 1_800_000
 
+# 爬虫的默认并发。与 Scrapling 的 Spider 默认值一致（spiders/spider.py 的
+# ``concurrent_requests = 4``），写在这里是为了让「部署没表态」与「部署表态成 4」在
+# 日志里不是同一件事。
+DEFAULT_CONCURRENT_REQUESTS = 4
+
+
+def _crawl_policy(args: dict[str, Any]) -> dict[str, Any]:
+    """读部署命名空间里的爬虫策略旋钮。
+
+    全是部署级（不进设置卡、模型入参到不了这里）：它们决定的是「这台机器怎么对待别人的
+    站点」—— 遵不遵守 robots.txt、隔多久发一个请求、同时开几条连接 —— 那是部署方的表态，
+    不是某次会话的偏好。取值一律**报错而不夹**：一个写错的 0 被悄悄抬成 1，读日志的人
+    只会以为「配的就是这样」。
+
+    :param args: 协议参数
+    :returns: 交给 Spider 类属性与构造器的那一份
+    :raises adapters.AdapterError: 取值非法
+    """
+    from adapters import AdapterError, _positive_int
+
+    deployment = args.get("deployment")
+    knobs: dict[str, Any] = deployment if isinstance(deployment, dict) else {}
+    strategy = knobs.get("crawlStrategy", "bfs")
+    if strategy not in ("bfs", "dfs"):
+        raise AdapterError("BAD_ARGS", f"crawlStrategy must be 'bfs' or 'dfs', got {strategy!r}")
+    delay_ms = knobs.get("crawlDownloadDelayMs", 0)
+    if not isinstance(delay_ms, (int, float)) or isinstance(delay_ms, bool) or delay_ms < 0:
+        raise AdapterError("BAD_ARGS", "crawlDownloadDelayMs must be a non-negative number")
+    checkpoint_dir = knobs.get("crawlCheckpointDir")
+    return {
+        "strategy": strategy,
+        "delay_seconds": float(delay_ms) / 1000.0,
+        "concurrency": _positive_int(
+            knobs.get("crawlConcurrentRequests"), "crawlConcurrentRequests", DEFAULT_CONCURRENT_REQUESTS
+        ),
+        "obey_robots": knobs.get("crawlRespectRobots") is True,
+        "autothrottle": knobs.get("crawlAutothrottle") is True,
+        "checkpoint_dir": checkpoint_dir if isinstance(checkpoint_dir, str) else "",
+    }
+
 
 def _clip_markdown(text: str, budget: int) -> str:
     """把单页正文封顶到 budget 字符。
@@ -107,18 +147,21 @@ def _make_spider(
     crawl_id: str,
     state: dict[str, Any],
     domains: set[str],
+    policy: dict[str, Any],
 ) -> Any:
     """动态造一个 spider 类。
 
     Spider 的 ``start_urls`` / ``allowed_domains`` / ``max_pages`` / ``output_dir``
     都是**类属性**而不是 ``__init__`` 参数 —— ``Spider.__init__`` 只收 crawldir 与
-    interval，当构造参数传会直接 TypeError。所以只能在类体上写。
+    interval，当构造参数传会直接 TypeError。所以只能在类体上写。待站策略（robots.txt、
+    限速、并发、抓取顺序）同理，它们也是 Spider 的类属性。
 
     :param url: 起始 URL
     :param limit: 最多爬多少页
     :param crawl_id: 爬虫 id，用于日志
     :param state: 结果槽；爬完写进它
     :param domains: 起始域集合，链接发现与收页复核共用同一份
+    :param policy: ``_crawl_policy`` 读出的待站策略
     :returns: spider 实例
     """
     from scrapling.spiders import SiteToMarkdownSpider
@@ -131,6 +174,13 @@ def _make_spider(
         allowed_domains = domains
         max_pages = limit
         output_dir = None
+        # 待站策略。robots_txt_obey 打开后 0.5 会把「取不到 robots.txt」当成禁止爬该域
+        # （0.4.15 是放行），所以这一档要么别开，要么确保那台站点的 robots.txt 取得回来。
+        robots_txt_obey = policy["obey_robots"]
+        download_delay = policy["delay_seconds"]
+        concurrent_requests = policy["concurrency"]
+        crawl_strategy = policy["strategy"]
+        autothrottle_enabled = policy["autothrottle"]
 
         def configure_sessions(self, manager: Any) -> None:
             """把爬虫的会话换成「只跟安全重定向、走配置里那份代理」的那一份。
@@ -225,7 +275,7 @@ def _make_spider(
             )
             return None
 
-    return Collector()
+    return Collector(crawldir=policy["checkpoint_dir"] or None)
 
 
 def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
@@ -248,6 +298,7 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
     max_content_chars = _positive_int(args.get("maxContentChars"), "maxContentChars", DEFAULT_MAX_CONTENT_CHARS)
     budget_ms = _positive_int(args.get("maxDurationMs"), "maxDurationMs", DEFAULT_MAX_RUNTIME_MS)
     strip_inline_images = _strip_inline_images(args)
+    policy = _crawl_policy(args)
     crawl_id = uuid.uuid4().hex[:12]
     state: dict[str, Any] = {
         "error": None,
@@ -284,7 +335,7 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
         }
 
     try:
-        spider = _make_spider(url, max_pages, crawl_id, state, domains)
+        spider = _make_spider(url, max_pages, crawl_id, state, domains, policy)
     except BaseException as error:
         with _CRAWL_LOCK:
             _CRAWLS.pop(crawl_id, None)
@@ -370,21 +421,33 @@ def _get_crawl(crawl_id: Any) -> dict[str, Any]:
 def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
     """查一个爬虫的状态与已收结果。
 
+    ``since`` 是本轮之前已经读走多少页（按下标，不是 URL）。带上它只回新增的那一段：
+    整份 pages 每轮重发，流量是 O(n²)，而 `max_content_chars` 的默认预算意味着几十页就能
+    凑出一个超过 Host 侧 8 MiB 帧上限的回包 —— 那一帧会被当成坏帧，整个 sidecar 连正在
+    跑的会话一起被拆掉。不带时仍回全部（探针与直连调用要的是全量）。
+
     :param args: 协议参数
-    :returns: {crawlId, running, pages, error, expired}
+    :returns: {crawlId, running, pages, total, error, expired}
     """
+    from adapters import AdapterError
+
+    since = args.get("since", 0)
+    if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+        raise AdapterError("BAD_ARGS", "since must be a non-negative integer")
     entry = _get_crawl(args.get("crawlId"))
     state: dict[str, Any] = entry["state"]
     # pages 是 spider 线程边跑边 append 的活列表，而回包要经 json.dumps 序列化。
     # 进锁里复制一份：一边序列化一边追加，结果要么漏一页要么撞上 RuntimeError。
     with _CRAWL_LOCK:
-        pages = list(state["pages"])
+        total = len(state["pages"])
+        pages = list(state["pages"][since:])
         running = _is_running(entry)
     return {
         "crawlId": entry["crawl_id"],
         # thread 为 None 表示 spider 还在构造中：没跑起来，但也没结束。
         "running": running,
         "pages": pages,
+        "total": total,
         "error": state["error"],
         # 截止到点而停的爬虫带这个标记：模型能看出「为什么比 maxPages 少」。
         "expired": state.get("expired") is True,

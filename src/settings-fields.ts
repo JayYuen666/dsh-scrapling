@@ -149,14 +149,14 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         fallback: true,
       },
       {
-        key: "stealthEnabled",
+        key: "networkEnabled",
         kind: "boolean",
-        label: { zh: "scrapling_stealth_fetch", en: "scrapling_stealth_fetch" },
+        label: { zh: "scrapling_session_network", en: "scrapling_session_network" },
         hint: {
-          zh: "patchright 反检测抓取，最吃资源，默认关。",
-          en: "patchright anti-detection; heavy, off by default.",
+          zh: "读已开会话攒下的网络历史；会话需先用 recordNetwork 打开记录。",
+          en: "Read a session's recorded network history; the session must have recordNetwork on.",
         },
-        fallback: false,
+        fallback: true,
       },
       {
         key: "sessionEnabled",
@@ -169,11 +169,24 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         fallback: true,
       },
       {
+        key: "sessionStateEnabled",
+        kind: "boolean",
+        label: { zh: "scrapling_session_state_*", en: "scrapling_session_state_*" },
+        hint: {
+          zh: "存/取浏览器登录态；需部署侧配好 sessionStateDir。",
+          en: "Save/load browser login state; needs a deployment-side sessionStateDir.",
+        },
+        fallback: true,
+      },
+      {
         key: "crawlEnabled",
         kind: "boolean",
         label: { zh: "scrapling_crawl", en: "scrapling_crawl" },
-        hint: { zh: "后台 Spider 作业，默认关。", en: "Background spider jobs; off by default." },
-        fallback: false,
+        hint: {
+          zh: "后台 Spider 作业，只守起始域；需 profile 带作业后端。",
+          en: "Background spider jobs confined to the start domain; needs a jobs backend.",
+        },
+        fallback: true,
       },
       {
         key: "answerEnabled",
@@ -273,8 +286,8 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
     id: "browser",
     title: { zh: "浏览器行为", en: "Browser behaviour" },
     note: {
-      zh: "只在渲染 / 反检测 / XHR 三条路径上生效。",
-      en: "Only affects the render / stealth / XHR paths.",
+      zh: "只在渲染 / XHR 两条路径上生效。",
+      en: "Only affects the render / XHR paths.",
     },
     fields: [
       {
@@ -308,14 +321,14 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         fallback: true,
       },
       {
-        key: "captureXhrPattern",
-        kind: "text",
-        label: { zh: "XHR 捕获正则", en: "XHR capture pattern" },
+        key: "pierceShadow",
+        kind: "boolean",
+        label: { zh: "穿透 Shadow DOM", en: "Pierce Shadow DOM" },
         hint: {
-          zh: "只记录 URL 匹配这个正则的请求；.* 是全部。",
-          en: "Only record requests whose URL matches; .* means all.",
+          zh: "把 open shadow root 里的内容并进正文，默认关；页面把正文封进 shadow DOM 时才打开。",
+          en: "Merge open shadow root content into the body; off by default. On when a page hides its content in shadow DOM.",
         },
-        fallback: ".*",
+        fallback: false,
       },
       {
         key: "waitSelectorState",
@@ -434,20 +447,20 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         kind: "boolean",
         label: { zh: "接管内置 web_fetch", en: "Provide the built-in web_fetch" },
         hint: {
-          zh: '打开后还要在部署配置里写 fetchProvider: "scrapling"。',
-          en: 'Also needs fetchProvider: "scrapling" in the deployment config.',
+          zh: '默认开；部署配置里仍要写 fetchProvider: "scrapling"，否则 base bundle 那条 fetchProvider: http 仍然赢。',
+          en: 'On by default; the deployment config still needs fetchProvider: "scrapling", otherwise the base bundle\'s fetchProvider: http wins.',
         },
-        fallback: false,
+        fallback: true,
       },
       {
         key: "provideWebSearch",
         kind: "boolean",
         label: { zh: "接管内置 web_search", en: "Provide the built-in web_search" },
         hint: {
-          zh: "打开后还要配 searchEndpoint（SearXNG 兼容接口）与 searchProvider。",
-          en: "Also needs a SearXNG-compatible searchEndpoint and searchProvider.",
+          zh: "默认开；还需要配 searchEndpoint（SearXNG 兼容接口）与 searchProvider，否则不会接管。",
+          en: "On by default; still needs a SearXNG-compatible searchEndpoint and searchProvider, otherwise it does not take over.",
         },
-        fallback: false,
+        fallback: true,
       },
     ],
   },

@@ -25,7 +25,7 @@ Measured on a page whose content exists only after JavaScript runs:
 
 This plugin adds exactly three things dsh's built-in tools cannot do:
 
-1. **Browser rendering** - JavaScript execution via Playwright / patchright.
+1. **Browser rendering** - JavaScript execution via patchright.
 2. **Structured extraction** - CSS/XPath selection returning data, not a wall of Markdown.
 3. **Self-healing selectors** - Scrapling's `adaptive` mode relocates an element after
    the site's markup changes. Verified working: a selector that returns `None` after a
@@ -33,7 +33,7 @@ This plugin adds exactly three things dsh's built-in tools cannot do:
 
 ## Status
 
-All eleven tools (the session family counts as four) are implemented, registered and
+All thirteen tools (the session family counts as seven) are implemented, registered and
 exercised by the test suite. Tools
 are registered **conditionally**: the plugin probes what the environment can actually
 do at startup and only registers tools that will work, so the model never burns a
@@ -43,10 +43,9 @@ turn on a tool that was guaranteed to fail.
 |---|---|---|---|
 | `scrapling_fetch` | `Fetcher` (curl_cffi) | no | safe; a write verb is serialised once `allowWriteMethods` is on (parallel writes are duplicate submissions) |
 | `scrapling_extract` | `Selector` + CSS/XPath + `adaptive` | no | safe |
-| `scrapling_render` | `DynamicFetcher` (Playwright) | yes | serialised |
-| `scrapling_capture_xhr` | `capture_xhr` | yes | serialised |
-| `scrapling_stealth_fetch` | `StealthyFetcher` (patchright) | yes | serialised |
-| `scrapling_session_open` / `scrapling_session_fetch` / `scrapling_session_list` / `scrapling_session_close` | Scrapling session classes | depends | serialised |
+| `scrapling_render` | `StealthySession` (patchright) | yes | serialised; the anti-detection switches (`solveCloudflare` / `hideCanvas` / `blockWebrtc`) live here |
+| `scrapling_capture_xhr` | `capture_xhr` (session-level recording) | yes | serialised |
+| `scrapling_session_open` / `scrapling_session_fetch` / `scrapling_session_network` / `scrapling_session_state_save` / `scrapling_session_state_load` / `scrapling_session_list` / `scrapling_session_close` | Scrapling session classes | depends | serialised |
 | `scrapling_crawl` | Scrapling Spider framework | no | serialised, runs as a job |
 | `scrapling_answer` | any of the above, plus `ctx.llm` | no (yes with `render:true`) | serialised |
 
@@ -70,22 +69,24 @@ would throw all of that away.
 minutes, a tool call has a timeout. Watch it with `job_list`, read it with
 `job_output`, stop it with `job_kill`. A crawl also has a wall-clock ceiling
 (`crawlMaxRuntimeSeconds`) and never leaves the start domain. Politeness is the
-deployment's call, stated in the open: Scrapling's spider defaults are kept as-is —
-robots.txt is **not** obeyed, per-domain delay is 0, and up to 4 requests run in
-parallel. The crawl is confined to the start domain, so it never fans out across
-unrelated sites; a target that needs gentler behaviour should sit behind a rate
-limiter on the deployment side.
+deployment's call, stated in the open: it is configured through the deployment knobs
+(`crawlRespectRobots`, `crawlDownloadDelayMs`, `crawlConcurrentRequests`,
+`crawlAutothrottle`, `crawlStrategy`, `crawlCheckpointDir`), and **their defaults keep
+Scrapling's spider defaults** — robots.txt is **not** obeyed, per-domain delay is 0,
+and up to 4 requests run in parallel. The crawl is confined to the start domain, so it
+never fans out across unrelated sites; a target that needs gentler behaviour is a
+deployment decision, not a per-call one.
 
 ## Requirements
 
-- **Python 3.10+** with Scrapling installed, reachable via `PATH` (or set `pythonBin`).
+- **Python 3.14+** with Scrapling installed, reachable via `PATH` (or set `pythonBin`).
 - **Browser engines are entirely the user's responsibility.** The plugin does not
   download anything. Without a browser it simply does not register the
   browser-dependent tools, so the model never wastes a turn calling them.
 
 ```sh
-pip install "scrapling[rag]>=0.4.15,<0.5"
-python -m playwright install chromium
+pip install "scrapling[rag]>=0.5,<0.6"
+python -m patchright install chromium
 ```
 
 > **Why `rag` and not `fetchers`?** `rag` is `fetchers` plus `markdownify`, and the
@@ -93,11 +94,25 @@ python -m playwright install chromium
 > raises `ModuleNotFoundError` on the first fetch. The Python side then tells you exactly
 > which package is missing.
 
-> **Version range**: this plugin is developed and verified against Scrapling **0.4.15**
+> **Version range**: this plugin is developed and verified against Scrapling **0.5**
 > and depends on its `Convertor._strip_noise_tags` / `_sanitize_for_ai`, `Selector`,
 > `Spider` and `SessionManager` interfaces. None of those are stable API surface, so the
-> upper bound is pinned below `0.5`; outside the range the guards still run, but the
+> upper bound is pinned below `0.6`; outside the range the guards still run, but the
 > anti-injection cleaning and the crawl path may not behave as documented.
+
+> **What 0.5 breaks, and how this plugin follows it:**
+> - **The browser backend is patchright only.** 0.5 removed the plain Playwright backend
+>   (`DynamicFetcher` / `DynamicSession`), so browser scraping is one code path. The old
+>   standalone `scrapling_stealth_fetch` is therefore **gone**: its anti-detection
+>   arguments now live on `scrapling_render`.
+> - **`capture_xhr` became session-level recording.** A capture now records into a
+>   session, so this plugin adds `scrapling_session_network` to read what an open session
+>   has accumulated; `scrapling_capture_xhr` itself opens a throwaway session for one page.
+> - **`extra_flags` is additive now, not replacing.** Upstream made `config.extra_flags`
+>   *stack on top of* the built-in anti-detection flags instead of replacing them, so the
+>   old "passing `extra_flags` silently wipes the whole stealth stack" invariant no longer
+>   holds. This plugin sends **no** `extra_flags` at all, and WebRTC leak protection is
+>   carried by the `block_webrtc` switch itself.
 
 ## Install
 
@@ -119,18 +134,31 @@ instead of dsh's plain-HTTP implementation. The model still calls `web_fetch` /
 > (`tool "X" is already registered`). Registering a same-named tool is therefore closed off;
 > the `ctx.web` provider seam is the supported replacement channel.
 
-Both must be done together, or the built-in tools break:
+**`provideWebFetch` and `provideWebSearch` are on by default**, so the plugin registers
+both providers whenever the sidecar is up. That still does **not** take over the built-in
+tools on its own: the deployment config has to name the provider.
 
-1. set `provideWebFetch` / `provideWebSearch` to `true` in the plugin config;
+1. `provideWebFetch` / `provideWebSearch` stay at their default (`true`);
 2. set `fetchProvider` / `searchProvider` to `"scrapling"` in the **deployment** config.
 
-> **Why both?** `ctx.web` auto-selects only when exactly one usable provider is registered.
-> A second one without naming it yields `WEB_PROVIDER_AMBIGUOUS` and the tool becomes
-> unavailable outright. Hence both switches default to `false`.
+> **Why step 2 is still required.** The base bundle sets `fetchProvider: http`, and an id
+> that is configured **wins** over auto-selection — so merely having the provider
+> registered does not displace anything. (And if two providers are usable with no id
+> named, `ctx.web` yields `WEB_PROVIDER_AMBIGUOUS` and the tool becomes unavailable
+> outright.)
+
+Two consequences of pointing that deployment line at this plugin:
+
+- **If the sidecar cannot start, the built-in `web_fetch` reports
+  `WEB_PROVIDER_CONFIGURED_UNAVAILABLE`** rather than quietly falling back to HTTP — the
+  configured provider is not available, and the tool says so.
+- **If you later remove the plugin but leave the line in** the deployment config, the
+  built-in tools report `WEB_PROVIDER_CONFIGURED_MISSING` — the named provider is no
+  longer registered. Go back and remove `fetchProvider` / `searchProvider` too.
 
 When `searchEndpoint` is empty the search provider's `available()` is `false` — a second
-guard: enabling `provideWebSearch` without configuring an endpoint cannot displace the
-built-in `web_search`.
+guard: `provideWebSearch` being on cannot displace the built-in `web_search` until an
+endpoint is configured.
 
 ### Search + render in one call
 
@@ -141,7 +169,7 @@ header), so `web_search` is split in two:
   expected to be SearXNG-compatible JSON: GET `<endpoint>?q=<query>&format=json` returning
   `{"results": [{"url", "title", "content"}]}`. Any backend producing that shape works.
 - **Reading** → this plugin's sidecar. The first `searchRenderTopN` results (3 by default)
-  are actually fetched and, when a browser is available, rendered through Playwright. The
+  are actually fetched and, when a browser is available, rendered through patchright. The
   body lands in `content`, the URLs in `sources`.
 
 One `web_search` call therefore yields both "which pages are relevant" and "what those
@@ -169,14 +197,23 @@ Notable switches:
 
 - `pythonBin` - interpreter name or absolute path; empty means `python3` on `PATH`.
 - `fetchEnabled` / `extractEnabled` / `renderEnabled` / `captureXhrEnabled` /
-  `sessionEnabled` / `answerEnabled` - on by default.
-- `stealthEnabled` / `crawlEnabled` - **off** by default (extra browser dependency /
-  long-running background job).
+  `networkEnabled` / `sessionEnabled` / `sessionStateEnabled` / `crawlEnabled` /
+  `answerEnabled` - on by default.
+  `scrapling_crawl` needs a profile that ships a jobs backend; without one it fails
+  loudly (`JOBS_UNAVAILABLE`) rather than silently doing nothing. `sessionStateEnabled`
+  controls the `scrapling_session_state_save` / `scrapling_session_state_load` pair, and
+  those need a deployment-side `sessionStateDir` to be usable.
+- `pierceShadow` - **off** by default: it merges the contents of open shadow roots into
+  the body. A page that hides its text in shadow DOM is invisible to a plain HTML read,
+  so this is the switch for those; the model can also override it per call on the
+  browser tools.
 - `extractionType` - `markdown` (default), `html` or `text`. All three paths run the
   same anti-injection cleaning; `html` additionally strips event-handler attributes
   (`on*`, `srcdoc`, `formaction`) and `meta refresh`, so the result is **not**
   byte-for-byte raw HTML.
-- `*MaxOutputChars` - per-tool output caps. `crawlMaxItems` is the deployment-side
+- `*MaxOutputChars` - per-tool output caps. The host-side cap only governs what reaches
+  the model context; the sidecar clips first by `maxContentChars` (characters) and the
+  host then trims to a byte budget. `crawlMaxItems` is the deployment-side
   ceiling over the model-supplied `maxPages`; an out-of-range `maxPages` (0, negative,
   NaN) is passed through unchanged so the sidecar reports the parameter error rather
   than this plugin silently clamping it into a legal-looking value.
@@ -199,10 +236,10 @@ Notable switches:
 - `answerProvider` / `answerModel` / `answerMaxTokens` - the model `scrapling_answer`
   routes to and the per-call token ceiling. Provider and model left empty mean "follow
   the model the current session is already using"; `answerMaxTokens` caps the reply.
-- `mainContentOnly` / `headless` / `networkIdle` / `captureXhrPattern` /
-  `waitSelectorState` / `dataDir` - extraction scope, browser mode, the XHR capture
-  filter, the selector state a page must reach before it is read, and the sidecar
-  working directory. Each is documented at its declaration in [`host.ts`](./host.ts).
+- `mainContentOnly` / `headless` / `networkIdle` / `waitSelectorState` / `dataDir` -
+  extraction scope, browser mode, the selector state a page must reach before it is read,
+  and the sidecar working directory. Each is documented at its declaration in
+  [`host.ts`](./host.ts).
 - `sidecarHandshakeTimeoutMs` / `fetchTimeoutMs` / `sidecarGraceMs` - the budget for the
   sidecar handshake, the per-call cooperative timeout (declared as the tools' `timeoutMs`), and
   how long the client waits for the process to exit after that timeout before forcing it down.
@@ -233,12 +270,18 @@ Notable switches:
 
 **Deployment-grade knobs** (not on the settings card; set them in the `config:` block of
 `cordis.patch.yml`): `requestTimeoutSeconds`, `maxUrlLength`, `browserExecutablePath`,
-`browserCdpUrl`, `searchEndpoint`, `searchRenderTopN`, `crawlMaxRuntimeSeconds`,
-`allowWriteMethods` (default `false`). The first two of the browser pair are strong
-capabilities - one hands Chromium a file
-to execute, the other hands the browser to a debugger endpoint - so they come only from
-deployment config and are unreachable from model input. `allowWriteMethods` is off by default
-for the same kind of reason: it decides whether the model may change state on a remote host.
+`browserCdpUrl`, `browserInitScript`, `browserRealChrome`, `browserDnsOverHttps`,
+`recordRequests`, `maxRecordedRequests`, `sessionStateDir`, `crawlMaxRuntimeSeconds`,
+`crawlRespectRobots`, `crawlDownloadDelayMs`, `crawlConcurrentRequests`,
+`crawlAutothrottle`, `crawlStrategy`, `crawlCheckpointDir`, `searchEndpoint`,
+`searchRenderTopN`, `allowWriteMethods` (default `false`). The browser pair
+(`browserExecutablePath`, `browserCdpUrl`) and `browserInitScript` are strong
+capabilities - they hand Chromium a file to execute and the browser to a debugger
+endpoint - so they come only from deployment config and are unreachable from model input.
+`allowWriteMethods` is off by default for the same kind of reason: it decides whether the
+model may change state on a remote host. The crawler knobs and `sessionStateDir` are
+deployment decisions too - see
+[Sessions, network history and crawler etiquette](#sessions-network-history-and-crawler-etiquette).
 
 > **Settings changes need a dsh restart.** The gate policy and the sidecar environment are
 > snapshotted once when the plugin is applied; edits on the settings card take effect on the
@@ -247,8 +290,39 @@ for the same kind of reason: it decides whether the model may change state on a 
 Disabling a tool also removes its system-prompt guidance, so the model is never told
 about a capability that is not registered. The guidance is re-read at each prompt
 assembly against the tools that scope can actually see, so a machine without a browser
-loses the render/stealth lines, and a sidecar that never came up loses all of them -
+loses the render / capture_xhr lines, and a sidecar that never came up loses all of them -
 advice to call a missing tool costs a round trip and a confusing `UNKNOWN_TOOL`.
+
+## Sessions, network history and crawler etiquette
+
+Scrapling 0.5 exposes a few capabilities that this plugin surfaces as tools, each with a
+deployment knob beside it. The tools are on the settings card; the knobs are
+deployment-only (the `config:` block of `cordis.patch.yml`).
+
+- **Network history.** An open session can record the XHR/fetch requests it makes.
+  `recordRequests` is the deployment default, and the model can turn recording on for one
+  session with `recordNetwork` on `scrapling_session_open`. Read it back with
+  `scrapling_session_network` (`urlPattern` / `includeBody` / `networkLimit` /
+  `maxBodyChars`); `maxRecordedRequests` caps how many entries a session keeps. A session
+  that is not recording reports an error rather than an empty list.
+- **Shadow DOM.** `pierceShadow` merges open shadow roots into the body (off by default);
+  the model can also override it per call on the browser tools.
+- **Login state.** `sessionStateDir` points at a directory for Playwright-compatible
+  login-state files. `scrapling_session_state_save` / `scrapling_session_state_load` write
+  and read them; the model can only pass a **plain file name** (no path), so the directory
+  stays a deployment decision. Empty means the pair is disabled.
+- **Crawler etiquette and order.** `crawlRespectRobots` (off by default) makes the spider
+  obey robots.txt; with it on, a domain whose robots.txt cannot be fetched is **blocked**
+  rather than assumed permitted. `crawlDownloadDelayMs` (`0`) sets the gap between
+  requests, `crawlConcurrentRequests` (`4`) the parallelism, `crawlAutothrottle` (off) lets
+  the spider slow itself down, and `crawlStrategy` (`bfs` / `dfs`) picks breadth- or
+  depth-first.
+- **Crawl checkpoints.** `crawlCheckpointDir` (empty) lets a crawl persist its queue, so a
+  restarted crawl resumes instead of going back to the start URL.
+- **Browser extras.** `browserInitScript` injects a JS file into every page (a strong
+  capability), `browserRealChrome` uses the locally-installed Google Chrome instead of the
+  bundled Chromium, and `browserDnsOverHttps` routes the browser's DNS over HTTPS (useful
+  with a proxy to avoid DNS leaks).
 
 ## Proxies
 
@@ -276,7 +350,7 @@ connects directly no matter where the proxy came from.
 What that looks like in practice - **with or without a proxy, the tools just work, with no
 setting to fill in**:
 
-| Your setup | Static fetching | Render / stealth / XHR |
+| Your setup | Static fetching | Render / XHR |
 | --- | --- | --- |
 | No proxy | direct | direct |
 | TUN mode (system-wide) | direct, forwarded by the TUN | same |
@@ -321,18 +395,16 @@ Details worth knowing:
   (`intranet`, `router`) stay rejected.
 - **WebRTC leaks are closed when proxied.** Chromium's WebRTC can send UDP around an
   HTTP/SOCKS proxy, so one STUN call in a page is enough to learn the visitor's real exit
-  address. patchright gets `block_webrtc`; Playwright has no equivalent switch, so it goes
-  in as a Chromium launch flag - the same *pair* of flags upstream uses for `block_webrtc`,
-  and it must stay on the Playwright side only: Scrapling gives `config.extra_flags`
-  priority over the 53 anti-detection flags it computes itself, so passing `extra_flags` to
-  the stealth engine silently replaces the whole stealth stack (that was a real bug, found
-  by reflecting the launch args back out of the upstream session).
-- **`captureXhrPattern` applies to browser and stealth sessions too.** Those keys only take
-  effect when the session is constructed - `validate_fetch` drops anything else on a
-  per-request call - so they are sent at `scrapling_session_open`, and
-  `scrapling_session_fetch` returns the captured endpoints alongside the page. The capture
-  itself is per page, not a session-wide history: upstream builds a fresh container for
-  every fetch, so five pages never replay page one's endpoints five times.
+  address. In 0.5 that protection is carried by the `block_webrtc` switch itself: this
+  plugin turns it on whenever a proxy is in play, and sends **no** `extra_flags` along the
+  way. (Before 0.5 it needed a pair of Chromium launch flags, because `config.extra_flags`
+  then **replaced** the anti-detection flags upstream computed; upstream made it additive,
+  so that workaround is gone with the old browser backend.)
+- **Network history is session-level.** Recording is a construction-time setting
+  (`recordRequests` deployment default, or `recordNetwork` per `scrapling_session_open`),
+  and `scrapling_session_network` reads whatever the session accumulated across fetches.
+  `scrapling_capture_xhr`, by contrast, opens a throwaway session for one page and returns
+  the requests that page made.
 - **`headers` and `retries` on `scrapling_session_fetch` are static-session only, and a
   browser session says so.** Upstream reads neither for Playwright/patchright sessions
   (request headers there are `extraHeaders`, retries is a construction-time setting) and
@@ -437,9 +509,9 @@ JSON endpoint.
   written to the pipe. The `web_search` provider runs the same gate over the URLs it is
   about to hand back: a hit the gate rejects never becomes a citeable source, so the model
   is never offered an address the next fetch would refuse.
-- **Browser engines ignore proxy environment variables.** Playwright does not read
-  `HTTP_PROXY` / `HTTPS_PROXY`, so `scrapling_render` / `scrapling_capture_xhr` /
-  `scrapling_stealth_fetch` connect **directly** even when the rest of the system is
+- **Browser engines ignore proxy environment variables.** patchright does not read
+  `HTTP_PROXY` / `HTTPS_PROXY`, so `scrapling_render` and `scrapling_capture_xhr`
+  connect **directly** even when the rest of the system is
   routed through a proxy — a browser-bound request leaves the tunnel. curl_cffi (behind
   `scrapling_fetch` and the crawler) *does* honour those variables, so the two halves
   behave differently on a proxy-bound network. This is stated rather than papered over:
@@ -448,7 +520,8 @@ JSON endpoint.
   worse than saying so. `allowSyntheticDns` above only fixes the *gate*; it does not
   change where traffic goes.
 - **There are quotas; the resident resources are not unbounded.** At most 8 concurrent
-  sessions (of which at most 3 may be `browser`/`stealth`, each a real Chromium process), at
+  sessions (of which at most 3 may be browser sessions — the `stealth` session type, each a
+  real Chromium process), at
   most 2 crawls in flight, per-page bodies clipped at `maxContentChars`, 8 MB per protocol
   frame, and 16 frames of pending queue. Hitting a ceiling yields a specific error code
   (`SESSION_LIMIT` / `CRAWL_BUSY` / `BAD_FRAME`) the model can back off from, rather than

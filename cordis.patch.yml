@@ -1,7 +1,7 @@
 # dsh-scrapling：Scrapling 网页抓取插件（bundle）。
-# 11 个工具（scrapling_fetch / scrapling_extract / scrapling_render /
-# scrapling_capture_xhr / scrapling_stealth_fetch / scrapling_session_* /
-# scrapling_crawl / scrapling_answer），后端是常驻 Python 进程，经 ctx.subprocess 的 stdin/stdout
+# 13 个工具（scrapling_fetch / scrapling_extract / scrapling_render /
+# scrapling_capture_xhr / scrapling_session_* / scrapling_crawl / scrapling_answer），
+# 后端是常驻 Python 进程，经 ctx.subprocess 的 stdin/stdout
 # 跑 JSON-lines 协议（stdout 走协议、stderr 走日志）。
 # 每个工具一个 Config .volatile() 开关；关闭时连 systemPrompt 指引段也不注册。
 # 浏览器未就绪时不注册依赖浏览器的工具，并在设置卡给出安装指引。

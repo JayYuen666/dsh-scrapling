@@ -6,7 +6,7 @@
 // `scrapling/engines/_browsers/_validators.py` 的 `validate_fetch`）。于是「设置卡拧了旋钮、
 // 行为没变、日志一个字都没有」。单元测试再怎么加密也撞不到这条缝，因为判据不在我们手里。
 //
-// 这里的判据全从上游取：`py/tests/contract_probe.py` 把三套引擎换成记录器、驱动 adapters 的
+// 这里的判据全从上游取：`py/tests/contract_probe.py` 把引擎换成记录器、驱动 adapters 的
 // 真实代码路径，抓下每个调用点实际发出的 kwargs，再拿上游的 TypedDict 与 `_fetch_params` 字段
 // 逐一对照。本文件只负责跑探针、把结论变成断言。
 //
@@ -44,34 +44,52 @@ function indexKeys(calls: ProbeCall[]): KeyIndex {
 // 必须是同一份上游状态 —— 分两次跑，中途装/换了什么就会让两组断言互相矛盾。
 const report: ProbeReport = await runProbe();
 
-/** 会话开场与会话抓取两侧都要点到的站点名。 */
-const SESSION_OPEN_SITES = ["session.open.browser", "session.open.stealth"];
+/** 会话开场两侧都要点到的站点名。 */
+const SESSION_OPEN_SITES = ["session.open.static", "session.open.stealth"];
 
 describe("上游 Scrapling 契约：适配器发出的关键字必须被上游读到", () => {
   it("探针确实驱动了全部引擎调用点（驱动退化就是真空通过）", () => {
     const sites = report.calls.map((call) => call.site).toSorted();
+    // 0.5 只剩 patchright 一套浏览器，所以「一次性浏览器抓取」与「浏览器的两类会话」各有自己的
+    // 站点名（browser.render / session.*.stealth）；原先那一组 browser.stealth 与 browser 会话
+    // 的点位已随旧后端一起消失。
     for (const wanted of [
       "static.get",
       "static.post",
       "browser.render",
-      "browser.stealth",
+      "capture.open",
+      "capture.fetch",
       "session.open.static",
-      ...SESSION_OPEN_SITES,
+      "session.open.stealth",
       "session.fetch.static",
-      "session.fetch.browser",
       "session.fetch.stealth",
     ]) {
       expect(sites, `调用点 ${wanted} 没被驱动`).toContain(wanted);
     }
-    // 一次性抓取那两个站点必须把会话级参数面点亮（_browser_params 读到的键全在）；
-    // 会话 fetch 那两个反过来**只能**有 fetch 层认得的键 —— 数量掉到 9 才是修好了，
-    // 涨回 17 说明有人又把会话级设置往 fetch 层塞。
-    for (const site of ["browser.render", "browser.stealth"]) {
-      expect(report.checked[site], `${site} 抓到的键太少`).toBeGreaterThanOrEqual(15);
+    // 键数按「不低于某个下限」钉，而不是写死等号：驱动退化（漏了一个调用点、少填了一批参数）
+    // 会掉破下限，而某天上游多认一个键不该让这里变红。
+    const FLOORS: Record<string, number> = {
+      "browser.render": 20,
+      "capture.open": 10,
+      "capture.fetch": 10,
+      "session.open.stealth": 10,
+      "session.open.static": 2,
+      "session.fetch.stealth": 10,
+      "session.fetch.static": 4,
+      "static.get": 4,
+      "static.post": 4,
+    };
+    for (const [site, floor] of Object.entries(FLOORS)) {
+      expect(report.checked[site], `${site} 抓到的键太少`).toBeGreaterThanOrEqual(floor);
     }
-    for (const site of ["session.fetch.browser", "session.fetch.stealth"]) {
-      expect(report.checked[site], `${site} 抓到的键太少`).toBeGreaterThanOrEqual(8);
-      expect(report.checked[site], `${site} 又混进了会话级键`).toBeLessThanOrEqual(12);
+    // 会话 fetch 那两处反过来只能落在 fetch 层的字段面里：涨过上限就是有人又把构造期才生效的
+    // 设置往 fetch 层塞（`silentAtSessionFetch` 抓的是同一类漂移，这里先给一道量级闸）。
+    const CEILINGS: Record<string, number> = {
+      "session.fetch.static": 6,
+      "session.fetch.stealth": 14,
+    };
+    for (const [site, ceiling] of Object.entries(CEILINGS)) {
+      expect(report.checked[site], `${site} 又混进了会话级键`).toBeLessThanOrEqual(ceiling);
     }
   });
 
@@ -92,44 +110,50 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
   });
 
   it("会话开场把只有开场才生效的那些设置带上（fetch 层传了也没用）", () => {
-    // capture_xhr / block_ads / executable_path / cdp_url / locale / timezone_id /
-    // useragent / headless 只在 DynamicSession(...) / StealthySession(...) 的构造期被读。
-    // 探针的入参把这些全点亮了，所以开场记录里必须都出现——缺一个就是「用户拧了旋钮没反应」。
+    // 构造期读、之后每次 fetch 再传会被 `validate_fetch` 丢掉的键，必须出现在开场那一帧上，
+    // 否则「设置卡拧了旋钮、行为没变、日志一个字都没有」。static 与 stealth 两类会话读的不是
+    // 同一组：static 只剩 impersonate / timeout，身份、区域与反检测那一整组只落在浏览器
+    // （stealth）那一侧。
     const open = indexKeys(report.calls.filter((call) => call.site.startsWith("session.open.")));
-    const wanted = [
-      "headless",
-      "timeout",
-      "capture_xhr",
-      "block_ads",
-      "executable_path",
-      "cdp_url",
-      "locale",
-      "timezone_id",
-      "useragent",
-    ];
     for (const site of SESSION_OPEN_SITES) {
-      const keys = open.get(site);
-      expect(keys, `${site} 没被记录`).toBeDefined();
-      for (const key of wanted) {
-        expect(keys!.has(key), `${site} 缺 ${key}`).toBe(true);
-      }
+      expect(open.get(site), `${site} 没被记录`).toBeDefined();
     }
-    // stealth 的 WebRTC/WebGL/canvas 是启动 flag，只在开场生效：漏了就是「代理已开但
-    // WebRTC 仍泄露真实出口 IP」那一类静默失败。
-    for (const key of ["solve_cloudflare", "hide_canvas", "block_webrtc", "allow_webgl"]) {
-      expect(open.get("session.open.stealth")!.has(key), `session.open.stealth 缺 ${key}`).toBe(
-        true,
-      );
+    const WANTED: Record<string, string[]> = {
+      "session.open.static": ["impersonate", "timeout"],
+      "session.open.stealth": [
+        "headless",
+        "timeout",
+        "block_ads",
+        "executable_path",
+        "cdp_url",
+        "locale",
+        "timezone_id",
+        "useragent",
+        // 下面三条是**只有构造期才认**的反检测启动 flag：漏了就是「代理已开但 WebRTC
+        // 仍泄露真实出口 IP」那一类静默失败。
+        //
+        // `solve_cloudflare` **不在**这一组：它是 fetch 层认得的键，逐次 fetch 传也生效，
+        // 所以上游把它挡在会话构造参数之外（见 py/adapters.py 的 SESSION_ONLY_KEYS）。
+        "hide_canvas",
+        "block_webrtc",
+        "allow_webgl",
+      ],
+    };
+    for (const [site, wanted] of Object.entries(WANTED)) {
+      const keys = open.get(site);
+      for (const key of wanted) {
+        expect(keys?.has(key), `${site} 缺 ${key}`).toBe(true);
+      }
     }
   });
 
-  it("配了代理时 stealth 的整套反检测启动参数必须还在", () => {
-    // 探针全程假定部署配了代理，因为那条路径才是坑：_browser_params 与 _make_session 在
-    // 有代理时塞一条 extra_flags，而上游 `_base.py` 算 flag 时 `config.extra_flags`
-    // **优先于**内部递进来的 53 条 STEALTH_ARGS —— 传了就是整段替换。后果是「stealth 抓取
-    // 在有代理的机器上静默退化成普通 Chromium」，连 block_webrtc 自己那两条 flag 也没了。
-    // 这条断言不看我们传了什么，它拿传出去的参数真造一次会话、读上游最终下发的 flag。
-    expect(report.stealthArgsDowngraded).toStrictEqual([]);
+  it("stealth 路径的三条不变量都成立（不发 extra_flags、走代理时 block_webrtc 为真、参数仍在）", () => {
+    // 0.5 把 `config.extra_flags` 从「顶掉上游那套反检测 flag」改成「叠加到它们之上」，于是旧
+    // 前提（传了 extra_flags 整套 stealth 就没了）作废。取而代之的是三条：本仓任何路径都**不发**
+    // extra_flags；走代理时 `block_webrtc` 为真（WebRTC 防泄露改由这条开关承担）；那套 flag 仍
+    // 出现在最终启动参数里。探针把这三条合成 stealthInvariants —— 它对着实际发出的 kwargs 判，
+    // 而不是对着某个开关的默认值判。
+    expect(report.stealthInvariants).toStrictEqual([]);
   });
 
   it("反检测启动参数的条数至少是默认那一组加整套", () => {
@@ -181,7 +205,9 @@ describe("上游事实钉桩：本仓代码直接依赖的形状", () => {
   });
 
   it("回包构造器仍收本仓 _fake_response 传的那几个键", () => {
+    // 0.5 给签名加了一个 `_log` 形参（排在第一个），所以期望的第一项是它，其余保持原样。
     expect(facts.responseInitParams).toStrictEqual([
+      "_log",
       "content",
       "cookies",
       "encoding",
@@ -202,13 +228,15 @@ describe("上游事实钉桩：本仓代码直接依赖的形状", () => {
     expect(facts.storageInitParams).toStrictEqual(["storage_file", "url"]);
   });
 
-  it("上游 Spider 基类默认仍是不遵守 robots.txt、不限速", () => {
+  it("上游 Spider 基类默认仍是不遵守 robots.txt、不限速、且只抓正文", () => {
     // README 明写「does not obey robots.txt, per-domain delay is 0, up to 4 concurrent」。
     // 那条声明靠上游默认值成立——默认值一变，README 就变成错的文档。
     expect(facts.spiderDefaults.robots_txt_obey).toBe(false);
     expect(facts.spiderDefaults.autothrottle_enabled).toBe(false);
     expect(facts.spiderDefaults.download_delay).toBe(0);
     expect(facts.spiderDefaults.concurrent_requests).toBe(4);
+    // 0.5 起多了一项：默认就只要正文（`main_content_only`），爬虫的每页结果因此也走正文口径。
+    expect(facts.spiderDefaults.main_content_only).toBe(true);
     expect(facts.spiderDefaults.max_pages).toBe(0);
     expect(facts.spiderDefaults.output_dir).toBeNull();
   });

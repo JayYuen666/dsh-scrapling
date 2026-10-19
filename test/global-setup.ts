@@ -18,7 +18,7 @@ const LOCAL_PYTHON = path.join(import.meta.dirname, "..", "_env", ".venv", "bin"
 if (!existsSync(LOCAL_PYTHON)) {
   throw new Error(
     `缺少探针解释器：${LOCAL_PYTHON} 不存在。\n` +
-      '先按 README「环境要求」建好：pip install "scrapling[rag]>=0.4.15,<0.5"\n' +
+      '先按 README「环境要求」建好：pip install "scrapling[rag]>=0.5,<0.6"\n' +
       "CI 上由 .github/workflows/publish.yml 的「备 sidecar 解释器」那一步代劳。\n" +
       "这里刻意不把用例跳过——跳过会拉低覆盖率，而覆盖率门禁的报错不会指向真正的原因。",
   );

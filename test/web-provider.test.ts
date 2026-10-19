@@ -45,8 +45,7 @@ describe("available", () => {
         static: true,
         extract: true,
         browser: false,
-        stealth: false,
-        version: "0.4.15",
+        version: "0.5",
       },
       configurable: true,
     });

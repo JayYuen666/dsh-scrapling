@@ -35,13 +35,27 @@ export interface SilentRecord {
   honorableAtOpen: string[];
 }
 
-/** stealth 反检测启动参数被整段冲掉的记录。 */
-export interface StealthDowngrade {
+/**
+ * stealth 路径上的一条不变量违规。
+ *
+ * 字段随违规种类而变（不该出现的键、该为真却缺失的开关、被顶掉的启动参数条数），所以这里
+ * 把站点单列、其余按可选出面 —— 具体形状由探针的 `_stealth_check` 决定，见其实现。
+ */
+export interface StealthInvariantViolation {
+  /** 出问题的调用点。 */
   site: string;
-  missingStealthArgs: number;
-  of: number;
-  sample: string[];
-  totalArgs: number;
+  /** 不该出现却出现了的键（例如 `extra_flags`）。 */
+  unexpected?: string;
+  /** 该为真却缺失的东西（例如走代理时的 `block_webrtc`）。 */
+  missing?: string;
+  /** 被整段顶掉的反检测启动参数条数。 */
+  missingStealthArgs?: number;
+  /** 上游 STEALTH_ARGS 的总数。 */
+  of?: number;
+  /** 前几条缺失的参数名，便于排查。 */
+  sample?: string[];
+  /** 本次实测的启动参数总数。 */
+  totalArgs?: number;
 }
 
 /**
@@ -103,8 +117,8 @@ export interface ProbeReport {
   violations: ViolationRecord[];
   /** 会话 fetch 层被静默丢弃的键。 */
   silentAtSessionFetch: SilentRecord[];
-  /** stealth 启动参数被冲掉的调用点。 */
-  stealthArgsDowngraded: StealthDowngrade[];
+  /** stealth 路径上的不变量违规（不发 extra_flags / 走代理时 block_webrtc 为真 / 反检测参数仍在）。 */
+  stealthInvariants: StealthInvariantViolation[];
   /** 本仓声明的 fetch 层键集与上游实际字段的差。 */
   fetchLevelKeysDrift: string[];
   /** 上游 `Python` 侧每个协议方法真正读到的键。 */

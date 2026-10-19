@@ -31,17 +31,16 @@ HTML 转 Markdown 用 turndown。作为默认档这没问题，但代价是：
 
 ## 当前状态
 
-十一个工具（会话类算四个）全部实现、注册，并有测试覆盖。工具是**条件注册**的：插件启动时先探测运行环境
+十三个工具（会话类算七个）全部实现、注册，并有测试覆盖。工具是**条件注册**的：插件启动时先探测运行环境
 真正具备什么，只注册能用的 —— 模型不会浪费一轮去调用一个注定失败的工具。
 
 | 工具 | 后端 | 需要浏览器 | 并发 |
 |---|---|---|---|
 | `scrapling_fetch` | `Fetcher`（curl_cffi） | 否 | 可并发；开了 `allowWriteMethods` 之后写动词转串行（并行写就是重复提交） |
 | `scrapling_extract` | `Selector` + CSS/XPath + `adaptive` | 否 | 可并发 |
-| `scrapling_render` | `DynamicFetcher`（Playwright） | 是 | 串行 |
-| `scrapling_capture_xhr` | `capture_xhr` | 是 | 串行 |
-| `scrapling_stealth_fetch` | `StealthyFetcher`（patchright） | 是 | 串行 |
-| `scrapling_session_open` / `scrapling_session_fetch` / `scrapling_session_list` / `scrapling_session_close` | Scrapling 会话类 | 看情况 | 串行 |
+| `scrapling_render` | `StealthySession`（patchright） | 是 | 串行；反检测开关（`solveCloudflare` / `hideCanvas` / `blockWebrtc`）也在这一条上 |
+| `scrapling_capture_xhr` | `capture_xhr`（会话级记录） | 是 | 串行 |
+| `scrapling_session_open` / `scrapling_session_fetch` / `scrapling_session_network` / `scrapling_session_state_save` / `scrapling_session_state_load` / `scrapling_session_list` / `scrapling_session_close` | Scrapling 会话类 | 看情况 | 串行 |
 | `scrapling_crawl` | Scrapling Spider 框架 | 否 | 串行，后台作业 |
 | `scrapling_answer` | 上面任一抓取 + `ctx.llm` | 否（`render:true` 时是） | 串行 |
 
@@ -60,30 +59,43 @@ cookie，浏览器引擎要保留页面池，`adaptive` 要保留 SQLite 指纹�
 
 `scrapling_crawl` **立刻返回作业 id** 而不是阻塞：一次爬取是分钟级的，而工具调用有超时。
 用 `job_list` 看进度、`job_output` 读结果、`job_kill` 中断。爬虫另有总时长上限
-（`crawlMaxRuntimeSeconds`），且不会爬出起始域。礼貌性由部署方定夺，这里如实声明：
-沿用了 Scrapling spider 的默认值 —— **不遵守** robots.txt、每域延迟为 0、最多 4 个请求
-并发。爬取被锁在起始域内，不会向无关站点扩散；需要更温和行为的站点，请在部署侧套一层
-限速。
+（`crawlMaxRuntimeSeconds`），且不会爬出起始域。礼貌性由部署方定夺，这里如实声明：它由部署级
+旋钮配置（`crawlRespectRobots`、`crawlDownloadDelayMs`、`crawlConcurrentRequests`、
+`crawlAutothrottle`、`crawlStrategy`、`crawlCheckpointDir`），而**它们的默认值沿用 Scrapling
+spider 的默认值** —— **不遵守** robots.txt、每域延迟为 0、最多 4 个请求并发。爬取被锁在
+起始域内，不会向无关站点扩散；需要更温和行为的站点是部署方的决定，而不是某次调用的参数。
 
 ## 环境要求
 
-- **Python 3.10+**，装好 Scrapling，能从 `PATH` 找到（或设置 `pythonBin`）。
+- **Python 3.14+**，装好 Scrapling，能从 `PATH` 找到（或设置 `pythonBin`）。
 - **浏览器完全由用户负责。** 插件不下载任何东西。没有浏览器时它只是不注册那些依赖
   浏览器的工具，模型不会浪费一轮去调用它们。
 
 ```sh
-pip install "scrapling[rag]>=0.4.15,<0.5"
-python -m playwright install chromium
+pip install "scrapling[rag]>=0.5,<0.6"
+python -m patchright install chromium
 ```
 
 > **为什么是 `rag` 而不是 `fetchers`？** `rag` 就是 `fetchers` 再加上 `markdownify`，而
 > `extractionType` 默认就是 `markdown` —— 装成 `fetchers` 的话，第一次抓取就会在 Markdown
 > 转换处抛 `ModuleNotFoundError`。Python 侧会明确告诉你是哪个包没装。
 
-> **版本范围**：本插件在 Scrapling **0.4.15** 上开发与验证，并依赖它的
+> **版本范围**：本插件在 Scrapling **0.5** 上开发与验证，并依赖它的
 > `Convertor._strip_noise_tags` / `_sanitize_for_ai`、`Selector`、`Spider` 与
-> `SessionManager` 这些接口。这些都还不是稳定 API 面，所以上界钉在 `0.5` 之前；装到
+> `SessionManager` 这些接口。这些都还不是稳定 API 面，所以上界钉在 `0.6` 之前；装到
 > 范围外时守卫会照常运行，但反注入清洗与爬虫链路可能不按预期。
+
+> **0.5 破坏了什么，本插件怎么跟着走：**
+> - **浏览器后端只剩 patchright。** 0.5 删掉了纯 Playwright 后端（`DynamicFetcher` /
+>   `DynamicSession`），浏览器抓取因此只剩一条代码路径。原来独立的 `scrapling_stealth_fetch`
+>   随之**删除**：它的反检测参数现在都在 `scrapling_render` 上。
+> - **`capture_xhr` 改成会话级记录。** 捕获现在记进会话，于是本插件新增
+>   `scrapling_session_network` 来读一个已开会话攒下的历史；`scrapling_capture_xhr` 自己为
+>   单页起一个临时会话。
+> - **`extra_flags` 现在是叠加而非替换。** 上游把 `config.extra_flags` 从「顶掉内建反检测
+>   flag」改成「叠加到它们之上」，所以过去那条「传了 `extra_flags` 整套 stealth 就没了」的
+>   不变量不再成立。本插件**任何路径都不发** `extra_flags`，WebRTC 防泄露由 `block_webrtc`
+>   开关本身承担。
 
 ## 安装
 
@@ -103,17 +115,25 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 > 重名会**抛错**（`tool "X" is already registered`）。所以同名注册工具这条路是封死的，
 > `ctx.web` 的 provider 接缝是官方留的替换通道。
 
-两件事必须**同时**做，否则反而会把内置工具弄坏：
+**`provideWebFetch` 与 `provideWebSearch` 默认就是开的**，所以只要 sidecar 起来了，两个
+provider 都会被注册。但这**还不足以**真正接管内置工具：部署配置仍要点名。
 
-1. 在插件配置里把 `provideWebFetch` / `provideWebSearch` 设为 `true`。
+1. `provideWebFetch` / `provideWebSearch` 保持默认（`true`）；
 2. 在**部署配置**里把 `fetchProvider` / `searchProvider` 设为 `"scrapling"`。
 
-> **为什么必须两件都做？** `ctx.web` 只在「恰好一个」可用 provider 时自动选。注册了第二个
-> 却没点名，会得到 `WEB_PROVIDER_AMBIGUOUS`，对应工具直接不可用。这也是两个开关默认
-> **false** 的原因。
+> **为什么第 2 步仍然必须做。** base bundle 里写的是 `fetchProvider: http`，而**配了 id 就
+> 以它为准**——所以仅仅「注册了 provider」并不会顶掉任何东西。（而且两个 provider 都可用、
+> 又没点名时，`ctx.web` 会给出 `WEB_PROVIDER_AMBIGUOUS`，对应工具直接不可用。）
+
+把那一行指向本插件之后，有两个反向风险要知道：
+
+- **sidecar 起不来时，内置 `web_fetch` 会报 `WEB_PROVIDER_CONFIGURED_UNAVAILABLE`**，而不是
+  悄悄退回纯 HTTP——被配置的 provider 不可用，工具会如实报出来。
+- **日后卸掉插件却留着那一行**，内置工具会报 `WEB_PROVIDER_CONFIGURED_MISSING`——点名的
+  provider 不再注册了。要回去把 `fetchProvider` / `searchProvider` 一并撤掉。
 
 `searchEndpoint` 留空时 search provider 的 `available()` 为 false —— 这也是一道闸：光开
-`provideWebSearch` 而忘了配端点，不会把内置 `web_search` 顶掉。
+`provideWebSearch` 而没配端点，不会把内置 `web_search` 顶掉。
 
 ### 搜索 + 渲染一体化
 
@@ -149,9 +169,14 @@ Scrapling 的 Markdown 输出报成 `text`，内置渲染路径显示完全正�
   「所有工具不可用」：每个工具都要 sidecar，静默降级只会让模型在几轮之后才发现工具全都不见了。
   设成 `false` 才走降级，附一条警告。
 - `fetchEnabled` / `extractEnabled` / `renderEnabled` / `captureXhrEnabled` /
-  `sessionEnabled` / `answerEnabled` —— 默认开。
-- `stealthEnabled` / `crawlEnabled` —— **默认关**（前者多一层浏览器依赖，
-  后者是重量级后台任务）。
+  `networkEnabled` / `sessionEnabled` / `sessionStateEnabled` / `crawlEnabled` /
+  `answerEnabled` —— 默认开。`scrapling_crawl`
+  要求 profile 带作业后端；没有时它会当场报 `JOBS_UNAVAILABLE`，而不是静默地什么都不做。
+  `sessionStateEnabled` 管的是 `scrapling_session_state_save` /
+  `scrapling_session_state_load` 这一对，而它们要能可用还得部署侧配好 `sessionStateDir`。
+- `pierceShadow` —— **默认关**：它把 open shadow root 的内容并进正文。页面把正文封进
+  shadow DOM 时，一段普通 HTML 读不到它，这一枚就是为那种页面准备的；模型也能在浏览器类
+  工具上按次覆盖。
 - `extractionType` —— `markdown`（默认）/ `html` / `text`。三条路径都过同一套反注入
   清洗；`html` 额外剥掉事件处理器属性（`on*`、`srcdoc`、`formaction`）与 `meta refresh`，
   因此**拿到的不是字节级原始 HTML**。
@@ -164,8 +189,8 @@ Scrapling 的 Markdown 输出报成 `text`，内置渲染路径显示完全正�
   `socks5://127.0.0.1:7890`，可带 `user:pass@`。**留空表示跟随环境。** 它是部署级能力，
   绝不进入任何工具 schema。判定顺序见下面的「代理」。
 - `proxyBypass` —— 直连、不走代理的主机名，对应 `NO_PROXY`。
-- `*MaxOutputChars` —— 各工具的输出封顶。宿主侧的封顶只影响进模型上下文的那一段，
-  真正的字节上限在 Python 侧（`maxContentChars`）。`crawlMaxItems` 是部署侧给模型可传的
+- `*MaxOutputChars` —— 各工具的输出封顶。宿主侧的封顶只影响进模型上下文的那一段；
+  sidecar 侧先按 `maxContentChars`（字符）截一次，宿主再按字节预算收口。`crawlMaxItems` 是部署侧给模型可传的
   `maxPages` 封的顶；越界的 `maxPages`（0、负数、NaN）**原样透传**，让 sidecar 报参数错误，
   而不是由本插件悄悄夹成一个看起来合法的值。`crawlMaxRuntimeSeconds` 是爬虫的**墙上时钟**
   上限：页数上限管不了一页等一分钟的站点，而爬虫是没人看的后台线程。到点由蜘蛛走引擎自己
@@ -184,24 +209,56 @@ Scrapling 的 Markdown 输出报成 `text`，内置渲染路径显示完全正�
   单次调用的协同超时（声明在各工具的 `timeoutMs` 上），以及超时之后客户端再等进程退出多久才
   强制拆掉。三项都在设置卡上。`scrapling_crawl` 是例外：它作为作业运行且不传超时——一次爬取
   是分钟级的，套一个固定预算会让每次成功都在最后一刻被判超时，然后整个进程被拆掉重来。
-- `mainContentOnly` / `headless` / `networkIdle` / `blockAds` / `captureXhrPattern` /
-  `waitSelectorState` / `dataDir` —— 抽取范围、浏览器模式、XHR 捕获过滤、页面被读取前必须
-  达到的选择器状态，以及 sidecar 的工作目录。逐项说明见 [`host.ts`](./host.ts) 里的注释。
+- `blockAds` —— 默认开。它**叠在** SSRF 守卫之上而不是与它竞争：守卫最后注册（于是浏览器引擎
+  先跑它）并用 `route.fallback()` 放行，让 Scrapling 自己的拦截处理器仍然可达。
+- `mainContentOnly` / `headless` / `networkIdle` / `waitSelectorState` / `dataDir` ——
+  抽取范围、浏览器模式、页面被读取前必须达到的选择器状态，以及 sidecar 的工作目录。
+  逐项说明见 [`host.ts`](./host.ts) 里的注释。
 
 **部署级旋钮**（不在设置卡上，只走 [`cordis.patch.yml`](./cordis.patch.yml) 的 `config:`
 块）：`requestTimeoutSeconds`、`maxUrlLength`、`browserExecutablePath`、`browserCdpUrl`、
-`searchEndpoint`、`searchRenderTopN`、`crawlMaxRuntimeSeconds`、`allowWriteMethods`（默认 `false`）。
-其中 `browserExecutablePath` 与 `browserCdpUrl` 是强能力 —— 前者等于让 Chromium 执行指定文件，
-后者等于把浏览器交给指定调试端点 —— 所以它们只从部署配置来，模型入参到不了。
-`allowWriteMethods` 同理：它决定模型能不能改对端的状态，因此默认关，也只从部署配置来。
+`browserInitScript`、`browserRealChrome`、`browserDnsOverHttps`、`recordRequests`、
+`maxRecordedRequests`、`sessionStateDir`、`crawlMaxRuntimeSeconds`、`crawlRespectRobots`、
+`crawlDownloadDelayMs`、`crawlConcurrentRequests`、`crawlAutothrottle`、`crawlStrategy`、
+`crawlCheckpointDir`、`searchEndpoint`、`searchRenderTopN`、`allowWriteMethods`（默认 `false`）。
+其中 `browserExecutablePath`、`browserCdpUrl` 与 `browserInitScript` 是强能力 —— 它们等于让
+Chromium 执行指定文件、把浏览器交给指定调试端点、或往每个页面注入一段 JS —— 所以只从部署配置来，
+模型入参到不了。`allowWriteMethods` 同理：它决定模型能不能改对端的状态，因此默认关，也只从部署
+配置来。爬虫那几枚与 `sessionStateDir` 同样是部署方的决定，见下面
+[会话、网络历史与爬虫礼仪](#会话网络历史与爬虫礼仪)。
 
 > **改完设置要重启 dsh。** 闸门策略与 sidecar 的环境变量都在插件 `apply()` 时取一次快照，
 > 设置卡上的改动要等下次启动才生效。
 
 关掉某个工具时，它的 system prompt 指引段**也一并消失**，
 不会出现「工具没了但提示词还在」的割裂。指引每次装配都按「那个 scope 真看得见哪些工具」
-现取，所以没装浏览器的机器会少掉 render/stealth 那几句，sidecar 没起来的机器则一句都不说 ——
+现取，所以没装浏览器的机器会少掉 render / capture_xhr 那几句，sidecar 没起来的机器则一句都不说 ——
 叫模型去调一个不存在的工具，代价是一轮往返加一个看不懂的 `UNKNOWN_TOOL`。
+
+## 会话、网络历史与爬虫礼仪
+
+Scrapling 0.5 放出几项能力，本插件把它们做成工具，每项旁边配一枚部署旋钮。工具在设置卡上，
+旋钮只走部署配置（[`cordis.patch.yml`](./cordis.patch.yml) 的 `config:` 块）。
+
+- **网络历史。** 一个已开会话可以记录它发出的 XHR/fetch 请求。`recordRequests` 是部署级默认值，
+  模型可以在 `scrapling_session_open` 上用 `recordNetwork` 为这一个会话打开记录。用
+  `scrapling_session_network` 读回来（`urlPattern` / `includeBody` / `networkLimit` /
+  `maxBodyChars`）；`maxRecordedRequests` 决定一个会话最多留多少条。没开记录的会话会**报错**，
+  而不是回一个空列表。
+- **Shadow DOM。** `pierceShadow` 把 open shadow root 并进正文（默认关）；模型也能在浏览器类
+  工具上按次覆盖。
+- **登录态。** `sessionStateDir` 指向一个存放 Playwright 兼容登录态文件的目录。
+  `scrapling_session_state_save` / `scrapling_session_state_load` 一存一取；模型只能给一个
+  **纯文件名**（不能带路径），所以目录始终是部署方的决定。留空表示这对工具被禁用。
+- **爬虫礼仪与顺序。** `crawlRespectRobots`（默认关）让蜘蛛遵守 robots.txt；打开后，取不到
+  robots.txt 的域会被**阻塞**，而不是当作允许。`crawlDownloadDelayMs`（`0`）是请求之间的间隔，
+  `crawlConcurrentRequests`（`4`）是并发数，`crawlAutothrottle`（关）让蜘蛛自行放慢，
+  `crawlStrategy`（`bfs` / `dfs`）选广度或深度优先。
+- **断点续爬。** `crawlCheckpointDir`（空）让爬取把队列落盘，重启后从断点接着走，而不是回到
+  起始 URL 重跑。
+- **浏览器附加项。** `browserInitScript` 往每个页面注入一段 JS（强能力），`browserRealChrome`
+  改用本机安装的 Google Chrome 而不是自带 Chromium，`browserDnsOverHttps` 让浏览器的 DNS 走
+  DoH（配代理时防 DNS 泄露）。
 
 ## 代理
 
@@ -223,7 +280,7 @@ curl_cffi 对系统设置一无所知，不补这一档就会发现「浏览器�
 
 各环境下的实际表现 —— **开或不开代理，工具都直接可用，一行设置都不用填**：
 
-| 你的环境 | 静态抓取 | 渲染 / 反检测 / XHR |
+| 你的环境 | 静态抓取 | 渲染 / XHR |
 | --- | --- | --- |
 | 不开代理 | 直连 | 直连 |
 | TUN 模式（系统层接管） | 直连，由 TUN 转发 | 同左 |
@@ -258,15 +315,14 @@ PAC 是唯一还需要手工填一次的形态：求值 PAC 要下载脚本并�
   需要代理才能访问。IP 字面量、本地能解析出来的私网答案、单标签主机名（`intranet`、`router`
   这类）三条**照旧拒**。
 - **走代理时会关掉 WebRTC 泄露。** Chromium 的 WebRTC 能绕过 HTTP/SOCKS 代理直接发 UDP，页面
-  里一句 STUN 就能问出访客的真实出口 IP。patchright 用 `block_webrtc`，Playwright 没有对应
-  开关，走 Chromium 的启动 flag —— 用的是上游为 `block_webrtc` 下的**那两条**，而且只能加在
-  Playwright 那一侧：上游算启动参数时让 `config.extra_flags` 优先于它自己算出的 53 条反检测
-  flag，所以往 stealth 引擎传 `extra_flags` 会把整套反检测静默换掉（这是一条真实缺陷，靠把
-  参数送回上游、再把最终下发的 flag 读回来才照得出来）。
-- **`captureXhrPattern` 对浏览器与反检测会话同样生效。** 这些键只在**会话构造**时被读：
-  会话内每次 fetch 传过去会被 `validate_fetch` 丢掉，所以它们在 `scrapling_session_open`
-  那一帧上发出，而 `scrapling_session_fetch` 会把抓到的接口摘要与正文一并返回。摘要本身是
-  **逐页**的：上游每次 fetch 都新建一个收集容器，所以连着取五页不会把第一页的接口回五遍。
+  里一句 STUN 就能问出访客的真实出口 IP。0.5 起这道防护由 `block_webrtc` 开关本身承担：只要
+  有代理在，本插件就把它打开，一路上**不发**任何 `extra_flags`。（0.5 之前才需要往 Chromium
+  的启动参数里塞两条 flag，因为那时的 `config.extra_flags` 会**替换**上游自己算出的反检测
+  flag；上游改成叠加之后，那个绕法随旧浏览器后端一起消失。）
+- **网络历史是会话级的。** 记录是构造期设置（部署默认 `recordRequests`，或每次
+  `scrapling_session_open` 上的 `recordNetwork`），`scrapling_session_network` 读的是这个会话
+  跨多次抓取攒下的历史。对比之下 `scrapling_capture_xhr` 为单页起一个临时会话，只回那一页发出
+  的请求。
 - **`scrapling_session_fetch` 的 `headers` 与 `retries` 只属于 static 会话，给浏览器会话会直接报错。**
   浏览器那侧的请求头是 `extraHeaders`，重试则是会话构造期的设置；上游对这两个键一声不吭地
   丢掉，所以本包替它报错（`BAD_ARGS` 并点名该改用哪个旋钮）——「拧了没反应」正是这个插件要
@@ -346,14 +402,15 @@ PAC 是唯一还需要手工填一次的形态：求值 PAC 要下载脚本并�
   也对它准备交回的 URL 跑同一道闸门：被闸门判否的命中不会成为可引用的 source，模型因此不会
   拿到一个「下一次抓取必然被拒」的地址。
 
-- **浏览器引擎不认代理环境变量。** Playwright 不读 `HTTP_PROXY` / `HTTPS_PROXY`，所以
-  `scrapling_render` / `scrapling_capture_xhr` / `scrapling_stealth_fetch` 即使在整台机器
+- **浏览器引擎不认代理环境变量。** patchright 不读 `HTTP_PROXY` / `HTTPS_PROXY`，所以
+  `scrapling_render` 与 `scrapling_capture_xhr` 即使在整台机器
   都走代理时也**直连**——走浏览器的那部分请求会溜出隧道。而 `scrapling_fetch` 与爬虫底下的
   curl_cffi **是**认这些变量的，于是两半在必须走代理的网络上行为不一致。这里写明而不是绕过去：
   把浏览器也送进代理等于交给本包一项部署级强能力，而在没法对着一个真实代理验证的前提下
   把它发出去，比说清楚更糟。上面的 `allowSyntheticDns` 只修闸门，**不改变流量去向**。
 
-- **有配额，不是无上限的常驻资源。** 同开会话至多 8 个（其中 `browser`/`stealth` 至多 3
+- **有配额，不是无上限的常驻资源。** 同开会话至多 8 个（其中浏览器会话 —— 也就是 `stealth`
+  会话类型 —— 至多 3
   个，每个都是一个真实的 Chromium 进程）、同时在跑的爬虫至多 2 个、单页正文按
   `maxContentChars` 封顶、单个协议帧 8 MB、待处理队列 16 帧。撞上限时返回的是明确的错误码
   （`SESSION_LIMIT` / `CRAWL_BUSY` / `BAD_FRAME`），由模型自己退避，而不是把机器吃光。

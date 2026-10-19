@@ -33,12 +33,12 @@ jobs:
       # 才需要浏览器，那是用户侧的运行时依赖，不是测试门槛。
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: "3.12"
-      - name: 备 sidecar 解释器（覆盖率门禁的前提）
+          python-version: "3.14"
+      - name: 备 sidecar 解释器（Python 门禁的前提）
         run: |
           python -m venv _env/.venv
           _env/.venv/bin/python -m pip install --upgrade pip
-          _env/.venv/bin/python -m pip install "scrapling[rag]>=0.4.15,<0.5"
+          _env/.venv/bin/python -m pip install "scrapling[rag]>=0.5,<0.6"
           _env/.venv/bin/python -c "import scrapling; print('scrapling', scrapling.__version__)"
       # Python 侧的静态检查。版本在 py/requirements-dev.txt 里精确钉：规则集随版本漂移，
       # 不钉的话「升级 ruff」与「新写一处违规」在门禁上长得一模一样。
@@ -107,28 +107,10 @@ jobs:
           done
       - run: pnpm install --frozen-lockfile
       - run: pnpm run check
-      # 下面三步都直接点名 venv 里的解释器：check 脚本里的 python3 走 PATH，而 CI 上真正的
-      # 解释器是上面那个 venv（PATH 上的没有 scrapling、也没有 ruff/mypy）。点名它还顺带
-      # 让 ruff 与 mypy 看得见 scrapling 的类型 —— 那是 mypy 能报出真问题的前提。
-      # mypy 与 coverage 不进门禁：前者报的是「标注与实现不一致」，后者是要先知道缺口在哪。
-      - name: Python 静态检查（ruff check + format）
-        run: _env/.venv/bin/python -m ruff check py/ && _env/.venv/bin/python -m ruff format --check py/
-      # mypy 的失败记录在 CI 日志里但不拦发布 —— 它报的是「标注与实现不一致」，不是编译
-      # 失败（pyproject.toml 的 [tool.mypy] 写了完整理由）。continue-on-error 让红灯可见
-      # 而不阻塞；没有这一行，step 一红发布就停，与「暂不阻塞」的声明相反。
-      - name: Python 类型检查（mypy，记录用，不阻塞）
-        run: _env/.venv/bin/python -m mypy py/
-        continue-on-error: true
-      # 此前这一步根本不在 CI 里：84 条 sidecar 端到端用例只在本地跑，发布前它们一次都没参与过判定。
-      - name: Python sidecar 端到端
-        run: _env/.venv/bin/python py/tests/test_bridge.py
-      # Python 覆盖率先只做记录：四个随包发布的模块此前没有任何覆盖数字，而它们跑在用户
-      # 机器上。数字进日志而不进门禁，等缺口摸清再谈阈值。
-      - name: Python 覆盖率（记录用，不阻塞）
-        run: |
-          DSH_PY_COVERAGE=1 _env/.venv/bin/python -m coverage run --parallel-mode py/tests/test_bridge.py
-          _env/.venv/bin/python -m coverage combine
-          _env/.venv/bin/python -m coverage report -m
+      # Python 面不在这里另跑一遍：`check` 已经含 `check:py` 的八步链（`py:which` → `face:py` → ruff
+      # 检查/格式 → mypy → sidecar 端到端 → bandit → 覆盖率地板），解释器由该仓 `py` 入口的解析规则选定。
+      # 强度只写在那一条链里：要放宽或收紧 Python 面就改该仓 `package.json` 的 `check:py`，在 CI 里另起
+      # 一步就会出现两套说法互相打脸的形状（一步拦、一步只记录）。
       # prepack 会重建 host.js / client.js；产物不入库也发得出去。
       # 凭据两条路：配了 NPM_TOKEN 就经 NODE_AUTH_TOKEN 注入；没配就交给 OIDC。
       # setup-node 配了 registry-url 之后会设 NPM_CONFIG_USERCONFIG 指向它自己生成的那份

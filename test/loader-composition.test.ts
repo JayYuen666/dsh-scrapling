@@ -246,7 +246,7 @@ describe("经真实 Loader 装载本插件", () => {
   });
 
   it("解释器不可用时按降级路径走：注册 0 个工具，也不拉进程", () => {
-    // 这条是 failFastOnMissingPython=false 的真实后果。要看到 9~11 个工具得给真解释器，
+    // 这条是 failFastOnMissingPython=false 的真实后果。要看到工具真被注册得给真解释器，
     // 而那条路径 host.test.ts 已经拿 _env/.venv 逐条钉过（含注册计划与作业接线）。
     expect(loaded.tools).toStrictEqual([]);
   });
@@ -277,7 +277,8 @@ describe("经真实 Loader 装载本插件", () => {
     try {
       const text = await guidanceOf(loaded.ctx);
       expect(text).toContain("scrapling_fetch");
-      // 默认档开着 render/session，但它们没注册，所以那几句不该出现；crawl/stealth 是关的。
+      // 这一份配置里默认开着 render/network/session/state，但它们没注册，所以那几句不该出现；
+      // crawl/answer 同理 —— 只有 fetch 这一条真被注册进容器。
       expect(text).not.toContain("scrapling_render");
       expect(text).not.toContain("scrapling_session_open");
       expect(text).not.toContain("scrapling_crawl");

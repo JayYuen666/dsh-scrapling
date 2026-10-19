@@ -4,7 +4,7 @@
 // （buildRow）与一段注册逻辑（apply 用假 ctx 驱动），两者都能在 Node 下验证。
 
 import { describe, expect, it } from "vitest";
-import { buildRow, readArgs, ROW_TOOLS } from "../src/client-entry.ts";
+import { buildRow, readArgs, resultMetaOf, ROW_TOOLS } from "../src/client-entry.ts";
 import { BUNDLE_PACKAGE_NAME, LOCALE_NS, SETTINGS_ENTRY_ID } from "../src/settings-fields.ts";
 
 /** 测试里反复用到的示例地址。 */
@@ -152,6 +152,40 @@ describe("readArgs", () => {
   });
 });
 
+/**
+ * 宿主的 toolview props 把阶段写在顶层，`block` 是按阶段变形的联合。
+ * 这一组期望写死成字面量：把判据改成从 `resultMetaOf` 反推，它就只是在复读自己。
+ */
+describe("resultMetaOf", () => {
+  it("只有 result 那一支才交回投影", () => {
+    const meta = { statusCode: 200, url: SAMPLE };
+    expect(resultMetaOf({ phase: "result", block: { meta } } as never)).toStrictEqual(meta);
+  });
+
+  it("start 那一支没有 meta 可读，即便宿主给了也不认", () => {
+    expect(
+      resultMetaOf({ phase: "start", block: { meta: { statusCode: 200 } } } as never),
+    ).toBeUndefined();
+  });
+
+  it("preparing 那一支同样不交回投影", () => {
+    expect(
+      resultMetaOf({ phase: "preparing", block: { meta: { statusCode: 200 } } } as never),
+    ).toBeUndefined();
+  });
+
+  it("落定了但投影还没进来时是 undefined，而不是抛", () => {
+    expect(resultMetaOf({ phase: "result", block: {} } as never)).toBeUndefined();
+  });
+
+  it("阶段写在 block 里不是宿主的形状：那种 props 一律读不到投影", () => {
+    // 这条钉的是修复前的坏形状：宿主从不把 phase 放进 block，所以那时结果侧的字段永远不渲染。
+    expect(
+      resultMetaOf({ block: { phase: "result", meta: { statusCode: 200 } } } as never),
+    ).toBeUndefined();
+  });
+});
+
 const BUNDLE_CONFIG_SLOT = "plugins.bundle.config";
 const TOOLVIEW_SLOT = "tool.call.toolview";
 
@@ -162,9 +196,9 @@ const SERVICE_NAMES = ["slots", "locale", "configForms"];
  * 造一个够用的假宿主。
  *
  * `names` 是本包声明给宿主的 inject 清单，ctx 只放行清单里的名字：这就是 cordis 上下文
- * 代理的真行为（@deepseek-ai/cordis lib/index.js:671-697 —— 没注入的名字抛
+ * 代理的真行为（@deepseek-ai/cordis 的 `ReflectService.handler.get` —— 没注入的名字抛
  * `cannot get property "<name>" without inject`，而抛出落在 `ctx.effect` 体内时只被记进
- * logger，同文件 :1261）。替身要是像早先那样把整套服务无条件摆在 ctx 上，「清单里少写一枚
+ * logger）。替身要是像早先那样把整套服务无条件摆在 ctx 上，「清单里少写一枚
  * configForms」这种错在 Node 下什么都测不出来，真浏览器里的症状却是整张设置卡连同全部结果
  * 行一起静默消失 —— 这个 bug 就是这样躲在替身与宿主的差别里的。
  *
@@ -240,7 +274,7 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
     },
   };
   // ctx 只放行清单里的名字，其余名字留一个会炸的 getter，抛的串与宿主逐字相同。
-  // effect 不算「注入的服务」—— 它是 cordis 混进每个 ctx 的方法面（lib/index.js:743）。
+  // effect 不算「注入的服务」—— 它是 @deepseek-ai/cordis 混进每个 ctx 的方法面。
   const ctx: Record<string, unknown> = { effect: RUN_EFFECT_IMMEDIATELY };
   for (const name of SERVICE_NAMES) {
     if (names.includes(name)) {
@@ -380,13 +414,15 @@ describe("apply", () => {
     }
     const element = render({
       toolName: "scrapling_fetch",
-      block: { phase: "result", args: { text: NO_VALUE, value: NO_VALUE } },
-    }) as { type?: unknown; props: { block?: unknown; toolName?: string } };
+      phase: "result",
+      block: { args: { text: NO_VALUE, value: NO_VALUE }, meta: { statusCode: 200, url: SAMPLE } },
+    }) as { type?: unknown; props: { block?: unknown; phase?: string; toolName?: string } };
     // 交给宿主渲染器的是一个组件元素；RowView 自身才是真正读 block 的那一层。
     expect(element.type).toBeTypeOf("function");
-    // props 里带着宿主给的 block，而不是本包自己的一份 args —— 这一条正是「结果行只剩
+    // props 里带着宿主给的 block 与顶层 phase，而不是本包自己的一份 args —— 这一条正是「结果行只剩
     // 工具名」的根因：早先 RowView 只接了一个 tool 字符串，owner props 整个被丢掉。
     expect(element.props.block).toBeDefined();
+    expect(element.props.phase).toBe("result");
     expect(element.props.toolName).toBe("scrapling_fetch");
   });
 

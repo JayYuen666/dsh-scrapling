@@ -1,26 +1,28 @@
-# Python 侧的静态检查：ruff（检查 + 格式）与 mypy（类型）。
+# Python 侧的静态检查：ruff（检查 + 格式）、mypy（类型）、bandit（安全）与 coverage（地板棘轮）。
 #
-# 为什么值得有：这四份 .py 是**随包发布**的（package.json 的 files 里逐份列着），
-# 跑在用户的机器上。此前它们只有 py/tests/test_bridge.py 这一层运行时验证 —— 没有
-# 类型检查、没有 lint、没有格式门禁，而代码里已经躺着 24 个 `# noqa:` 与 7 个
-# `# pyright: ignore` 抑制标记，两个工具却一个都没配。那些标记于是成了没人校验的
-# 死文档：该抑制的理由还在，但「不再需要抑制」与「新增一处违规」都没有人会知道。
-# TypeScript 侧的 oxlint 明确开着 reportUnusedDisableDirectives: error，这一份配置
-# 把同一件事补到 Python 侧。
+# 为什么值得有：py/ 下随包发布的那几份 .py 列在 package.json 的 files 里，跑在用户的机器上。
+# 配上这一段配置之前，它们只有 py/tests/test_bridge.py 一层运行时验证：没有类型检查、没有 lint、
+# 没有格式门禁，而代码里已经躺着成片的 `# noqa:` 抑制标记。那些标记于是成了没人校验的死文档——
+# 该抑制的理由还在，但「不再需要抑制」与「新增一处违规」都没人会知道。TypeScript 侧的 oxlint
+# 明确开着 reportUnusedDisableDirectives: error，这一份配置把同一件事补到 Python 侧。
 #
-# 装上再跑：pip install -r py/requirements-dev.txt
-#   npm run lint:py      ruff check（进门禁）
-#   npm run fmt:py       ruff format --check（进门禁）
-#   npm run typecheck:py mypy（暂不进门禁，原因见 [tool.mypy]）
-#   npm run cov:py       coverage（暂不进门禁，先知道缺口在哪）
+# 建解释器与环境：在伞根跑 pnpm py:setup（uv 建 _env/.venv 并装 py/requirements-dev.txt）。
+#   npm run lint:py        ruff check
+#   npm run fmt:py         ruff format --check
+#   npm run typecheck:py   mypy
+#   npm run bandit:py      bandit -q -ll（medium 及以上；Low 记入已知缺口，不加 # nosec）
+#   npm run test:py        py/tests/test_bridge.py 端到端
+#   npm run coverage:floor 覆盖率地板；cov:py 是"看缺口在哪"的报表面
+# 以上全在 check:py 里，随 pnpm run check 进 CI。
 
 [tool.ruff]
 # 与仓库里中文注释的既成行宽对齐：TS 侧的 oxfmt 默认不重排注释，注释行普遍到 120。
-# 收到 88 会逼着把 174 行中文注释全部重折，那与「检查有没有缺陷」无关。
+# 收到更窄的行宽会逼着把全部中文注释重折，那与「检查有没有缺陷」无关。
 line-length = 120
-# README 声明的地板是 Python 3.10；lint 规则按这个地板选，避免 UP 一类规则把
-# 3.10 用户直接修坏。
-target-version = "py310"
+# 地板是 Python 3.14+：README 双语承诺、[tool.mypy] 的 python_version 与 py/bridge.py 的运行时硬闸
+# 说的是同一件事。抬上来之后 ruff format 会按 PEP 758 去掉 except 元组的括号，那只有 3.14 解析得
+# 了——所以改这一行必须同时跑一次 ruff format py/ 并把产物一并提交，否则 fmt:py 立刻红。
+target-version = "py314"
 
 [tool.ruff.lint]
 select = [
@@ -31,26 +33,26 @@ select = [
   "B", # bugbear：闭包捕获循环变量（B023）就在这一类里，实测抓到过真缺陷
   "SIM", # flake8-simplify： suppress 之类
   "RET", # flake8-return：return 前的多余赋值
-  "BLE001", # 裸 except Exception —— 本仓库刻意保留既有 8 处带理由的抑制
+  "BLE001", # 裸 except Exception —— 本仓库刻意保留带理由的既有抑制，开这条等于把它们一起判死
   "PLW0603", # global 语句 —— 同理，抑制标记里写着「为什么可以」
-  "S603", # subprocess 调用 —— 守卫读系统代理那一处参数全是本文件常量
+  "S603", # subprocess 调用 —— 守卫读系统代理的参数全是本文件常量
   "N802", # 函数命名 —— BaseHTTPRequestHandler 的 do_GET 约定
   "E402", # 模块级 import 不在文件头 —— bridge.py 为避开循环依赖而内联导入
 ]
 
 # ANN401 刻意不开：Playwright 的 page/route/websocket 全是运行时才知道形状的第三方对象，
-# 代码对它们一律标 Any（guard.py 的 install 就有 28 处）。开这一条要加 25 处抑制，
-# 收益为负 —— 那三处 `# noqa: ANN401` 因此已改成普通注释，把同样的理由留在原地。
+# 代码对它们一律标 Any。开这一条会把成片的既有标注判成违规、逼出一堆只为过门而写的抑制，
+# 收益为负 —— 原先几处 `# noqa: ANN401` 因此改成普通注释，理由留在原地但不占着抑制标记。
 
 [tool.mypy]
 ignore_missing_imports = true
 # 不设 warn_unused_ignores / disallow_untyped_defs 那一族：这一侧的 duck 类型是刻意
 # 的（Playwright 对象、跨语言回包），严格档会逼出一堆只为进一步沉默而存在的 ignore。
-# 因此 mypy 目前**不进门禁**：它报的是「标注与实现不一致」，不是编译失败。
-python_version = "3.10"
+# mypy 已进 check:py：它报的是「标注与实现不一致」，这一侧要在门禁里看见。
+python_version = "3.14"
 
 [tool.coverage.run]
-# 只量随包发布的那四份 + 测试脚本本身；__pycache__ 与 _env 一概不进。
+# 只量随包发布的源文件 + 测试脚本本身；__pycache__ 与 _env 一概不进。
 source = ["py"]
 parallel = true
 # sidecar 是被 terminate 的：不收尾信号的话，它的数据文件不会落盘。

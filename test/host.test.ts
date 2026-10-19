@@ -16,12 +16,13 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { createCrawlTool } from "../lib/tools.ts";
-import type { ToolDeps, ToolSettings } from "../lib/tools.ts";
+import type { CrawlSink, ToolDeps, ToolSettings } from "../lib/tools.ts";
 import type { AnswerResult } from "../lib/answer.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
 import {
   Config as configSchema,
   apply,
+  createCrawlEventRouter,
   createUrlGate,
   guidanceFor,
   inject,
@@ -57,8 +58,9 @@ const ALL_ON: ToolFlags = {
   extract: true,
   render: true,
   captureXhr: true,
-  stealth: true,
+  network: true,
   session: true,
+  sessionState: true,
   crawl: true,
   answer: true,
 };
@@ -69,8 +71,9 @@ const ALL_OFF: ToolFlags = {
   extract: false,
   render: false,
   captureXhr: false,
-  stealth: false,
+  network: false,
   session: false,
+  sessionState: false,
   crawl: false,
   answer: false,
 };
@@ -94,8 +97,7 @@ const FULL_CAPS: SidecarCapabilities = {
   static: true,
   extract: true,
   browser: true,
-  stealth: true,
-  version: "0.4.15",
+  version: "0.5",
 };
 
 /**
@@ -217,6 +219,9 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
   // 恒走真值那一支，于是「默认关」这条安全承诺在测试里根本没被验到。
   const plainFlag = (key: string, fallback: boolean): boolean =>
     (overrides[key] as boolean | undefined) ?? fallback;
+  // 部署级二选一枚举（crawlStrategy）同样是裸值，且类型是 `"bfs" | "dfs"` 而非泛 string。
+  const plainChoice = (key: string, fallback: "bfs" | "dfs"): "bfs" | "dfs" =>
+    (overrides[key] as "bfs" | "dfs" | undefined) ?? fallback;
   return {
     pythonBin: pick("pythonBin", ""),
     failFastOnMissingPython: pick("failFastOnMissingPython", true),
@@ -224,9 +229,10 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     extractEnabled: pick("extractEnabled", true),
     renderEnabled: pick("renderEnabled", true),
     captureXhrEnabled: pick("captureXhrEnabled", true),
-    stealthEnabled: pick("stealthEnabled", false),
+    networkEnabled: pick("networkEnabled", true),
     sessionEnabled: pick("sessionEnabled", true),
-    crawlEnabled: pick("crawlEnabled", false),
+    sessionStateEnabled: pick("sessionStateEnabled", true),
+    crawlEnabled: pick("crawlEnabled", true),
     answerEnabled: pick("answerEnabled", true),
     extractionType: pick("extractionType", "markdown"),
     mainContentOnly: pick("mainContentOnly", true),
@@ -240,7 +246,7 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     headless: pick("headless", true),
     networkIdle: pick("networkIdle", false),
     blockAds: pick("blockAds", true),
-    captureXhrPattern: pick("captureXhrPattern", ".*"),
+    pierceShadow: pick("pierceShadow", false),
     waitSelectorState: pick("waitSelectorState", "attached"),
     sidecarHandshakeTimeoutMs: pick("sidecarHandshakeTimeoutMs", 30_000),
     fetchTimeoutMs: pick("fetchTimeoutMs", 120_000),
@@ -249,11 +255,23 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     maxUrlLength: plain("maxUrlLength", 2048),
     browserExecutablePath: plainText("browserExecutablePath", ""),
     browserCdpUrl: plainText("browserCdpUrl", ""),
+    browserInitScript: plainText("browserInitScript", ""),
+    browserRealChrome: plainFlag("browserRealChrome", false),
+    browserDnsOverHttps: plainFlag("browserDnsOverHttps", false),
+    recordRequests: plainFlag("recordRequests", false),
+    maxRecordedRequests: plain("maxRecordedRequests", 100),
+    sessionStateDir: plainText("sessionStateDir", ""),
+    crawlRespectRobots: plainFlag("crawlRespectRobots", false),
+    crawlDownloadDelayMs: plain("crawlDownloadDelayMs", 0),
+    crawlConcurrentRequests: plain("crawlConcurrentRequests", 4),
+    crawlAutothrottle: plainFlag("crawlAutothrottle", false),
+    crawlStrategy: plainChoice("crawlStrategy", "bfs"),
+    crawlCheckpointDir: plainText("crawlCheckpointDir", ""),
     allowWriteMethods: plainFlag("allowWriteMethods", false),
     nat64Prefixes: pick("nat64Prefixes", ""),
     dataDir: pick("dataDir", ""),
-    provideWebFetch: pick("provideWebFetch", false),
-    provideWebSearch: pick("provideWebSearch", false),
+    provideWebFetch: pick("provideWebFetch", true),
+    provideWebSearch: pick("provideWebSearch", true),
     searchEndpoint: plainText("searchEndpoint", ""),
     searchRenderTopN: plain("searchRenderTopN", 3),
     answerProvider: pick("answerProvider", ""),
@@ -305,9 +323,16 @@ describe("config schema", () => {
     expect(volatileRef("pythonBin").get()).toBe("");
   });
 
-  it("stealth 与 crawl 默认关（多一层浏览器依赖 / 重量级后台任务）", () => {
-    expect(volatileRef("stealthEnabled").get()).toBe(false);
-    expect(volatileRef("crawlEnabled").get()).toBe(false);
+  it("工具开关默认全开；pierceShadow 默认关（只有页面把正文封进 shadow DOM 时才需要它）", () => {
+    expect(volatileRef("crawlEnabled").get()).toBe(true);
+    expect(volatileRef("networkEnabled").get()).toBe(true);
+    expect(volatileRef("sessionStateEnabled").get()).toBe(true);
+    expect(volatileRef("pierceShadow").get()).toBe(false);
+  });
+
+  it("接管内置 web_fetch / web_search 的开关默认开（真正接管仍要部署侧配 provider 名）", () => {
+    expect(volatileRef("provideWebFetch").get()).toBe(true);
+    expect(volatileRef("provideWebSearch").get()).toBe(true);
   });
 
   it("抽取默认 markdown 且只取 body —— 与 dsh 内置 web_fetch 的呈现口径对齐", () => {
@@ -349,51 +374,41 @@ describe("volatile 快照", () => {
 });
 
 describe("工具注册计划", () => {
-  it("全开且能力齐备时七个工具全注册", () => {
+  it("全开且能力齐备时十三个工具全注册", () => {
     expect(planTools(ALL_ON, FULL_CAPS).ready).toStrictEqual(TOOL_SPECS.map((spec) => spec.name));
   });
 
   it("用户关掉的工具不注册，原因记为 disabled", () => {
-    const plan = planTools({ ...ALL_ON, stealth: false, crawl: false }, FULL_CAPS);
-    expect(plan.ready).toHaveLength(9);
+    const plan = planTools({ ...ALL_ON, crawl: false, answer: false }, FULL_CAPS);
+    expect(plan.ready).toHaveLength(11);
     expect(plan.skipped).toStrictEqual([
-      { name: "scrapling_stealth_fetch", reason: "disabled" },
       { name: "scrapling_crawl", reason: "disabled" },
+      { name: "scrapling_answer", reason: "disabled" },
     ]);
   });
 
-  it("缺浏览器时不注册浏览器类工具，也不注册依赖 stealth 的", () => {
-    const caps: SidecarCapabilities = { ...FULL_CAPS, browser: false, stealth: false };
+  it("缺浏览器时不注册两个浏览器类工具，会话与爬虫照常", () => {
+    // 0.5 起浏览器抓取只剩 patchright 一套，所以依赖 browser 的只有 render 与 capture_xhr；
+    // 会话、登录态存取、爬虫、问答都不需要浏览器，能力缺了也照常注册。
+    const caps: SidecarCapabilities = { ...FULL_CAPS, browser: false };
     const plan = planTools(ALL_ON, caps);
     expect(plan.ready).toStrictEqual([
       "scrapling_fetch",
       "scrapling_extract",
       "scrapling_session_open",
       "scrapling_session_fetch",
+      "scrapling_session_network",
+      "scrapling_session_state_save",
+      "scrapling_session_state_load",
       "scrapling_session_list",
       "scrapling_session_close",
       "scrapling_crawl",
       "scrapling_answer",
     ]);
-    expect(plan.skipped).toContainEqual({ name: "scrapling_render", reason: "browser-missing" });
-    expect(plan.skipped).toContainEqual({
-      name: "scrapling_capture_xhr",
-      reason: "browser-missing",
-    });
-    expect(plan.skipped).toContainEqual({
-      name: "scrapling_stealth_fetch",
-      reason: "stealth-missing",
-    });
-  });
-
-  it("有浏览器但没有 stealth 时，浏览器类照常注册", () => {
-    const caps: SidecarCapabilities = { ...FULL_CAPS, stealth: false };
-    const plan = planTools(ALL_ON, caps);
-    expect(plan.ready).toContain("scrapling_render");
-    expect(plan.skipped).toContainEqual({
-      name: "scrapling_stealth_fetch",
-      reason: "stealth-missing",
-    });
+    expect(plan.skipped).toStrictEqual([
+      { name: "scrapling_render", reason: "browser-missing" },
+      { name: "scrapling_capture_xhr", reason: "browser-missing" },
+    ]);
   });
 
   it("scrapling 缺失时一个工具都不注册", () => {
@@ -409,7 +424,7 @@ describe("工具注册计划", () => {
     expect(plan.skipped.every((item) => item.reason === "scrapling-missing")).toBe(true);
   });
 
-  it("全关时 ready 为空、skipped 记满七条 disabled", () => {
+  it("全关时 ready 为空、skipped 记满 disabled", () => {
     const plan = planTools(ALL_OFF, FULL_CAPS);
     expect(plan.ready).toStrictEqual([]);
     expect(plan.skipped).toHaveLength(TOOL_SPECS.length);
@@ -454,14 +469,16 @@ describe("每个工具的输出预算各走各的旋钮", () => {
     expect(outputBudgetOf(config, "scrapling_extract")).toBe(222);
     expect(outputBudgetOf(config, "scrapling_render")).toBe(333);
     expect(outputBudgetOf(config, "scrapling_capture_xhr")).toBe(444);
-    // 会话类产出的是句柄与列表而非页面正文，跟渲染同档；爬虫同理。
+    // 会话类产出的是句柄与列表而非页面正文，跟渲染同档；爬虫、网络历史与登录态存取同理。
     expect(outputBudgetOf(config, "scrapling_session_list")).toBe(333);
+    expect(outputBudgetOf(config, "scrapling_session_network")).toBe(333);
+    expect(outputBudgetOf(config, "scrapling_session_state_save")).toBe(333);
     expect(outputBudgetOf(config, "scrapling_crawl")).toBe(333);
   });
 });
 
 describe("system prompt 指引段", () => {
-  it("全开且工具都在时八段指引都在，只开一条时就只剩一条", () => {
+  it("全开且工具都在时九段指引都在，只开一条时就只剩一条", () => {
     // 判据是**行数与开关数一一对应**，而不是逐行文本内容：指引写的是给人读的话，措辞会变，
     // 而「关掉一个工具就少一段」这个不变式不会变。
     expect(guidanceFor(ALL_ON, EVERYWHERE).split("\n")).toHaveLength(Object.keys(ALL_ON).length);
@@ -475,7 +492,7 @@ describe("system prompt 指引段", () => {
   });
 
   it("开关开着但工具没注册时，那句指引也不说（这是同一个不变式的另一半）", () => {
-    // 注册还要过 planTools 的环境要求：没装 Chromium 时 render/stealth 整组不注册，而
+    // 注册还要过 planTools 的环境要求：没装 Chromium 时 render / capture_xhr 不注册，而
     // Python 起不来（failFastOnMissingPython=false）时**一个都不注册**。只看开关就会给模型
     // 一串点了就报 UNKNOWN_TOOL 的建议 —— 与「少一段指引」是同一种故障的两个方向。
     for (const spec of TOOL_SPECS) {
@@ -518,7 +535,15 @@ describe("system prompt 指引段", () => {
         factories.push(factory);
       },
     } as unknown as never;
-    await apply(ctx, makeConfig({ pythonBin: "", failFastOnMissingPython: false }));
+    await apply(
+      ctx,
+      makeConfig({
+        pythonBin: "",
+        failFastOnMissingPython: false,
+        crawlEnabled: false,
+        networkEnabled: false,
+      }),
+    );
 
     // settings 那条与 sidecar 回收那条之外，指引段自己也占一个 effect。
     expect(factories.length).toBeGreaterThanOrEqual(3);
@@ -530,19 +555,24 @@ describe("system prompt 指引段", () => {
     expect(section?.text).toBeTypeOf("function");
     const read = (): string => (typeof section?.text === "function" ? section.text({}) : "");
 
-    // 解释器不可用 → 一个工具都没注册 → 指引必须整段为空。这一格以前是「默认档里 stealth/crawl
-    // 关着所以那两段不出现」，而那在注册表为空时同样成立，看不出真正的因果。
+    // 解释器不可用 → 一个工具都没注册 → 指引必须整段为空。这一格以前是「默认档里某两段
+    // 关着所以不出现」，而那在注册表为空时同样成立，看不出真正的因果。
     expect(tools.names).toStrictEqual([]);
     expect(read()).toBe("");
 
-    // 注册上两条，指引就只说这两条：默认档里 stealth/crawl 是关的，所以即便有人注册了它们
-    // 也不该出现（开关那一半仍然管着）。
-    tools.names.push("scrapling_fetch", "scrapling_render", "scrapling_stealth_fetch");
+    // 注册了几条，指引就只说开关开着的那几条：crawl / network 这两条的开关被显式关掉了，
+    // 所以即便有人把它们的工具塞进注册表也不该出现（开关那一半仍然管着）。
+    tools.names.push(
+      "scrapling_fetch",
+      "scrapling_render",
+      "scrapling_crawl",
+      "scrapling_session_network",
+    );
     const text = read();
     expect(text).toContain("scrapling_fetch");
     expect(text).toContain("scrapling_render");
-    expect(text).not.toContain("scrapling_stealth_fetch");
     expect(text).not.toContain("scrapling_crawl");
+    expect(text).not.toContain("scrapling_session_network");
   });
 });
 
@@ -781,15 +811,19 @@ describe("apply", () => {
     const caps = await probe.ensureStarted();
     await probe.dispose();
 
-    await apply(ctx, makeConfig({ pythonBin: python }));
+    // 这一格不验 provider 注册（那条由「接管 ctx.web 的两个接缝」那组负责），而夹具里
+    // 也没有 ctx.web 面，所以把默认开着的 fetch provider 显式关掉，免得 apply 在半路抛。
+    await apply(ctx, makeConfig({ pythonBin: python, provideWebFetch: false }));
     // 握手成功后必然打出注册计划这一行。
     expect(infos.some((line) => line.includes("注册"))).toBe(true);
-    // 真正注册上去的 =「静态两条」+「会话四条」+「问答一条」+（浏览器可用时的两条）。
-    // stealth 要 patchright、crawl 默认关，这两条按构造就不在里面。会话四条与问答一条
-    // 都是独立工具名，少一条就说明 TOOL_SPECS 与构造器又对不上了。
+    // 真正注册上去的 =「静态两条」+「会话七条」+「爬虫一条」+「问答一条」+（浏览器可用时的两条）。
+    // 会话七条都是独立工具名，少一条就说明 TOOL_SPECS 与构造器又对不上了。
     const sessionTools = [
       "scrapling_session_open",
       "scrapling_session_fetch",
+      "scrapling_session_network",
+      "scrapling_session_state_save",
+      "scrapling_session_state_load",
       "scrapling_session_list",
       "scrapling_session_close",
     ];
@@ -800,9 +834,16 @@ describe("apply", () => {
           "scrapling_render",
           "scrapling_capture_xhr",
           ...sessionTools,
+          "scrapling_crawl",
           "scrapling_answer",
         ]
-      : ["scrapling_fetch", "scrapling_extract", ...sessionTools, "scrapling_answer"];
+      : [
+          "scrapling_fetch",
+          "scrapling_extract",
+          ...sessionTools,
+          "scrapling_crawl",
+          "scrapling_answer",
+        ];
     expect(registered).toStrictEqual(expected);
 
     // 再跑一次「全部关掉」：ready 为空时日志要落到 (none) 分支。
@@ -812,11 +853,15 @@ describe("apply", () => {
       ctx,
       makeConfig({
         pythonBin: python,
+        provideWebFetch: false,
         fetchEnabled: false,
         extractEnabled: false,
         renderEnabled: false,
         captureXhrEnabled: false,
+        networkEnabled: false,
         sessionEnabled: false,
+        sessionStateEnabled: false,
+        crawlEnabled: false,
         answerEnabled: false,
       }),
     );
@@ -828,6 +873,44 @@ describe("apply", () => {
     expect(settingsRegistrations).toStrictEqual(["false", "false"]);
     // 卸载插件要能回收进程 —— disposer 把 promise 交回来，宿主会 await 它。
     await Promise.all(disposers.map((disposer) => disposer()));
+  });
+});
+
+/**
+ * 造一份只把 append 记进数组的爬虫出口。
+ *
+ * @param out - 收到的文本
+ * @returns 出口
+ */
+function recordingSink(out: string[]): CrawlSink {
+  return {
+    append: (text): void => {
+      out.push(text);
+    },
+    progress: (): void => undefined,
+    signal: new AbortController().signal,
+  };
+}
+
+describe("爬虫事件路由", () => {
+  it("按 crawlId 交给各自的作业；未登记与已清掉的帧都丢掉", () => {
+    // 两只蜘蛛并行（py/crawl.py 的 MAX_CONCURRENT_CRAWLS 是 2）时，单槽位会把一只的
+    // 进度写进另一只的输出。这里钉的是「归属只看 crawlId」。
+    const outA: string[] = [];
+    const outB: string[] = [];
+    const sinkA = recordingSink(outA);
+    const sinkB = recordingSink(outB);
+    const router = createCrawlEventRouter();
+    router.route("c1", "before-register");
+    router.register("c1", sinkA);
+    router.register("c2", sinkB);
+    router.route("c1", "a-1");
+    router.route("c2", "b-1");
+    router.forget(sinkA);
+    router.route("c1", "after-forget");
+    router.route("c2", "b-2");
+    expect(outA).toStrictEqual(["a-1\n"]);
+    expect(outB).toStrictEqual(["b-1\n", "b-2\n"]);
   });
 });
 
@@ -845,7 +928,7 @@ const CRAWL_SETTINGS = {
   networkIdle: false,
   pageTimeoutMs: 30_000,
   waitSelectorState: "attached" as const,
-  captureXhrPattern: ".*",
+  pierceShadow: false,
   requestTimeoutSeconds: 120,
   blockAds: false,
   crawlMaxItems: 10,
@@ -853,6 +936,18 @@ const CRAWL_SETTINGS = {
   crawlMaxRuntimeSeconds: 600,
   browserExecutablePath: "",
   browserCdpUrl: "",
+  browserInitScript: "",
+  browserRealChrome: false,
+  browserDnsOverHttps: false,
+  recordRequests: false,
+  maxRecordedRequests: 100,
+  sessionStateDir: "",
+  crawlRespectRobots: false,
+  crawlDownloadDelayMs: 0,
+  crawlConcurrentRequests: 4,
+  crawlAutothrottle: false,
+  crawlStrategy: "bfs" as const,
+  crawlCheckpointDir: "",
   // 爬虫这一组与写方法无关，按 schema 默认档给关：夹具跟着默认走，才不至于把闸门开着
   // 这件事悄悄当成前提。
   allowWriteMethods: false,
@@ -1130,6 +1225,8 @@ describe("apply 到爬虫作业的完整链路", () => {
           pythonBin: python,
           crawlEnabled: true,
           failFastOnMissingPython: false,
+          // 夹具没有 ctx.web 面：把默认开着的 fetch provider 关掉，免得 apply 在半路抛。
+          provideWebFetch: false,
           // 本地测试站点在回环地址上：与 Python 侧同一份放行设置，Host 侧闸门才放得过。
           allowedHosts: LOOPBACK_ALLOWLIST,
         }),
@@ -1567,6 +1664,7 @@ describe("接管 ctx.web 的两个接缝", () => {
         harness.ctx,
         makeConfig({
           pythonBin: LOCAL_PYTHON,
+          provideWebFetch: false,
           provideWebSearch: true,
           searchEndpoint: "http://search.example/api",
           allowedHosts: LOOPBACK_ALLOWLIST,

@@ -42,8 +42,8 @@ export interface ToolSettings {
   readonly pageTimeoutMs: number;
   /** 等待的选择器状态。 */
   readonly waitSelectorState: WaitSelectorState;
-  /** 拦截抓到的 XHR 时用的正则。 */
-  readonly captureXhrPattern: string;
+  /** 是否把 open shadow root 的内容并进正文。 */
+  readonly pierceShadow: boolean;
   /** Python 侧单次请求的硬上限（秒）。与 timeoutMs 是两层：后者管宿主等多久，前者管子进程
    *  自己何时放弃——只设前者，一个卡死的子进程会一直占着宿主的协同超时。 */
   readonly requestTimeoutSeconds: number;
@@ -58,10 +58,34 @@ export interface ToolSettings {
    * 后台线程。到点由 Python 侧按引擎自己的停机通道收尾，不需要谁来杀它。
    */
   readonly crawlMaxRuntimeSeconds: number;
-  /** 浏览器二进制路径；空表示用 Playwright 自带的。部署级，模型改不了。 */
+  /** 浏览器二进制路径；空表示用引擎自带的。部署级，模型改不了。 */
   readonly browserExecutablePath: string;
-  /** CDP 端点；空表示由 Playwright 拉起进程。部署级，模型改不了。 */
+  /** CDP 端点；空表示由引擎拉起进程。部署级，模型改不了。 */
   readonly browserCdpUrl: string;
+  /** 页面创建时注入的 JS 文件绝对路径。部署级，模型改不了。 */
+  readonly browserInitScript: string;
+  /** 是否改用本机安装的 Google Chrome（而不是自带 Chromium）。部署级。 */
+  readonly browserRealChrome: boolean;
+  /** 是否让浏览器走 DNS-over-HTTPS（配代理时防 DNS 泄露）。部署级。 */
+  readonly browserDnsOverHttps: boolean;
+  /** 会话是否默认记录网络历史；模型可在 session_open 上按次打开。部署级默认值。 */
+  readonly recordRequests: boolean;
+  /** 每个会话最多保留多少条网络记录。部署级。 */
+  readonly maxRecordedRequests: number;
+  /** 会话登录态文件的存放目录；空表示禁用这对工具。部署级，模型改不了。 */
+  readonly sessionStateDir: string;
+  /** 爬虫是否遵守 robots.txt。部署级。 */
+  readonly crawlRespectRobots: boolean;
+  /** 爬虫两次请求之间的间隔（毫秒）。部署级。 */
+  readonly crawlDownloadDelayMs: number;
+  /** 爬虫的并发请求数。部署级。 */
+  readonly crawlConcurrentRequests: number;
+  /** 爬虫是否启用自适应限速（按站点响应自动放慢）。部署级。 */
+  readonly crawlAutothrottle: boolean;
+  /** 爬虫的抓取顺序：bfs 先进先出 / dfs 后进先出。部署级。 */
+  readonly crawlStrategy: "bfs" | "dfs";
+  /** 爬虫断点目录；空表示不落断点。部署级。 */
+  readonly crawlCheckpointDir: string;
   /**
    * 部署有没有开放**写方法**（POST/PUT/DELETE 与 `body`）。
    *
@@ -661,11 +685,21 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
   });
 }
 
-/** 浏览器抓取的一条 XHR 摘要。 */
-export interface XhrSummary {
+/**
+ * 会话网络历史里的一条 XHR/fetch 记录。
+ *
+ * `body` 只在调用方显式要求时才有，且已经在 Python 侧按预算截断过。`bodyNote` 是上游存不下
+ * 正文时给出的原因 —— 「这个接口没有正文」与「上游没把它存下来」是两件要采取不同行动的事。
+ */
+export interface NetworkEntry {
   url: string;
   status: number;
   bytes: number;
+  method: string;
+  resourceType: string;
+  bodyNote?: string;
+  body?: string;
+  bodyTruncated?: boolean;
 }
 
 /**
@@ -676,7 +710,7 @@ export interface XhrSummary {
  * 多返回这个字段会被判成 `value.xhr is not a declared property`，工具次次失败。
  */
 export interface BrowserResult extends FetchResult {
-  xhr?: XhrSummary[];
+  xhr?: NetworkEntry[];
 }
 
 /** 浏览器工具的公共参数说明。 */
@@ -688,10 +722,16 @@ const BROWSER_PARAMS_TEXT = {
   },
   extractionType: { type: "string", description: "输出形态：markdown（默认）/ html / text。" },
   mainContentOnly: { type: "boolean", description: "只保留 body 内容，默认 true。" },
+  pierceShadow: {
+    type: "boolean",
+    description:
+      "把 open shadow root 里的内容并进结果，默认 false。页面把正文放在 shadow DOM 里时，" +
+      "不打开它在一段 HTML 里根本看不到那些内容。",
+  },
   networkIdle: {
     type: "boolean",
     description:
-      "等到网络静默再取内容。页面靠 JS 渲染时**必须**打开，否则 Playwright 的 load 事件" +
+      "等到网络静默再取内容。页面靠 JS 渲染时**必须**打开，否则引擎的 load 事件" +
       "早于渲染完成，你会只拿到加载占位。默认跟随设置。",
   },
   waitSelector: {
@@ -705,11 +745,11 @@ const BROWSER_PARAMS_TEXT = {
 /**
  * 一次性浏览器抓取独有的「身份与区域」参数。
  *
- * 刻意不并进上面那份共享块：`headless` / `useragent` / `locale` / `timezone_id` 在**会话**
- * 路径上只在构造期生效，从会话内的 fetch 传过去会被上游 validate_fetch 静默丢掉。共享块
- * scrapling_session_fetch 也在用，写进去等于给模型一个不起作用的旋钮 —— 会话侧的入口是
- * scrapling_session_open。waitMs 与 extraHeaders 两边都真生效，因此留在这份里也给会话抓取
- * 单独声明。
+ * 刻意不并进上面那份共享块：`headless` / `useragent` / `locale` / `timezone_id` / 三条 flag 类
+ * 反检测参数在**会话**路径上只在构造期生效，从会话内的 fetch 传过去会被上游 validate_fetch
+ * 静默丢掉。共享块 scrapling_session_fetch 也在用，写进去等于给模型一个不起作用的旋钮 ——
+ * 会话侧的入口是 scrapling_session_open。waitMs 与 extraHeaders 两边都真生效，因此留在这份里
+ * 也给会话抓取单独声明。
  */
 const BROWSER_IDENTITY_PARAMS = {
   headless: { type: "boolean", description: "无头运行浏览器，默认跟随设置。" },
@@ -731,32 +771,83 @@ const BROWSER_IDENTITY_PARAMS = {
     type: "json",
     description: "额外请求头（对象），值统一转成字符串。google_search 给的 referer 会盖过它。",
   },
+  solveCloudflare: {
+    type: "boolean",
+    description: "尝试点掉 Cloudflare 挑战框（最多 3 次）。不保证成功，默认 false。",
+  },
+  hideCanvas: {
+    type: "boolean",
+    description: "给 canvas 读数加噪声（反指纹）。只在会话开场生效，中途改不了。",
+  },
+  blockWebrtc: {
+    type: "boolean",
+    description: "禁掉绕过代理的 WebRTC UDP。走代理时无论这里怎么填都开。只在会话开场生效。",
+  },
+  allowWebgl: {
+    type: "boolean",
+    description:
+      "是否放行 WebGL，默认 true。关掉能挡掉一类指纹，但有些页面会因为没 WebGL 不出内容。" +
+      "只在会话开场生效，中途改不了。",
+  },
 } as const;
 
 /**
- * 把 sidecar 的 XHR 摘要归一成结构化列表。
+ * 把回包里的一条记录归一成声明的形状。
  *
- * 响应体可能很大，所以 Python 侧只回 URL/状态码/字节数；模型看到摘要后自己决定要不要
- * 再对其中某个 URL 单独抓一次。
+ * @param item - 回包里的单条记录
+ * @returns 归一后的条目
+ */
+function normalizeNetworkEntry(item: Record<string, unknown>): NetworkEntry {
+  return {
+    url: typeof item["url"] === "string" ? item["url"] : "",
+    status: typeof item["status"] === "number" ? item["status"] : 0,
+    bytes: typeof item["bytes"] === "number" ? item["bytes"] : 0,
+    method: typeof item["method"] === "string" ? item["method"] : "GET",
+    resourceType: typeof item["resourceType"] === "string" ? item["resourceType"] : "",
+    ...(typeof item["bodyNote"] === "string" ? { bodyNote: item["bodyNote"] } : {}),
+    ...(typeof item["body"] === "string" ? { body: item["body"] } : {}),
+    ...(item["bodyTruncated"] === true ? { bodyTruncated: true } : {}),
+  };
+}
+
+/**
+ * 把 sidecar 的网络历史条目归一成结构化列表。
+ *
+ * 承载条目的字段名由调用方点明：两条路径的回包本来就不同名（`capture` 回 `xhr`、
+ * `session.network` 回 `matches`）。这里若改成「哪个键有就用哪个」的猜测，其中一条会悄悄
+ * 恒回空列表 —— 而这个参数的存在就是为了让那种错在调用点上看得见。
  *
  * @param raw - 回包里的 result
- * @returns XHR 摘要列表
+ * @param key - 这条路径承载条目的字段名
+ * @returns 网络条目列表
  */
-function toXhr(raw: unknown): XhrSummary[] {
-  if (!isRecord(raw) || !Array.isArray(raw["xhr"])) {
+function toNetworkEntries(raw: unknown, key: "xhr" | "matches"): NetworkEntry[] {
+  if (!isRecord(raw) || !Array.isArray(raw[key])) {
     return [];
   }
-  const items: XhrSummary[] = [];
-  for (const item of raw["xhr"]) {
-    if (isRecord(item)) {
-      items.push({
-        url: typeof item["url"] === "string" ? item["url"] : "",
-        status: typeof item["status"] === "number" ? item["status"] : 0,
-        bytes: typeof item["bytes"] === "number" ? item["bytes"] : 0,
-      });
-    }
+  return raw[key].flatMap((item) => (isRecord(item) ? [normalizeNetworkEntry(item)] : []));
+}
+
+/**
+ * 读网络历史的那几个参数，按方法分档。
+ *
+ * 只有 `capture` 读它们。把 `urlPattern` 之类发给 `render` 或会话抓取等于递过去一个对面
+ * 根本不读的键 —— 那正是本包一直在消灭的「拧了没反应」。
+ *
+ * @param method - sidecar 方法名
+ * @param args - 工具入参
+ * @returns 要并进载荷的键
+ */
+function networkReadParams(method: string, args: Record<string, unknown>): Record<string, unknown> {
+  if (method !== "capture") {
+    return {};
   }
-  return items;
+  return {
+    urlPattern: args["urlPattern"] ?? null,
+    includeBody: args["includeBody"] === true,
+    networkLimit: args["networkLimit"] ?? null,
+    maxBodyChars: args["maxBodyChars"] ?? null,
+  };
 }
 
 /**
@@ -773,7 +864,7 @@ function browserPayload(
   method: string,
 ): { method: string; params: Record<string, unknown> } {
   const { waitSelector } = args;
-  // 会话抓取这一帧被 static 与 browser 两种会话共用：static 那一支读 headers/retries，
+  // 会话抓取这一帧被 static 与浏览器两种会话共用：static 那一支读 headers/retries，
   // 浏览器那一支读 extraHeaders/timeoutMs。只给会话帧补前者，免得给 render 发一个
   // Python 根本不读的键（那是「拧了没反应」的老毛病）。
   const sessionScoped = method === METHOD_SESSION_FETCH;
@@ -784,20 +875,33 @@ function browserPayload(
       cssSelector: args["cssSelector"] ?? null,
       extractionType: args["extractionType"] ?? settings.extractionType,
       mainContentOnly: args["mainContentOnly"] ?? settings.mainContentOnly,
+      pierceShadow: args["pierceShadow"] ?? settings.pierceShadow,
       headless: args["headless"] ?? settings.headless,
       networkIdle: args["networkIdle"] ?? settings.networkIdle,
       timeoutMs: settings.pageTimeoutMs,
       maxContentChars: settings.maxOutputBytes,
-      captureXhrPattern: settings.captureXhrPattern,
       blockAds: settings.blockAds,
+      // 反检测那几条只在被显式拧过时才发：没给就交给 Python 的默认值（hide_canvas=False、
+      // allow_webgl=True、block_webrtc 由「有没有代理」决定）。发一个默认值等于把
+      // 「部署没表态」写死成一次表态。
+      ...(args["solveCloudflare"] === true ? { solveCloudflare: true } : {}),
+      ...(args["hideCanvas"] === true ? { hideCanvas: true } : {}),
+      ...(args["blockWebrtc"] === true ? { blockWebrtc: true } : {}),
+      ...(args["allowWebgl"] === false ? { allowWebgl: false } : {}),
+      ...networkReadParams(method, args),
       // requestTimeoutSeconds 与 maxUrlLength 不往线上传：前者只作用于静态抓取（那边发的
       // 是 timeoutSeconds —— Python 真读的那个名字），后者是 Host 侧 URL 闸门自己的上限。
       // Python 从不看这两个键，发过去就是「设置拧了没反应」的另一种写法。
-      // deployment 是部署级能力的专用命名空间：Python 侧只从这里读浏览器二进制路径、
-      // CDP 端点与输出形态开关，不在模型可见的透传表里。
+      // deployment 是部署级能力的专用命名空间：Python 侧只从这里读浏览器二进制路径、CDP
+      // 端点、注入脚本、真实 Chrome、DoH、网络记录的开关与容量、输出形态开关。
       deployment: {
         browserExecutablePath: settings.browserExecutablePath,
         browserCdpUrl: settings.browserCdpUrl,
+        browserInitScript: settings.browserInitScript,
+        browserRealChrome: settings.browserRealChrome,
+        browserDnsOverHttps: settings.browserDnsOverHttps,
+        recordRequests: settings.recordRequests,
+        maxRecordedRequests: settings.maxRecordedRequests,
         stripInlineImages: settings.stripInlineImages,
       },
       waitMs: args["waitMs"] ?? null,
@@ -812,34 +916,61 @@ function browserPayload(
   };
 }
 
-/** XHR 摘要的条目 schema。 */
-const XHR_ITEM = {
+/** 网络历史条目的条目 schema。 */
+const NETWORK_ITEM = {
   type: "object" as const,
   additionalProperties: false as const,
   properties: {
     url: { type: "string" as const, required: true as const },
     status: { type: "integer" as const, required: true as const },
     bytes: { type: "integer" as const, required: true as const },
+    method: { type: "string" as const, required: true as const },
+    resourceType: { type: "string" as const, required: true as const },
+    bodyNote: { type: "string" as const },
+    body: { type: "string" as const },
+    bodyTruncated: { type: "boolean" as const },
   },
 };
 
 /**
- * 把浏览器抓取结果渲染成模型看的文本，末尾附上 XHR 摘要。
+ * 网络历史条目 → 模型可读的若干行。
+ *
+ * 正文只在条目真的带了 body 时展开；`bodyNote` 说明上游为什么没存下正文。
+ *
+ * @param matches - 归一后的条目
+ * @returns 行文本
+ */
+function networkLines(matches: readonly NetworkEntry[]): string[] {
+  return matches.map((item) => {
+    const kind = item.resourceType.length > 0 ? `, ${item.resourceType}` : "";
+    const head = `- ${item.method} ${item.url} (HTTP ${item.status}, ${item.bytes}B${kind})`;
+    if (typeof item.bodyNote === "string") {
+      return `${head} — no body: ${item.bodyNote}`;
+    }
+    if (typeof item.body !== "string") {
+      return head;
+    }
+    const label = item.bodyTruncated === true ? "body (truncated)" : "body";
+    return `${head} — ${label}:\n${item.body}`;
+  });
+}
+
+/**
+ * 把浏览器抓取结果渲染成模型看的文本，末尾附上网络历史。
  *
  * @param value - 浏览器抓取载荷
  * @returns 模型侧文本
  */
 function renderBrowser(value: BrowserResult | FetchResult): string {
   const body = renderFetch(value);
-  // 不带 XHR 的工具（render）其 schema 里没有这个字段，execute 也就不会产出它；
-  // capture_xhr 那一路上它一定是数组。这里只能断言一次：联合类型里 FetchResult 没有
+  // 不带网络历史的工具（render）其 schema 里没有这个字段，execute 也就不会产出它；
+  // capture 那一路上它一定是数组。这里只能断言一次：联合类型里 FetchResult 没有
   // 这个键，但两个调用点传进来的对象都出自 createBrowserTool 的 execute。
-  const captured: XhrSummary[] = (value as Partial<BrowserResult>).xhr ?? [];
+  const captured: NetworkEntry[] = (value as Partial<BrowserResult>).xhr ?? [];
   if (captured.length === 0) {
     return body;
   }
-  const lines = captured.map((item) => `- ${item.url} (HTTP ${item.status}, ${item.bytes}B)`);
-  return `${body}\n\nCaptured XHR/fetch:\n${lines.join("\n")}`;
+  return `${body}\n\nCaptured XHR/fetch:\n${networkLines(captured).join("\n")}`;
 }
 
 /** 建浏览器抓取工具时的可变部分。 */
@@ -847,8 +978,10 @@ interface BrowserToolOptions {
   readonly name: string;
   readonly description: string;
   readonly method: string;
-  /** 结果里是否带 XHR 摘要。 */
+  /** 结果里是否带网络历史。 */
   readonly withXhr: boolean;
+  /** 额外的参数声明；只有 capture 用它装「怎么读网络历史」那几枚。 */
+  readonly extraParameters?: Record<string, unknown>;
 }
 
 /**
@@ -866,7 +999,7 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
   return defineTool({
     name: options.name,
     description: options.description,
-    parameters: { ...BROWSER_PARAMS_TEXT, ...BROWSER_IDENTITY_PARAMS },
+    parameters: { ...BROWSER_PARAMS_TEXT, ...BROWSER_IDENTITY_PARAMS, ...options.extraParameters },
     output: {
       schema: {
         type: "object",
@@ -878,7 +1011,9 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
           content: { type: "string", required: true },
           truncated: { type: "boolean", required: true },
           notice: { type: "string", required: true },
-          ...(options.withXhr ? { xhr: { type: "array", required: true, items: XHR_ITEM } } : {}),
+          ...(options.withXhr
+            ? { xhr: { type: "array", required: true, items: NETWORK_ITEM } }
+            : {}),
         },
       },
       render: (_args, value) => [{ type: "text", text: renderBrowser(value) }],
@@ -906,7 +1041,7 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
         notice: capped.notice,
         // 只在 schema 声明了 xhr 的那个工具上才产出它：schema 是
         // additionalProperties: false，无条件带上会让 render 每一次都被判非法。
-        ...(options.withXhr ? { xhr: toXhr(raw) } : {}),
+        ...(options.withXhr ? { xhr: toNetworkEntries(raw, "xhr") } : {}),
       };
       return result;
     },
@@ -925,11 +1060,32 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
   });
 }
 
+/** capture 独有的「怎么读这次抓到的网络历史」参数。 */
+const NETWORK_READ_PARAMS = {
+  urlPattern: {
+    type: "string",
+    description:
+      '只回 URL 匹配这个正则的条目，例如 "/api/"。留空表示全部（只含 XHR/fetch 与 HTTP 错误）。',
+  },
+  includeBody: {
+    type: "boolean",
+    description:
+      "连响应体一起回，默认 false。上游只为文本类型存正文，存不下时条目上会给出原因；" +
+      "单条上限由 maxBodyChars 决定。",
+  },
+  networkLimit: { type: "integer", description: "最多回多少条，默认 50。" },
+  maxBodyChars: { type: "integer", description: "单条正文的字符上限，默认 20000。" },
+} as const;
+
 /**
- * 建 `scrapling_render`：用真实浏览器渲染后抓取。
+ * 建 `scrapling_render`：用真实浏览器（patchright）渲染后抓取。
  *
- * 这是内置 `web_fetch` 结构上给不了的能力：它不执行 JavaScript，遇到 SPA 只能拿到
- * 加载占位。代价是慢得多（秒级起步）且吃内存，所以先试 `scrapling_fetch`。
+ * Scrapling 0.5 删掉了纯 Playwright 后端，浏览器抓取只剩 patchright 这一套，所以原来那个
+ * `scrapling_stealth_fetch` 已并入本工具 —— 反检测参数现在都在这里。
+ *
+ * 官方宣传「轻松绕过所有类型的 Cloudflare Turnstile」是**夸大**的：实现只是对挑战框
+ * 固定偏移点一次鼠标（抖动 3px/2px），最多 3 次，无 token 处理。所以参数说明写的是
+ * 「尝试」而不是「一定能过」。
  *
  * @param deps - 依赖
  * @returns 工具定义
@@ -941,6 +1097,7 @@ export function createRenderTool(deps: ToolDeps): ToolDefinition {
       "用真实浏览器打开一个 URL、执行 JavaScript，再把渲染后的页面抓下来。" +
       "内置 web_fetch 不执行 JS，遇到单页应用只能拿到加载占位时才需要它。" +
       "比 web_fetch 慢得多、也更吃内存 —— 先试 scrapling_fetch，确认内容确实依赖 JS 再用这个。" +
+      "站点对自动化痕迹敏感时再打开 solveCloudflare / hideCanvas / blockWebrtc 那几枚开关。" +
       "**结果比 scrapling_fetch 短就该退回静态抓取**：不少页面在服务端下发了可读文字（给搜索引擎与无 JS 用户），" +
       "加载后又用自己的脚本把那些容器清空、换成 canvas/Lottie 动画 —— 这类页面渲染后只会更少，" +
       "穷举 networkIdle / waitSelector / mainContentOnly / headless 都补不回来。" +
@@ -952,10 +1109,11 @@ export function createRenderTool(deps: ToolDeps): ToolDefinition {
 }
 
 /**
- * 建 `scrapling_capture_xhr`：渲染页面的同时，把它发出的 XHR/fetch 响应摘要一并收回来。
+ * 建 `scrapling_capture_xhr`：抓一次页面，并把这次抓取记下的 XHR/fetch 一并交回来。
  *
  * 很多站点的数据不渲染进 DOM，而是从一个 JSON 接口取。抓这个接口比解析 DOM 稳得多，
- * 而且拿到的就是原始结构化数据。
+ * 而且拿到的就是原始结构化数据。0.5 起「记录」是**会话级**的，所以这条路径自己起一个临时
+ * 会话抓一次再读它的历史 —— 对模型仍然是一次动作。
  *
  * @param deps - 依赖
  * @returns 工具定义
@@ -964,95 +1122,13 @@ export function createCaptureXhrTool(deps: ToolDeps): ToolDefinition {
   return createBrowserTool(deps, {
     name: "scrapling_capture_xhr",
     description:
-      "用真实浏览器打开一个 URL，同时收集它发出的所有 XHR/fetch 请求（URL、状态码、字节数）。" +
-      "站点数据来自 JSON 接口而不是 DOM 时，用它找到那个接口，再对接口 URL 单独抓一次即可拿到原始结构化数据。" +
-      "响应体不回传 —— 只回摘要，避免把模型上下文撑爆。",
-    method: "render",
+      "用真实浏览器打开一个 URL，并把这次抓取发出的 XHR/fetch 一并回给你（方法、URL、状态码、字节数）。" +
+      "站点数据来自 JSON 接口而不是 DOM 时，用它找到那个接口，再对接口 URL 单独抓一次即可拿到原始数据。" +
+      "默认只回摘要；要接口的响应体就打开 includeBody（单条上限由 maxBodyChars 定）。" +
+      "要读一个**已开会话**攒下的历史（跨多次抓取与页面动作）时用 scrapling_network。",
+    method: "capture",
     withXhr: true,
-  });
-}
-
-/**
- * 建 `scrapling_stealth_fetch`：用 patchright 的反检测浏览器抓取。
- *
- * 官方宣传「轻松绕过所有类型的 Cloudflare Turnstile」是**夸大**的：实现只是对挑战框
- * 固定偏移点一次鼠标（抖动 3px/2px），最多 3 次，无 token 处理。所以这里的描述写的是
- * 「提高成功率」而不是「一定能过」。
- *
- * @param deps - 依赖
- * @returns 工具定义
- */
-export function createStealthFetchTool(deps: ToolDeps): ToolDefinition {
-  const { sidecar, settings } = deps;
-  return defineTool({
-    name: "scrapling_stealth_fetch",
-    description:
-      "用带反检测补丁的浏览器（patchright）打开 URL 并抓取渲染后的页面。" +
-      "站点对自动化痕迹敏感、scrapling_render 拿不到内容时才需要它。" +
-      "比 render 更慢更吃内存。Cloudflare 挑战可能需要几次尝试才能过，不保证成功。",
-    parameters: {
-      ...BROWSER_PARAMS_TEXT,
-      ...BROWSER_IDENTITY_PARAMS,
-      solveCloudflare: {
-        type: "boolean",
-        description: "尝试点击 Cloudflare 挑战框。默认 false；开了最多尝试 3 次。",
-      },
-      hideCanvas: {
-        type: "boolean",
-        description: "给 canvas 读数加噪声（反指纹）。默认 false。",
-      },
-      blockWebrtc: {
-        type: "boolean",
-        description: "禁掉绕过代理的 WebRTC UDP。走代理时无论这里怎么填都开。",
-      },
-      allowWebgl: {
-        type: "boolean",
-        description:
-          "是否放行 WebGL，默认 true。关掉能挡掉一类指纹，但有些页面会因为没 WebGL 不出内容。",
-      },
-    },
-    output: {
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          url: { type: "string", required: true },
-          statusCode: { type: "integer", required: true },
-          extractionType: { type: "string", required: true },
-          content: { type: "string", required: true },
-          truncated: { type: "boolean", required: true },
-          notice: { type: "string", required: true },
-        },
-      },
-      render: (_args, value) => [{ type: "text", text: renderFetch(value) }],
-      presentationMeta: (_args, value) => ({
-        url: value.url,
-        statusCode: value.statusCode,
-        truncated: value.truncated,
-      }),
-    },
-    timeoutMs: settings.timeoutMs,
-    isConcurrencySafe: () => false,
-    async execute(args, exec: ToolRunContext): Promise<FetchResult> {
-      const payload = browserPayload(args, settings, "stealth_fetch");
-      const raw = await sidecar.call(
-        payload.method,
-        {
-          ...payload.params,
-          solveCloudflare: args["solveCloudflare"] === true,
-        },
-        { signal: exec.signal, timeoutMs: settings.timeoutMs },
-      );
-      const base = toFetchResult(raw, String(payload.params["extractionType"]));
-      const capped = capText(base.content, settings.maxOutputBytes, RECOVERY_HINT);
-      return {
-        ...base,
-        content: capped.text,
-        truncated: truncationOf(base.truncated, capped),
-        notice: capped.notice,
-      };
-    },
-    presentCall: (args) => ({ card: "generic", title: args["url"], kind: "fetch" }),
+    extraParameters: NETWORK_READ_PARAMS,
   });
 }
 
@@ -1226,13 +1302,12 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
       sessionType: {
         type: "string",
         required: true,
-        description:
-          "static（curl_cffi，最快）/ browser（Playwright，执行 JS）/ stealth（patchright，反检测）。",
+        description: "static（curl_cffi，最快）/ stealth（patchright，执行 JS 且带反检测）。",
       },
-      headless: { type: "boolean", description: "browser/stealth 是否无头运行，默认 true。" },
+      headless: { type: "boolean", description: "浏览器会话是否无头运行，默认 true。" },
       solveCloudflare: {
         type: "boolean",
-        description: "仅 stealth：是否尝试点 Cloudflare 挑战框。",
+        description: "浏览器会话：是否尝试点掉 Cloudflare 挑战框。",
       },
       // 这几枚只在**会话构造期**被读：会话内每次 fetch 传同类键会被上游静默丢掉，
       // 所以入口必须开在这里（fetch 层的那份见 scrapling_session_fetch / render）。
@@ -1245,15 +1320,20 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
       },
       hideCanvas: {
         type: "boolean",
-        description: "仅 stealth：给 canvas 读数加噪声。开场定死，中途改不了。",
+        description: "浏览器会话：给 canvas 读数加噪声。开场定死，中途改不了。",
       },
       blockWebrtc: {
         type: "boolean",
-        description: "仅 stealth：禁掉绕过代理的 WebRTC UDP。走代理时强制开。",
+        description: "浏览器会话：禁掉绕过代理的 WebRTC UDP。走代理时强制开。",
       },
       allowWebgl: {
         type: "boolean",
-        description: "仅 stealth：是否放行 WebGL。开场定死，中途改不了。",
+        description: "浏览器会话：是否放行 WebGL。开场定死，中途改不了。",
+      },
+      recordNetwork: {
+        type: "boolean",
+        description:
+          "让这个会话记下它的 XHR/fetch 历史，之后用 scrapling_network 读。默认跟随部署设置。",
       },
     },
     output: {
@@ -1289,16 +1369,21 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
           hideCanvas: args["hideCanvas"] === true,
           blockWebrtc: args["blockWebrtc"] === true,
           allowWebgl: args["allowWebgl"] ?? true,
+          recordNetwork: args["recordNetwork"] === true,
           // 这几枚旋钮**只在开场生效**：会话内每次 fetch 传过去会被上游 validate_fetch
           // 静默丢掉（见 py/adapters.py 的 FETCH_LEVEL_KEYS）。之前只发 sessionType /
-          // headless / solveCloudflare，于是设置卡上的页面超时、广告拦截、XHR 正则、
-          // 浏览器二进制路径与 CDP 端点对浏览器会话全部无效，且不报错。
+          // headless / solveCloudflare，于是设置卡上的页面超时、广告拦截、浏览器二进制路径
+          // 与 CDP 端点对浏览器会话全部无效，且不报错。
           timeoutMs: settings.pageTimeoutMs,
           blockAds: settings.blockAds,
-          captureXhrPattern: settings.captureXhrPattern,
           deployment: {
             browserExecutablePath: settings.browserExecutablePath,
             browserCdpUrl: settings.browserCdpUrl,
+            browserInitScript: settings.browserInitScript,
+            browserRealChrome: settings.browserRealChrome,
+            browserDnsOverHttps: settings.browserDnsOverHttps,
+            recordRequests: settings.recordRequests,
+            maxRecordedRequests: settings.maxRecordedRequests,
           },
         },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
@@ -1327,16 +1412,16 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
       extraHeaders: {
         type: "json",
         description:
-          "这一次请求的额外请求头（对象）。**三种会话都生效**，想给浏览器会话带请求头就用它。",
+          "这一次请求的额外请求头（对象）。**两种会话都生效**，想给浏览器会话带请求头就用它。",
       },
       headers: {
         type: "json",
         description:
-          "仅 static 会话：本次请求的请求头（对象）。给 browser/stealth 会话传它会**直接报错** —— 浏览器侧请用 extraHeaders。",
+          "仅 static 会话：本次请求的请求头（对象）。给浏览器会话传它会**直接报错** —— 浏览器侧请用 extraHeaders。",
       },
       retries: {
         type: "integer",
-        description: "仅 static 会话：本次请求的重试次数。给 browser/stealth 会话传它会直接报错。",
+        description: "仅 static 会话：本次请求的重试次数。给浏览器会话传它会直接报错。",
       },
     },
     output: {
@@ -1351,12 +1436,9 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
           truncated: { type: "boolean", required: true },
           notice: { type: "string", required: true },
           sessionId: { type: "string", required: true },
-          // 会话按设置的 captureXhrPattern 抓到的接口摘要。声明成可选：没配正则时会话
-          // 压根不捕获，硬要 required 就等于逼每条结果都带一个空数组。
-          xhr: { type: "array", items: XHR_ITEM },
         },
       },
-      render: (_args, value) => [{ type: "text", text: renderBrowser(value) }],
+      render: (_args, value) => [{ type: "text", text: renderFetch(value) }],
       presentationMeta: (_args, value) => ({
         url: value.url,
         statusCode: value.statusCode,
@@ -1365,10 +1447,7 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
     },
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => false,
-    async execute(
-      args,
-      exec: ToolRunContext,
-    ): Promise<FetchResult & { sessionId: string; xhr: XhrSummary[] }> {
+    async execute(args, exec: ToolRunContext): Promise<FetchResult & { sessionId: string }> {
       const raw = await sidecar.call(
         METHOD_SESSION_FETCH,
         {
@@ -1385,16 +1464,197 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
         truncated: truncationOf(base.truncated, capped),
         notice: capped.notice,
         sessionId: args["sessionId"],
-        // 会话的 XHR 正则在开场时就定死了（capture_xhr 只在构造期生效），但**收集是逐页的**：
-        // 上游每次 fetch 在自己的 page generator 里新建一个 xhr_captured 列表
-        // （engines/_browsers/_stealth.py 与 _dynamic.py），所以这里回的是「这一次页面加载
-        // 期间命中正则的请求」，不是整场会话的历史 —— 连着取五页不会把第一页的接口回五遍。
-        // 没配正则时是空表。
-        xhr: toXhr(raw),
       };
     },
     presentCall: (args) => ({ card: "generic", title: args["url"], kind: "fetch" }),
   });
+}
+
+/**
+ * 建 `scrapling_session_network`：读一个已开会话记下的网络历史。
+ *
+ * 与 `scrapling_capture_xhr` 的分工：那条是「不知道接口在哪，开一次看看」，这条是
+ * 「我有一个会话，读它攒下的全部历史」—— 会话级记录跨多次抓取、跨页面动作，能捞到单次
+ * 抓取看不到的那些请求。
+ *
+ * @param deps - 依赖
+ * @returns 工具定义
+ */
+export function createSessionNetworkTool(deps: ToolDeps): ToolDefinition {
+  const { sidecar, settings } = deps;
+  return defineTool({
+    name: "scrapling_session_network",
+    description:
+      "读一个会话记下的 XHR/fetch 历史（方法、URL、状态码、字节数），可按 URL 正则与条数筛选，" +
+      "也可以连响应体一起读。" +
+      "会话必须已经开着记录：在 scrapling_session_open 上打开 recordNetwork，或由部署侧开启默认。" +
+      "没开记录的会话会直接报错，而不是回一个空列表。",
+    parameters: {
+      sessionId: { type: "string", required: true, description: "会话 id。" },
+      ...NETWORK_READ_PARAMS,
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          sessionId: { type: "string", required: true },
+          count: { type: "integer", required: true },
+          matches: { type: "array", required: true, items: NETWORK_ITEM },
+        },
+      },
+      render: (_args, value) => [
+        {
+          type: "text",
+          text:
+            value.matches.length === 0
+              ? `session ${value.sessionId} recorded no XHR/fetch (${value.count} matches)`
+              : `session ${value.sessionId} — ${value.count} XHR/fetch:\n${networkLines(
+                  value.matches,
+                ).join("\n")}`,
+        },
+      ],
+    },
+    timeoutMs: settings.timeoutMs,
+    isConcurrencySafe: () => false,
+    async execute(
+      args,
+      exec: ToolRunContext,
+    ): Promise<{ sessionId: string; count: number; matches: NetworkEntry[] }> {
+      const raw = await sidecar.call(
+        "session.network",
+        {
+          sessionId: args["sessionId"],
+          urlPattern: args["urlPattern"] ?? null,
+          includeBody: args["includeBody"] === true,
+          networkLimit: args["networkLimit"] ?? null,
+          maxBodyChars: args["maxBodyChars"] ?? null,
+        },
+        { signal: exec.signal, timeoutMs: settings.timeoutMs },
+      );
+      const matches = toNetworkEntries(raw, "matches");
+      return {
+        /* v8 ignore next —— 非字符串到不了：schema 声明 sessionId 是必填字符串，而
+           defineTool 的包装在校验不过时先抛，根本走不到这里。留着只为工具契约变更时
+           不把一次调用打挂。 */
+        sessionId: typeof args["sessionId"] === "string" ? args["sessionId"] : "",
+        count: isRecord(raw) && typeof raw["count"] === "number" ? raw["count"] : matches.length,
+        matches,
+      };
+    },
+    presentCall: (args) => ({ card: "generic", title: args["sessionId"], kind: "search" }),
+  });
+}
+
+/**
+ * 把会话状态工具的返回归一成声明过的形状。
+ *
+ * @param raw - sidecar 回包
+ * @param sessionId - 本次传入的会话 id
+ * @param saving - 是存还是取
+ * @returns 声明过的三个字段
+ */
+function toStateResult(
+  raw: unknown,
+  sessionId: string,
+  saving: boolean,
+): { sessionId: string; path: string; saved: boolean } {
+  const record = isRecord(raw) ? raw : {};
+  return {
+    sessionId: typeof record["sessionId"] === "string" ? record["sessionId"] : sessionId,
+    path: typeof record["path"] === "string" ? record["path"] : "",
+    saved: record["saved"] === true ? true : !saving,
+  };
+}
+
+/**
+ * 建会话状态存取工具。
+ *
+ * 目录由部署侧定（`sessionStateDir`），模型只能给一个纯文件名 —— 这是**写文件**的能力，
+ * 让模型选路径等于给它一个任意文件写入口。
+ *
+ * @param deps - 依赖
+ * @param saving - True 建「存」，False 建「取」
+ * @returns 工具定义
+ */
+function createSessionStateTool(deps: ToolDeps, saving: boolean): ToolDefinition {
+  const { sidecar, settings } = deps;
+  return defineTool({
+    name: saving ? "scrapling_session_state_save" : "scrapling_session_state_load",
+    description: saving
+      ? "把一个浏览器会话的登录态（cookie、localStorage、IndexedDB）存成一个文件，" +
+        "下次用 scrapling_session_state_load 载入即可复用，不必重新登录。登录完成之后再调用。"
+      : "把之前存下的登录态载入会话。载入本身不导航，之后要重新抓一次页面才用得上它。",
+    parameters: {
+      sessionId: { type: "string", required: true, description: "会话 id。" },
+      name: {
+        type: "string",
+        required: true,
+        description:
+          "状态文件名（不含扩展名，不能带路径）。文件落在部署配置的 sessionStateDir 目录里。",
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          sessionId: { type: "string", required: true },
+          path: { type: "string", required: true },
+          saved: { type: "boolean", required: true },
+        },
+      },
+      render: (_args, value) => [
+        {
+          type: "text",
+          text: saving
+            ? `browser state saved to ${value.path}`
+            : `browser state loaded from ${value.path}`,
+        },
+      ],
+    },
+    timeoutMs: settings.timeoutMs,
+    isConcurrencySafe: () => false,
+    async execute(
+      args,
+      exec: ToolRunContext,
+    ): Promise<{ sessionId: string; path: string; saved: boolean }> {
+      const raw = await sidecar.call(
+        saving ? "session.state_save" : "session.state_load",
+        {
+          sessionId: args["sessionId"],
+          name: args["name"],
+          deployment: { sessionStateDir: settings.sessionStateDir },
+        },
+        { signal: exec.signal, timeoutMs: settings.timeoutMs },
+      );
+      /* v8 ignore next —— 同 scrapling_session_network 那条：sessionId 由 schema 保证是
+         字符串，非字符串那一侧不可达（defineTool 先校验后执行）。 */
+      const sessionId = typeof args["sessionId"] === "string" ? args["sessionId"] : "";
+      return toStateResult(raw, sessionId, saving);
+    },
+    presentCall: (args) => ({ card: "generic", title: args["sessionId"], kind: "search" }),
+  });
+}
+
+/**
+ * 建 `scrapling_session_state_save`。
+ *
+ * @param deps - 依赖
+ * @returns 工具定义
+ */
+export function createSessionStateSaveTool(deps: ToolDeps): ToolDefinition {
+  return createSessionStateTool(deps, true);
+}
+
+/**
+ * 建 `scrapling_session_state_load`。
+ *
+ * @param deps - 依赖
+ * @returns 工具定义
+ */
+export function createSessionStateLoadTool(deps: ToolDeps): ToolDefinition {
+  return createSessionStateTool(deps, false);
 }
 
 /**
@@ -1511,6 +1771,14 @@ export interface CrawlSink {
    * Python 进程也不会被拆。
    */
   signal: AbortSignal;
+  /**
+   * 把这次爬虫的 crawlId 交给宿主，让 sidecar 推来的进度事件能找到这个作业的输出环。
+   *
+   * 事件帧与 `crawl.run` 的响应走同一条 stdout，只能靠 crawlId 归属；而 crawlId 在响应
+   * 里才第一次出现，宿主在那之前没有任何键可挂。缺省实现什么都不做（单测直接跑工具时
+   * 没有事件通道）。
+   */
+  track?: (crawlId: string) => void;
 }
 
 /** 爬虫作业的干活部分：宿主保证它只被调用一次，返回后作业就算结束。 */
@@ -1626,7 +1894,13 @@ async function drainOnce(
   signal: AbortSignal,
   seen: number,
 ): Promise<number> {
-  const raw = await sidecar.call("crawl.status", { crawlId }, { signal, timeoutMs: null });
+  // 只取 seen 之后新增的那一段：整份 pages 每轮重发是 O(n²)，且几十页就能把回包顶过
+  // Host 侧 8 MiB 帧上限 —— 那一帧会被判成坏帧，整个 sidecar 连同在跑的会话一起被拆掉。
+  const raw = await sidecar.call(
+    "crawl.status",
+    { crawlId, since: seen },
+    { signal, timeoutMs: null },
+  );
   /* v8 ignore next 1 —— sidecar 回了非对象时的兜底：协议层已保证回包是对象。 */
   const status = isRecord(raw) ? raw : {};
   const failure = typeof status["error"] === "string" ? status["error"] : "";
@@ -1634,26 +1908,27 @@ async function drainOnce(
     throw new Error(`crawl failed: ${failure}`);
   }
   /* v8 ignore start —— 下面这段只在「sidecar 回了非数组 pages」时走到，
-     属于对端形状异常的防御：过滤掉非对象项、跳过已输出过的页。
-     正常路径（crawl.status 每轮返回递增的 pages 数组）由集成测试覆盖。 */
+     属于对端形状异常的防御：过滤掉非对象项。
+     正常路径（crawl.status 每轮返回新增的 pages 数组）由集成测试覆盖。 */
   const allPages = Array.isArray(status["pages"]) ? status["pages"] : [];
   const pages = allPages.filter((page): page is Record<string, unknown> => isRecord(page));
-  for (const page of pages.slice(seen)) {
+  for (const page of pages) {
     sink.append(pageToText(page));
   }
   /* v8 ignore stop */
+  const total = seen + pages.length;
   if (status["running"] !== true && status["expired"] === true) {
     // 只在收尾那一拍说：页数比 maxPages 少的原因是整体截止到了点，不是站点就这么大。
     sink.progress("crawl stopped at its runtime budget; the page cap was not reached");
   }
-  sink.progress(`${pages.length} page(s) crawled`);
+  sink.progress(`${total} page(s) crawled`);
   if (status["running"] !== true) {
-    return pages.length;
+    return total;
   }
   await sleep(CRAWL_POLL_MS, undefined, { signal });
   // 自己递归而不是回调 drainCrawl：叫停只在最外层那一个 try 里做一次，
   // 每层各停一遍会让一次 job_kill 打出 N 帧 crawl.stop。
-  return drainOnce(sidecar, crawlId, sink, signal, pages.length);
+  return drainOnce(sidecar, crawlId, sink, signal, total);
 }
 
 /**
@@ -1713,7 +1988,8 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
     description:
       "后台爬一个网站，把每页转成 Markdown。**立刻返回 job id，不会阻塞。**" +
       "用 job_list 看进度、job_output 读已抓到的页面、job_kill 中断。" +
-      "爬取只在起始 URL 所属的域名内进行，并遵守站点的 robots.txt；默认最多 20 页。" +
+      "爬取只在起始 URL 所属的域名内进行，默认最多 20 页。" +
+      "是否遵守 robots.txt、请求间隔与并发数由部署侧配置（默认不遵守、无间隔、并发 4）。" +
       "只想抓一个已知 URL 时用 scrapling_fetch，不必起爬虫。",
     parameters: {
       url: { type: "string", required: true, description: URL_PARAM_DESC },
@@ -1759,7 +2035,21 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
         const signal = anySignal([sink.signal, exec.signal]);
         const started = await sidecar.call(
           "crawl.run",
-          { url, maxPages, maxDurationMs: settings.crawlMaxRuntimeSeconds * 1000 },
+          {
+            url,
+            maxPages,
+            maxDurationMs: settings.crawlMaxRuntimeSeconds * 1000,
+            // 待站策略全是部署级：它们决定「这台机器怎么对待别人的站点」，模型入参到不了
+            // 这里（Python 侧只从 deployment 读）。
+            deployment: {
+              crawlRespectRobots: settings.crawlRespectRobots,
+              crawlDownloadDelayMs: settings.crawlDownloadDelayMs,
+              crawlConcurrentRequests: settings.crawlConcurrentRequests,
+              crawlAutothrottle: settings.crawlAutothrottle,
+              crawlStrategy: settings.crawlStrategy,
+              crawlCheckpointDir: settings.crawlCheckpointDir,
+            },
+          },
           {
             signal,
             // 爬多久不固定，不能套用工具的默认超时。
@@ -1767,6 +2057,9 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
           },
         );
         crawlId = textOf(started, "crawlId");
+        // 先把 id 交给宿主再开始轮询：事件帧（进度、跳过）随时可能先到，而它们只带
+        // crawlId 一个归属键。
+        sink.track?.(crawlId);
         sink.progress(`crawling ${url} (max ${maxPages})`);
         await drainCrawl(sidecar, crawlId, sink, signal, 0);
       });

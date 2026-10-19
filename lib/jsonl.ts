@@ -7,6 +7,7 @@
 // Python 侧的 bridge.py 对齐（一帧一行、行内不得有裸换行）。
 
 import type { Readable } from "node:stream";
+import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { FrameError } from "./frame-error.ts";
 
 /** 「不是合法 JSON」这一类帧错误的 kind；抽成常量是因为它在三处出现。 */
@@ -32,19 +33,6 @@ export function encodeFrame(value: unknown): string {
 }
 
 /**
- * 判断一个 JSON 值是不是「帧对象」。
- *
- * 用类型谓词而不是 `as Record<string, unknown>` 断言：断言出来的类型编译器并不认可，
- * 断言错了要等到运行时才发现。
- *
- * @param value - JSON.parse 的结果
- * @returns 是否是普通对象
- */
-export function isFrameObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-/**
  * 解析一帧。
  *
  * @param line - 单行文本
@@ -59,7 +47,7 @@ export function decodeFrame(line: string): Record<string, unknown> {
       cause: error,
     });
   }
-  if (!isFrameObject(parsed)) {
+  if (!isRecord(parsed)) {
     throw new FrameError("not-an-object", `frame must be a JSON object: ${line.slice(0, 120)}`);
   }
   return parsed;

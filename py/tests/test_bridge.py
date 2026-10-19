@@ -18,6 +18,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -38,8 +39,28 @@ PAGE = b"""<!doctype html><html><head><title>SPA Shell</title></head>
   document.title = 'SPA Rendered';
 }, 40);</script></body></html>"""
 
+# 一个自己发起 XHR/fetch 的页面：capture 与 session.network 都要有一条**真接口**可记。
+# 那条请求的 resource_type 是 fetch，才不会被网络摘要的 include_static 过滤掉。
+XHR_PAGE = b"""<!doctype html><html><head><title>XHR Page</title></head>
+<body><div id="app">LOADING_PLACEHOLDER</div>
+<script>fetch('/api/data').then(function(r){return r.text()}).then(function(t){
+  document.getElementById('app').textContent = 'GOT:' + t;
+});</script></body></html>"""
+
+# /api/data 的响应体：给网络摘要留一段够长的正文，好用 includeBody + 一个小预算验截断。
+XHR_PAYLOAD = b'{"ok":true,"items":[1,2,3,4,5]}'
+
 failures: list[str] = []
 passes = 0
+# 跑量下限取的是「一次不差的全部条数」，不是「减去一点余量」：最小的几节只有 2 条，
+# 留了余量就等于允许最小的两三节静默消失，而那时 failures 照旧是空的。
+# 多加一条不需要动这里（只禁下降）；少一条就必须显式改这个数，改的人得说自己为什么少跑了。
+#
+# 下限分两档，档位由「这台机器能不能真起一次浏览器」决定：没有二进制时，依赖浏览器的那几节
+# 整段不参与（实测差 57 条），那不是静默消失。只写一档的后果实测过——该仓 CI 刻意不装浏览器，
+# 于是门禁红在环境上，红完读者先去怀疑代码。两档各自钉死、都只禁下降。
+MIN_CHECKS_WITH_BROWSER = 541
+MIN_CHECKS_WITHOUT_BROWSER = 484
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -61,10 +82,10 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 def _sidecar_argv() -> list[str]:
     """起 sidecar 子进程的命令行。
 
-    默认就是真实插件用的那条（``-u`` 关缓冲、``-I`` 隔离）。在跑覆盖率时多套一层
-    ``coverage run``：bridge.py 与 adapters 的各方法全都活在这个子进程里，不套的话
-    覆盖率度量只看得见父进程导入模块时执行的那一小截（实测 adapters.py 会显示 20%，
-    而它的抓取路径一条都没被算上）—— 那个数字不是「覆盖低」，是「根本没量到」。
+    默认就是真实插件用的那条（``-u`` 关缓冲、``-I`` 隔离）。在跑覆盖率时多套一层 ``coverage run``，
+    本意是把活在子进程里的 bridge.py 与 adapters 各方法也量进来；实测这层套子是空转的：子进程以 py/
+    为工作目录，而 ``source = ["py"]`` 按工作目录解析，它写出的数据文件不含任何测量。因此
+    ``DSH_PY_COVERAGE=1`` 设与不设，coverage 的读数一字不差 —— 地板量不到 instrumentation 接线断掉。
 
     ``--data-file`` 必须给**绝对路径**：子进程的工作目录是 py/，而覆盖率默认把数据写在
     当前目录下。不给的话它的那一份落在 py/ 里，父进程随后的 combine 与 erase 都只在
@@ -197,11 +218,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
     """只回 SPA 外壳；其余路径回一张占位图片；写方法把请求本身回显成 JSON。"""
 
     def do_GET(self) -> None:  # noqa: N802 —— BaseHTTPRequestHandler 的命名约定
-        """回一个页面或一张图；`/echo` 那一条回显请求本身（GET 带 body 时该被丢掉）。"""
+        """回一页、一张图、一段接口 JSON，或回显请求本身。"""
         if self.path == "/echo":
             self._echo()
             return
+        if self.path == "/api/data":
+            self._send(XHR_PAYLOAD, "application/json")
+            return
+        if self.path == "/xhrpage":
+            self._send(XHR_PAGE, "text/html; charset=utf-8")
+            return
         body, ctype = (PAGE, "text/html; charset=utf-8") if self.path == "/" else (b"\x89PNG", "image/png")
+        self._send(body, ctype)
+
+    def _send(self, body: bytes, ctype: str) -> None:
+        """回一段固定正文。"""
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -511,7 +542,7 @@ def run(sidecar: Sidecar, base: str, caps: dict[str, Any]) -> None:
     # 回归点：Playwright sync 对象绑定创建线程，而 bridge 的 worker 空闲 50ms 就退出。
     # 每次请求前隔 0.4s —— 远超空闲窗口，下一次调用必然由一条全新线程领走。
     # 没有会话专属执行线程时，这里稳定复现 greenlet.error。
-    browser_open = sidecar.call("session.open", {"sessionType": "browser"})
+    browser_open = sidecar.call("session.open", {"sessionType": "stealth"})
     browser_id = (browser_open.get("result") or {}).get("sessionId", "")
     check("browser session.open 成功", browser_open.get("ok") is True, repr(browser_open)[:200])
     time.sleep(0.4)
@@ -791,7 +822,6 @@ class FakeResponse:
     url = "http://127.0.0.1:1/"
     status = 200
     history = ()
-    captured_xhr = None
     html_content = HOSTILE.decode()
 
     def _selector(self) -> Any:
@@ -924,6 +954,26 @@ def run_output_shape() -> None:
         str(stripped["content"])[:120],
     )
 
+    # 剥与封顶的先后：内联图排在正文前面时，先封顶会让整份预算被 base64 吃光，
+    # 剥完只剩一个 alt 占位 —— README 与 crawl 那条路径都写的是「先剥再封顶」。
+    class BudgetResponse(FakeResponse):
+        def markdown(self, css_selector: str | None = None, main_content_only: bool = False) -> str:
+            return "![logo](data:image/svg+xml;base64," + "A" * 400 + ")\n\n正文在这里"
+
+    budgeted = adapters.to_payload(
+        BudgetResponse(),
+        extraction_type="markdown",
+        css_selector=None,
+        main_content_only=True,
+        max_content_chars=40,
+    )
+    check(
+        "封顶之前先剥内嵌图：预算不被 base64 吃掉",
+        "正文在这里" in str(budgeted["content"]),
+        repr(budgeted["content"])[:120],
+    )
+    check("剥完没超预算就不标 truncated", budgeted["truncated"] is False, repr(budgeted))
+
 
 def run_crawl_guards() -> None:
     """爬虫的边界：域内判定、select 的字符预算、站外重定向与叫停通道。
@@ -969,6 +1019,12 @@ def run_crawl_guards() -> None:
         _run_page_confinement(crawl)
         _run_crawl_happy_path(crawl)
         _run_crawl_stop(crawl)
+        for bad_since in (-1, True, "1"):
+            try:
+                crawl.crawl_status({"crawlId": "whatever", "since": bad_since})
+                check(f"since={bad_since!r} 被拒", False, "被当成合法值放行")
+            except adapters.AdapterError as error:
+                check(f"since={bad_since!r} 被拒", error.code == "BAD_ARGS", error.code)
     finally:
         crawl.close_all_crawls()
         guard.configure(allowed_hosts=frozenset())
@@ -1051,22 +1107,33 @@ def _run_crawl_happy_path(crawl: Any) -> None:
         check("每收一页报一次进度", len(progress) == len(status["pages"]), f"{len(progress)} vs {len(status['pages'])}")
         check("进度的 done 逐页递增", [item["done"] for item in progress] == list(range(1, len(progress) + 1)), "")
 
+        # 增量读法：Host 每轮只拿新增的那一段，回包大小与页数无关。整份重发既是 O(n²)，
+        # 也会在几十页后顶过 8 MiB 帧上限，把整个 sidecar 判成坏帧拆掉。
+        tail = crawl.crawl_status({"crawlId": crawl_id, "since": 1})
+        check("since 之后只回新增页", tail["pages"] == status["pages"][1:], repr(tail["pages"])[:120])
+        check("total 仍是全部页数", tail["total"] == len(status["pages"]), str(tail["total"]))
+
         # maxPages 是**页数**闸门：再多链接也不许多收。
         capped_id = crawl.crawl_run({"url": f"{base}/", "maxPages": 1})["crawlId"]
         capped = _await_crawl_done(crawl, capped_id, 60)
         check("maxPages 真的封顶", len(capped["pages"]) <= 1, str(len(capped["pages"])))
 
-        # README 明写「不遵守 robots.txt、每域延迟 0、最多 4 个并发」——那条声明挂在
-        # Spider 基类的默认值上。这里钉住它，默认值哪天被上游改掉，README 会立刻变成错的文档。
-        spider = crawl._make_spider(f"{base}/", 5, "defaults", {"pages": [], "deadline": 0}, {"127.0.0.1"})
+        # README 明写「不遵守 robots.txt、每域延迟 0、最多 4 个并发」——那些是部署没表态时
+        # `_crawl_policy` 给的目标值，由 `_make_spider` 写进 Spider 的类属性。两处都钉：
+        # 默认值哪天被上游或本仓改掉，README 会立刻变成错的文档。
+        spider = crawl._make_spider(
+            f"{base}/", 5, "defaults", {"pages": [], "deadline": 0}, {"127.0.0.1"}, crawl._crawl_policy({})
+        )
         for attr, wanted in (
             ("robots_txt_obey", False),
             ("autothrottle_enabled", False),
             ("download_delay", 0.0),
             ("concurrent_requests", 4),
+            ("crawl_strategy", "bfs"),
         ):
             check(f"文档默认值：{attr}", getattr(spider, attr) == wanted, repr(getattr(spider, attr)))
         check("不落盘（output_dir 未设）", spider.output_dir is None, repr(spider.output_dir))
+        check("默认不落断点（crawldir 未设）", spider.crawldir is None, repr(spider.crawldir))
     finally:
         crawl._emit_event = emit
         crawl.close_all_crawls()
@@ -1093,10 +1160,11 @@ def _scrape_one(crawl: Any, url: str) -> list[dict[str, Any]]:
     }
     spider = crawl._make_spider(
         "http://a.test:8080/start",
-        limit=5,
-        crawl_id="confinement",
-        state=state,
-        domains={"a.test", "a.test:8080"},
+        5,
+        "confinement",
+        state,
+        {"a.test", "a.test:8080"},
+        crawl._crawl_policy({}),
     )
     asyncio.run(spider.on_scraped_item({"url": url, "title": "T", "markdown": f"BODY {url}"}))
     return state["pages"]
@@ -1209,6 +1277,77 @@ def _run_crawl_stop(crawl: Any) -> None:
         server.shutdown()
 
 
+def run_crawl_policy() -> None:
+    """爬虫策略旋钮：部署命名空间读出来的值要一字不差地写进 Spider 的类属性。
+
+    为什么单立一条：这些旋钮决定的是「这台机器怎么对待别人的站点」，而 `_make_spider` 只能
+    在类体上写它们（``Spider.__init__`` 只收 crawldir 与 interval）。写错的表现是「配了跟没配
+    一样」，不报错 —— 所以要有一条同时钉「读成什么」与「写进去是什么」。
+    """
+    sys.path.insert(0, str(PY_DIR))
+    import adapters
+    import crawl
+
+    policy = crawl._crawl_policy(
+        {
+            "deployment": {
+                "crawlStrategy": "dfs",
+                "crawlDownloadDelayMs": 250,
+                "crawlConcurrentRequests": 2,
+                "crawlRespectRobots": True,
+                "crawlAutothrottle": True,
+                "crawlCheckpointDir": str(Path(tempfile.gettempdir()) / "crawl-ckpt"),
+            }
+        }
+    )
+    check("爬虫策略：strategy=dfs", policy["strategy"] == "dfs", repr(policy))
+    check("爬虫策略：毫秒换算成秒", policy["delay_seconds"] == 0.25, repr(policy))
+    check("爬虫策略：并发原样", policy["concurrency"] == 2, repr(policy))
+    check("爬虫策略：robots 开关原样", policy["obey_robots"] is True, repr(policy))
+    check("爬虫策略：autothrottle 开关原样", policy["autothrottle"] is True, repr(policy))
+    check(
+        "爬虫策略：断点目录原样",
+        policy["checkpoint_dir"] == str(Path(tempfile.gettempdir()) / "crawl-ckpt"),
+        repr(policy),
+    )
+
+    defaults = crawl._crawl_policy({})
+    check(
+        "未表态时是 bfs / 0 / 4 / 不遵守 robots / 不开 autothrottle / 不落断点",
+        (
+            defaults["strategy"],
+            defaults["delay_seconds"],
+            defaults["concurrency"],
+            defaults["obey_robots"],
+            defaults["autothrottle"],
+            defaults["checkpoint_dir"],
+        )
+        == ("bfs", 0.0, 4, False, False, ""),
+        repr(defaults),
+    )
+
+    # 取值一律报错而不夹：一个写错的策略被悄悄抬成 bfs，读日志的人只会以为「配的就是这样」。
+    for bad in ("random", "", None, 1, True):
+        try:
+            crawl._crawl_policy({"deployment": {"crawlStrategy": bad}})
+            check(f"crawlStrategy={bad!r} 被拒", False, "被当成合法值放行")
+        except adapters.AdapterError as error:
+            check(f"crawlStrategy={bad!r} 被拒", error.code == "BAD_ARGS", error.code)
+
+    # 策略真的写进了类属性：造一个真 Spider 类（不 start），逐项核对。
+    state: dict[str, Any] = {"pages": [], "deadline": 0}
+    spider = crawl._make_spider("http://a.test/", 3, "policy", state, {"a.test"}, policy)
+    check("类属性：crawl_strategy", spider.crawl_strategy == "dfs", repr(spider.crawl_strategy))
+    check("类属性：download_delay", spider.download_delay == 0.25, repr(spider.download_delay))
+    check("类属性：concurrent_requests", spider.concurrent_requests == 2, repr(spider.concurrent_requests))
+    check("类属性：robots_txt_obey", spider.robots_txt_obey is True, repr(spider.robots_txt_obey))
+    check("类属性：autothrottle_enabled", spider.autothrottle_enabled is True, repr(spider.autothrottle_enabled))
+    check("配了目录才落断点", spider.crawldir is not None, repr(spider.crawldir))
+
+    plain = crawl._make_spider("http://a.test/", 3, "policy-plain", state, {"a.test"}, defaults)
+    check("没配目录就不落断点", plain.crawldir is None, repr(plain.crawldir))
+
+
 def run_limits() -> None:
     """上限类判定的验证：会话名额、爬虫名额、单页正文封顶。"""
     sys.path.insert(0, str(PY_DIR))
@@ -1244,6 +1383,32 @@ def run_limits() -> None:
         for session_id in list(adapters._SESSIONS):
             adapters.session_close({"sessionId": session_id})
         check("会话全部关掉后表是空的", adapters._SESSIONS == {}, str(len(adapters._SESSIONS)))
+
+        # 一次性静态抓取与 static 会话抓取必须在 Python 侧复判地址：Host 闸门判完到
+        # curl_cffi 真建连之间隔着进程边界（TOCTOU），拿一个本机回环字面量直接问适配器，
+        # 不经过 Host。地址选 9 号端口（它不会有人监听）而不是元数据端点：这条守卫真被
+        # 拆掉时，变异跑会立刻 connection refused 而不是挂在一条 120 秒的请求上。
+        for label, call in (
+            ("一次性 fetch 在 Python 侧复判地址", lambda: adapters.fetch({"url": "http://127.0.0.1:9/x"})),
+            (
+                "static 会话抓取同样复判地址",
+                lambda: adapters.session_fetch(
+                    {
+                        "sessionId": adapters.session_open({"sessionType": "static"})["sessionId"],
+                        "url": "http://127.0.0.1:9/x",
+                    }
+                ),
+            ),
+        ):
+            try:
+                call()
+                check(label, False, "回环地址被放行")
+            except Exception as error:  # noqa: BLE001 —— 守卫被拆掉时这里会是 curl 的连接错
+                code = getattr(error, "code", type(error).__name__)
+                check(label, code == "URL_BLOCKED", str(code))
+            finally:
+                for session_id in list(adapters._SESSIONS):
+                    adapters.session_close({"sessionId": session_id})
 
         # 爬虫起点复核：与浏览器路径同一个实现，两侧同解。
         for blocked in ("http://127.0.0.1:9/x", "http://169.254.169.254/", "http://[::1]/"):
@@ -1289,6 +1454,41 @@ def run_extraction() -> None:
         leaked = [marker for marker in LEAK_MARKERS if marker in body]
         check(f"{kind} 路径不泄漏注入载荷", not leaked, repr(leaked))
         check(f"{kind} 路径保留正文", "VISIBLE-OK" in body, body[:120])
+
+
+def run_python_floor_gate() -> None:
+    """解释器地板：低于 (3, 14) 要有消息，且 bridge 在导入期非零退出、只写 stderr。
+
+    负路径靠注入 ``sys.version_info`` 的子进程验证——支持面只有 3.14+，真旧解释器不在
+    范围内，而「退出码 / stdout 干净 / stderr 有话」这三条本来就只能量子进程。
+
+    :returns: 无
+    """
+    inserted = str(PY_DIR) not in sys.path
+    if inserted:
+        sys.path.insert(0, str(PY_DIR))
+    import bridge
+
+    check("地板常量是 (3, 14)", bridge.MIN_PYTHON == (3, 14), str(bridge.MIN_PYTHON))
+    check("3.14 恰好达标放行", bridge.check_python((3, 14, 0)) is None)
+    check("更高版本放行", bridge.check_python((3, 15, 1)) is None)
+    message = bridge.check_python((3, 13, 7))
+    check("3.13 被拦下并给出消息", isinstance(message, str), repr(message))
+    text = str(message)
+    check("消息点名地板与当前版本", "需要 Python 3.14+" in text and "当前 3.13.7" in text, text)
+    if inserted:
+        sys.path.remove(str(PY_DIR))
+
+    spoof = f"import sys;sys.path.insert(0, {str(PY_DIR)!r});sys.version_info = (3, 13, 7, 'final', 0);import bridge"
+    proc = subprocess.run(  # noqa: S603
+        [sys.executable, "-I", "-c", spoof],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    check("伪旧解释器下 bridge 退出 78", proc.returncode == 78, repr(proc.returncode))
+    check("拦截消息不进 stdout", proc.stdout == "", repr(proc.stdout[:120]))
+    check("拦截消息进 stderr", "需要 Python 3.14+" in proc.stderr, repr(proc.stderr[:200]))
 
 
 def check_dependency_missing_mapping() -> None:
@@ -1806,9 +2006,23 @@ def run_concurrency_guards() -> None:
     """
     sys.path.insert(0, str(PY_DIR))
     import adapters
-    import crawl
+    import guard
 
-    adapters._SESSIONS.clear()
+    # 会话抓取现在会过 Python 侧的地址复判（与一次性 fetch 同一条），而这里的假会话
+    # 用的是不存在的域名：放行它，这一节量的才是锁与名额，不是 URL 政策。
+    guard.configure(allowed_hosts=frozenset({"a.test"}))
+    try:
+        _run_concurrency_core(adapters)
+    finally:
+        adapters._SESSIONS.clear()
+        guard.configure(allowed_hosts=frozenset())
+
+
+def _run_concurrency_core(adapters: Any) -> None:
+    """并发名额与串行化的断言体；放行集合由调用方管。"""
+    import crawl
+    import guard
+
     results: list[str] = []
     lock = threading.Lock()
 
@@ -1910,8 +2124,6 @@ def run_concurrency_guards() -> None:
     #
     # 起点用本地服务而不是外网：外网在 CI 上可能压根不通，那时 busy 里一个 "ok" 都没有，
     # 「名额不超发」就退化成 0 <= 2 的恒真式 —— 而那种绿看起来与真跑过一模一样。
-    import guard
-
     crawl._CRAWLS.clear()
     guard.configure(allowed_hosts=frozenset({"127.0.0.1"}))
     server, slow_base = _serve(_SlowHandler)
@@ -1974,8 +2186,13 @@ def run_concurrency_guards() -> None:
         guard.configure(allowed_hosts=frozenset())
 
 
-def run_xhr_secret_redaction() -> None:
-    """XHR 摘要的 URL 脱敏：凭据型查询参数不能进模型上下文。"""
+def run_network_summary() -> None:
+    """网络摘要的形状与 URL 脱敏：凭据型查询参数不能进模型上下文。
+
+    这条对着 0.5 的新契约：摘要不再是响应上的 ``captured_xhr``，而是从
+    ``session.network``（``NetworkRecorder``）里 ``search`` 出来的。形状、正文预算与
+    ``bodyNote`` 三条都要钉，否则「这条接口没正文」与「这个接口本来就空」会混成同一件事。
+    """
     sys.path.insert(0, str(PY_DIR))
     import adapters
 
@@ -2014,26 +2231,67 @@ def run_xhr_secret_redaction() -> None:
         url = "https://a.test/api?access_token=secret-value&page=3"
         status = 200
         body = b"x" * 12
+        request_headers = {"method": "GET"}
+        meta = {"method": "GET", "resource_type": "fetch"}
 
-    summary = adapters._xhr_summary([_Item()])
+    class _Recorder:
+        """够 _network_summary 调用的最小 NetworkRecorder 替身。"""
+
+        enabled = True
+
+        def __init__(self, items: list[Any]) -> None:
+            self._items = items
+
+        def search(self, url_pattern: Any = None, limit: Any = 100, include_static: bool = True) -> list[Any]:
+            """按 limit 截断地回出条目（这里不实现过滤，摘要在调用侧做）。"""
+            _ = (url_pattern, include_static)
+            return self._items[:limit] if limit else self._items
+
+    summary = adapters._network_summary(
+        _Recorder([_Item()]), pattern=None, limit=10, include_body=False, max_body_chars=100
+    )
+    check("摘要里的凭据已脱敏", len(summary) == 1 and "secret-value" not in summary[0]["url"], repr(summary))
     check(
-        "摘要里的凭据已脱敏",
-        len(summary) > 0 and "secret-value" not in summary[0]["url"],
+        "条目形状带 url/status/bytes/method/resourceType",
+        {"url", "status", "bytes", "method", "resourceType"} <= set(summary[0]),
         repr(summary),
     )
-    check("摘要仍带着状态码与字节数", summary[0]["status"] == 200 and summary[0]["bytes"] == 12)
+    check("摘要仍带着状态码与字节数", summary[0]["status"] == 200 and summary[0]["bytes"] == 12, repr(summary))
 
-    # 捕获正则由用户手写，而它会由 Scrapling 塞进响应处理器、对每个响应跑一次 re.search。
-    # 写坏时不在这里报出来，错误就发生在浏览器的事件回调里，看不出根因是正则。
+    # 正文只在显式要求时回，且按预算截断 —— 上游存的量级不该决定模型看见什么。
+    with_body = adapters._network_summary(
+        _Recorder([_Item()]), pattern=None, limit=10, include_body=True, max_body_chars=5
+    )
+    check(
+        "includeBody 时带正文并按预算截断",
+        with_body[0].get("body") == "xxxxx" and with_body[0].get("bodyTruncated") is True,
+        repr(with_body),
+    )
+    no_body = adapters._network_summary(
+        _Recorder([_Item()]), pattern=None, limit=10, include_body=False, max_body_chars=5
+    )
+    check("不要求正文时不回正文", "body" not in no_body[0], repr(no_body))
+
+    class _EmptyBody(_Item):
+        body = b""
+        meta = {"method": "GET", "resource_type": "xhr", "body_note": "body dropped"}
+
+    noted = adapters._network_summary(
+        _Recorder([_EmptyBody()]), pattern=None, limit=10, include_body=False, max_body_chars=100
+    )
+    check("没有正文时把上游的原因带出去", noted[0].get("bodyNote") == "body dropped", repr(noted))
+
+    # URL 过滤正则由用户手写，而上游拿它做 re.compile；编译不过会抛 ValueError，读的人看不出
+    # 根因是自己正则写错了。所以在读历史之前就地判。
     try:
-        adapters._browser_params({"captureXhrPattern": "(["}, "http://127.0.0.1:1/")
-        check("坏正则报 BAD_ARGS", False, "竟然放行了")
+        adapters._url_pattern({"urlPattern": "(["})
+        check("坏 urlPattern 报 BAD_ARGS", False, "竟然放行了")
     except adapters.AdapterError as error:
-        check("坏正则报 BAD_ARGS", error.code == "BAD_ARGS", error.code)
-        check("报错点名是 captureXhrPattern", "captureXhrPattern" in str(error), str(error))
-    params = adapters._browser_params({"captureXhrPattern": "/api/"}, "http://127.0.0.1:1/")
-    check("合法正则照常传给引擎", params["capture_xhr"] == "/api/", repr(params.get("capture_xhr")))
-    check("没给正则时不塞这个词", "capture_xhr" not in adapters._browser_params({}, "http://127.0.0.1:1/"))
+        check("坏 urlPattern 报 BAD_ARGS", error.code == "BAD_ARGS", error.code)
+        check("报错点名是 urlPattern", "urlPattern" in str(error), str(error))
+    check("没给正则时给 None（上游据此不过滤）", adapters._url_pattern({}) is None)
+    check("空串也不过滤", adapters._url_pattern({"urlPattern": ""}) is None)
+    check("合法正则原样返回", adapters._url_pattern({"urlPattern": "/api/"}) == "/api/")
 
 
 def run_write_verbs(sidecar: Sidecar, base: str) -> None:
@@ -2056,7 +2314,7 @@ def run_write_verbs(sidecar: Sidecar, base: str) -> None:
         content = frame.get("result", {}).get("content", "")
         try:
             parsed = json.loads(content)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return {"_raw": content, "_frame": frame}
         return parsed if isinstance(parsed, dict) else {"_raw": content, "_frame": frame}
 
@@ -2120,6 +2378,178 @@ def run_write_verbs(sidecar: Sidecar, base: str) -> None:
     )
 
 
+def run_capture(sidecar: Sidecar, base: str) -> None:
+    """capture 端到端：自己起一个临时会话抓一次，并把这次抓取记下的 XHR/fetch 一起交回。
+
+    判据只能落在**真浏览器真发过的那条请求**上：`capture` 的全部意义就是那份历史，而它由
+    上游的 ``NetworkRecorder`` 生成 —— mock 掉它等于什么都没验。
+    """
+    print("\n== capture（临时会话 + 网络历史）==")
+    answer = sidecar.call("capture", {"url": f"{base}/xhrpage", "extractionType": "text", "networkIdle": True})
+    result = answer.get("result") or {}
+    check("capture 成功", answer.get("ok") is True, repr(answer)[:240])
+    check("capture 恒回 xhr 键", isinstance(result.get("xhr"), list), repr(result)[:200])
+    entries = [item for item in (result.get("xhr") or []) if isinstance(item, dict)]
+    api = next((item for item in entries if "/api/data" in str(item.get("url", ""))), None)
+    check("记下了页面自己发的 fetch", api is not None, repr(entries)[:240])
+    if api is not None:
+        check(
+            "条目形状带 url/status/bytes/method/resourceType",
+            {"url", "status", "bytes", "method", "resourceType"} <= set(api),
+            repr(api)[:200],
+        )
+        check("条目方法为 GET", api.get("method") == "GET", repr(api)[:200])
+        check("条目状态 200", api.get("status") == 200, repr(api)[:200])
+        check("没要求正文时不回正文", "body" not in api, repr(api)[:200])
+
+    # 坏正则要在读历史之前就被拦下，而不是让上游在事件回调里抛一句看不出根因的话。
+    bad = sidecar.call("capture", {"url": f"{base}/", "urlPattern": "([", "extractionType": "text"})
+    check("坏 urlPattern 回 BAD_ARGS", bad.get("error", {}).get("code") == "BAD_ARGS", repr(bad)[:200])
+
+    # includeBody 才带正文，且按 maxBodyChars 截断。
+    with_body = sidecar.call(
+        "capture",
+        {
+            "url": f"{base}/xhrpage",
+            "extractionType": "text",
+            "networkIdle": True,
+            "includeBody": True,
+            "maxBodyChars": 6,
+        },
+    )
+    body_entries = [item for item in ((with_body.get("result") or {}).get("xhr") or []) if isinstance(item, dict)]
+    body_api = next((item for item in body_entries if "/api/data" in str(item.get("url", ""))), None)
+    check(
+        "includeBody 时带（截断的）正文",
+        body_api is not None and body_api.get("body") is not None,
+        repr(with_body)[:240],
+    )
+    if body_api is not None:
+        check(
+            "正文按 maxBodyChars 截断并标记（对端正文长于预算）",
+            body_api.get("bodyTruncated") is True and len(str(body_api.get("body", ""))) <= 6,
+            repr(body_api)[:200],
+        )
+
+
+def run_session_network(sidecar: Sidecar, base: str) -> None:
+    """session.network 与 recordNetwork（模型可见）：会话历史只在**开记录**时才读得到。
+
+    这条钉住那个刻意的取舍：没开记录时报一句可读的错（文案里含 ``recordNetwork``），而不是
+    回一个空列表 —— 「没开记录」与「这次没抓到接口」是要采取不同行动的两件事。
+    """
+    print("\n== session.network 与 recordNetwork ==")
+    static_session = sidecar.call("session.open", {"sessionType": "static"})
+    static_id = (static_session.get("result") or {}).get("sessionId", "")
+    denied = sidecar.call("session.network", {"sessionId": static_id})
+    check("static 会话读网络历史报 BAD_ARGS", denied.get("error", {}).get("code") == "BAD_ARGS", repr(denied)[:200])
+    sidecar.call("session.close", {"sessionId": static_id})
+
+    off = sidecar.call("session.open", {"sessionType": "stealth"})
+    off_id = (off.get("result") or {}).get("sessionId", "")
+    not_recorded = sidecar.call("session.network", {"sessionId": off_id})
+    check(
+        "没开记录的浏览器会话报 NETWORK_NOT_RECORDED",
+        not_recorded.get("error", {}).get("code") == "NETWORK_NOT_RECORDED",
+        repr(not_recorded)[:200],
+    )
+    check(
+        "报错文案点名 recordNetwork",
+        "recordNetwork" in str(not_recorded.get("error", {}).get("message", "")),
+        repr(not_recorded)[:200],
+    )
+    sidecar.call("session.close", {"sessionId": off_id})
+
+    on = sidecar.call("session.open", {"sessionType": "stealth", "recordNetwork": True})
+    on_id = (on.get("result") or {}).get("sessionId", "")
+    check("recordNetwork:true 的会话开得起来", on.get("ok") is True, repr(on)[:200])
+    sidecar.call(
+        "session.fetch", {"sessionId": on_id, "url": f"{base}/xhrpage", "extractionType": "text", "networkIdle": True}
+    )
+    net = sidecar.call("session.network", {"sessionId": on_id})
+    net_result = net.get("result") or {}
+    matches = net_result.get("matches") or []
+    check("开了记录的会话读得到历史", net.get("ok") is True, repr(net)[:200])
+    check("count 与 matches 一致", net_result.get("count") == len(matches), repr(net_result)[:200])
+    check("含页面自己发的 fetch", any("/api/data" in str(item.get("url", "")) for item in matches), repr(matches)[:240])
+    sidecar.call("session.close", {"sessionId": on_id})
+
+
+def run_session_state(sidecar: Sidecar) -> None:
+    """session.state_save / state_load：落点、命名空间与三条错误码。
+
+    写文件的能力必须锁在部署给定的目录里，模型只能给一个**纯文件名**：让模型选路径等于给它
+    一个任意文件写入口。所以三条判据分别对着「没配目录」「名字不纯」「上游报错」。
+    """
+    print("\n== session.state_save / state_load ==")
+    state_dir = tempfile.mkdtemp(prefix="dsh-scrapling-state-")
+    opened = sidecar.call("session.open", {"sessionType": "stealth"})
+    session_id = (opened.get("result") or {}).get("sessionId", "")
+
+    disabled = sidecar.call("session.state_save", {"sessionId": session_id, "name": "login"})
+    check(
+        "没配 sessionStateDir 报 STATE_DISABLED",
+        disabled.get("error", {}).get("code") == "STATE_DISABLED",
+        repr(disabled)[:200],
+    )
+
+    for bad_name in ("../escape", "a/b", ".hidden"):
+        rejected = sidecar.call(
+            "session.state_save",
+            {"sessionId": session_id, "name": bad_name, "deployment": {"sessionStateDir": state_dir}},
+        )
+        check(
+            f"名字 {bad_name!r} 被拒（只收纯文件名）",
+            rejected.get("error", {}).get("code") == "BAD_ARGS",
+            repr(rejected)[:200],
+        )
+
+    saved = sidecar.call(
+        "session.state_save",
+        {"sessionId": session_id, "name": "login", "deployment": {"sessionStateDir": state_dir}},
+    )
+    saved_result = saved.get("result") or {}
+    check("state_save 成功", saved.get("ok") is True, repr(saved)[:200])
+    check(
+        "落点是 <dir>/<name>.json",
+        saved_result.get("path") == str(Path(state_dir) / "login.json"),
+        repr(saved_result)[:200],
+    )
+    check("saved 为真", saved_result.get("saved") is True, repr(saved_result)[:200])
+    check("状态文件真的落了盘", (Path(state_dir) / "login.json").exists(), "")
+
+    loaded = sidecar.call(
+        "session.state_load",
+        {"sessionId": session_id, "name": "login", "deployment": {"sessionStateDir": state_dir}},
+    )
+    check("state_load 成功", loaded.get("ok") is True, repr(loaded)[:200])
+    check("load 的 saved 为假", (loaded.get("result") or {}).get("saved") is False, repr(loaded)[:200])
+
+    missing = sidecar.call(
+        "session.state_load",
+        {"sessionId": session_id, "name": "no-such-state", "deployment": {"sessionStateDir": state_dir}},
+    )
+    check(
+        "载入不存在的状态翻成 STATE_FAILED（而不是裸栈）",
+        missing.get("error", {}).get("code") == "STATE_FAILED",
+        repr(missing)[:200],
+    )
+    sidecar.call("session.close", {"sessionId": session_id})
+
+    static_session = sidecar.call("session.open", {"sessionType": "static"})
+    static_id = (static_session.get("result") or {}).get("sessionId", "")
+    static_state = sidecar.call(
+        "session.state_save",
+        {"sessionId": static_id, "name": "x", "deployment": {"sessionStateDir": state_dir}},
+    )
+    check(
+        "static 会话没有浏览器状态，报 BAD_ARGS",
+        static_state.get("error", {}).get("code") == "BAD_ARGS",
+        repr(static_state)[:200],
+    )
+    sidecar.call("session.close", {"sessionId": static_id})
+
+
 def run_session_param_guards() -> None:
     """会话入参的分支验证：static 专属的键给浏览器会话时必须**报错**，不能静默无效。
 
@@ -2128,6 +2558,20 @@ def run_session_param_guards() -> None:
     """
     sys.path.insert(0, str(PY_DIR))
     import adapters
+    import guard
+
+    # static 那一条会真的走到 `guard.url_allowed`（本期补上的 Python 侧复判），而
+    # `contract.test` 是个不存在的域名：不放行它就会在到达「headers/retries 是否被这条
+    # 判据拦下」之前先吃一条 URL_BLOCKED，断言于是变成了在量别的东西。
+    guard.configure(allowed_hosts=frozenset({"contract.test"}))
+    try:
+        _probe_session_params(adapters)
+    finally:
+        guard.configure(allowed_hosts=frozenset())
+
+
+def _probe_session_params(adapters: Any) -> None:
+    """会话入参分支的实际断言体；放行集合由调用方管。"""
 
     def probe(kind: str, extra: dict[str, Any]) -> tuple[str, str]:
         """按会话类型跑一次 session_fetch，返回 (错误码, 错误消息)。
@@ -2157,7 +2601,7 @@ def run_session_param_guards() -> None:
         return "", ""
 
     # 浏览器会话的请求头走 extra_headers（会话构造期或本次 fetch 都认），retries 则是构造期参数。
-    for kind in ("browser", "stealth"):
+    for kind in ("stealth",):
         for key, hint in (("headers", "extraHeaders"), ("retries", "scrapling_session_open")):
             code, message = probe(kind, {key: ({"A": "b"} if key == "headers" else 2)})
             check(f"{kind} 会话收到 {key} 时报错", code == "BAD_ARGS", f"{code} / {message}")
@@ -2186,13 +2630,16 @@ def run_session_param_guards() -> None:
 
 
 def run_webrtc_guards() -> None:
-    """stealth 会话的 WebRTC 强制开启必须与**会话真正拿到的代理**同源。
+    """stealth 会话的 WebRTC 强制开启必须与**会话真正拿到的代理**同源，且永不发 extra_flags。
 
-    `_browser_params` 里那条 `or "proxy" in params` 判的是 `browser_proxy("")`，而空 URL 没有
-    主机名，绕过清单里任何主机名条目都命中不了它 —— 只有 `default_proxy()` 认的「整台机器
-    直连」那个 `*` 例外。于是 `proxyBypass=*` 时前者算出「有代理」并把 block_webrtc 钉成真，
-    而会话其实是直连的：模型明确填了 blockWebrtc=false 也会被静默盖掉。这正是本包在消灭的
-    「拧了没反应」，所以两条都要钉：强制开启跟着真代理走，而显式入参仍然算数。
+    0.5 删掉了纯 Playwright 后端，WebRTC 防泄露从「往启动参数塞两条等价 flag」移交给了
+    ``block_webrtc`` 一条开关本身（``extra_flags`` 也从顶掉改成叠加），所以旧的
+    ``WEBRTC_NO_LEAK_FLAGS`` 那一套没有了。这里钉两条新不变量：
+
+    - ``block_webrtc`` 的强制开启跟着 ``default_proxy()``（会话真正拿到的那份）走，而
+      ``proxyBypass=*`` 这种「整台机器直连」不算有代理 —— 前者按 ``browser_proxy("")`` 判，
+      空 URL 命中不了任何主机名条目，两条判据就在这里分歧。
+    - 本仓任何路径都不发 ``extra_flags``：叠加语义下它不再破坏反检测，但发它没有正当理由。
     """
     sys.path.insert(0, str(PY_DIR))
     import adapters
@@ -2215,10 +2662,9 @@ def run_webrtc_guards() -> None:
 
         return _Stub
 
-    originals = (fetchers.DynamicSession, fetchers.StealthySession)
+    original = fetchers.StealthySession
     saved = (guard.PROXY_URL, guard._BYPASS_ENTRIES)  # noqa: SLF001 —— 与本文件其它代理用例同一口径
     try:
-        fetchers.DynamicSession = stub("browser")  # type: ignore[misc,assignment]
         fetchers.StealthySession = stub("stealth")  # type: ignore[misc,assignment]
 
         guard.PROXY_URL = "http://127.0.0.1:7890"
@@ -2232,14 +2678,7 @@ def run_webrtc_guards() -> None:
             stealth.get("block_webrtc") is True,
             repr(stealth)[:200],
         )
-
-        adapters._make_session("browser", {"sessionId": "w"})  # noqa: SLF001
-        browser = captured["browser"]
-        check(
-            "Playwright 侧走代理时用那两条等价 flag（没有 block_webrtc 开关可传）",
-            set(guard.WEBRTC_NO_LEAK_FLAGS) <= set(browser.get("extra_flags") or []),
-            repr(browser.get("extra_flags"))[:200],
-        )
+        check("走代理的会话构造不发 extra_flags", "extra_flags" not in stealth, repr(stealth)[:200])
 
         guard._BYPASS_ENTRIES = ("*",)  # noqa: SLF001 —— 「整台机器直连」
         check("绕过清单写着 * 时会话按直连开", guard.default_proxy() == "", "")
@@ -2261,13 +2700,6 @@ def run_webrtc_guards() -> None:
         adapters._make_session("stealth", {"sessionId": "w", "blockWebrtc": True})  # noqa: SLF001
         check("显式要求屏蔽 WebRTC 时照办", captured["stealth"].get("block_webrtc") is True, "")
 
-        adapters._make_session("browser", {"sessionId": "w"})  # noqa: SLF001
-        check(
-            "直连的 Playwright 会话不再被塞进那两条 flag",
-            "extra_flags" not in captured["browser"],
-            repr(captured["browser"].get("extra_flags"))[:200],
-        )
-
         guard.PROXY_URL = ""
         guard._BYPASS_ENTRIES = ()  # noqa: SLF001
         adapters._make_session("stealth", {"sessionId": "w"})  # noqa: SLF001
@@ -2277,8 +2709,9 @@ def run_webrtc_guards() -> None:
             clean.get("proxy") is None and clean.get("block_webrtc") is False,
             repr(clean)[:200],
         )
+        check("直连的会话同样不发 extra_flags", "extra_flags" not in clean, repr(clean)[:200])
     finally:
-        fetchers.DynamicSession, fetchers.StealthySession = originals  # type: ignore[misc,assignment]
+        fetchers.StealthySession = original  # type: ignore[misc,assignment]
         guard.PROXY_URL, guard._BYPASS_ENTRIES = saved  # noqa: SLF001
         guard.configure_from_env()
 
@@ -2349,10 +2782,844 @@ def run_write_gate(base: str) -> None:
     guard.configure(allow_write_methods=keep)
 
 
+# ---------------------------------------------------------------------------
+# 进程内单元。`py/package.json` 的覆盖率地板只量**这个进程**（`source = ["py"]` 是相对子进程
+# cwd 解析的，sidecar 里跑的代码一条都不进地板），所以凡是想进地板的 adapters / crawl 代码，
+# 都必须由这里直接 import 调用，不能只经 `sidecar.call(...)`。替身引擎不发网络，除了
+# `capabilities()` 那次真探针外一律不起浏览器。
+# ---------------------------------------------------------------------------
+
+
+def _raiser(exc: BaseException) -> Any:  # noqa: ANN401 —— 造出来的就是可调用对象
+    """造一个一调用就抛 exc 的函数（用来逼出错误分支）。"""
+
+    def boom(*_args: Any, **_kwargs: Any) -> Any:  # noqa: ANN401 —— 恒抛，返回值无意义
+        raise exc
+
+    return boom
+
+
+class _DeadThread:
+    """一个 `is_alive()` 恒假、`start()` 什么都不做的线程替身。"""
+
+    def is_alive(self) -> bool:
+        """恒为「已结束」。"""
+        return False
+
+    def join(self, timeout: float | None = None) -> None:
+        """无事可等。"""
+
+    def start(self) -> None:
+        """不起线程。"""
+
+
+class _StubNetwork:
+    """够读 `session.network` 的 NetworkRecorder 替身。"""
+
+    def __init__(self, enabled: bool = False) -> None:
+        """:param enabled: 这个会话记录不记录"""
+        self.enabled = enabled
+
+    def search(self, **_kwargs: Any) -> list[Any]:
+        """回一份空的网络历史。"""
+        return []
+
+
+def _session_stub(*, broken_state: bool = False) -> type:
+    """造一个 ``StealthySession`` 替身类：起、抓、读历史、存取状态都够用。
+
+    :param broken_state: 存取状态时抛错（用来逼出 STATE_FAILED）
+    """
+    import adapters
+
+    class _Stub:
+        """替身会话。"""
+
+        def __init__(self, **kwargs: Any) -> None:
+            """:param kwargs: 构造参数（会记下来核对）"""
+            self.kwargs = kwargs
+            self.network = _StubNetwork()
+            self.state_path: str | None = None
+
+        def start(self) -> None:
+            """开场（替身不启浏览器）。"""
+
+        def fetch(self, url: str, **_kwargs: Any) -> Any:  # noqa: ANN401 —— 返回上游 Response
+            """回一份不带网络的 Response。"""
+            return adapters._fake_response("<p>ok</p>", url, 200)
+
+        def close(self) -> None:
+            """关闭（替身无事可做）。"""
+
+        def save_state(self, path: str) -> None:
+            """记下落点；broken_state 时抛。"""
+            if broken_state:
+                raise RuntimeError("state write failed")
+            self.state_path = path
+
+        def load_state(self, path: str) -> None:
+            """记下落点；broken_state 时抛。"""
+            if broken_state:
+                raise RuntimeError("state read failed")
+            self.state_path = path
+
+    return _Stub
+
+
+def run_inprocess_adapters() -> None:
+    """进程内直接驱动 adapters 的参数收口与工具函数（让它们进覆盖率地板）。"""
+    sys.path.insert(0, str(PY_DIR))
+    import adapters
+    import guard
+
+    print("\n== 进程内：adapters 参数收口与工具函数 ==")
+
+    try:
+        adapters._require(None)
+        check("_require(None) 报 SCRAPLING_MISSING", False, "没抛")
+    except adapters.AdapterError as error:
+        check("_require(None) 报 SCRAPLING_MISSING", error.code == "SCRAPLING_MISSING", error.code)
+
+    for bad in ("x", True, 0, -3):
+        try:
+            adapters._positive_int(bad, "f", 7)
+            check(f"_positive_int({bad!r}) 被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check(f"_positive_int({bad!r}) 被拒", error.code == "BAD_ARGS", error.code)
+    check("_positive_int 缺省值", adapters._positive_int(None, "f", 7) == 7, "")
+
+    for bad_num in ("x", True, 0, -1.5):
+        try:
+            adapters._positive_number(bad_num, "f", 1.0)
+            check(f"_positive_number({bad_num!r}) 被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check(f"_positive_number({bad_num!r}) 被拒", error.code == "BAD_ARGS", error.code)
+    check("_positive_number 数值原样", adapters._positive_number(2.5, "f", 1.0) == 2.5, "")
+    check("_positive_number 缺省值", adapters._positive_number(None, "f", 1.0) == 1.0, "")
+
+    try:
+        adapters._string_map(5, "f")
+        check("_string_map 非对象被拒", False, "放行")
+    except adapters.AdapterError as error:
+        check("_string_map 非对象被拒", error.code == "BAD_ARGS", error.code)
+    check("_string_map 压成 str 值", adapters._string_map({"a": 1}, "f") == {"a": "1"}, "")
+    check("_string_map None 给 None", adapters._string_map(None, "f") is None, "")
+
+    # clip：截在代理对中间时会留下孤立高代理，要丢掉它
+    check("clip 丢掉孤立高代理", adapters.clip("ab\ud800c", 3) == ("ab", True), repr(adapters.clip("ab\ud800c", 3)))
+    check("clip 未超限原样返回", adapters.clip("abc", 5) == ("abc", False), "")
+    check(
+        "_jsonable 兜底成字符串",
+        adapters._jsonable(object()).startswith("<object object at"),
+        repr(adapters._jsonable(object())),
+    )
+
+    for args, note in (({"extractionType": "pdf"}, "未知 extractionType"), ({"cssSelector": 5}, "cssSelector 非串")):
+        try:
+            adapters._extraction(args)
+            check(f"_extraction 拒绝{note}", False, "放行")
+        except adapters.AdapterError as error:
+            check(f"_extraction 拒绝{note}", error.code == "BAD_ARGS", error.code)
+    try:
+        adapters._url({})
+        check("_url 缺 url 被拒", False, "放行")
+    except adapters.AdapterError as error:
+        check("_url 缺 url 被拒", error.code == "BAD_ARGS", error.code)
+
+    saved_proxy = guard.PROXY_URL
+    try:
+        guard.PROXY_URL = "http://127.0.0.1:7890"
+        params = adapters._static_params({"headers": {"A": "b"}}, "https://example.com/")
+        check("_static_params 带代理表", params.get("proxies") == {"all": "http://127.0.0.1:7890"}, repr(params))
+        check("_static_params 带请求头", params.get("headers") == {"A": "b"}, repr(params))
+    finally:
+        guard.PROXY_URL = saved_proxy
+
+    class _BoomRecorder:
+        """search 直接抛的记录器替身。"""
+
+        def search(self, **_kwargs: Any) -> list[Any]:
+            """抛。"""
+            raise RuntimeError("recorder off")
+
+    check(
+        "_network_summary 记录器抛时给空表",
+        adapters._network_summary(_BoomRecorder(), pattern=None, limit=1, include_body=False, max_body_chars=1) == [],
+        "",
+    )
+
+    class _BoomItem:
+        """取 meta 就抛的条目替身。"""
+
+        @property
+        def meta(self) -> Any:  # noqa: ANN401 —— 恒抛
+            """抛。"""
+            raise RuntimeError("bad item")
+
+    class _OneRecorder:
+        """回一条坏条目的记录器替身。"""
+
+        def search(self, **_kwargs: Any) -> list[Any]:
+            """回 [_BoomItem()]。"""
+            return [_BoomItem()]
+
+    check(
+        "_network_summary 单条抛时跳过并继续",
+        adapters._network_summary(_OneRecorder(), pattern=None, limit=1, include_body=False, max_body_chars=1) == [],
+        "",
+    )
+
+    from scrapling.parser import Selector
+
+    page = Selector("<html><body><h1>HELLO</h1></body></html>")
+    check("_scoped_pages 按选择器收窄", [node.tag for node in adapters._scoped_pages(page, "h1")] == ["h1"], "")
+
+    adapters._strip_active_content(object())  # 没有 _root 应当是 no-op
+    check("_strip_active_content 无 root 时不炸", True, "")
+
+    class _FakeEl:
+        """够 _strip_active_content 看的元素替身。"""
+
+        tag = "p"
+        attrib = None
+
+    class _FakeRoot:
+        """元素迭代器替身。"""
+
+        def iter(self) -> Any:  # noqa: ANN401 —— 迭代器
+            """回一个无 attrib 的元素。"""
+            return iter([_FakeEl()])
+
+    class _FakeTree:
+        """带 _root 的页面替身。"""
+
+        _root = _FakeRoot()
+
+    adapters._strip_active_content(_FakeTree())
+    check("_strip_active_content 跳过无 attrib 的元素", True, "")
+
+    for kind, value, want in (
+        (str, "x", "x"),
+        (str, "", None),
+        (str, 5, None),
+        (bool, True, True),
+        (bool, "x", None),
+        (int, 5, 5),
+        (int, True, None),
+        (int, 0, None),
+        (int, -1, None),
+    ):
+        got = adapters._knob_value(kind, value)
+        check(f"_knob_value({kind.__name__}, {value!r})", got == want, repr(got))
+
+    full = adapters._browser_params(
+        {
+            "networkIdle": True,
+            "waitSelector": "#x",
+            "waitSelectorState": "visible",
+            "useragent": "u",
+            "locale": "en",
+            "timezoneId": "UTC",
+            "pierceShadow": True,
+            "waitMs": 50,
+            "extraHeaders": {"A": "b"},
+            "deployment": {
+                "browserExecutablePath": "/usr/bin/true",
+                "browserCdpUrl": "http://127.0.0.1:9222",
+                "browserInitScript": str(Path(tempfile.gettempdir()) / "x.js"),
+                "browserRealChrome": True,
+                "browserDnsOverHttps": True,
+                "recordRequests": True,
+                "maxRecordedRequests": 10,
+            },
+        },
+        "https://example.com/",
+    )
+    expected: dict[str, Any] = {
+        "network_idle": True,
+        "wait_selector": "#x",
+        "wait_selector_state": "visible",
+        "useragent": "u",
+        "locale": "en",
+        "timezone_id": "UTC",
+        "pierce_shadow": True,
+        "wait": 50,
+        "extra_headers": {"A": "b"},
+    }
+    for key, want in expected.items():
+        check(f"_browser_params 带上 {key}", full.get(key) == want, repr(full.get(key)))
+    for key in (
+        "executable_path",
+        "cdp_url",
+        "init_script",
+        "real_chrome",
+        "dns_over_https",
+        "record_requests",
+        "max_recorded_requests",
+    ):
+        check(f"_browser_params 落部署旋钮 {key}", key in full, repr(full.get(key)))
+    wrong = adapters._browser_params(
+        {"deployment": {"maxRecordedRequests": "10", "browserRealChrome": "yes"}}, "https://example.com/"
+    )
+    check(
+        "_browser_params 错类型旋钮不生效",
+        "max_recorded_requests" not in wrong and "real_chrome" not in wrong,
+        repr(wrong),
+    )
+    check(
+        "_browser_params fetch 层只发白名单",
+        set(adapters._browser_params({}, "https://example.com/", level="fetch")) <= adapters.FETCH_LEVEL_KEYS,
+        "",
+    )
+
+    check(
+        "_network_read 收出四个参数",
+        adapters._network_read({"urlPattern": "/a/", "networkLimit": 3, "includeBody": True, "maxBodyChars": 10})
+        == ("/a/", 3, True, 10),
+        "",
+    )
+
+    fake = adapters._fake_response("<p>x</p>", "https://x.test/", 200)
+    check("_fake_response 造出真 Response", fake.status == 200 and fake.url == "https://x.test/", "")
+
+
+def run_inprocess_browser() -> None:
+    """进程内：fetch / render / capture / extract / select 的真代码路径（替身引擎，不发网络）。"""
+    sys.path.insert(0, str(PY_DIR))
+    import adapters
+    import guard
+    import scrapling.fetchers as fetchers
+
+    print("\n== 进程内：fetch / render / capture / extract / select ==")
+    saved_hosts = set(guard.ALLOWED_HOSTS)
+    saved_write = guard.ALLOW_WRITE_METHODS
+    saved_fetcher = adapters.Fetcher
+    saved_stealth = adapters.StealthyFetcher
+    saved_session = fetchers.StealthySession
+
+    class _StubFetcher:
+        """``Fetcher`` 的替身：四个动词都回一份不联网的 Response。"""
+
+        def get(self, url: str, **_kwargs: Any) -> Any:  # noqa: ANN401 —— 返回上游 Response
+            """回一份 Response。"""
+            return adapters._fake_response("<p>ok</p>", url, 200)
+
+        post = put = delete = get
+
+    class _StubStealthyFetcher:
+        """``StealthyFetcher`` 的替身。"""
+
+        def fetch(self, url: str, **_kwargs: Any) -> Any:  # noqa: ANN401 —— 同上
+            """回一份 Response。"""
+            return adapters._fake_response("<p>ok</p>", url, 200)
+
+    guard.configure(allowed_hosts=frozenset({"example.com"}))
+    adapters.Fetcher = _StubFetcher()  # type: ignore[misc,assignment]
+    adapters.StealthyFetcher = _StubStealthyFetcher()  # type: ignore[misc,assignment]
+    fetchers.StealthySession = _session_stub()  # type: ignore[misc,assignment]
+    try:
+        guard.configure(allow_write_methods=True)
+        got = adapters.fetch({"url": "https://example.com/", "cookies": {"c": "1"}, "impersonate": "chrome"})
+        check("fetch 带 cookies/impersonate 走通", got["status"] == 200, repr(got)[:120])
+        try:
+            adapters.fetch({"url": "https://example.com/", "method": "PATCH"})
+            check("fetch 未知方法被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check("fetch 未知方法被拒", error.code == "BAD_ARGS", error.code)
+        adapters.fetch({"url": "https://example.com/", "method": "POST", "body": "a=1"})
+        adapters.fetch({"url": "https://example.com/", "method": "POST", "body": [1, 2]})
+        check("fetch 非 GET 的 body 两条分支走通", True, "")
+
+        rendered = adapters.render({"url": "https://example.com/", "extractionType": "text"})
+        check(
+            "render 组装载荷",
+            rendered["status"] == 200 and rendered["extractionType"] == "text",
+            repr(rendered)[:120],
+        )
+
+        captured = adapters.capture(
+            {"url": "https://example.com/", "extractionType": "text", "urlPattern": "/a/", "networkLimit": 2}
+        )
+        check("capture 恒带 xhr 键", isinstance(captured.get("xhr"), list), repr(captured)[:120])
+        records = adapters._capture_once(
+            {}, url="https://example.com/", pattern=None, entries=2, include_body=False, body_chars=10
+        )[1]
+        check("_capture_once 直接可用", isinstance(records, list), repr(records)[:120])
+
+        check("extract 走通", adapters.extract({"html": "<p>hi</p>"})["status"] == 200, "")
+        for extract_args, note in (({"html": 5}, "html 非串"), ({"html": "x", "status": "200"}, "status 非整数")):
+            try:
+                adapters.extract(extract_args)
+                check(f"extract 拒绝{note}", False, "放行")
+            except adapters.AdapterError as error:
+                check(f"extract 拒绝{note}", error.code == "BAD_ARGS", error.code)
+
+        html = "<p class='k'>a</p><p class='k'>b</p>"
+        for select_args, note in (
+            ({"html": 5}, "html 非串"),
+            ({"html": "x"}, "缺 selector"),
+            ({"html": "x", "selector": "p", "attribute": 5}, "attribute 非串"),
+            ({"html": "x", "selector": "p", "url": 5}, "url 非串"),
+        ):
+            try:
+                adapters.select(select_args)
+                check(f"select 拒绝{note}", False, "放行")
+            except adapters.AdapterError as error:
+                check(f"select 拒绝{note}", error.code == "BAD_ARGS", error.code)
+        check(
+            "select xpath 路径",
+            adapters.select({"html": html, "selector": "//p", "useXpath": True})["count"] == 2,
+            "",
+        )
+        attributed = adapters.select({"html": html, "selector": "p", "includeAttributes": True})
+        check("select 带属性", attributed["matches"][0]["attributes"]["class"] == "k", "")
+
+        # adaptive 会按**相对路径**开 SQLite 指纹库，所以换到临时目录再跑，别把产物留在仓库里。
+        cwd = os.getcwd()
+        try:
+            os.chdir(tempfile.mkdtemp(prefix="dsh-cov-adaptive-"))
+            check(
+                "select adaptive 路径",
+                adapters.select({"html": html, "selector": "p", "adaptive": True})["count"] == 2,
+                "",
+            )
+        finally:
+            os.chdir(cwd)
+
+        page = FakePage()
+        adapters.page_setup(page)
+        check("page_setup 装上 HTTP 路由", "route" in [name for name, _, _ in page.routes], repr(page.routes))
+    finally:
+        adapters.Fetcher = saved_fetcher  # type: ignore[misc,assignment]
+        adapters.StealthyFetcher = saved_stealth  # type: ignore[misc,assignment]
+        fetchers.StealthySession = saved_session  # type: ignore[misc,assignment]
+        guard.configure(allowed_hosts=frozenset(saved_hosts))
+        guard.configure(allow_write_methods=saved_write)
+
+
+def _browser_ground_truth() -> bool:
+    """测试自己起一次浏览器，作为 ``capabilities()["browser"]`` 的外部对照。
+
+    原先这一档写死「必须探到浏览器」，于是它判的是**这台机器装没装浏览器**：该仓 CI 刻意不装
+    （runner 上没有二进制），门禁就红在环境上。改成两侧都对表：本机起得来就必须报 True、起不来
+    就必须报 False，把探测写死成任何一侧都会在其中一个环境里红。
+    """
+    import importlib
+
+    try:
+        sync_playwright = importlib.import_module("patchright.sync_api").sync_playwright
+        with sync_playwright() as driver:
+            driver.chromium.launch(headless=True).close()
+    except Exception:  # noqa: BLE001 —— 对照只关心起不起得来；起不来的原因由真探测那一侧报
+        return False
+    return True
+
+
+def run_inprocess_capabilities() -> None:
+    """进程内：能力探测（含一次真浏览器探针）与版本读取的兜底分支。"""
+    sys.path.insert(0, str(PY_DIR))
+    import types
+
+    import adapters
+
+    print("\n== 进程内：能力探测 ==")
+    check("_scrapling_version 读出非空", bool(adapters._scrapling_version()), "")
+    saved = sys.modules.get("scrapling")
+    sys.modules["scrapling"] = types.ModuleType("scrapling")
+    try:
+        check("_scrapling_version 读不到版本时给空串", adapters._scrapling_version() == "", "")
+    finally:
+        if saved is None:
+            sys.modules.pop("scrapling", None)
+        else:
+            sys.modules["scrapling"] = saved
+    check("_probe_browser 起不来给 False", adapters._probe_browser("no.such.module_xyz") is False, "")
+
+    report = adapters.capabilities()
+    check("capabilities 报 scrapling 可用", report["scrapling"] is True, repr(report)[:120])
+    check(
+        "capabilities 有 version / browser / proxy",
+        {"version", "browser", "proxy"} <= set(report),
+        repr(report)[:160],
+    )
+    want_browser = _browser_ground_truth()
+    check(
+        "capabilities 的 browser 与「测试自己起一次浏览器」的成败一致",
+        report["browser"] is want_browser,
+        f"capabilities 报 {report['browser']}，自己起一次是 {want_browser}",
+    )
+    check(
+        "capabilities 的 proxy 是摘要形态",
+        set(report["proxy"]) == {"configured", "source", "server"},
+        repr(report["proxy"]),
+    )
+
+
+def run_inprocess_sessions() -> None:
+    """进程内：会话注册表、network 与 state 的全部错误/成功分支。"""
+    sys.path.insert(0, str(PY_DIR))
+    import adapters
+    import scrapling.fetchers as fetchers
+
+    print("\n== 进程内：会话注册表 / network / state ==")
+    saved_session = fetchers.StealthySession
+    saved_make = adapters._make_session
+    tmp = tempfile.mkdtemp(prefix="dsh-cov-state-")
+    try:
+        fetchers.StealthySession = _session_stub()  # type: ignore[misc,assignment]
+        adapters.close_all_sessions()
+
+        try:
+            adapters._make_session("bogus", {})
+            check("_make_session 未知类型被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check("_make_session 未知类型被拒", error.code == "BAD_ARGS", error.code)
+
+        opened = adapters.session_open({"sessionType": "stealth", "sessionId": "cov-stealth", "recordNetwork": True})
+        check("session_open 走 worker 路径", opened["sessionId"] == "cov-stealth", repr(opened))
+        entry = adapters._SESSIONS["cov-stealth"]
+        check(
+            "recordNetwork 打开记录开关",
+            entry["session"].kwargs.get("record_requests") is True,
+            repr(entry["session"].kwargs),
+        )
+
+        for bad, code in ((5, "BAD_ARGS"), ("nope", "NO_SUCH_SESSION")):
+            try:
+                adapters._get_session(bad)
+                check(f"_get_session({bad!r}) 被拒", False, "放行")
+            except adapters.AdapterError as error:
+                check(f"_get_session({bad!r}) 被拒", error.code == code, error.code)
+        adapters._SESSIONS["pend"] = {"pending": True, "type": "static", "lock": threading.Lock()}
+        try:
+            adapters._get_session("pend")
+            check("_get_session 构造中的条目被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check("_get_session 构造中的条目被拒", error.code == "NO_SUCH_SESSION", error.code)
+
+        fetched = adapters.session_fetch(
+            {"sessionId": "cov-stealth", "url": "https://example.com/", "extractionType": "text"}
+        )
+        check("session_fetch 浏览器分支走通", fetched["sessionId"] == "cov-stealth", repr(fetched)[:120])
+        for key in ("headers", "retries"):
+            try:
+                adapters.session_fetch(
+                    {
+                        "sessionId": "cov-stealth",
+                        "url": "https://example.com/",
+                        key: ({"A": "b"} if key == "headers" else 1),
+                    }
+                )
+                check(f"浏览器会话收到 {key} 被拒", False, "放行")
+            except adapters.AdapterError as error:
+                check(f"浏览器会话收到 {key} 被拒", error.code == "BAD_ARGS", error.code)
+
+        rows = adapters.session_list({})["sessions"]
+        check("session_list 列出已登记会话", any(row["sessionId"] == "cov-stealth" for row in rows), repr(rows))
+
+        adapters._SESSIONS["cov-static"] = {
+            "sessionId": "cov-static",
+            "type": "static",
+            "session": object(),
+            "closer": object(),
+            "lock": threading.Lock(),
+            "worker": None,
+            "pending": False,
+        }
+        try:
+            adapters.session_network({"sessionId": "cov-static"})
+            check("session_network 静态会话被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check("session_network 静态会话被拒", error.code == "BAD_ARGS", error.code)
+        try:
+            adapters.session_network({"sessionId": "cov-stealth"})
+            check("session_network 未开记录被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check("session_network 未开记录被拒", error.code == "NETWORK_NOT_RECORDED", error.code)
+        entry["session"].network.enabled = True
+        summary = adapters.session_network({"sessionId": "cov-stealth", "networkLimit": 3})
+        check(
+            "session_network 已开记录回条目",
+            summary == {"sessionId": "cov-stealth", "count": 0, "matches": []},
+            repr(summary),
+        )
+
+        for args, note, code in (
+            ({}, "没配 sessionStateDir", "STATE_DISABLED"),
+            ({"deployment": {"sessionStateDir": tmp}}, "缺 name", "BAD_ARGS"),
+            ({"deployment": {"sessionStateDir": tmp}, "name": "../x"}, "name 带路径", "BAD_ARGS"),
+            ({"deployment": {"sessionStateDir": tmp}, "name": ".h"}, "name 以点开头", "BAD_ARGS"),
+        ):
+            try:
+                adapters._state_path(args)
+                check(f"_state_path 拒绝{note}", False, "放行")
+            except adapters.AdapterError as error:
+                check(f"_state_path 拒绝{note}", error.code == code, error.code)
+        check(
+            "_state_path 落点是 <dir>/<name>.json",
+            adapters._state_path({"deployment": {"sessionStateDir": tmp}, "name": "login"})
+            == str(Path(tmp) / "login.json"),
+            "",
+        )
+
+        save = adapters.session_state_save(
+            {"sessionId": "cov-stealth", "name": "login", "deployment": {"sessionStateDir": tmp}}
+        )
+        check(
+            "session_state_save 落点与 saved",
+            save["path"] == str(Path(tmp) / "login.json") and save["saved"] is True,
+            repr(save),
+        )
+        load = adapters.session_state_load(
+            {"sessionId": "cov-stealth", "name": "login", "deployment": {"sessionStateDir": tmp}}
+        )
+        check("session_state_load 的 saved 为假", load["saved"] is False, repr(load))
+        try:
+            adapters._session_state(
+                {"sessionId": "cov-static", "name": "x", "deployment": {"sessionStateDir": tmp}}, saving=True
+            )
+            check("static 会话存取状态被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check("static 会话存取状态被拒", error.code == "BAD_ARGS", error.code)
+
+        fetchers.StealthySession = _session_stub(broken_state=True)  # type: ignore[misc,assignment]
+        broken = adapters.session_open({"sessionType": "stealth", "sessionId": "cov-broken"})
+        check("session_open 返回 id", broken["sessionId"] == "cov-broken", "")
+        try:
+            adapters.session_state_save(
+                {"sessionId": "cov-broken", "name": "login", "deployment": {"sessionStateDir": tmp}}
+            )
+            check("state 上游报错翻成 STATE_FAILED", False, "放行")
+        except adapters.AdapterError as error:
+            check("state 上游报错翻成 STATE_FAILED", error.code == "STATE_FAILED", error.code)
+        # 浏览器条目的 close 走属主线程（worker 路径）
+        adapters.session_close({"sessionId": "cov-broken"})
+        check("浏览器会话 close 走 worker", "cov-broken" not in adapters._SESSIONS, repr(sorted(adapters._SESSIONS)))
+        fetchers.StealthySession = _session_stub()  # type: ignore[misc,assignment]
+
+        adapters._make_session = _raiser(adapters.AdapterError("X", "boom"))
+        try:
+            adapters.session_open({"sessionType": "static"})
+            check("session_open 构造失败透传 AdapterError", False, "放行")
+        except adapters.AdapterError as error:
+            check("session_open 构造失败透传 AdapterError", error.code == "X", error.code)
+        adapters._make_session = _raiser(ValueError("boom"))
+        try:
+            adapters.session_open({"sessionType": "stealth"})
+            check("session_open 构造失败包成 SESSION_OPEN_FAILED", False, "放行")
+        except adapters.AdapterError as error:
+            check("session_open 构造失败包成 SESSION_OPEN_FAILED", error.code == "SESSION_OPEN_FAILED", error.code)
+        adapters._make_session = saved_make
+
+        adapters._SESSIONS.clear()
+        for index in range(adapters.MAX_BROWSER_SESSIONS):
+            adapters._SESSIONS[f"b{index}"] = {
+                "sessionId": f"b{index}",
+                "type": "stealth",
+                "session": object(),
+                "lock": threading.Lock(),
+                "worker": None,
+            }
+        try:
+            adapters.session_open({"sessionType": "stealth", "sessionId": "over"})
+            check("浏览器会话名额判 SESSION_LIMIT", False, "放行")
+        except adapters.AdapterError as error:
+            check("浏览器会话名额判 SESSION_LIMIT", error.code == "SESSION_LIMIT", error.code)
+        adapters._SESSIONS.clear()
+
+        adapters._close_entry("ghost")
+        check("_close_entry 未知 id 是 no-op", True, "")
+        adapters._SESSIONS["p2"] = {"pending": True, "type": "static", "lock": threading.Lock()}
+        adapters._close_entry("p2")
+        check("_close_entry 构造中的条目不碰 closer", "p2" not in adapters._SESSIONS, "")
+
+        worker = adapters._SessionWorker()
+        try:
+            check("_SessionWorker.run 回值", worker.run(lambda: 5) == 5, "")
+            try:
+                worker.run(_raiser(RuntimeError("boom")))
+                check("_SessionWorker 任务异常回到调用方", False, "没抛")
+            except RuntimeError:
+                check("_SessionWorker 任务异常回到调用方", True, "")
+        finally:
+            worker.stop()
+        check("_SessionWorker.stop 收线程", True, "")
+
+        # close_all_sessions 要真的有条目可关，循环体才算跑到
+        last_stub = _session_stub()
+        adapters._SESSIONS["cov-last"] = {
+            "sessionId": "cov-last",
+            "type": "stealth",
+            "session": last_stub(),
+            "closer": last_stub(),
+            "lock": threading.Lock(),
+            "worker": None,
+        }
+        adapters.close_all_sessions()
+        check("close_all_sessions 清空登记", adapters._SESSIONS == {}, repr(adapters._SESSIONS))
+    finally:
+        fetchers.StealthySession = saved_session  # type: ignore[misc,assignment]
+        adapters._make_session = saved_make
+        adapters.close_all_sessions()
+
+
+def run_inprocess_crawl() -> None:
+    """进程内：crawl 的登记/叫停/起线程/淘汰/取名各分支。"""
+    sys.path.insert(0, str(PY_DIR))
+    import adapters
+    import crawl
+    import guard
+
+    print("\n== 进程内：crawl 分支 ==")
+    saved_hosts = set(guard.ALLOWED_HOSTS)
+    saved_proxy = guard.PROXY_URL
+    saved_make = crawl._make_spider
+    saved_emit = crawl._emit_event
+    saved_thread = crawl.threading.Thread
+    guard.configure(allowed_hosts=frozenset({"a.test"}))
+    crawl._emit_event = lambda *args, **kwargs: None
+    try:
+        try:
+            crawl._crawl_policy({"deployment": {"crawlDownloadDelayMs": -1}})
+            check("crawlDownloadDelayMs=-1 被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check("crawlDownloadDelayMs=-1 被拒", error.code == "BAD_ARGS", error.code)
+
+        # 配了代理时 configure_sessions 会把代理交给 FetcherSession
+        guard.PROXY_URL = "http://127.0.0.1:7890"
+        spider = crawl._make_spider(
+            "http://a.test/", 2, "cov-proxy", {"pages": [], "deadline": 0}, {"a.test"}, crawl._crawl_policy({})
+        )
+        check("爬虫配代理时会话带上 proxies", spider is not None, "")
+        guard.PROXY_URL = saved_proxy
+
+        # on_scraped_item：页数已到上限时直接返回 None
+        state: dict[str, Any] = {"pages": [{"url": "http://a.test/", "title": "t", "markdown": "m"}], "deadline": 0}
+        spider = crawl._make_spider("http://a.test/", 1, "cov-full", state, {"a.test"}, crawl._crawl_policy({}))
+        out = asyncio.run(spider.on_scraped_item({"url": "http://a.test/x", "title": "x", "markdown": "y"}))
+        check("页数到上限时不再收", out is None and len(state["pages"]) == 1, repr(state["pages"]))
+
+        crawl._CRAWLS.clear()
+        crawl._make_spider = _raiser(adapters.AdapterError("X", "boom"))
+        try:
+            crawl.crawl_run({"url": "http://a.test/"})
+            check("crawl_run 透传 AdapterError", False, "放行")
+        except adapters.AdapterError as error:
+            check("crawl_run 透传 AdapterError", error.code == "X", error.code)
+        check("构造失败的爬虫不留登记", crawl._CRAWLS == {}, repr(sorted(crawl._CRAWLS)))
+        crawl._make_spider = _raiser(ValueError("boom"))
+        try:
+            crawl.crawl_run({"url": "http://a.test/"})
+            check("crawl_run 包成 CRAWL_SETUP_FAILED", False, "放行")
+        except adapters.AdapterError as error:
+            check("crawl_run 包成 CRAWL_SETUP_FAILED", error.code == "CRAWL_SETUP_FAILED", error.code)
+
+        # worker 起手就被叫停（crawl_stop 在 spider 登记之前到）：一页都不抓
+        def _mark_stop(
+            url: str, limit: int, crawl_id: str, state: dict[str, Any], domains: set[str], policy: Any
+        ) -> Any:  # noqa: ANN401 —— 替身
+            """把该 id 的登记标成已叫停，并回一个够登记用的蜘蛛替身。"""
+            crawl._CRAWLS[crawl_id]["stop_requested"] = True
+            return object()
+
+        crawl._CRAWLS.clear()
+        crawl._make_spider = _mark_stop
+        crawl_id = crawl.crawl_run({"url": "http://a.test/"})["crawlId"]
+        crawl._CRAWLS[crawl_id]["thread"].join(timeout=5)
+        check("被叫停的 worker 一页都不抓", crawl.crawl_status({"crawlId": crawl_id})["pages"] == [], "")
+
+        class _BoomSpider:
+            """start() 抛错的蜘蛛替身。"""
+
+            def start(self) -> None:
+                """抛。"""
+                raise RuntimeError("start boom")
+
+            def pause(self) -> None:
+                """无事可停。"""
+
+        crawl._CRAWLS.clear()
+        crawl._make_spider = lambda *args, **kwargs: _BoomSpider()
+        crawl_id = crawl.crawl_run({"url": "http://a.test/"})["crawlId"]
+        crawl._CRAWLS[crawl_id]["thread"].join(timeout=5)
+        check("spider.start 抛时收进 state", "boom" in str(crawl.crawl_status({"crawlId": crawl_id})["error"]), "")
+
+        # 起线程失败：把占位摘掉、名额还回去，再抛
+        class _BadThread:
+            """start() 抛错的线程替身。"""
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                """:param args: 忽略
+                :param kwargs: 忽略
+                """
+
+            def start(self) -> None:
+                """抛。"""
+                raise RuntimeError("cannot start thread")
+
+            def is_alive(self) -> bool:
+                """恒假。"""
+                return False
+
+            def join(self, timeout: float | None = None) -> None:
+                """无事可等。"""
+
+        crawl._CRAWLS.clear()
+        crawl._make_spider = lambda *args, **kwargs: _BoomSpider()
+        crawl.threading.Thread = _BadThread  # type: ignore[misc,assignment]
+        try:
+            crawl.crawl_run({"url": "http://a.test/"})
+            check("起线程失败时抛且不留登记", False, "放行")
+        except RuntimeError:
+            check("起线程失败时抛且不留登记", crawl._CRAWLS == {}, repr(sorted(crawl._CRAWLS)))
+        finally:
+            crawl.threading.Thread = saved_thread  # type: ignore[misc,assignment]
+
+        # 淘汰最旧的已结束条目
+        crawl._CRAWLS.clear()
+        for index in range(crawl.MAX_REMEMBERED_CRAWLS + 3):
+            crawl._CRAWLS[f"c{index}"] = {
+                "thread": _DeadThread(),
+                "crawl_id": f"c{index}",
+                "state": {"pages": [], "deadline": 0},
+                "stop_requested": False,
+            }
+        crawl._evict_finished_crawls()
+        check("淘汰后只剩上限条数", len(crawl._CRAWLS) == crawl.MAX_REMEMBERED_CRAWLS, str(len(crawl._CRAWLS)))
+        check("最旧的条目被丢掉", "c0" not in crawl._CRAWLS, "")
+
+        for bad, code in ((5, "BAD_ARGS"), ("nope", "NO_SUCH_CRAWL")):
+            try:
+                crawl._get_crawl(bad)
+                check(f"_get_crawl({bad!r}) 被拒", False, "放行")
+            except adapters.AdapterError as error:
+                check(f"_get_crawl({bad!r}) 被拒", error.code == code, error.code)
+
+        # 还没起线程的爬虫叫停：只置标志，stopping 为假
+        crawl._CRAWLS.clear()
+        crawl._CRAWLS["nostop"] = {
+            "thread": None,
+            "crawl_id": "nostop",
+            "state": {"pages": [], "deadline": 0},
+            "stop_requested": False,
+        }
+        answer = crawl.crawl_stop({"crawlId": "nostop"})
+        check("构造中的爬虫叫停说在停为假", answer == {"crawlId": "nostop", "stopping": False}, repr(answer))
+        check("构造中的叫停置上标志", crawl._CRAWLS["nostop"]["stop_requested"] is True, "")
+        crawl._CRAWLS.clear()
+    finally:
+        crawl._make_spider = saved_make
+        crawl._emit_event = saved_emit
+        crawl.threading.Thread = saved_thread  # type: ignore[misc,assignment]
+        crawl._CRAWLS.clear()
+        guard.configure(allowed_hosts=frozenset(saved_hosts))
+        guard.PROXY_URL = saved_proxy
+
+
 def main() -> int:
     """入口。
 
-    :returns: 退出码，0 表示全过
+    :returns: 退出码，0 表示全过且跑量达到本机那一档的下限
     """
     server, base = start_server()
     sidecar = Sidecar()
@@ -2371,6 +3638,13 @@ def main() -> int:
         run_write_verbs(sidecar, base)
         # 闸门那一半必须**关掉写方法**再起一个 sidecar（同一个服务地址能复用）。
         run_write_gate(base)
+        # capture / session.network / session.state_* 都要真浏览器，浏览器不可用就跳过。
+        if caps.get("browser"):
+            run_capture(sidecar, base)
+            run_session_network(sidecar, base)
+            run_session_state(sidecar)
+        else:
+            print("  SKIP  capture / session.network / session.state_*（capabilities.browser = false）")
     finally:
         sidecar.close()
         server.shutdown()
@@ -2402,11 +3676,24 @@ def main() -> int:
     print("\n== 爬虫边界（真站点收页 / 站外重定向 / 叫停 / select 预算）==")
     run_crawl_guards()
 
-    print("\n== XHR 摘要脱敏 ==")
-    run_xhr_secret_redaction()
+    print("\n== 爬虫策略旋钮（部署命名空间 → Spider 类属性）==")
+    run_crawl_policy()
+
+    print("\n== 网络摘要脱敏与形状 ==")
+    run_network_summary()
+
+    print("\n== 进程内单元（覆盖率地板只量本进程）==")
+    run_inprocess_adapters()
+    run_inprocess_browser()
+    run_inprocess_capabilities()
+    run_inprocess_sessions()
+    run_inprocess_crawl()
 
     print("\n== 提取路径的反注入清洗 ==")
     run_extraction()
+
+    print("\n== 解释器地板（运行时硬闸）==")
+    run_python_floor_gate()
 
     print("\n== 缺可选依赖的归类 ==")
     check_dependency_missing_mapping()
@@ -2415,6 +3702,17 @@ def main() -> int:
     print(f"passed {passes}, failed {len(failures)}")
     for item in failures:
         print(f"  - {item}")
+    has_browser = _browser_ground_truth()
+    floor = MIN_CHECKS_WITH_BROWSER if has_browser else MIN_CHECKS_WITHOUT_BROWSER
+    print(f"跑量下限档位：{'有浏览器' if has_browser else '无浏览器'}，下限 {floor}")
+    ran = passes + len(failures)
+    if ran < floor:
+        print(
+            f"本次只跑了 {ran} 条断言，低于下限 {floor}：有小节静默消失或整段没执行，"
+            "上面的 failed 0 是「没量到」而不是「都过了」。",
+            file=sys.stderr,
+        )
+        return 1
     return 0 if not failures else 1
 
 

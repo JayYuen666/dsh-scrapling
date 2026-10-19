@@ -24,5 +24,3 @@ __pycache__/
 # 探针脚本用的虚拟环境：404MB，机器本地状态，不入库
 _env/.venv/
 
-# 本机 npm 配置：实测含 _authToken 行，属凭据，绝不入库
-.npmrc

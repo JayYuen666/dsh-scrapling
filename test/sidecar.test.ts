@@ -46,7 +46,7 @@ interface FakeHandle {
 const readyFrame = (): Record<string, unknown> => ({
   event: "ready",
   protocol: PROTOCOL_VERSION,
-  capabilities: { scrapling: true, static: true, extract: true, browser: false, stealth: false },
+  capabilities: { scrapling: true, static: true, extract: true, browser: false },
 });
 
 /** 假 runtime 的可调项。 */
@@ -167,9 +167,8 @@ const NORMALIZED_URL = "http://93.184.216.34/normalized";
 function options(overrides: Partial<SidecarOptions> = {}): SidecarOptions {
   // 这两个默认值只服务于下面「真实 python 进程」那组用例（其余用例都显式传 80 / 5000
   // 这类小值做超时断言）。真实进程冷启动要 import scrapling 并探浏览器，安静机器上就要
-  // 1.5s 上下；并发或机器一忙，2000ms 就成了一笔随缘的假失败 —— 实测全量跑时同一组用例
-  // 耗时飘到 10–24s，而基配置的 testTimeout 是 20s，于是直接超时。
-  // 放宽到 15s 不影响任何超时语义断言：那几条用例传的是自己的小值。
+  // 一秒以上；并发或机器一忙还能再涨数倍，贴着基配置的 testTimeout 给就会随缘超时。
+  // 放宽这两个值不影响任何超时语义断言：那几条用例传的是自己的小值。
   return {
     pythonBin: "python3",
     bridgePath: BRIDGE,
@@ -188,7 +187,6 @@ describe("parseCapabilities", () => {
       static: false,
       extract: false,
       browser: false,
-      stealth: false,
     });
   });
 
@@ -198,7 +196,7 @@ describe("parseCapabilities", () => {
   });
 
   it("版本号只在是字符串时带上", () => {
-    expect(parseCapabilities({ version: "0.4.15" }).version).toBe("0.4.15");
+    expect(parseCapabilities({ version: "0.5" }).version).toBe("0.5");
     expect(parseCapabilities({ version: 15 }).version).toBeUndefined();
   });
 });
