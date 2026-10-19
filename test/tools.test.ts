@@ -10,7 +10,7 @@ import { once } from "node:events";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { capText, tailOf } from "../lib/output.ts";
+import { capText } from "../lib/output.ts";
 import {
   createAnswerTool,
   createCaptureXhrTool,
@@ -199,6 +199,36 @@ function isLowSurrogate(code: number): boolean {
   return code >= LOW_SURROGATE_START && code <= LOW_SURROGATE_END;
 }
 
+/**
+ * 造一份 `scrapling_session_open` 的参数面里 `sessionType` 那一格。
+ *
+ * @param browser - 这台机器有没有可用的浏览器
+ * @returns 该参数的 enum 与 description
+ */
+function sessionTypeParam(browser: boolean): { enum?: string[]; description?: string } {
+  const fake = fakeSidecar({});
+  Object.defineProperty(fake.client, "capabilities", {
+    value: { scrapling: true, static: true, extract: true, browser, writeMethods: false },
+    configurable: true,
+  });
+  const tool = createSessionOpenTool({
+    sidecar: fake.client,
+    settings: SETTINGS,
+    startCrawlJob: fakeJobStarter,
+    answer: fakeAnswer,
+  });
+  const compiled = tool.parameters as
+    | { properties?: Record<string, { enum?: string[]; description?: string }> }
+    | undefined;
+  return compiled?.properties?.["sessionType"] ?? {};
+}
+
+/** 测试里统一用的假作业 id（`scrapling-<hex>` 形态的一枚具体样本）。 */
+const SAMPLE_JOB_ID = "scrapling-1";
+
+/** 假 sidecar 的短名包装：多处用到，且不捕获任何外层变量，故放模块级。 */
+const deps = (result: unknown): ReturnType<typeof fakeSidecar> => fakeSidecar(result);
+
 describe("capText", () => {
   it("未超预算时原样返回且没有页脚", () => {
     const result = capText("hello", 1000, "再取一次");
@@ -232,16 +262,6 @@ describe("capText", () => {
     const result = capText("x".repeat(1000), 100, "");
     expect(result.truncated).toBe(true);
     expect(result.notice.length).toBeGreaterThan(0);
-  });
-});
-
-describe("tailOf", () => {
-  it("保留尾部", () => {
-    expect(tailOf("abcdef", 3)).toBe("def");
-  });
-
-  it("预算为零时给空串而不是整串", () => {
-    expect(tailOf("abcdef", 0)).toBe("");
   });
 });
 
@@ -2052,6 +2072,28 @@ describe("会话工具", () => {
     );
   });
 
+  it("没有浏览器时 sessionType 只剩 static，参数说明也跟着变", () => {
+    expect(sessionTypeParam(true).enum).toStrictEqual(["static", "stealth"]);
+    const withoutBrowser = sessionTypeParam(false);
+    expect(withoutBrowser.enum).toStrictEqual(["static"]);
+    // 取值摘掉了，说明里也不能再介绍一个选不到的档。
+    expect(withoutBrowser.description).not.toContain("stealth");
+  });
+
+  it("静态会话的抓取补上 timeoutSeconds（会话帧原本只发 timeoutMs，那对静态支路无效）", async () => {
+    const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "b", truncated: false });
+    const tool = createSessionFetchTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute({ sessionId: "s1", url: SAMPLE_URL }, sessionExec());
+    const params = fake.calls[0]?.params as Record<string, unknown>;
+    expect(params["timeoutSeconds"]).toBe(SETTINGS.requestTimeoutSeconds);
+    expect(params["timeoutMs"]).toBe(SETTINGS.pageTimeoutMs);
+  });
+
   it("list 回包不是对象时给空列表", async () => {
     const fake = fakeSidecar(42);
     const tool = createSessionListTool({
@@ -2198,6 +2240,9 @@ describe("scrapling_crawl", () => {
         url: SAMPLE_URL,
         maxPages: 3,
         maxDurationMs: 1_800_000,
+        // 每页正文的预算跟着设置走：不给这个键时 Python 落回它写死的 20 万，设置卡上
+        // 「渲染输出上限」对爬虫就是白写的。
+        maxContentChars: SETTINGS.maxOutputBytes,
         // 站点的礼貌与顺序整套走 deployment 命名空间：模型入参到不了这里，Python 只从
         // deployment 读。夹具跟着 SETTINGS 的部署档走，串档立刻暴露。
         deployment: {
@@ -2266,10 +2311,10 @@ describe("scrapling_crawl", () => {
     });
     const blocks = tool.output.render(
       { url: SAMPLE_URL },
-      { jobId: "scrapling-1", url: SAMPLE_URL, maxPages: 20 },
+      { jobId: SAMPLE_JOB_ID, url: SAMPLE_URL, maxPages: 20 },
     );
     const text = JSON.stringify(blocks);
-    expect(text).toContain("scrapling-1");
+    expect(text).toContain(SAMPLE_JOB_ID);
     expect(text).toContain("job_output");
     // 输出里不该再出现那个内部句柄的名头，更不该出现它后面空着的半截文案。
     expect(text).not.toContain("crawlId");
@@ -2288,6 +2333,122 @@ describe("scrapling_crawl", () => {
       title: SAMPLE_URL,
       kind: "search",
     });
+  });
+
+  it("more 为真时立刻接着取下一段，一页都不丢", async () => {
+    // 对端按字节分片（见 py/crawl.py 的 MAX_STATUS_BYTES）：第一段说 more，第二段才是尾。
+    // 少了这一支，`since` 停在第一段、剩下的页永远读不到。
+    const since: number[] = [];
+    const fake = fakeSidecar({ crawlId: "c1" });
+    Object.assign(fake.client, {
+      call: async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+        if (method === "crawl.run") {
+          return { crawlId: "c1" };
+        }
+        const from = Number(params["since"]);
+        since.push(from);
+        return from === 0
+          ? {
+              running: true,
+              more: true,
+              error: null,
+              pages: [{ url: `${SAMPLE_URL}#1`, title: "t1", markdown: "m1" }],
+            }
+          : {
+              running: false,
+              more: false,
+              error: null,
+              pages: [{ url: `${SAMPLE_URL}#2`, title: "t2", markdown: "m2" }],
+            };
+      },
+    });
+    const appended: string[] = [];
+    const progress: string[] = [];
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: async (_label, run) => {
+        await run({
+          append: (text: string): void => {
+            appended.push(text);
+          },
+          progress: (line: string): void => {
+            progress.push(line);
+          },
+          signal: new AbortController().signal,
+        });
+        return "job-1";
+      },
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL, maxPages: 2 }, sessionExec());
+    expect(since).toStrictEqual([0, 1]);
+    expect(appended).toHaveLength(2);
+    expect(appended[1]).toContain("#2");
+    expect(progress.at(-1)).toBe("2 page(s) crawled");
+  });
+});
+
+describe("结果侧投影（结果行读的就是这几个键）", () => {
+  /**
+   * 造一份最小依赖。
+   *
+   * @param result - 假 sidecar 的回包
+   * @returns 依赖与调用记录
+   */
+  it("extract 投影出 count；session_open 投影出会话 id 与类型", async () => {
+    const extract = createExtractTool({
+      sidecar: deps({ count: 2, truncated: false, matches: [] }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    expect(
+      extract.output.presentationMeta?.({}, { count: 2, truncated: false, matches: [] }),
+    ).toStrictEqual({ count: 2 });
+
+    const open = createSessionOpenTool({
+      sidecar: deps({ sessionId: "s1", sessionType: "static", createdAt: "t" }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    expect(
+      open.output.presentationMeta?.(
+        {},
+        { sessionId: "s1", sessionType: "static", createdAt: "t" },
+      ),
+    ).toStrictEqual({ sessionId: "s1", sessionType: "static" });
+  });
+
+  it("session_list 投影出条数；crawl 投影出作业 id", async () => {
+    const list = createSessionListTool({
+      sidecar: deps({ sessions: [] }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    expect(
+      list.output.presentationMeta?.(
+        {},
+        {
+          sessions: [
+            { sessionId: "s1", sessionType: "static", createdAt: "t" },
+            { sessionId: "s2", sessionType: "static", createdAt: "t" },
+          ],
+        },
+      ),
+    ).toStrictEqual({ count: 2 });
+
+    const crawl = createCrawlTool({
+      sidecar: deps({ crawlId: "c1" }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    expect(
+      crawl.output.presentationMeta?.({}, { jobId: SAMPLE_JOB_ID, url: SAMPLE_URL, maxPages: 2 }),
+    ).toStrictEqual({ jobId: SAMPLE_JOB_ID });
   });
 });
 

@@ -1,6 +1,6 @@
 {
   "name": "@jayyuen66/dsh-scrapling",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Scrapling 网页抓取插件（dsh）：静态/浏览器抓取 + CSS/XPath 结构化抽取 + 选择器自愈 + capture_xhr 与会话网络历史 + 登录态存取 + Spider 爬虫，由常驻 Python 进程驱动。",
   "keywords": [
     "dsh",

@@ -79,7 +79,8 @@ deployment decision, not a per-call one.
 
 ## Requirements
 
-- **Python 3.14+** with Scrapling installed, reachable via `PATH` (or set `pythonBin`).
+- **Python 3.14+** with Scrapling installed, in the repo's `_env/.venv` or reachable via
+  `PATH` (or set `pythonBin`). The chosen interpreter is logged at load time.
 - **Browser engines are entirely the user's responsibility.** The plugin does not
   download anything. Without a browser it simply does not register the
   browser-dependent tools, so the model never wastes a turn calling them.
@@ -121,6 +122,11 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 ```
 
 The plugin is also installable from the Web UI via **Sidebar -> Plugins -> Add plugin**.
+
+
+## Shared version floor
+
+This package inlines `@jayyuen66/dsh-plugin-shared` at build time, so the runtime bundle no longer imports it -- but the version resolved for the build must still export every name the sources use. A profile `overrides` pin lower than this package's declared `@jayyuen66/dsh-plugin-shared` version makes the build read a copy that lacks those names.
 
 ## Replacing the built-in `web_fetch` and `web_search`
 
@@ -195,7 +201,8 @@ that field follows along.
 
 Notable switches:
 
-- `pythonBin` - interpreter name or absolute path; empty means `python3` on `PATH`.
+- `pythonBin` - interpreter name or absolute path; empty means "the repo's `_env/.venv` when
+  it is executable, otherwise `python3` on `PATH`". Whichever one is chosen is logged.
 - `fetchEnabled` / `extractEnabled` / `renderEnabled` / `captureXhrEnabled` /
   `networkEnabled` / `sessionEnabled` / `sessionStateEnabled` / `crawlEnabled` /
   `answerEnabled` - on by default.

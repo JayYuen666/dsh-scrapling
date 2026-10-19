@@ -7,12 +7,10 @@
 // 这里统一两件事：头尾两段截断（保头保尾，中间省略），以及用官方的
 // `formatRetentionNotice` 生成「留了什么、丢了多少、怎么拿回来」。
 //
-// 截断切点必须落在安全位置：`dsh-plugin-shared/lib/text` 的 `truncateStart` 与官方的
-// `truncateWithoutSplittingSurrogatePair` 都处理了代理对，直接 `slice` 会在切点留下
-// 孤立高代理 —— 那种文本进会话日志后会让后续 Messages 请求整体失败（dsh PR #4827）。
+// 截断切点必须落在安全位置：官方的 `TextRetainer` 处理了代理对，直接 `slice` 会在切点
+// 留下孤立高代理 —— 那种文本进会话日志后会让后续 Messages 请求整体失败（dsh PR #4827）。
 
 import { formatRetentionNotice, TextRetainer } from "@deepseek-ai/dsh-output-retention";
-import { truncateStart } from "@jayyuen66/dsh-plugin-shared/lib/text";
 
 /** 一次封顶的结果。 */
 export interface CappedText {
@@ -63,15 +61,4 @@ export function capText(text: string, budgetBytes: number, recovery: string): Ca
     () => recovery,
   );
   return { text: kept.text, truncated: kept.truncated, notice };
-}
-
-/**
- * 给「只保留尾部」的场合用，例如把整页压成一行预览。
- *
- * @param text - 完整正文
- * @param chars - 保留的字符数
- * @returns 尾部片段
- */
-export function tailOf(text: string, chars: number): string {
-  return truncateStart(text, chars);
 }

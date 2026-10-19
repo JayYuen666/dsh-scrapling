@@ -4,6 +4,7 @@
 // （buildRow）与一段注册逻辑（apply 用假 ctx 驱动），两者都能在 Node 下验证。
 
 import { describe, expect, it } from "vitest";
+import { TOOL_SPECS } from "../host.ts";
 import { buildRow, readArgs, resultMetaOf, ROW_TOOLS } from "../src/client-entry.ts";
 import { BUNDLE_PACKAGE_NAME, LOCALE_NS, SETTINGS_ENTRY_ID } from "../src/settings-fields.ts";
 
@@ -27,6 +28,18 @@ const NO_OP = (): void => undefined;
 // cordis 的 effect 会**立刻**执行函数体并持有它的返回值，测试替身必须照做：少了这一步，
 // effect 里的注册一次都不会发生。
 const RUN_EFFECT_IMMEDIATELY = (run: () => unknown): unknown => run();
+
+/** 结果行里"会话"那一列的字面量键：本文件多处用到。
+ *  刻意写独立字面量而不是引实现的 `ROW_SESSION_KEY`——期望值必须与被测对象各写一份，
+ *  引用实现在实现改名时会同步变绿，那条断言就什么都没测。 */
+const SESSION_LABEL_KEY = "row.session";
+const TYPE_LABEL_KEY = "row.type";
+
+/** 期望的一行 `{ labelKey, value }`：测试里成片出现，抽一处避免同一字面量散落多次。 */
+const fieldOf = (labelKey: string, value: string): { labelKey: string; value: string } => ({
+  labelKey,
+  value,
+});
 
 describe("buildRow", () => {
   it("抓取类展示 URL 与 HTTP 状态", () => {
@@ -79,18 +92,36 @@ describe("buildRow", () => {
   it("session_open 展示类型与会话 id", () => {
     const row = buildRow("scrapling_session_open", { sessionType: "browser" }, { sessionId: "s1" });
     expect(row.fields).toStrictEqual([
-      { labelKey: "row.type", value: "browser" },
-      { labelKey: "row.session", value: "s1" },
+      { labelKey: TYPE_LABEL_KEY, value: "browser" },
+      fieldOf(SESSION_LABEL_KEY, "s1"),
     ]);
   });
 
   it("session_close / session_list 各有各的字段", () => {
     expect(buildRow("scrapling_session_close", { sessionId: "s1" }, {}).fields).toStrictEqual([
-      { labelKey: "row.session", value: "s1" },
+      fieldOf(SESSION_LABEL_KEY, "s1"),
     ]);
     expect(buildRow("scrapling_session_list", {}, { count: 3 }).fields).toStrictEqual([
       { labelKey: "row.sessionCount", value: "3" },
     ]);
+  });
+
+  it("session_network 展示会话", () => {
+    expect(buildRow("scrapling_session_network", { sessionId: "s2" }, {}).fields).toStrictEqual([
+      fieldOf(SESSION_LABEL_KEY, "s2"),
+    ]);
+  });
+
+  it("登录态存取展示会话与文件名；没给名字就只展示会话", () => {
+    for (const tool of ["scrapling_session_state_save", "scrapling_session_state_load"]) {
+      expect(buildRow(tool, { sessionId: "s3", name: "login" }, {}).fields).toStrictEqual([
+        fieldOf(SESSION_LABEL_KEY, "s3"),
+        { labelKey: "row.name", value: "login" },
+      ]);
+      expect(buildRow(tool, { sessionId: "s3" }, {}).fields).toStrictEqual([
+        fieldOf(SESSION_LABEL_KEY, "s3"),
+      ]);
+    }
   });
 
   it("crawl 展示起始、上限与作业 id", () => {
@@ -323,9 +354,11 @@ describe("apply", () => {
     expect(registered.filter((entry) => entry.name === TOOLVIEW_SLOT)).toStrictEqual([]);
   });
 
-  it("结果行清单覆盖 host.ts 注册的每个工具，少一个就少画一行", () => {
-    expect(ROW_TOOLS).toContain("scrapling_answer");
-    expect(new Set(ROW_TOOLS).size).toBe(ROW_TOOLS.length);
+  it("结果行清单与 host.ts 的登记表逐项相等（多一个幽灵少一个真工具都算红）", () => {
+    // 只断言 `toContain("scrapling_answer")` 是不够的：那条曾经放过了「清单里留着已经删掉的
+    // scrapling_stealth_fetch、同时缺三个真会话工具」这一整片漂移。两张表的对应关系是集合相等，
+    // 判据就得写成集合相等。
+    expect([...ROW_TOOLS].toSorted()).toStrictEqual(TOOL_SPECS.map((spec) => spec.name).toSorted());
   });
 
   it("设置卡挂在 plugins.bundle.config 上，键是包名，并带上 locale 席位", async () => {

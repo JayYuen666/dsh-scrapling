@@ -25,8 +25,7 @@ export type BlockReason =
   | "ambiguous-authority"
   | "no-address"
   | "private-address"
-  | "resolve-failed"
-  | "port-not-allowed";
+  | "resolve-failed";
 
 /** 策略判定结果。`ok` 为 false 时 `reason`/`message` 一定存在。 */
 export type UrlVerdict =
@@ -40,11 +39,6 @@ export type ResolveAddresses = (hostname: string) => Promise<readonly string[]>;
 export interface UrlPolicyOptions {
   /** URL 最大字符数；与 dsh 内置 web_fetch 的 2048 对齐。 */
   readonly maxUrlLength: number;
-  /**
-   * 允许的端口。留空表示**不限制端口** —— 与 dsh 内置 fetch provider 同取舍
-   * （它全树唯一的 `.port` 引用是同源比较，没有端口白名单）。
-   */
-  readonly allowPorts?: readonly number[];
   /** DNS 解析器；不传则用 `node:dns/promises` 的 lookup。 */
   readonly resolve?: ResolveAddresses;
   /**
@@ -532,7 +526,7 @@ async function resolveWithNodeDns(hostname: string): Promise<readonly string[]> 
  * @returns 带 `screen` / `verify` / `isPublicAddress` 的策略对象
  */
 export function createUrlPolicy(options: UrlPolicyOptions): UrlPolicy {
-  const { maxUrlLength, allowPorts } = options;
+  const { maxUrlLength } = options;
   const resolve = options.resolve ?? resolveWithNodeDns;
   const table = buildNat64Table([...DEFAULT_NAT64_PREFIXES, ...(options.nat64Prefixes ?? [])]);
   const allowed = new Set((options.allowHosts ?? []).map((host) => host.trim().toLowerCase()));
@@ -587,13 +581,6 @@ export function createUrlPolicy(options: UrlPolicyOptions): UrlPolicy {
         ok: false,
         reason: "credentials-not-allowed",
         message: "credentials in URLs are not allowed",
-      };
-    }
-    if (allowPorts !== undefined && url.port.length > 0 && !allowPorts.includes(Number(url.port))) {
-      return {
-        ok: false,
-        reason: "port-not-allowed",
-        message: `port ${url.port} is not in the allow list`,
       };
     }
     return { ok: true, url };

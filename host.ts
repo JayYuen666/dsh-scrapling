@@ -12,6 +12,7 @@
 // proxy **绝不**进任何模型可见 schema。浏览器侧的 SSRF 守卫由 Python 侧用自己写的
 // 回调注册（见 py/guard.py），模型只能传数据，不能传代码。
 
+import { accessSync, constants } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -62,9 +63,14 @@ export type WaitSelectorState = "attached" | "detached" | "hidden" | "visible";
  */
 export interface Config {
   // ---- 环境定位（用户可改）----
-  /** Python 解释器名或绝对路径；留空则用 PATH 上的 `python3`。 */
+  /** Python 解释器名或绝对路径；留空则依次探仓内 `_env/.venv` 与 PATH 上的 `python3`。 */
   pythonBin: Volatile<string>;
-  /** Scrapling 未安装时是否直接拒绝加载（true）还是降级为「所有工具不可用」。 */
+  /**
+   * 选中的解释器起不来时是否直接拒绝加载（true）还是降级为「所有工具不可用」。
+   *
+   * 判的是**进程能不能起来**（解释器路径错、协议对不上、握手超时）；解释器起得来但里面
+   * 没装 Scrapling 是另一回事，那种情况无论开关如何都只降级，并在日志里点名解释器路径。
+   */
   failFastOnMissingPython: Volatile<boolean>;
 
   // ---- 每工具开关（用户可改）----
@@ -508,7 +514,7 @@ const GUIDANCE: Record<keyof ToolFlags, string> = {
 };
 
 /** 一个工具对运行环境的最低要求。 */
-export type ToolRequirement = "scrapling" | "browser";
+export type ToolRequirement = "scrapling" | "browser" | "jobs";
 /** 工具构造器：名字到「给定依赖造一个工具定义」的映射。 */
 type ToolBuilder = (deps: ToolDeps) => ToolDefinition;
 
@@ -593,7 +599,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     requires: "scrapling",
     build: createSessionCloseTool,
   },
-  { name: "scrapling_crawl", flag: "crawl", requires: "scrapling", build: createCrawlTool },
+  // 爬虫是唯一需要**作业后端**的工具：它把整站抓取挂到 ctx.jobs 上跑，其余 12 个工具
+  // 都是一次性调用。没有作业后端时它必然在 start() 那一刻失败，因此按能力跳过。
+  { name: "scrapling_crawl", flag: "crawl", requires: "jobs", build: createCrawlTool },
   {
     name: "scrapling_answer",
     flag: "answer",
@@ -667,7 +675,7 @@ export function outputBudgetOf(config: Config, toolName: string): number {
 const NONE = "none" as const;
 
 /** 一个工具没被注册的原因。 */
-export type SkipReason = "disabled" | "scrapling-missing" | "browser-missing";
+export type SkipReason = "disabled" | "scrapling-missing" | "browser-missing" | "jobs-unavailable";
 
 /** 注册计划的结果。 */
 export interface ToolPlan {
@@ -691,6 +699,7 @@ export interface ToolPlan {
 export function planTools(
   flags: ToolFlags,
   capabilities: SidecarCapabilities | undefined,
+  jobsReady = false,
 ): ToolPlan {
   const ready: string[] = [];
   const skipped: { name: string; reason: SkipReason }[] = [];
@@ -701,6 +710,12 @@ export function planTools(
     }
     if (requires === "browser" && !capabilities.browser) {
       return "browser-missing";
+    }
+    // 作业后端缺失时爬虫必挂：`jobs.start()` 会在发起任何请求之前抛
+    // 「no job controller serves this agent」。不注册它，模型就不会浪费一轮去调一个
+    // 注定失败的工具 —— 与 browser-missing 同一套取舍。
+    if (requires === "jobs" && !jobsReady) {
+      return "jobs-unavailable";
     }
     return NONE;
   };
@@ -738,6 +753,43 @@ export function resolveDataDir(configured: string): string {
     return path.resolve(trimmed);
   }
   return path.join(os.homedir(), ".dsh-scrapling");
+}
+
+/** 仓内解释器相对包根的路径；与根 `scripts/lib/py-env.mjs` 的 `VENV_REL` 同一套规则。 */
+const VENV_PYTHON = path.join("_env", ".venv", "bin", "python");
+
+/** 选中的解释器，以及它为什么被选中。 */
+export interface PythonChoice {
+  /** 交给 `ctx.subprocess.resolveExecutable` 的那个名字或绝对路径。 */
+  readonly path: string;
+  /** 选中来源：显式配置 / 仓内 venv / PATH。 */
+  readonly via: "configured" | "_env/.venv" | "PATH";
+}
+
+/**
+ * 定下这次用哪个 Python。
+ *
+ * 三条规则，按优先级：设置卡填了就用它；没填时**先看仓内 venv**（`py:setup` 建的那份，
+ * 可执行才算 —— 文件在但跑不起来的 venv 是坏掉的机器本地态）；都没有才落 PATH 上的
+ * `python3`。判据与根 `scripts/lib/py-env.mjs` 的 `resolvePython` 逐条一致：两处答得不
+ * 一样时，门禁判绿的解释器就不是插件真用的那个。
+ *
+ * @param configured - 设置卡上的 `pythonBin`；空白表示没表态
+ * @param packageRoot - 包根目录（`host.js` 所在的那一层）
+ * @returns 选中的解释器与来源
+ */
+export function resolvePythonBin(configured: string, packageRoot: string): PythonChoice {
+  const explicit = configured.trim();
+  if (explicit.length > 0) {
+    return { path: explicit, via: "configured" };
+  }
+  const venv = path.join(packageRoot, VENV_PYTHON);
+  try {
+    accessSync(venv, constants.X_OK);
+    return { path: venv, via: "_env/.venv" };
+  } catch {
+    return { path: "python3", via: "PATH" };
+  }
 }
 
 /**
@@ -851,6 +903,69 @@ function sinkOf(
  * @param run - 作业主体
  * @returns 作业 id
  */
+/**
+ * 作业后端**真的可用**吗。
+ *
+ * 不能只看 `ctx.get("jobs") !== undefined`：注册表本身几乎总在（`dsh-jobs-local` 是
+ * base 层的一部分），但有 controller 附着才允许 `start()`。实测两种情形都出现过——
+ * host 层的 `tool-jobs` 被 `disabled: true` 时，`ctx.jobs` 在、`start()` 却抛
+ * 「no job controller serves this agent」，而那句文案指向「装 tool-jobs」（装好了也没用）。
+ *
+ * `servesOwner` 是 private，没有公开的只读判据，所以这里用**行为探测**：起一个立即
+ * 完成的空作业。成功 ⇒ controller 在位；抛错 ⇒ 不可用。探测作业当场 `remove` 掉，
+ * 不占并发名额、不留记录、不产生完成通知（它在 `remove` 之前就已经 settle）。
+ *
+ * @param jobs - `ctx.get("jobs")` 的取值
+ * @returns 可用为 true
+ */
+/**
+ * 作业后端能不能起作业。
+ *
+ * 判据是 `attachController` 在不在 —— 而不是"`ctx.jobs` 存在"（它几乎总在），也不是
+ * "试着起一个作业"（那会留一条记录、还要处理清理失败）。
+ *
+ * 为什么 `attachController` 就够：`scrapling_crawl` 起作业时自己挂 controller
+ * （见 `startUnderCrawlController`），所以后端只要能 attach 就能起。反过来，一个连
+ * `attachController` 都没有的注册表实现，本插件确实无从挂闸门。
+ *
+ * @param jobs - `ctx.get("jobs")` 的取值
+ * @returns 可用为 true
+ */
+function probeJobsReady(jobs: unknown): boolean {
+  if (typeof jobs !== "object" || jobs === null) {
+    return false;
+  }
+  const face = jobs as { attachController?: unknown; start?: unknown };
+  return typeof face.attachController === "function" && typeof face.start === "function";
+}
+
+/** 作业注册表的最小面：本包只用到 start 与 attachController。
+ *  两个成员都按泛型给，调用方传什么类型就回什么类型 —— 不镜像宿主那份 JobSpec。 */
+interface CrawlJobsFace<Spec, Id> {
+  start: (spec: Spec) => Id;
+  attachController: (name: string) => () => void;
+}
+
+/**
+ * 在**自挂的 controller 作用域内**起一个作业，返回后立刻撤销附着。
+ *
+ * 为什么不是常驻附着：`attachController` 是往宿主平面登记「有人能收这桶作业」的闸门。
+ * 常驻一枚等于在本插件活着的整段时间里替全宿主开着它 —— 而官方契约要求生产者起的作业
+ * 必须是 owner 收得掉的。只在 `start()` 那一瞬挂着，宿主其余判定一个字不变。
+ *
+ * @param jobs - 作业注册表
+ * @param spec - 作业描述（原样交给 `start`）
+ * @returns 作业 id
+ */
+function startUnderCrawlController<Spec, Id>(jobs: CrawlJobsFace<Spec, Id>, spec: Spec): Id {
+  const detach = jobs.attachController("scrapling: crawl");
+  try {
+    return jobs.start(spec);
+  } finally {
+    detach();
+  }
+}
+
 function startCrawlJob(
   ctx: Context,
   router: CrawlEventRouter,
@@ -867,14 +982,27 @@ function startCrawlJob(
     return Promise.reject(
       new SidecarError(
         "JOBS_UNAVAILABLE",
-        "这个 profile 没有作业后端（ctx.jobs 不可用），scrapling_crawl 需要它来跑后台作业",
+        "这个 profile 没有作业后端（ctx.jobs 不可用），scrapling_crawl 需要它来跑后台作业。" +
+          "本插件在注册时已按能力跳过 crawl，走到这里说明注册之后后端被卸载了。" +
+          "单页抓取（scrapling_fetch / extract / render）不受影响。",
       ),
     );
   }
+  // 自己挂一枚 controller，只在 `start()` 那一瞬。
+  //
+  // 为什么必需：`dsh-jobs-local` 的 `servesOwner` 先看**宿主平面**有没有 controller
+  // 附着，没有才看 owner 的 scope 链；而 `attachController` 只能往宿主平面注册（它用的是
+  // jobs 服务自己的 ctx）。web profile 把宿主平面的 `tool-jobs` **显式 disabled**（改由各
+  // preset 提供），于是宿主平面恒为空 —— 裸 `start()` 在默认 profile 下必抛
+  // 「no job controller serves this agent」，而那句文案说「装 tool-jobs」（装了也没用）。
+  // 同工作区的 `dsh-ocr-review` 早就是这么解的（`startUnderOcrController`），本工具照做。
+  //
+  // 为什么只挂一瞬：常驻一枚等于在「宿主故意没装 job 工具」的组成里替全宿主开着那道闸门。
+  // detach 之后 `start()` 立刻回到被拒（实测），所以这不会改变宿主的任何既有判定。
   // jobs.start 本身是同步的；用 Promise.resolve 包一层是为了匹配工具层那条
   // async 契约 —— 免得以后真要等点什么（比如先确认会话）时再改两边。
   return Promise.resolve(
-    jobs.start({
+    startUnderCrawlController(jobs, {
       kind: "scrapling",
       label,
       run: (job) => {
@@ -1103,46 +1231,26 @@ function baseSettingsOf(config: Config): BaseSettings {
 }
 
 /**
- * 插件入口。
+ * 造 sidecar 客户端：解释器、桥接脚本、数据目录与两侧同解的环境变量都在这里对齐。
  *
- * 流程：建客户端 → 探测能力 → 按「开关 ∩ 能力」注册工具。
+ * 从 apply 抽出来是因为它自己就有一组不变量（三枚两侧同解的环境变量 + 回收路径），
+ * 摊在 apply 里会让「卸载时收干净」这条与「注册哪些工具」混成一段读不下去的逻辑。
  *
- * 能力探测会真的拉起一个 Python 进程，所以 `apply` 是 async 的 ——
- * 官方也这么做（deepseek-harness 的 `packages/fs/tool-fs-search`）。
- *
- * @param ctx - 宿主上下文
- * @param config - 已由 schemastery 填满默认值的配置
+ * @param options - 已解析好的解释器、配置、URL 闸门与爬虫事件路由
+ * @returns sidecar 客户端与它的事件面
  */
-export async function apply(
-  ctx: Context & SettingsFace & SystemPromptFace,
-  config: Config,
-): Promise<void> {
-  // 登记「本页由自带卡片编辑」。`auto: false` 是告诉宿主别再自动生成一份通用表单 ——
-  // 自动那份会把整表字段摊成没有分组、没有说明的长列表，而真正在编辑这张卡的
-  // client.js 已经按用途分了组、补了「改了会怎样」。
-  //
-  // 这行不是可有可无的礼貌：宿主侧的设置投影一直存在（命名空间由 cordis.patch.yml 的
-  // `id` 决定），缺的只是页面。哪天宿主开始自动生成页面而我们没登记，用户就会同时看到
-  // 两份互相覆盖的表单。
-  ctx.effect(() => ctx.settings.configure({ auto: false }, ctx.fiber), "scrapling: settings page");
-
-  const flags = snapshotFlags(config);
-  const dataDir = resolveDataDir(config.dataDir.get());
-  const bridgePath = path.join(import.meta.dirname, "py", "bridge.py");
-  // 闸门建一次、两处共用：sidecar 每次调用过它，search provider 的 sources 也过它。
-  const urlGate = createUrlGate(config);
-  const crawlEvents = createCrawlEventRouter();
-  try {
-    await ensureDataDir(dataDir);
-  } catch (error) {
-    ctx.logger.warn(probeFailure(error));
-    return;
-  }
-
-  const sidecar = createSidecar(ctx, {
-    pythonBin: config.pythonBin.get() || "python3",
-    bridgePath,
-    cwd: dataDir,
+function makeSidecar(options: {
+  ctx: Context;
+  config: Config;
+  python: PythonChoice;
+  urlGate: (url: string) => Promise<string>;
+  crawlEvents: ReturnType<typeof createCrawlEventRouter>;
+}): SidecarClient {
+  const { ctx, config, python, urlGate, crawlEvents } = options;
+  return createSidecar(ctx, {
+    pythonBin: python.path,
+    bridgePath: path.join(import.meta.dirname, "py", "bridge.py"),
+    cwd: resolveDataDir(config.dataDir.get()),
     handshakeTimeoutMs: config.sidecarHandshakeTimeoutMs.get(),
     requestTimeoutMs: config.fetchTimeoutMs.get(),
     graceMs: config.sidecarGraceMs.get(),
@@ -1173,6 +1281,91 @@ export async function apply(
       crawlEvents.route(typeof frame["crawlId"] === "string" ? frame["crawlId"] : "", text);
     },
   });
+}
+
+/**
+ * 插件入口。
+ *
+ * 流程：建客户端 → 探测能力 → 按「开关 ∩ 能力」注册工具。
+ *
+ * 能力探测会真的拉起一个 Python 进程，所以 `apply` 是 async 的 ——
+ * 官方也这么做（deepseek-harness 的 `packages/fs/tool-fs-search`）。
+ *
+ * @param ctx - 宿主上下文
+ * @param config - 已由 schemastery 填满默认值的配置
+ */
+/**
+ * 作业后端不可用时把**怎么修**写出来。
+ *
+ * 这条路径上只少了 scrapling_crawl 一个工具，其余十二个照常，所以它不是致命错误；
+ * 但宿主那条报错文案会说「装 dsh-tool-jobs」，而那个包通常早就装好了 —— 真正被关掉的
+ * 是 host 层的装载条目。照抄这条建议能直接解决。
+ *
+ * @param ctx - 宿主上下文（只用于 logger）
+ * @param plan - 本次注册计划
+ */
+function warnJobsUnavailable(ctx: Context, plan: ToolPlan): void {
+  if (!plan.skipped.some((item) => item.reason === "jobs-unavailable")) {
+    return;
+  }
+  ctx.logger.warn(
+    "[dsh-scrapling] scrapling_crawl 不注册：这个 profile 的作业后端没有 controller 附着。" +
+      "修法是在 profile 的 cordis.patch.yml 里显式启用 host 层的 tool-jobs：" +
+      "`- id: tool-jobs` / `  name: '@deepseek-ai/dsh-tool-jobs'` / `  disabled: false`，" +
+      "改完重启宿主。其余十二个工具不受影响。",
+  );
+}
+
+/**
+ * 缺 scrapling 时把选中解释器一起点名。
+ *
+ * 这条路径上工具全都不注册，而「解释器里没装」与「装了但 PATH 指错」在日志里长得一样，
+ * 用户要的是那一行路径。
+ *
+ * @param ctx - 宿主上下文（只用于 logger）
+ * @param plan - 本次注册计划
+ * @param python - 选中的解释器
+ */
+function warnScraplingMissing(ctx: Context, plan: ToolPlan, python: PythonChoice): void {
+  if (!plan.skipped.some((item) => item.reason === "scrapling-missing")) {
+    return;
+  }
+  ctx.logger.warn(
+    `[dsh-scrapling] 选中的解释器 ${python.path} 里没有可用的 Scrapling：` +
+      '装上它（pip install "scrapling[rag]>=0.5,<0.6"），或把 pythonBin 指向装了它的解释器。',
+  );
+}
+
+export async function apply(
+  ctx: Context & SettingsFace & SystemPromptFace,
+  config: Config,
+): Promise<void> {
+  // 登记「本页由自带卡片编辑」。`auto: false` 是告诉宿主别再自动生成一份通用表单 ——
+  // 自动那份会把整表字段摊成没有分组、没有说明的长列表，而真正在编辑这张卡的
+  // client.js 已经按用途分了组、补了「改了会怎样」。
+  //
+  // 这行不是可有可无的礼貌：宿主侧的设置投影一直存在（命名空间由 cordis.patch.yml 的
+  // `id` 决定），缺的只是页面。哪天宿主开始自动生成页面而我们没登记，用户就会同时看到
+  // 两份互相覆盖的表单。
+  ctx.effect(() => ctx.settings.configure({ auto: false }, ctx.fiber), "scrapling: settings page");
+
+  const flags = snapshotFlags(config);
+  const dataDir = resolveDataDir(config.dataDir.get());
+  // 选中哪支解释器每一次都要说出来：这台机器上「仓内 venv 有 scrapling、PATH 上的 python3
+  // 没有」是常态，而两者的症状完全一样（工具一个都不注册），日志里没有这一行就只能靠猜。
+  const python = resolvePythonBin(config.pythonBin.get(), import.meta.dirname);
+  ctx.logger.info(`[dsh-scrapling] Python 解释器：${python.path}（${python.via}）`);
+  // 闸门建一次、两处共用：sidecar 每次调用过它，search provider 的 sources 也过它。
+  const urlGate = createUrlGate(config);
+  const crawlEvents = createCrawlEventRouter();
+  try {
+    await ensureDataDir(dataDir);
+  } catch (error) {
+    ctx.logger.warn(probeFailure(error));
+    return;
+  }
+
+  const sidecar = makeSidecar({ ctx, config, python, urlGate, crawlEvents });
 
   // 进程随插件卸载一起回收。disposer 把 promise 直接交回去：cordis 的
   // `Disposable<T> = () => T` 允许返回任意值，宿主会 await 它 —— 这样能保证
@@ -1193,15 +1386,24 @@ export async function apply(
     ctx.logger.warn(probeFailure(error));
   }
 
-  const plan = planTools(flags, capabilities);
+  // 作业后端在建计划**之前**探一次：它决定 scrapling_crawl 注册不注册。
+  // 探测走行为（见 probeJobsReady 的注释）：`ctx.jobs` 在、但 `start()` 被拒是真实存在
+  // 的一态（host 层的 tool-jobs 被 disabled 时），只看对象在不在会把一个必挂的工具注册出去。
+  const jobsReady = probeJobsReady(ctx.get("jobs"));
+  const plan = planTools(flags, capabilities, jobsReady);
   for (const item of plan.skipped) {
     if (item.reason !== "disabled") {
       ctx.logger.warn(`[dsh-scrapling] ${item.name} 不注册：${item.reason}`);
     }
   }
+  // 缺 scrapling 时把选中解释器一起点名：这条路径上工具全都不注册，而「解释器里没装」
+  // 与「装了但 PATH 指错」在日志里长得一样，用户要的是那一行路径。
+  warnScraplingMissing(ctx, plan, python);
 
-  // 按计划真正注册。工具构造器按名字索引而不是散在各处，避免「登记表加了一个工具却忘了
-  // 在这里接线」这种漏注册 —— 下面的断言会在缺构造器时立刻炸出来。
+  warnJobsUnavailable(ctx, plan);
+
+  // 按计划真正注册。登记表里每一项自己带着构造器，所以不存在「加了一个工具却忘了接线」
+  // 这一类漏注册。
   const startJob = (label: string, run: CrawlJobRunner): Promise<string> =>
     startCrawlJob(ctx, crawlEvents, label, run);
   // 回答模型：三项配置全空就跟随会话当前模型，与官方内置 web_search 的做法一致。

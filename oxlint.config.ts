@@ -4,7 +4,17 @@ export default definePluginConfig({
   // 本包真实用到的同步写盘 API —— node/no-sync 的包内例外。
   // 构建脚本（build-host.ts / build-client.ts）按需同步读写产物；renameSync 是原子写的
   // 最后一步（先写临时文件再改名），同样只出现在构建脚本里。
-  syncWrites: ["writeFileSync", "readFileSync", "existsSync", "mkdirSync", "rmSync", "renameSync"],
+  syncWrites: [
+    "writeFileSync",
+    "readFileSync",
+    "existsSync",
+    "mkdirSync",
+    "rmSync",
+    "renameSync",
+    "accessSync",
+    "chmodSync",
+    "mkdtempSync",
+  ],
   titlePrefixes: [
     "ADR",
     "CIDR",

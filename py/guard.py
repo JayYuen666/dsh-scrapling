@@ -27,9 +27,6 @@ from urllib.parse import unquote, urlparse
 # 放行的额外主机名。默认空 —— 只有字面量公网 IP 与解析到公网的域名能过。
 ALLOWED_HOSTS: frozenset[str] = frozenset()
 
-# 额外放行的端口；空表示不限端口（与 dsh 内置 fetch provider 同取舍）。
-ALLOWED_PORTS: frozenset[int] = frozenset()
-
 # 允许额外放行主机名的环境变量。默认不设 ⇒ 放行集合为空 ⇒ 守卫最严。
 #
 # 这是一个**安全相关**开关：把它指到内网地址等于主动放弃对那些目标的 SSRF 防护。
@@ -121,21 +118,18 @@ EXTRA_NAT64_PREFIXES: tuple[str, ...] = ()
 _NAT64_EMBEDDED_OFFSET: dict[int, int] = {96: 12, 64: 9, 56: 7, 48: 6, 40: 5, 32: 4}
 
 
-def configure(allowed_hosts=None, allowed_ports=None, nat64_prefixes=None, allow_write_methods=None) -> None:
+def configure(allowed_hosts=None, nat64_prefixes=None, allow_write_methods=None) -> None:
     """按部署配置收紧或放宽放行集合。
 
     只应由宿主侧在启动时调用一次，参数来自用户显式设置，而不是模型入参。
 
     :param allowed_hosts: 额外放行的主机名；None 表示沿用当前值
-    :param allowed_ports: 额外放行的端口；None 表示沿用当前值
     :param nat64_prefixes: 额外的 NAT64 前缀（CIDR）；None 表示沿用当前值
     :param allow_write_methods: 是否开放写方法；None 表示沿用当前值
     """
-    global ALLOWED_HOSTS, ALLOWED_PORTS, EXTRA_NAT64_PREFIXES, ALLOW_WRITE_METHODS  # noqa: PLW0603 —— 模块级策略常量，需整体替换
+    global ALLOWED_HOSTS, EXTRA_NAT64_PREFIXES, ALLOW_WRITE_METHODS  # noqa: PLW0603 —— 模块级策略常量，需整体替换
     if allowed_hosts is not None:
         ALLOWED_HOSTS = allowed_hosts
-    if allowed_ports is not None:
-        ALLOWED_PORTS = allowed_ports
     if nat64_prefixes is not None:
         EXTRA_NAT64_PREFIXES = nat64_prefixes
     if allow_write_methods is not None:
@@ -799,11 +793,10 @@ def url_allowed(url: str) -> tuple[bool, str]:
     if not host:
         return False, "URL has no host"
     try:
-        port = parsed.port
+        _ = parsed.port
     except ValueError:
+        # 端口超界（如 :99999）时 urlparse 只在取 .port 那一刻才抛，hostname 本身是好的。
         return False, "URL has an invalid port"
-    if ALLOWED_PORTS and port is not None and port not in ALLOWED_PORTS:
-        return False, f"port {port} is not in the allow list"
     if not is_public_address(host, proxied=bool(proxy_for(url))):
         return False, f"host does not resolve to a public address: {host}"
     return True, ""

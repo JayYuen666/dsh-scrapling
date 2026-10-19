@@ -10,6 +10,7 @@ daemon 线程**跑 spider，主线程立刻返回 crawl id；进度通过「没�
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -34,6 +35,10 @@ MAX_CONCURRENT_CRAWLS = 2
 # 登记表最多留几个已结束的爬虫条目。crawl.status 是唯一能读走结果的入口，所以条目不能一
 # 结束就删；但全留着就是内存泄漏，所以留一个上限，按最旧的淘汰。
 MAX_REMEMBERED_CRAWLS = 16
+
+# 一次 crawl.status 回包的字节上界。Host 侧按 8 MiB 切帧，而一个快站点能在一个轮询间隔里
+# 落下几十页；留一半余量，越过切帧线的那一帧会把整个 sidecar 拆掉。回不完的由 `more` 交接。
+MAX_STATUS_BYTES = 4 * 1024 * 1024
 
 # 一次爬虫的整体截止（毫秒）。页数上限管不了「一页等一分钟」：1000 页的慢站点能跑几个
 # 小时，而爬虫跑在没人看的后台线程里，没有任何外部计时器会来叫停它。部署侧可按次调小。
@@ -422,12 +427,13 @@ def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
     """查一个爬虫的状态与已收结果。
 
     ``since`` 是本轮之前已经读走多少页（按下标，不是 URL）。带上它只回新增的那一段：
-    整份 pages 每轮重发，流量是 O(n²)，而 `max_content_chars` 的默认预算意味着几十页就能
-    凑出一个超过 Host 侧 8 MiB 帧上限的回包 —— 那一帧会被当成坏帧，整个 sidecar 连正在
-    跑的会话一起被拆掉。不带时仍回全部（探针与直连调用要的是全量）。
+    整份 pages 每轮重发，流量是 O(n²)。但增量本身也可能很大 —— 一个快站点能在一个轮询
+    间隔里落下几十页，每页又按 ``max_content_chars`` 封顶 —— 而 Host 侧是按 8 MiB 切帧的：
+    超了就是一帧坏帧，整个 sidecar 连同正在跑的会话一起被拆掉。所以回包再按**字节**分片：
+    回不完就置 ``more``，调用方拿新的 ``since`` 立刻接着取，一页都不丢。
 
     :param args: 协议参数
-    :returns: {crawlId, running, pages, total, error, expired}
+    :returns: {crawlId, running, pages, total, error, expired, more}
     """
     from adapters import AdapterError
 
@@ -437,10 +443,10 @@ def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
     entry = _get_crawl(args.get("crawlId"))
     state: dict[str, Any] = entry["state"]
     # pages 是 spider 线程边跑边 append 的活列表，而回包要经 json.dumps 序列化。
-    # 进锁里复制一份：一边序列化一边追加，结果要么漏一页要么撞上 RuntimeError。
+    # 进锁里取一段：一边序列化一边追加，结果要么漏一页要么撞上 RuntimeError。
     with _CRAWL_LOCK:
         total = len(state["pages"])
-        pages = list(state["pages"][since:])
+        pages, more = _take_pages(state["pages"], since)
         running = _is_running(entry)
     return {
         "crawlId": entry["crawl_id"],
@@ -448,10 +454,34 @@ def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
         "running": running,
         "pages": pages,
         "total": total,
+        "more": more,
         "error": state["error"],
         # 截止到点而停的爬虫带这个标记：模型能看出「为什么比 maxPages 少」。
         "expired": state.get("expired") is True,
     }
+
+
+def _take_pages(all_pages: list[dict[str, Any]], since: int) -> tuple[list[dict[str, Any]], bool]:
+    """从 ``since`` 起取一段页，按 :data:`MAX_STATUS_BYTES` 封顶。
+
+    至少回一页：单页就超预算时也回它，否则调用方永远取不到下一页，轮询变成死循环。
+    单页体量由 ``max_content_chars`` 兜着，一页远小于 Host 那份 8 MiB 切帧上限。
+
+    :param all_pages - 活页表
+    :param since - 已经读走多少页
+    :returns: (这一段的页, 后面还有没有)
+    """
+    if since >= len(all_pages):
+        return [], False
+    taken: list[dict[str, Any]] = []
+    spent = 0
+    for index in range(since, len(all_pages)):
+        size = len(json.dumps(all_pages[index], ensure_ascii=False).encode("utf-8"))
+        if taken and spent + size > MAX_STATUS_BYTES:
+            return taken, True
+        taken.append(all_pages[index])
+        spent += size
+    return taken, False
 
 
 def crawl_stop(args: dict[str, Any]) -> dict[str, Any]:

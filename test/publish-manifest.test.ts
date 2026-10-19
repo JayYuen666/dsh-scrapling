@@ -344,6 +344,7 @@ describe("构建产物可载入", () => {
       planTools: (
         flags: Record<string, boolean>,
         capabilities: unknown,
+        jobsReady?: boolean,
       ) => {
         ready: readonly string[];
       };
@@ -360,16 +361,13 @@ describe("构建产物可载入", () => {
       version: "0.5",
     };
     expect(artifact.TOOL_SPECS).toHaveLength(13);
-    const { ready } = artifact.planTools(allOn, full);
+    const { ready } = artifact.planTools(allOn, full, true);
     // 有浏览器时十三个全注册；会话类各自独立，所以总数与工具数相等。
     expect(ready).toHaveLength(13);
     // 关掉浏览器的分支同样要成立，且恰好少掉那两个依赖浏览器的工具。写成差集而不是
     // 写死个数：以后往登记表里加工具，这个断言仍然成立，而不会因为数字对不上而失败。
     const BROWSER_TOOLS = new Set(["scrapling_render", "scrapling_capture_xhr"]);
-    const { ready: withoutBrowser } = artifact.planTools(allOn, {
-      ...full,
-      browser: false,
-    });
+    const { ready: withoutBrowser } = artifact.planTools(allOn, { ...full, browser: false }, true);
     expect(withoutBrowser).toStrictEqual(ready.filter((name) => !BROWSER_TOOLS.has(name)));
     expect(BROWSER_TOOLS.has("scrapling_render")).toBe(true);
   });

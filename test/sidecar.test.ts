@@ -187,6 +187,7 @@ describe("parseCapabilities", () => {
       static: false,
       extract: false,
       browser: false,
+      writeMethods: false,
     });
   });
 
@@ -198,6 +199,33 @@ describe("parseCapabilities", () => {
   it("版本号只在是字符串时带上", () => {
     expect(parseCapabilities({ version: "0.5" }).version).toBe("0.5");
     expect(parseCapabilities({ version: 15 }).version).toBeUndefined();
+  });
+
+  it("写方法与出口代理如实上报（代理形状不对就不带这一项）", () => {
+    expect(
+      parseCapabilities({
+        scrapling: true,
+        writeMethods: true,
+        proxy: { configured: true, source: "settings", server: "http://127.0.0.1:7890" },
+      }),
+    ).toStrictEqual({
+      scrapling: true,
+      static: false,
+      extract: false,
+      browser: false,
+      writeMethods: true,
+      proxy: { configured: true, source: "settings", server: "http://127.0.0.1:7890" },
+    });
+    const malformed: unknown[] = [
+      undefined,
+      "nope",
+      { configured: "yes", source: "settings", server: "x" },
+      { configured: true, source: 7, server: "x" },
+      { configured: true, source: "settings" },
+    ];
+    for (const proxy of malformed) {
+      expect(parseCapabilities({ proxy }).proxy).toBeUndefined();
+    }
   });
 });
 

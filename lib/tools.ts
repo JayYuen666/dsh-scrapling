@@ -650,6 +650,7 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
         },
       },
       render: (_args, value) => [{ type: "text", text: renderMatches(value) }],
+      presentationMeta: (_args, value) => ({ count: value.count }),
     },
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => true,
@@ -889,9 +890,7 @@ function browserPayload(
       ...(args["blockWebrtc"] === true ? { blockWebrtc: true } : {}),
       ...(args["allowWebgl"] === false ? { allowWebgl: false } : {}),
       ...networkReadParams(method, args),
-      // requestTimeoutSeconds 与 maxUrlLength 不往线上传：前者只作用于静态抓取（那边发的
-      // 是 timeoutSeconds —— Python 真读的那个名字），后者是 Host 侧 URL 闸门自己的上限。
-      // Python 从不看这两个键，发过去就是「设置拧了没反应」的另一种写法。
+      // maxUrlLength 不往线上传：它是 Host 侧 URL 闸门自己的上限，Python 从不看。
       // deployment 是部署级能力的专用命名空间：Python 侧只从这里读浏览器二进制路径、CDP
       // 端点、注入脚本、真实 Chrome、DoH、网络记录的开关与容量、输出形态开关。
       deployment: {
@@ -906,8 +905,17 @@ function browserPayload(
       },
       waitMs: args["waitMs"] ?? null,
       extraHeaders: args["extraHeaders"] ?? null,
+      // 会话抓取这一帧被 static 与浏览器两种会话共用：static 那一支读 headers / retries /
+      // timeoutSeconds，浏览器那一支读 extraHeaders 与 timeoutMs。只给会话帧补 static 的
+      // 那三个键，免得给 render 发一个 Python 根本不读的键（那是「拧了没反应」的老毛病）。
       ...(sessionScoped
-        ? { headers: args["headers"] ?? null, retries: args["retries"] ?? null }
+        ? {
+            headers: args["headers"] ?? null,
+            retries: args["retries"] ?? null,
+            // 静态会话不接受 timeoutMs，只认 timeoutSeconds；不给的话部署级那枚
+            // requestTimeoutSeconds 对会话路径完全无效，每次都落回 Python 写死的 120 秒。
+            timeoutSeconds: settings.requestTimeoutSeconds,
+          }
         : {}),
       ...(typeof waitSelector === "string" && waitSelector.length > 0
         ? { waitSelector, waitSelectorState: settings.waitSelectorState }
@@ -1292,6 +1300,9 @@ interface SessionOpenResult {
  */
 export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
   const { sidecar, settings } = deps;
+  // 浏览器不可用时把 stealth 从可选值里摘掉：静态会话本来就能用，所以这条工具留着，
+  // 但模型不该看得见一个必然以 SESSION_OPEN_FAILED 收场的取值。
+  const browserReady = sidecar.capabilities?.browser === true;
   return defineTool({
     name: "scrapling_session_open",
     description:
@@ -1302,7 +1313,10 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
       sessionType: {
         type: "string",
         required: true,
-        description: "static（curl_cffi，最快）/ stealth（patchright，执行 JS 且带反检测）。",
+        enum: browserReady ? ["static", "stealth"] : ["static"],
+        description: browserReady
+          ? "static（curl_cffi，最快）/ stealth（patchright，执行 JS 且带反检测）。"
+          : "static（curl_cffi）。这台机器没有可用的浏览器，只有这一个档可选。",
       },
       headless: { type: "boolean", description: "浏览器会话是否无头运行，默认 true。" },
       solveCloudflare: {
@@ -1352,6 +1366,10 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
           text: `session ${value.sessionId} (${value.sessionType}) opened at ${value.createdAt}`,
         },
       ],
+      presentationMeta: (_args, value) => ({
+        sessionId: value.sessionId,
+        sessionType: value.sessionType,
+      }),
     },
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => false,
@@ -1700,6 +1718,7 @@ export function createSessionListTool(deps: ToolDeps): ToolDefinition {
                   .join("\n"),
         },
       ],
+      presentationMeta: (_args, value) => ({ count: value.sessions.length }),
     },
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => true,
@@ -1894,8 +1913,7 @@ async function drainOnce(
   signal: AbortSignal,
   seen: number,
 ): Promise<number> {
-  // 只取 seen 之后新增的那一段：整份 pages 每轮重发是 O(n²)，且几十页就能把回包顶过
-  // Host 侧 8 MiB 帧上限 —— 那一帧会被判成坏帧，整个 sidecar 连同在跑的会话一起被拆掉。
+  // 只取 seen 之后新增的那一段：整份 pages 每轮重发是 O(n²)。
   const raw = await sidecar.call(
     "crawl.status",
     { crawlId, since: seen },
@@ -1917,6 +1935,12 @@ async function drainOnce(
   }
   /* v8 ignore stop */
   const total = seen + pages.length;
+  if (status["more"] === true) {
+    // 对端按字节预算只回了一段（见 py/crawl.py 的 MAX_STATUS_BYTES）：紧接着取下一段，
+    // 一页都不丢。这里不睡那一拍 —— 睡眠的意思是「还没跑完，等它攒点新页」，而现在是有
+    // 现成的页等着读。
+    return drainOnce(sidecar, crawlId, sink, signal, total);
+  }
   if (status["running"] !== true && status["expired"] === true) {
     // 只在收尾那一拍说：页数比 maxPages 少的原因是整体截止到了点，不是站点就这么大。
     sink.progress("crawl stopped at its runtime budget; the page cap was not reached");
@@ -2017,6 +2041,7 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
             "用 job_output 读进度，job_kill 中断。",
         },
       ],
+      presentationMeta: (_args, value) => ({ jobId: value.jobId }),
     },
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => false,
@@ -2039,6 +2064,9 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
             url,
             maxPages,
             maxDurationMs: settings.crawlMaxRuntimeSeconds * 1000,
+            // 单页正文预算。不给的话 Python 落回它写死的默认值，设置卡上「渲染输出上限」
+            // 这一档对爬虫就完全无效 —— 而 job_output 里读到的正是每页正文。
+            maxContentChars: settings.maxOutputBytes,
             // 待站策略全是部署级：它们决定「这台机器怎么对待别人的站点」，模型入参到不了
             // 这里（Python 侧只从 deployment 读）。
             deployment: {

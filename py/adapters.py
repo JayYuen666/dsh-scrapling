@@ -23,6 +23,7 @@ import concurrent.futures
 import contextlib
 import queue
 import re
+import sys
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -68,9 +69,10 @@ class AdapterError(RuntimeError):
 def _require(engine: object) -> None:
     """引擎不可用时给出可执行的提示，而不是抛一个裸 AttributeError。"""
     if engine is None:
+        # 带上解释器路径：装在哪份 Python 里是这条错误的全部信息量，而用户手上通常不止一份。
         raise AdapterError(
             "SCRAPLING_MISSING",
-            'Scrapling is not importable in this Python environment. Install it with: pip install "scrapling[rag]"',
+            f'Scrapling is not importable in {sys.executable}. Install it with: pip install "scrapling[rag]"',
         )
 
 
@@ -545,10 +547,6 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
             # 发、对端收到空体，而回包上没有一行能看出这件事。
             params["json"] = _jsonable(body)
 
-    # Host 侧闸门判过之后到 curl_cffi 真解析、真建连之间隔着一个进程边界（TOCTOU），
-    # 所以这里在发车之前用同一份 guard 复判一次 —— 浏览器路径由 page.route 逐请求兜住，
-    # 静态路径没有那一层，不在这里补就是「两道防线」只说了一半。判在写方法之后：那一条是
-    # 部署表态（非 GET 一律拒），与目标地址无关，不该被一条 URL_BLOCKED 盖掉。
     # Host 侧闸门判过之后到 curl_cffi 真解析、真建连之间隔着一个进程边界（TOCTOU），
     # 所以这里在发车之前用同一份 guard 复判一次 —— 浏览器路径由 page.route 逐请求兜住，
     # 静态路径没有那一层，不在这里补就是「两道防线」只说了一半。判在写方法之后：那一条是
@@ -1353,17 +1351,27 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
         raise AdapterError("SESSION_OPEN_FAILED", f"{type(error).__name__}: {error}") from error
 
     with _SESSION_LOCK:
-        _SESSIONS[session_id] = {
-            "session": usable,  # 真正发请求的对象
-            "closer": closer,  # 关它用的对象（static 是 wrapper，浏览器是自身）
-            "type": kind,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            # 同一把锁：占位时建的那把，盖回来而不是新建 —— 新建会让构造期与使用期各锁各的。
-            "lock": entry_lock,
-            # browser/stealth 的专属执行线程；static 为 None（见 _SessionWorker 的说明）。
-            "worker": worker,
-        }
-        created_at = _SESSIONS[session_id]["created_at"]
+        abandoned = placeholder.get("closed_while_pending") is True
+        if abandoned:
+            created_at = ""
+        else:
+            _SESSIONS[session_id] = {
+                "session": usable,  # 真正发请求的对象
+                "closer": closer,  # 关它用的对象（static 是 wrapper，浏览器是自身）
+                "type": kind,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                # 同一把锁：占位时建的那把，盖回来而不是新建 —— 新建会让构造期与使用期各锁各的。
+                "lock": entry_lock,
+                # browser/stealth 的专属执行线程；static 为 None（见 _SessionWorker 的说明）。
+                "worker": worker,
+            }
+            created_at = _SESSIONS[session_id]["created_at"]
+    if abandoned:
+        # 构造期间已经被要求关闭（sidecar 关机走的就是 close_all_sessions）：这一份刚建好的
+        # 会话绝不能登记 —— 登记了就没有任何人会再去关它，浏览器进程会活过 sidecar 自己。
+        _release_entry({"closer": closer, "type": kind, "lock": entry_lock})
+        if worker is not None:
+            worker.stop()
     return {
         "sessionId": session_id,
         "sessionType": kind,
@@ -1510,7 +1518,9 @@ def _close_entry(session_id: Any) -> None:
         return
     if entry.get("pending") is True:
         # 还没构造完：构造方自己会在成功时覆盖这一条，或在失败时把它摘掉。这里不能碰
-        # closer —— 它还不存在。
+        # closer —— 它还不存在。但必须留下墓碑：构造方一会儿会把建好的会话登记回来，
+        # 那一步要看见这次关闭，否则刚建好的浏览器没有任何人会再去关它。
+        entry["closed_while_pending"] = True
         return
     worker: _SessionWorker | None = entry.get("worker")
     if worker is not None:
@@ -1600,9 +1610,12 @@ def _state_path(args: dict[str, Any]) -> str:
     name = args.get("name")
     if not isinstance(name, str) or not name:
         raise AdapterError("BAD_ARGS", "name is required")
-    if name != Path(name).name or name.startswith("."):
+    # NUL 让 `Path(name).name` 仍然等于 name，却能进到后面的文件调用里：那一层会以一条
+    # 语焉不详的错误收场，而不是在这里点名说清。
+    if name != Path(name).name or name.startswith(".") or "\x00" in name:
         raise AdapterError("BAD_ARGS", f"name must be a plain file name, got {name!r}")
-    return str(Path(directory) / f"{name}.json")
+    stem = name[:-5] if name.lower().endswith(".json") else name
+    return str(Path(directory) / f"{stem}.json")
 
 
 def _session_state(args: dict[str, Any], *, saving: bool) -> dict[str, Any]:

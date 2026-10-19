@@ -67,7 +67,8 @@ spider 的默认值** —— **不遵守** robots.txt、每域延迟为 0、最�
 
 ## 环境要求
 
-- **Python 3.14+**，装好 Scrapling，能从 `PATH` 找到（或设置 `pythonBin`）。
+- **Python 3.14+**，装好 Scrapling —— 仓内 `_env/.venv` 里有、或能从 `PATH` 找到
+  （也可以设置 `pythonBin`）。插件装载时会把它选中的解释器写进日志。
 - **浏览器完全由用户负责。** 插件不下载任何东西。没有浏览器时它只是不注册那些依赖
   浏览器的工具，模型不会浪费一轮去调用它们。
 
@@ -104,6 +105,11 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 ```
 
 也可以在 Web 界面里 **Sidebar -> Plugins -> Add plugin** 安装。
+
+
+## shared 的版本下限
+
+本包在构建期就把 `@jayyuen66/dsh-plugin-shared` 内联进产物，运行期那份 bundle 不再 import 它——但构建时解析到的那份仍然必须导出源码用到的每个名字。profile 的 `overrides` 若把 `@jayyuen66/dsh-plugin-shared` 钉得低于本包声明的版本，构建读到的就是缺这些名字的一份产物。
 
 ## 替代 dsh 内置的 `web_fetch` 与 `web_search`
 
@@ -164,7 +170,8 @@ Scrapling 的 Markdown 输出报成 `text`，内置渲染路径显示完全正�
 
 主要开关：
 
-- `pythonBin` —— 解释器名或绝对路径；留空表示用 `PATH` 上的 `python3`。
+- `pythonBin` —— 解释器名或绝对路径；留空表示「仓内 `_env/.venv` 可执行就用它，否则用
+  `PATH` 上的 `python3`」。选中哪一支会写进日志。
 - `failFastOnMissingPython` —— 解释器不可用时直接**拒绝加载**（默认 `true`），而不是降级成
   「所有工具不可用」：每个工具都要 sidecar，静默降级只会让模型在几轮之后才发现工具全都不见了。
   设成 `false` 才走降级，附一条警告。

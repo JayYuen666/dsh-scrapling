@@ -9,7 +9,7 @@ import { createServer } from "node:http";
 import type { Socket } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -30,12 +30,15 @@ import {
   outputBudgetOf,
   planTools,
   resolveDataDir,
+  resolvePythonBin,
   snapshotFlags,
   TOOL_SPECS,
 } from "../host.ts";
 import type { Config as ConfigType, ToolFlags } from "../host.ts";
 import type { Volatile } from "@deepseek-ai/cordis";
+import { Context } from "@deepseek-ai/cordis";
 import type { SidecarCapabilities } from "../lib/sidecar.ts";
+import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
 
 /**
  * 造一个 volatile 引用。
@@ -98,6 +101,7 @@ const FULL_CAPS: SidecarCapabilities = {
   extract: true,
   browser: true,
   version: "0.5",
+  writeMethods: false,
 };
 
 /**
@@ -319,7 +323,7 @@ describe("插件元信息", () => {
 });
 
 describe("config schema", () => {
-  it("python 解释器默认走 PATH 上的 python3", () => {
+  it("pythonBin 默认留空（具体用哪支由 resolvePythonBin 现探）", () => {
     expect(volatileRef("pythonBin").get()).toBe("");
   });
 
@@ -375,11 +379,13 @@ describe("volatile 快照", () => {
 
 describe("工具注册计划", () => {
   it("全开且能力齐备时十三个工具全注册", () => {
-    expect(planTools(ALL_ON, FULL_CAPS).ready).toStrictEqual(TOOL_SPECS.map((spec) => spec.name));
+    expect(planTools(ALL_ON, FULL_CAPS, true).ready).toStrictEqual(
+      TOOL_SPECS.map((spec) => spec.name),
+    );
   });
 
   it("用户关掉的工具不注册，原因记为 disabled", () => {
-    const plan = planTools({ ...ALL_ON, crawl: false, answer: false }, FULL_CAPS);
+    const plan = planTools({ ...ALL_ON, crawl: false, answer: false }, FULL_CAPS, true);
     expect(plan.ready).toHaveLength(11);
     expect(plan.skipped).toStrictEqual([
       { name: "scrapling_crawl", reason: "disabled" },
@@ -391,7 +397,7 @@ describe("工具注册计划", () => {
     // 0.5 起浏览器抓取只剩 patchright 一套，所以依赖 browser 的只有 render 与 capture_xhr；
     // 会话、登录态存取、爬虫、问答都不需要浏览器，能力缺了也照常注册。
     const caps: SidecarCapabilities = { ...FULL_CAPS, browser: false };
-    const plan = planTools(ALL_ON, caps);
+    const plan = planTools(ALL_ON, caps, true);
     expect(plan.ready).toStrictEqual([
       "scrapling_fetch",
       "scrapling_extract",
@@ -413,19 +419,19 @@ describe("工具注册计划", () => {
 
   it("scrapling 缺失时一个工具都不注册", () => {
     const caps: SidecarCapabilities = { ...FULL_CAPS, scrapling: false };
-    const plan = planTools(ALL_ON, caps);
+    const plan = planTools(ALL_ON, caps, true);
     expect(plan.ready).toStrictEqual([]);
     expect(plan.skipped).toHaveLength(TOOL_SPECS.length);
   });
 
   it("尚未握手成功（capabilities 为 undefined）等价于缺 scrapling", () => {
-    const plan = planTools(ALL_ON, undefined);
+    const plan = planTools(ALL_ON, undefined, true);
     expect(plan.ready).toStrictEqual([]);
     expect(plan.skipped.every((item) => item.reason === "scrapling-missing")).toBe(true);
   });
 
   it("全关时 ready 为空、skipped 记满 disabled", () => {
-    const plan = planTools(ALL_OFF, FULL_CAPS);
+    const plan = planTools(ALL_OFF, FULL_CAPS, true);
     expect(plan.ready).toStrictEqual([]);
     expect(plan.skipped).toHaveLength(TOOL_SPECS.length);
     expect(plan.skipped.every((item) => item.reason === "disabled")).toBe(true);
@@ -631,14 +637,20 @@ describe("apply", () => {
     // failFastOnMissingPython 默认 true：Python 起不来就拒绝加载，不静默降级成
     // 「所有工具不可用」——后者会让模型几轮之后才发现工具全没了。
     await expect(apply(ctx, makeConfig({ pythonBin: "" }))).rejects.toThrow(INTERPRETER_UNUSABLE);
-    // 留空就该走 PATH 上的 python3，而不是空串。
-    expect(resolved).toStrictEqual(["python3"]);
+    // 留空不再等于 python3：仓内 `_env/.venv/bin/python` 可执行时就用它。用同一份解析器
+    // 算出期望值之外的**独立**判据：这条路必须指向包根下的 venv，而不是 PATH 上的名字。
+    expect(resolved).toStrictEqual([
+      path.join(path.resolve(import.meta.dirname, ".."), "_env", ".venv", "bin", "python"),
+    ]);
   });
 
   it("failFastOnMissingPython=false 时探测失败只 warn，降级为工具全不可用", async () => {
     const warnings: string[] = [];
+    const infos: string[] = [];
     const logger = {
-      info: (): void => undefined,
+      info: (line: string): void => {
+        infos.push(line);
+      },
       warn: (line: string): void => {
         warnings.push(line);
       },
@@ -663,6 +675,38 @@ describe("apply", () => {
       apply(ctx, makeConfig({ pythonBin: "", failFastOnMissingPython: false })),
     ).resolves.toBeUndefined();
     expect(warnings.some((line) => line.includes("未能启动"))).toBe(true);
+    // 选中哪支解释器必须每次都播报：这是「工具全没了」时唯一能对照的线索。
+    expect(infos.some((line) => line.includes("[dsh-scrapling] Python 解释器："))).toBe(true);
+    // 缺 Scrapling 时那条 warn 要点名解释器路径。这里写的是一条**独立的**事实：本仓
+    // `_env/.venv/bin/python` 就在包根下，所以这条文案必须带它，而不是带一个泛称。
+    expect(
+      warnings.some((line) => line.includes("_env/.venv/bin/python") && line.includes("Scrapling")),
+    ).toBe(true);
+  });
+
+  it("venv 存在但不可执行时落回 PATH；显式配置压过两者", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "dsh-python-choice-"));
+    const venvBin = path.join(root, "_env", ".venv", "bin");
+    mkdirSync(venvBin, { recursive: true });
+    writeFileSync(path.join(venvBin, "python"), "#!/bin/sh\nexit 0\n");
+
+    // 可执行位是判据本身：文件在但跑不起来属于坏掉的机器本地态，跟着它走会把整轮测量带崩。
+    // `writeFileSync` 落盘是 0644，所以先显式立起可执行位，这一档才是在判「文件在且能跑」。
+    chmodSync(path.join(venvBin, "python"), 0o755);
+    expect(resolvePythonBin("", root)).toStrictEqual({
+      path: path.join(venvBin, "python"),
+      via: "_env/.venv",
+    });
+    chmodSync(path.join(venvBin, "python"), 0o644);
+    expect(resolvePythonBin("", root)).toStrictEqual({ path: "python3", via: "PATH" });
+    expect(resolvePythonBin("", path.join(root, "absent"))).toStrictEqual({
+      path: "python3",
+      via: "PATH",
+    });
+    expect(resolvePythonBin("  /opt/py/bin/python3  ", root)).toStrictEqual({
+      path: "/opt/py/bin/python3",
+      via: "configured",
+    });
   });
 
   it("写方法这一档作为明确表态送到 Python 侧（两侧各判一次的前提）", async () => {
@@ -740,8 +784,15 @@ describe("apply", () => {
     const disposers: (() => unknown)[] = [];
     const settingsRegistrations: string[] = [];
     const registered: string[] = [];
+    const jobsStub = {
+      // 这条验的是「全能力时 13 个工具全注册」，所以作业后端要报可用；
+      // 探测作业（kind='probe'）照实回一个 id。
+      start: (): string => "probe-job",
+      // 本包起作业时自己挂 controller（见 startUnderCrawlController）。
+      attachController: (): (() => void) => (): void => undefined,
+    };
     const ctx = {
-      get: (): undefined => undefined,
+      get: (service: string): unknown => (service === "jobs" ? jobsStub : undefined),
       subprocess: {
         // 官方实现会校验可执行文件存在（SubprocessExecutableNotFoundError），这里照做：
         // 否则会拿一个不存在的解释器去 spawn，而 ENOENT 是异步事件，try/catch 抓不到。
@@ -1028,8 +1079,13 @@ describe("apply 的爬虫作业接线", () => {
       | { run?: (job: unknown) => { cancel: () => void; done: Promise<unknown> } }
       | undefined;
     const jobsStub = {
-      start: (received: typeof spec): string => {
-        spec = received;
+      // 只记真实作业：`scrapling` 在 apply 时先起一个 kind='probe' 的空作业探测后端，
+      // 那是能力探测，不是被测的接线。夹具据此分流，否则 spec 会被探测覆盖。
+      attachController: (): (() => void) => (): void => undefined,
+      start: (received: { kind?: string }): string => {
+        if (received.kind !== "probe") {
+          spec = received as typeof spec;
+        }
         return CRAWL_JOB_ID;
       },
     };
@@ -1153,12 +1209,18 @@ describe("apply 到爬虫作业的完整链路", () => {
 
     // 可选服务按文档用 ctx.get(name) 取，夹具要同时给 get 与 jobs。
     const jobsStub = {
+      attachController: (): (() => void) => (): void => undefined,
       start: (spec: {
+        kind?: string;
         run: (job: { append: (text: string) => void; updateProgress: (line: string) => void }) => {
           cancel: () => void;
           done: Promise<unknown>;
         };
       }): string => {
+        // 能力探测那个空作业不跑、也不写输出环（见上面第一处夹具的同一说明）。
+        if (spec.kind === "probe") {
+          return "probe-job";
+        }
         const job = {
           append: (text: string): void => {
             output.push(text);
@@ -1284,13 +1346,30 @@ function makeJobHarness({ withoutJobs = false }: { withoutJobs?: boolean } = {})
   const disposers: (() => unknown)[] = [];
   const webProviders: { fetch: string[]; search: string[] } = { fetch: [], search: [] };
   // 可选服务按文档用 ctx.get(name) 取，夹具要同时给 get 与 jobs。
+  //
+  // 这个夹具**复刻真实注册表的闸门**：没有 controller 附着时 start 抛
+  // 「no job controller serves this agent」。原先的夹具让 start 无条件成功，于是
+  // 「宿主平面的 tool-jobs 被 disabled」这一态在测试里根本不存在 —— 那正是
+  // scrapling_crawl 在真实 profile 里必挂而 57 条用例全绿的原因。
+  let attachDepth = 0;
   const jobsStub = {
+    attachController: (): (() => void) => {
+      attachDepth += 1;
+      return (): void => {
+        attachDepth -= 1;
+      };
+    },
     start: (spec: {
       run: (job: { append: (text: string) => void; updateProgress: (line: string) => void }) => {
         cancel: () => void;
         done: Promise<unknown>;
       };
     }): string => {
+      if (attachDepth === 0) {
+        throw new Error(
+          "background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)",
+        );
+      }
       const job = { append: (): void => undefined, updateProgress: (): void => undefined };
       state.hooks = spec.run(job);
       return CRAWL_JOB_ID;
@@ -1410,7 +1489,9 @@ describe("爬虫作业的取消与失败", () => {
   it.runIf(HAS_LOCAL_PYTHON)(
     "profile 没有作业后端时报可读错，而不是走到一半抛未捕获异常",
     async () => {
-      // 复用真起 sidecar 的夹具：能力探测要通过，scrapling_crawl 才会被注册。
+      // 没有作业后端时**根本不注册** scrapling_crawl：注册一个必然失败的工具等于让模型
+      // 白烧一轮。这条替换掉旧断言「注册后调用报 JOBS_UNAVAILABLE」——那是在测一个
+      // 本该不存在的状态。
       const harness = makeJobHarness({ withoutJobs: true });
       try {
         await apply(
@@ -1421,14 +1502,12 @@ describe("爬虫作业的取消与失败", () => {
             failFastOnMissingPython: false,
           }),
         );
-        const crawl = harness.tools.get("scrapling_crawl");
-        expect(crawl?.execute, "crawlEnabled 打开时应注册 scrapling_crawl").toBeDefined();
-        await expect(
-          crawl?.execute?.(
-            { url: "http://127.0.0.1:1/" },
-            { signal: new AbortController().signal },
-          ),
-        ).rejects.toMatchObject({ code: "JOBS_UNAVAILABLE" });
+        expect(
+          harness.tools.get("scrapling_crawl"),
+          "没有作业后端时不该注册 scrapling_crawl",
+        ).toBeUndefined();
+        // 其余十二个照常注册：缺的只是作业那一个。
+        expect(harness.tools.get("scrapling_fetch")).toBeDefined();
       } finally {
         harness.dispose();
       }
@@ -1495,6 +1574,30 @@ describe("爬虫作业的取消与失败", () => {
     const outcome = (await harness.hooks?.done) as { status: string; detail: string };
     expect(outcome.status).toBe("killed");
     expect(outcome.detail).toContain("positive integer");
+  });
+
+  it("注册之后作业后端消失：crawl 给出可读的 JOBS_UNAVAILABLE（防御分支）", async () => {
+    // 正常情况下 planTools 已经不会注册 crawl（后端不可用就跳过）。这一支覆盖的是
+    // **注册之后**后端被卸载的窗口：那时工具还在，但 ctx.get("jobs") 已经取不到。
+    // 判据只看错误码与可读文案，不关心用户该改什么配置——那一步在注册期就处理完了。
+    const harness = makeJobHarness();
+    try {
+      await apply(
+        harness.ctx,
+        makeConfig({ pythonBin: LOCAL_PYTHON, crawlEnabled: true, failFastOnMissingPython: false }),
+      );
+      const crawl = harness.tools.get("scrapling_crawl");
+      expect(crawl?.execute, "后端可用时应注册 crawl").toBeDefined();
+      // 把 jobs 服务摘掉，模拟"注册后卸载"。夹具的 ctx 是 `never`（与真实 ctx 同形的匿名
+      // 对象），这里按"有一个可替换的 get"收窄后再改。
+      const mutable = harness.ctx as unknown as { get: (name: string) => unknown };
+      mutable.get = (): undefined => undefined;
+      await expect(
+        crawl?.execute?.({ url: "http://127.0.0.1:1/" }, { signal: new AbortController().signal }),
+      ).rejects.toMatchObject({ code: "JOBS_UNAVAILABLE" });
+    } finally {
+      harness.dispose();
+    }
   });
 });
 
@@ -1742,4 +1845,94 @@ describe("接管 ctx.web 的两个接缝", () => {
       }
     },
   );
+});
+
+/** 起一枚真 `LocalJobRegistry`；配置走官方 schema 的默认值，不手抄数字。 */
+function makeRealRegistry(): LocalJobRegistry {
+  const parsed = (
+    LocalJobRegistry.Config as unknown as {
+      "~standard": {
+        validate: (value: unknown) => { issues?: unknown; value: unknown };
+      };
+    }
+  )["~standard"].validate({ pumpPollMs: 25 });
+  if (parsed.issues !== undefined) {
+    // 用 JSON.stringify 而不是 String：后者会把对象渲染成 "[object Object]"，读的人拿不到成因。
+    throw new Error(`LocalJobRegistry.Config 默认值解析失败：${JSON.stringify(parsed.issues)}`);
+  }
+  return new LocalJobRegistry(new Context(), parsed.value as never);
+}
+
+/** 一份最小 spec：真注册表要求 run 交出 cancel 与 done，缺一个就在 start 里抛。 */
+function realRegistrySpec(): never {
+  return {
+    kind: "scrapling",
+    label: "probe",
+    run: (): { cancel: () => void; done: Promise<unknown> } => ({
+      cancel: (): void => undefined,
+      done: Promise.resolve({ status: "completed" }),
+    }),
+  } as never;
+}
+
+/** 把「抛了还是成了」读成两个可断言的值，而不是靠 try/catch 里塞断言。 */
+function outcomeOf(start: () => string): { id?: string; error?: string } {
+  try {
+    return { id: start() };
+  } catch (error: unknown) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * 夹具的作业闸门必须与**真实现**同解。
+ *
+ * 为什么需要这条：上面那份 `jobsStub` 手抄了 `dsh-jobs-local` 的准入判定（没有 controller
+ * 附着就拒 start）。手抄件会腐烂——上游改了闸门或换了文案，夹具照旧，而用例继续绿。这条用
+ * 真注册表跑同样三种状态，把「手抄件是否还等于真件」变成一条会自己变红的断言。
+ *
+ * 三种状态就是本包生产代码所依赖的全部：
+ *   ① 裸 start 被拒 —— 这正是 `scrapling_crawl` 在默认 profile 里挂掉的形态；
+ *   ② attach 之后 start 成功 —— `startUnderCrawlController` 的做法；
+ *   ③ detach 之后回到被拒 —— 证明作用域是临时的，生产的 detach 不会给宿主留开着的闸门。
+ */
+describe("作业闸门：夹具与真实现同解", () => {
+  it("裸 start 被拒，attach 后成功，detach 后回到被拒", () => {
+    const registry = makeRealRegistry();
+    const bare = outcomeOf(() => registry.start(realRegistrySpec()));
+    expect(bare.id, "没有 controller 附着时真注册表必须拒绝").toBeUndefined();
+    expect(bare.error).toContain("no job controller serves this agent");
+
+    const detach = registry.attachController("scrapling: crawl");
+    let attached: { id?: string; error?: string };
+    try {
+      attached = outcomeOf(() => registry.start(realRegistrySpec()));
+    } finally {
+      detach();
+    }
+    expect(
+      attached.error,
+      `attach 之后应当起得来，实测：${String(attached.error)}`,
+    ).toBeUndefined();
+    expect(attached.id).toMatch(/^scrapling-[0-9a-f]{16}$/u);
+
+    const afterDetach = outcomeOf(() => registry.start(realRegistrySpec()));
+    expect(afterDetach.id, "detach 之后必须回到被拒：证明作用域是临时的").toBeUndefined();
+    expect(afterDetach.error).toContain("no job controller serves this agent");
+  });
+
+  it("夹具那句文案仍与真实现逐字一致（上游改文案时这条会红）", () => {
+    const registry = makeRealRegistry();
+    // 取 .message 而不是 String(error)：后者会带上 "Error: " 前缀，那样比的就成了 String 的格式。
+    let message = "";
+    try {
+      registry.start(realRegistrySpec());
+    } catch (error: unknown) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    // 夹具里写死的那句：两边对不上就说明手抄件已经腐烂，改夹具而不是放宽这里。
+    const stubbed =
+      "background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)";
+    expect(message).toBe(stubbed);
+  });
 });

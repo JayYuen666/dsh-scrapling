@@ -66,18 +66,13 @@ function resolverFrom(answers: Record<string, readonly string[]>): ResolveAddres
  * 建一个走假 DNS 的策略。
  *
  * @param answers - 假解析器返回的地址表；键是主机名
- * @param allowPorts - 端口白名单；不传表示不限端口
  * @returns 策略对象
  */
-function policyWith(
-  answers: Record<string, readonly string[]>,
-  allowPorts?: readonly number[],
-): UrlPolicy {
+function policyWith(answers: Record<string, readonly string[]>): UrlPolicy {
   const resolve = resolverFrom(answers);
   return createUrlPolicy({
     maxUrlLength: 2048,
     resolve,
-    ...(allowPorts === undefined ? {} : { allowPorts }),
   });
 }
 
@@ -115,14 +110,11 @@ describe("无需 DNS 的检查", () => {
     expect(reasonOf(defaultPolicy().screen(long))).toBe("too-long");
   });
 
-  it("配置端口白名单后按白名单判定", () => {
-    const policy = policyWith({ [HOST]: [PUBLIC_V4] }, [443]);
+  it("任何端口都放行（与 dsh 内置同取舍，本插件不提供端口白名单）", () => {
+    const policy = defaultPolicy();
     expect(policy.screen("https://example.com:443/x").ok).toBe(true);
-    expect(reasonOf(policy.screen("https://example.com:8443/x"))).toBe("port-not-allowed");
-  });
-
-  it("不给端口白名单时任何端口都放行（与 dsh 内置同取舍）", () => {
-    expect(defaultPolicy().screen("http://example.com:8080/x").ok).toBe(true);
+    expect(policy.screen("http://example.com:8080/x").ok).toBe(true);
+    expect(policy.screen("http://example.com:6379/x").ok).toBe(true);
   });
 });
 
@@ -339,18 +331,18 @@ describe("显式放行的主机名", () => {
     expect(reasonOf(await policy.verify("http://intranet.local/page"))).toBe(PRIVATE);
   });
 
-  it("放行只跳过地址判定，scheme / 内嵌凭据 / 端口照旧检查", async () => {
+  it("放行只跳过地址判定，scheme 与内嵌凭据照旧检查", async () => {
     const policy = createUrlPolicy({
       maxUrlLength: 2048,
       resolve,
       allowHosts: ["intranet.local"],
-      allowPorts: [80],
     });
     expect(reasonOf(await policy.verify("ftp://intranet.local/x"))).toBe(SCHEME);
     expect(reasonOf(await policy.verify("http://u:p@intranet.local/x"))).toBe(
       "credentials-not-allowed",
     );
-    expect(reasonOf(await policy.verify("http://intranet.local:8080/x"))).toBe("port-not-allowed");
+    const withPort = await policy.verify("http://intranet.local:8080/x");
+    expect(withPort.ok).toBe(true);
   });
 });
 

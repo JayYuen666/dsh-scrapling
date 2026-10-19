@@ -2879,6 +2879,12 @@ def run_inprocess_adapters() -> None:
         check("_require(None) 报 SCRAPLING_MISSING", False, "没抛")
     except adapters.AdapterError as error:
         check("_require(None) 报 SCRAPLING_MISSING", error.code == "SCRAPLING_MISSING", error.code)
+        # 装在哪份解释器里是这条错误的全部信息量：用户手上通常不止一份 python。
+        check(
+            "_require 的文案点名解释器",
+            sys.executable in str(error),
+            str(error),
+        )
 
     for bad in ("x", True, 0, -3):
         try:
@@ -2896,6 +2902,26 @@ def run_inprocess_adapters() -> None:
             check(f"_positive_number({bad_num!r}) 被拒", error.code == "BAD_ARGS", error.code)
     check("_positive_number 数值原样", adapters._positive_number(2.5, "f", 1.0) == 2.5, "")
     check("_positive_number 缺省值", adapters._positive_number(None, "f", 1.0) == 1.0, "")
+
+    state_dir = tempfile.mkdtemp(prefix="dsh-state-path-")
+    for bad_name in ("../escape", "a/b", ".hidden", "..", "", "x\x00y"):
+        try:
+            adapters._state_path({"name": bad_name, "deployment": {"sessionStateDir": state_dir}})
+            check(f"状态文件名 {bad_name!r} 被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check(f"状态文件名 {bad_name!r} 被拒", error.code == "BAD_ARGS", error.code)
+    check(
+        "已带 .json 的名字不重复拼后缀",
+        adapters._state_path({"name": "login.json", "deployment": {"sessionStateDir": state_dir}})
+        == str(Path(state_dir) / "login.json"),
+        "",
+    )
+    check(
+        "没带后缀时补 .json",
+        adapters._state_path({"name": "login", "deployment": {"sessionStateDir": state_dir}})
+        == str(Path(state_dir) / "login.json"),
+        "",
+    )
 
     try:
         adapters._string_map(5, "f")
@@ -3297,10 +3323,104 @@ def run_inprocess_sessions() -> None:
         except adapters.AdapterError as error:
             check("_get_session 构造中的条目被拒", error.code == "NO_SUCH_SESSION", error.code)
 
-        fetched = adapters.session_fetch(
-            {"sessionId": "cov-stealth", "url": "https://example.com/", "extractionType": "text"}
+        # 构造期间被要求关闭（sidecar 关机走的就是 close_all_sessions）：建好的那一份绝不能
+        # 登记回注册表 —— 登记了就再没有人会去关它，浏览器进程会活过 sidecar 自己。
+        saved_make_session = adapters._make_session
+        closed_log: list[str] = []
+
+        class _RecordingCloser:
+            """只记下自己被关过几次的替身。"""
+
+            def close(self) -> None:
+                """记一笔。"""
+                closed_log.append("close")
+
+            def __exit__(self, *exc: Any) -> None:
+                """记一笔。"""
+                closed_log.append("exit")
+
+        def _slow_make_session(kind: str, args: dict[str, Any]) -> tuple[Any, Any]:
+            """构造得足够慢，好在窗口里被叫停。"""
+            time.sleep(0.3)
+            return object(), _RecordingCloser()
+
+        adapters._make_session = _slow_make_session
+        adapters._SESSIONS.clear()
+        race: dict[str, Any] = {}
+
+        def _open_in_thread() -> None:
+            """在另一条线程里开会话。"""
+            try:
+                race["info"] = adapters.session_open({"sessionType": "static", "sessionId": "race-open"})
+            except Exception as error:  # noqa: BLE001 —— 记进断言里
+                race["error"] = repr(error)
+
+        opener = threading.Thread(target=_open_in_thread)
+        opener.start()
+        time.sleep(0.05)
+        adapters.close_all_sessions()
+        opener.join(5)
+        check(
+            "构造期被关闭的会话不登记回注册表",
+            adapters._SESSIONS == {} and "info" in race,
+            repr(sorted(adapters._SESSIONS)) + repr(race.get("error", "")),
         )
-        check("session_fetch 浏览器分支走通", fetched["sessionId"] == "cov-stealth", repr(fetched)[:120])
+        check("构造期被关闭的会话当场关掉", closed_log == ["exit"], repr(closed_log))
+        adapters._make_session = saved_make_session
+
+        # 上一段把注册表清空了（那正是它要证的），所以这里先自己登记一枚浏览器会话：
+        # 下面几条断的是 session_fetch 的浏览器分支，不该依赖上一段留下的残留状态。
+        # 浏览器条目必须有属主线程（greenlet 绑在那里），所以起一个真的 _SessionWorker，
+        # 条目形状与 session_open 登记的那份逐键一致。
+        _cov_worker = adapters._SessionWorker()
+
+        class _FetchableSession:
+            """只提供 `fetch` 的最小替身。
+
+            本段断的是**分支路由**：合法调用走通、static 专属键被拒。抓取实现不在这一层，
+            所以这里只证明「调用真的投递到了属主线程并被执行」。
+            """
+
+            def __init__(self) -> None:
+                """给一个可开关的网络记录器：下面要验「未开记录被拒 / 开了就回条目」。"""
+                self.network = type("_Rec", (), {"enabled": False})()
+
+            def fetch(self, url: str, **params: Any) -> dict[str, Any]:
+                """本段断的是路由，抓取实现不在这层。"""
+                raise RuntimeError("reachable")
+
+            def save_state(self, target: str) -> None:
+                """把落点写出来，够下面断「文件真的存在」即可。"""
+                Path(target).write_text("{}", encoding="utf-8")
+
+            def load_state(self, target: str) -> None:
+                """读一下被写的文件：存在性就是本段要的证据。"""
+                Path(target).read_text(encoding="utf-8")
+
+        adapters._SESSIONS["cov-stealth"] = {
+            "sessionId": "cov-stealth",
+            "type": "stealth",
+            "session": _FetchableSession(),
+            "closer": object(),
+            "lock": threading.Lock(),
+            "worker": _cov_worker,
+            "pending": False,
+        }
+        # 上面把键整个换掉了，`entry` 还指着旧那份：后面几条用例要在新条目上开网络记录。
+        entry = adapters._SESSIONS["cov-stealth"]
+        # 这枚替身的 fetch 会抛，正好证明调用**真的投递到了属主线程并被执行**：
+        # 若路由没走到浏览器分支，抛的会是 NO_SUCH_SESSION 而不是 FETCH_FAILED + reachable。
+        try:
+            adapters.session_fetch(
+                {"sessionId": "cov-stealth", "url": "https://example.com/", "extractionType": "text"}
+            )
+            check("session_fetch 浏览器分支投递到属主线程", False, "没抛")
+        except adapters.AdapterError as error:
+            check(
+                "session_fetch 浏览器分支投递到属主线程",
+                error.code == "FETCH_FAILED" and "reachable" in str(error),
+                f"{error.code}: {error}",
+            )
         for key in ("headers", "retries"):
             try:
                 adapters.session_fetch(

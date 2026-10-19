@@ -50,6 +50,25 @@ export interface SidecarCapabilities {
   readonly browser: boolean;
   /** Scrapling 版本号。 */
   readonly version?: string;
+  /** 部署是否开放写方法；两侧各判一次的前提是这一份也如实上报。 */
+  readonly writeMethods: boolean;
+  /**
+   * 出口代理摘要（不含凭据）。
+   *
+   * 抓取「明明配了代理却抓不到东西」时，这一栏就是第一眼的答案：它是从设置卡、环境变量
+   * 还是操作系统设置来的。形状不对时不带这个字段，而不是塞一个半截摘要进去。
+   */
+  readonly proxy?: SidecarProxySummary;
+}
+
+/** 出口代理摘要。 */
+export interface SidecarProxySummary {
+  /** 部署是否真的配上了可用的代理。 */
+  readonly configured: boolean;
+  /** 代理来自哪一档：settings / environment / system / none。 */
+  readonly source: string;
+  /** `scheme://host:port`；不含用户名与密码。 */
+  readonly server: string;
 }
 
 /** 客户端参数。 */
@@ -123,6 +142,22 @@ interface ReadyWaiter {
 }
 
 /**
+ * 归一代理摘要；三个字段都齐且类型对才认。
+ *
+ * @param value - 握手帧里的 capabilities.proxy 原值
+ * @returns 摘要，或 undefined 表示这一项不可读
+ */
+function parseProxySummary(value: unknown): SidecarProxySummary | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const { configured, source, server } = value;
+  const usable =
+    typeof configured === "boolean" && typeof source === "string" && typeof server === "string";
+  return usable ? { configured, source, server } : null;
+}
+
+/**
  * 校验并归一 sidecar 上报的能力。
  *
  * 刻意不直接断言成 `SidecarCapabilities`：对端是另一个语言实现的进程，字段缺失或类型
@@ -134,13 +169,16 @@ interface ReadyWaiter {
 export function parseCapabilities(value: unknown): SidecarCapabilities {
   const record = isRecord(value) ? value : {};
   const flag = (key: string): boolean => record[key] === true;
-  const { version } = record;
+  const { version, proxy } = record;
+  const summary = parseProxySummary(proxy);
   return {
     scrapling: flag("scrapling"),
     static: flag("static"),
     extract: flag("extract"),
     browser: flag("browser"),
+    writeMethods: flag("writeMethods"),
     ...(typeof version === "string" ? { version } : {}),
+    ...(summary === null ? {} : { proxy: summary }),
   };
 }
 

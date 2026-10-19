@@ -48,6 +48,10 @@ import type {
 } from "./settings-card.ts";
 
 /** 一行要展示的一项信息。label 是字典键而不是文案本身：可见文字统一走 locale 服务。 */
+/** 结果行字段的文案键：多处复用，抽一份免得字面量散落。 */
+const ROW_TYPE_KEY = "row.type";
+const ROW_SESSION_KEY = "row.session";
+
 export interface RowField {
   /** 字段名（展示用，不参与计算）；渲染时经 t() 取字。 */
   readonly labelKey: string;
@@ -79,10 +83,12 @@ export const ROW_TOOLS: readonly string[] = [
   "scrapling_extract",
   "scrapling_render",
   "scrapling_capture_xhr",
-  "scrapling_stealth_fetch",
   "scrapling_answer",
   "scrapling_session_open",
   "scrapling_session_fetch",
+  "scrapling_session_network",
+  "scrapling_session_state_save",
+  "scrapling_session_state_load",
   "scrapling_session_list",
   "scrapling_session_close",
   "scrapling_crawl",
@@ -146,8 +152,8 @@ export function buildRow(tool: string, args: unknown, meta: unknown): RowSpec {
       tool,
       title: tool,
       fields: [
-        { labelKey: "row.type", value: text(parameters["sessionType"]) },
-        { labelKey: "row.session", value: text(projected["sessionId"]) },
+        { labelKey: ROW_TYPE_KEY, value: text(parameters["sessionType"]) },
+        { labelKey: ROW_SESSION_KEY, value: text(projected["sessionId"]) },
       ],
     };
   }
@@ -155,8 +161,23 @@ export function buildRow(tool: string, args: unknown, meta: unknown): RowSpec {
     return {
       tool,
       title: tool,
-      fields: [{ labelKey: "row.session", value: text(parameters["sessionId"]) }],
+      fields: [{ labelKey: ROW_SESSION_KEY, value: text(parameters["sessionId"]) }],
     };
+  }
+  if (
+    tool === "scrapling_session_network" ||
+    tool === "scrapling_session_state_save" ||
+    tool === "scrapling_session_state_load"
+  ) {
+    const fields: RowField[] = [
+      { labelKey: ROW_SESSION_KEY, value: text(parameters["sessionId"]) },
+    ];
+    // 网络历史与登录态都以会话为轴；登录态那一对再多一个文件名，那是它唯一的模型侧入参。
+    const name = text(parameters["name"]);
+    if (name !== "") {
+      fields.push({ labelKey: "row.name", value: name });
+    }
+    return { tool, title: tool, fields };
   }
   if (tool === "scrapling_crawl") {
     return {
@@ -186,7 +207,14 @@ export function buildRow(tool: string, args: unknown, meta: unknown): RowSpec {
 }
 
 /** 结果行用得到的参数键。视图是惰性的，只挑这几个读才不会物化整段参数 JSON。 */
-const ARG_KEYS: readonly string[] = ["url", "selector", "sessionType", "sessionId", "maxPages"];
+const ARG_KEYS: readonly string[] = [
+  "url",
+  "selector",
+  "sessionType",
+  "sessionId",
+  "name",
+  "maxPages",
+];
 
 /** 宿主给的惰性参数视图上，本行用得到的两个读取器。两者都是全函数：缺席给 undefined。 */
 export interface ArgsFace {

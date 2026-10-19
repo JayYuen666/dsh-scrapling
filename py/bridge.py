@@ -196,7 +196,17 @@ def _worker() -> None:
                 time.sleep(0.05)
                 frame = _drain()
             if frame is None:
-                return
+                # 「判定该退出」必须与入队互斥：读者是在 _QUEUE_LOCK 里 append 之后才去数
+                # worker 的，而这里在同一个锁里复查队列 —— 否则会出现「_ensure_worker 看到
+                # 我还活着所以不补人，我随后就退了」，那一帧被永久搁置在队列里。
+                with _QUEUE_LOCK:
+                    if _QUEUE:
+                        continue
+                    with _WORKERS_LOCK:
+                        current = threading.current_thread()
+                        if current in _WORKERS:
+                            _WORKERS.remove(current)
+                    return
             try:
                 emit(handle(frame))
             except Exception as error:  # noqa: BLE001 —— 连序列化失败都不能让线程死掉
