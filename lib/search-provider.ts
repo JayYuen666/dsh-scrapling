@@ -135,6 +135,7 @@ function absolutize(raw: string, endpoint: string): string {
  * @param endpoint - 搜索端点
  * @param query - 已 trim 过的查询词
  * @param signal - 取消信号
+ * @param timeoutMs - 单次搜索的协同超时；到点即中止这次请求
  * @returns 命中的条目
  * @throws WebError - 端点不是 http(s)、后端非 2xx、或回包不可解析
  */
@@ -142,7 +143,12 @@ async function querySearchBackend(
   endpoint: string,
   query: string,
   signal: AbortSignal | undefined,
+  timeoutMs: number,
 ): Promise<ParsedSearchHit[]> {
+  // 超时与调用方取消是两个来源：只转发 signal 的话，接缝没给 signal（该参数本就是可选的）
+  // 时一次卡住的后端会让整次搜索永久挂起，而且没有任何可观测的超时错误。
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
   try {
     const searchUrl = new URL(endpoint);
     if (searchUrl.protocol !== "http:" && searchUrl.protocol !== "https:") {
@@ -151,7 +157,7 @@ async function querySearchBackend(
     searchUrl.searchParams.set("q", query);
     searchUrl.searchParams.set("format", "json");
     const response = await fetch(searchUrl, {
-      ...(signal === undefined ? {} : { signal }),
+      signal: combined,
       headers: { accept: "application/json" },
     });
     if (!response.ok) {
@@ -161,7 +167,8 @@ async function querySearchBackend(
   } catch (error: unknown) {
     // 取消不是故障：调用方改主意了，语义是「这次调用作废」。把它包成 provider 失败码，
     // seam 那头看到的就成了一次搜索失败，日志与用户提示都会指错方向。原样抛出。
-    if (signal?.aborted === true) {
+    // 超时同理：它是这次搜索的结局，而不是「后端回了坏东西」。
+    if (signal?.aborted === true || timeout.aborted) {
       throw error;
     }
     throw new WebError(String(error), "SCRAPLING_SEARCH_FAILED");
@@ -365,7 +372,7 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
       }
       const maxResults = boundResults(request.maxResults);
 
-      const hits = await querySearchBackend(endpoint, query, signal);
+      const hits = await querySearchBackend(endpoint, query, signal, deps.timeoutMs);
       // sources 也要过准入闸门：搜索后端的回包是外部输入，它尽可以回一条内网地址；
       // 不过闸的话，那条地址就原样出现在模型眼前，而本包对同一地址的抓取会被拦下。
       // 候选先截到 MAX_SOURCES 再过闸 —— 闸门每条一次 DNS，封顶必须落在过闸之前。

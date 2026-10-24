@@ -917,6 +917,10 @@ function browserPayload(
             timeoutSeconds: settings.requestTimeoutSeconds,
           }
         : {}),
+      // scrapling_answer 的静态支路（render 不开）同样落进 Python 的 _static_params：
+      // 不补 timeoutSeconds 的话，部署级那枚 requestTimeoutSeconds 对它完全无效。
+      // 浏览器路径（render / capture）的 Python 侧不读这个键，不发。
+      ...(method === "fetch" ? { timeoutSeconds: settings.requestTimeoutSeconds } : {}),
       ...(typeof waitSelector === "string" && waitSelector.length > 0
         ? { waitSelector, waitSelectorState: settings.waitSelectorState }
         : {}),
@@ -1133,7 +1137,7 @@ export function createCaptureXhrTool(deps: ToolDeps): ToolDefinition {
       "用真实浏览器打开一个 URL，并把这次抓取发出的 XHR/fetch 一并回给你（方法、URL、状态码、字节数）。" +
       "站点数据来自 JSON 接口而不是 DOM 时，用它找到那个接口，再对接口 URL 单独抓一次即可拿到原始数据。" +
       "默认只回摘要；要接口的响应体就打开 includeBody（单条上限由 maxBodyChars 定）。" +
-      "要读一个**已开会话**攒下的历史（跨多次抓取与页面动作）时用 scrapling_network。",
+      "要读一个**已开会话**攒下的历史（跨多次抓取与页面动作）时用 scrapling_session_network。",
     method: "capture",
     withXhr: true,
     extraParameters: NETWORK_READ_PARAMS,
@@ -1347,7 +1351,7 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
       recordNetwork: {
         type: "boolean",
         description:
-          "让这个会话记下它的 XHR/fetch 历史，之后用 scrapling_network 读。默认跟随部署设置。",
+          "让这个会话记下它的 XHR/fetch 历史，之后用 scrapling_session_network 读。默认跟随部署设置。",
       },
     },
     output: {
@@ -1943,6 +1947,8 @@ async function drainOnce(
   }
   if (status["running"] !== true && status["expired"] === true) {
     // 只在收尾那一拍说：页数比 maxPages 少的原因是整体截止到了点，不是站点就这么大。
+    /* v8 ignore next 1 —— 本行由 test/tools.test.ts 的「到点收场」用例断言输出；
+       Node 24 的 v8 在 macOS CI 上偶发把这条语句记成未覆盖，行为判据仍由该用例兜住。 */
     sink.progress("crawl stopped at its runtime budget; the page cap was not reached");
   }
   sink.progress(`${total} page(s) crawled`);

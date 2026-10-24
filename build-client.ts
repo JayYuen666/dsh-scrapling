@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // dsh-scrapling/build-client.ts —— 构建 client.js。
 //
-// 用 rolldown 把 src/client-entry.ts 打包为 CJS（react 外部化），再包进
+// 用 rolldown 把 src/client-entry.ts 打包为 CJS（react 按包名段外部化），再包进
 // window.__ModuleLoader__.load({ id, factory }) 外壳。id 取 package.json 的 name，
 // 与 dsh.client 模块表键一致。
 //
@@ -10,64 +10,32 @@
 // 与 build-host.ts 同理：**源码是 .ts，产物是 .js** —— Node 不肯在 node_modules 里
 // 剥类型，而 dsh 正是在 node_modules 里按包名载入 client.js 的。
 
-import { readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { rolldown } from "rolldown";
 import { canonicalizeRegionPaths } from "@jayyuen66/dsh-plugin-shared/lib/canonicalize-region-paths";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import {
+  externalizePackages,
+  hoistStrictDirective,
+  invokedDirectly,
+  readPackageJson,
+  singleChunkCode,
+  STRICT_DIRECTIVE,
+  writeArtifact,
+} from "./build-helpers.ts";
 
 const root = import.meta.dirname;
 
-/** CJS 产物的严格模式指令。折进 ModuleLoader 外壳之后它就不再是函数体的指令前导。 */
-const STRICT_DIRECTIVE = '"use strict";';
+// react 按**包名段**外部化：字符串项是精确匹配，只写 "react" 时 react/jsx-runtime 与
+// react-dom 的任意子路径都会被内联进产物，宿主与产物各持一份 React 实例 —— hook 报
+// Invalid hook call、状态互不可见，而构建照样成功退出。本包目前只 import "react"，
+// 但这条判据不该依赖「将来没人改用 JSX 自动运行时」。
+//
+// 其余裸说明符（node: 前缀与相对路径已由 rolldown 处理，不在此列）不外部化：产物是
+// 浏览器侧的单文件，除宿主提供的 react 之外不该在运行期解析任何东西。
+const isExternal = externalizePackages(["react"]);
 
-/**
- * 本文件是不是被 `node build-*.ts` 直接执行，而不是被 import 去内存里构建产物。
- *
- * 不能只比 `process.argv[1] === import.meta.filename`：Node 把 argv[1] 解析成绝对路径，
- * 但**不**折符号链接，而 ESM 侧 import.meta.* 一律按真实路径给。pnpm 的软链接包、
- * Windows 的 junction、以及「用一个 shim 转调」这三种形态下两个串恒不相等 —— 于是构建
- * 什么都不做、退出码还是 0，陈旧产物被静默发出去。两边都折成真实路径再比。
- *
- * @returns 是否是直接执行
- */
-export function invokedDirectly(): boolean {
-  const [entry] = process.argv.slice(1);
-  if (entry === undefined || entry.length === 0) {
-    return false;
-  }
-  if (import.meta.filename === entry || import.meta.url === pathToFileURL(entry).href) {
-    return true;
-  }
-  try {
-    return realpathSync(import.meta.filename) === realpathSync(entry);
-  } catch {
-    // 有一边不存在（argv[1] 指向别处、或文件名里有非常规字符）：宁可判否。
-    // 判否的代价只是「这次不构建」，而误判为真的代价是构建一条没人要求的产物。
-    return false;
-  }
-}
-
-/**
- * 把产物顶部的严格模式指令摘出来，交给外壳放回函数体第一行。
- *
- * rolldown 的 CJS 产物可能以 `"use strict";` 开头。它一旦被嵌进
- * `factory: (require) => { … }` 的函数体，就再也不是指令前导 —— 位置被 `var module`
- * 那些语句占掉了，于是整份代码跑在非严格模式下。源码是 ESM（天然严格），
- * 语义变化不会有人报错，只会在某个 `this` 或八进制字面量上悄悄出错。
- *
- * @param code - rolldown 产出的正文
- * @returns 摘掉指令后的正文
- */
-export function hoistStrictDirective(code: string): string {
-  const trimmed = code.replace(/^\s+/u, "");
-  return trimmed.startsWith(STRICT_DIRECTIVE)
-    ? trimmed.slice(STRICT_DIRECTIVE.length).replace(/^\s+/u, "")
-    : trimmed;
-}
-
-const pkgJson: unknown = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+const pkgJson = readPackageJson(root);
 
 const nameKey = "name";
 const nameRaw = isRecord(pkgJson) ? pkgJson[nameKey] : undefined;
@@ -82,26 +50,6 @@ if (pkgName === undefined) {
 }
 
 /**
- * 把产物写到磁盘：先写同目录的临时文件，再改名。
- *
- * 直接覆盖目标文件的话，中断、磁盘写满或进程被杀都会在目标位置留下半截 JS。同一文件系统
- * 内的改名是原子的，磁盘上因此永远只有完整的产物。
- *
- * @param target - 产物路径
- * @param text - 产物全文
- */
-function writeArtifact(target: string, text: string): void {
-  const scratch = `${target}.tmp-${process.pid}`;
-  try {
-    writeFileSync(scratch, text, "utf8");
-    renameSync(scratch, target);
-  } catch (error) {
-    rmSync(scratch, { force: true });
-    throw error;
-  }
-}
-
-/**
  * 生成 client.js 的完整文本（含 ModuleLoader 外壳）。
  *
  * @returns 产物文本
@@ -109,41 +57,22 @@ function writeArtifact(target: string, text: string): void {
 export async function buildClient(): Promise<string> {
   const bundle = await rolldown({
     input: path.join(root, "src", "client-entry.ts"),
-    external: ["react"],
+    external: isExternal,
     platform: "browser",
     resolve: {
       extensions: [".ts", ".mjs", ".js", ".json"],
     },
   });
   try {
-    const { output } = await bundle.generate({ format: "cjs" });
-    // 只取第一块等于「其余代码静默消失」：产物照样能构建、过语法检查、装得上，
-    // 直到某个函数在运行期变成 undefined 才暴露。宁可构建失败。
-    const chunks = output.filter((item) => item.type === "chunk");
-    if (chunks.length !== 1) {
-      throw new Error(
-        `expected exactly one chunk from rolldown, got ${chunks.length}; ` +
-          "this build writes a single file and must not split the bundle",
-      );
-    }
-    // 资产同样是「会静默消失」的输出：一个 .css/.png 被引用而产物只写一个 JS 文件时，
-    // 引用它的代码在运行期才会炸。这里连非 chunk 输出一起拒。
-    const extras = output.filter((item) => item.type !== "chunk");
-    if (extras.length > 0) {
-      throw new Error(
-        `rolldown also emitted ${extras.length} non-chunk output(s) ` +
-          `(${extras.map((item) => item.fileName).join(", ")}); ` +
-          "this build writes a single file and must not drop assets",
-      );
-    }
-    const [chunk] = chunks;
-    if (chunk === undefined) {
-      throw new Error("rolldown generate returned no chunk output");
-    }
+    const { output } = await bundle.generate({ format: "cjs", minify: true });
     // 见 shared/lib/canonicalize-region-paths.ts：`//#region` 行的路径由 rolldown 按
     // process.cwd() 算出 ⇒ 同一份源码两种字节。折 canonical 必须落在返回值之前
     // （新鲜度测试逐字节比内存构建与磁盘产物）。
-    const body = canonicalizeRegionPaths(hoistStrictDirective(chunk.code), root);
+    const body = canonicalizeRegionPaths(
+      hoistStrictDirective(singleChunkCode(output)),
+      root,
+      process.cwd(),
+    );
     return [
       "// GENERATED by build-client.ts — edit src/client-entry.ts, then run `node build-client.ts`.",
       "window.__ModuleLoader__.load({",
@@ -164,7 +93,10 @@ export async function buildClient(): Promise<string> {
     ].join("\n");
   } finally {
     // bundle 持有 rolldown 的 worker 资源，不关的话进程未必立刻退出。
-    await bundle.close();
+    // close 自己失败不该顶掉 generate/校验阶段的原始错误（finally 的异常会成为最终异常）。
+    await bundle.close().catch((closeError: unknown) => {
+      console.error("[build-client] failed to close rolldown bundle:", closeError);
+    });
   }
 }
 
@@ -174,7 +106,7 @@ async function main(): Promise<void> {
   console.info("client.js written:", out.length, "chars");
 }
 
-if (invokedDirectly()) {
+if (invokedDirectly(import.meta.filename, import.meta.url)) {
   // 这里用顶层 await：node/no-top-level-await 与本文件原本该满足的
   // unicorn/prefer-top-level-await 互斥，已在 oxlint.config.ts 里按「对侧互斥」
   // 记录了关掉哪一条。构建脚本只由 node 直接执行，不进 bundler 的 require(esm) 路径。

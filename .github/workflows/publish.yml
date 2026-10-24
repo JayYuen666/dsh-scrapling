@@ -1,26 +1,58 @@
 name: publish
 on:
   workflow_dispatch: {}
+# 两次手动 dispatch 撞上同一版本时，后一个只是拿版本冲突收尾；真正的浪费是两个 runner 并行
+# 跑同一份 check + publish，而且日志顺序会分不清哪一次落到了 registry。
+concurrency:
+  group: publish
+  cancel-in-progress: false
 permissions:
   contents: read
-  # npm trusted publishing（OIDC）要这一项，缺了报 ENEEDAUTH。这条不能省：pnpm 在这里
-  # 拿 id-token 去 registry 换发布凭据，没有它就换不到。缺这条时报的是
+  # npm trusted publishing（OIDC）要这一项。这条不能省：pnpm 拿 id-token 去 registry 换发布凭据，
+  # 没有它就换不到。少了它不会安静降级——命令里带着 --provenance 时，签来源证明那一步会硬失败并报
   # ERR_PNPM_ID_TOKEN_GITHUB_WORKFLOW_INCORRECT_PERMISSIONS。
+  # 交换成功时它赢过 NODE_AUTH_TOKEN（pnpm 的 publish_options.rs："OIDC takes precedence over
+  # a configured static token"），下面那个 secret 只在交换失败时才有用；registry 上该版本的
+  # _npmUser 记作 GitHub Actions <npm-oidc-no-reply@github.com> 正是这条路走通的痕迹。
   id-token: write
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # 发布链里有 install + 完整 check ；发布后由 registry 逐步可见。
+    # 不设上限的话，卡住的那一步会烧满 runner 的上限才被杀，期间没有任何信号。
+    timeout-minutes: 45
     steps:
+      # 发布只允许从默认分支派发：workflow_dispatch 能在任意分支/tag 上触发，而 publish 会把
+      # 检出时刻的那棵树原样推到 registry——版本号一旦占用就撤不回，只能弃号再发新版。
+      # 用「失败」而不是 job 级 `if:` 跳过：跳过在结论上是绿的，误点的人只会看到工作流"成功"。
+      - name: 确认发布只发生在默认分支
+        env:
+          TARGET_REF: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET_REF" != "$DEFAULT_BRANCH" ]; then
+            echo "::error::发布只能从默认分支（$DEFAULT_BRANCH）派发，当前是 $TARGET_REF。要发版请先把改动合进默认分支再 dispatch。"
+            exit 1
+          fi
       # action 按 tag 引用意味着上游动 tag 就等于本仓换了构建器。钉 commit SHA，
       # tag 版本写在同行注释里，升级时照着改这一行即可。
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
+          # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 12
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          # 与 ci.yml 同一口径：缓存键取自本仓的 pnpm-lock.yaml，省掉这台发布机上每次冷装
+          # 全套依赖的时间。发布链本来就有 install + 完整 check + prepack，缓存命中的是其中
+          # 最长的那一段。
+          cache: pnpm
       # 测试里有一批用例以 existsSync(_env/.venv/bin/python3) 为前提才能真跑起来。那个目录被
       # gitignore（它是机器本地状态），所以 CI 上必须自己备一份。缺了它，那批用例会退化成空转：
       # host.ts 的覆盖率从 100% 掉到 58%，门禁随之变红——而报错只说「覆盖率不达标」，真正的原因
@@ -31,9 +63,13 @@ jobs:
       # 浏览器**不装**：runner 上没有浏览器二进制时，那次运行里除上面两条外 292 条全过，
       # 依赖浏览器的是 runIf 门控的占位用例。运行期要用 render / capture_xhr / stealth 时
       # 才需要浏览器，那是用户侧的运行时依赖，不是测试门槛。
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
+          # 与 ci.yml 同一口径：依赖文件是 py/requirements-dev.txt，缓存的是它解析出来的
+          # 那一批轮子（既有检查工具，也有 pip 侧的传递依赖）。
+          cache: pip
+          cache-dependency-path: py/requirements-dev.txt
       - name: 备 sidecar 解释器（Python 门禁的前提）
         run: |
           python -m venv _env/.venv
@@ -43,9 +79,10 @@ jobs:
       # Python 侧的静态检查。版本在 py/requirements-dev.txt 里精确钉：规则集随版本漂移，
       # 不钉的话「升级 ruff」与「新写一处违规」在门禁上长得一模一样。
       # 缺这一步时 check:py 会以 "No module named ruff" 硬失败 —— 刻意不跳过。
-      # 顺手把 venv 顶上 PATH：pnpm run check 里的 check:py / test:py 走 PATH 上的 python3，
-      # CI 上那默认是 hostedtoolcache 的解释器（没有 ruff，也没有 scrapling）——这正是
-      # 首次跑发布时 check 步骤失败的原因。GITHUB_PATH 对后续步骤生效。
+      # 把 venv 顶到 PATH 上。门禁本身不依赖这一行：check:py / test:py 走的是 package.json
+      # 的 `py` 脚本，它在 `_env/.venv/bin/python` 可执行时直接用该绝对路径（与根
+      # `scripts/lib/py-env.mjs` 同一条规则），所以与 PATH 无关。留它是为了让后续步骤里按名字
+      # 调用 `python3` 的写法解析到装了 ruff 与 scrapling 的这一支，而不是 hostedtoolcache。
       - name: 备 Python 检查工具
         run: |
           _env/.venv/bin/python -m pip install -r py/requirements-dev.txt
@@ -56,12 +93,16 @@ jobs:
       # ③ 验证 OIDC 真能跑通后，再删掉 NPM_TOKEN 并吊销旧 automation token。
       # ② 到 ③ 之间别拖太久：新建的 trusted publisher 配置有 2 天窗口，期内必须完成第一次
       # 成功发布，过期即失效且不可编辑，只能删除重建。
+      # 这一步只做两件事：token 在场就校验形态、不在场就确认 OIDC 环境在。它**不决定**走哪条——
+      # 认证优先级写在 permissions 那段注释里：OIDC 在前，token 只兜底。
       - name: 确认发布凭据（OIDC 优先，回落静态 token）
+        id: norm
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           TOKEN="$(printf '%s' "$NPM_TOKEN" | tr -d '\r\n[:space:]')"
           if [ -n "$TOKEN" ]; then
+            echo "::add-mask::$TOKEN"
             case "$TOKEN" in
               npm_*) echo "凭据：secrets.NPM_TOKEN，形态为 npm access token";;
               ghp_*|github_pat_*) echo "这是 GitHub token——发到公共 npm 需要 npm 站点自己的 token（www.npmjs.com → Access Tokens），GH 的 token 对 npmjs 无效"; exit 1;;
@@ -72,13 +113,14 @@ jobs:
               echo "凭据里混进了非 token 字符（引号、说明文字之类）——请只贴 npm_ 开头那一串，不要带引号"
               exit 1
             fi
-            echo "走法：静态 token"
+            echo "形态合格。它不决定走哪条：本包 trusted publisher 已登记时 OIDC 优先，这枚 token 只在交换失败时兜底。"
+            # 凭据本身不跨步骤传递：步骤输出会落成 RUNNER_TEMP 下的文件，同 job 后续步骤
+            # （含 install 与 check 里跑的依赖脚本）都能枚举读到；写进 job 级环境同理。
+            # 所以这里只做形态校验，预检与发布各自从 secrets 取一次、各自就地清洗。
             exit 0
           fi
           # 没有静态 token 时只剩 OIDC 一条路：pnpm 12 内置 trusted publishing
           # （crates/publish/src/oidc.rs），拿 Actions 的 id-token 去 registry 换凭据。
-          # 这一步原先是无条件 exit 1，于是「没配 NPM_TOKEN」会把 OIDC 那条路整个堵死，
-          # 而 permissions 上那句注释宣称的却是两条路并存。改成转去核对 OIDC 环境。
           if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
             echo "既没有 secrets.NPM_TOKEN，也没有 OIDC 环境（ACTIONS_ID_TOKEN_REQUEST_URL 为空）——两条路都不可用"
             echo "补法二选一：① 在仓库 Secrets 里加 NPM_TOKEN；② 保留 permissions: id-token: write，"
@@ -86,25 +128,55 @@ jobs:
             exit 1
           fi
           echo "凭据：OIDC trusted publishing（未配 secrets.NPM_TOKEN）"
-          echo "走法：OIDC。身份由 registry 在交换时核验，本 workflow 不接触任何长期凭据"
+          echo "走法：OIDC（没有静态 token 可回落）。身份由 registry 在交换时核验，本 workflow 不接触任何长期凭据"
       - name: registry 预检（依赖库必须先公开）
+        id: precheck
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          TOKEN="$(printf '%s' "$NPM_TOKEN" | tr -d '\r\n[:space:]')"
-          if [ -n "$TOKEN" ]; then
-            echo "whoami: $(curl -s -H "Authorization: Bearer $TOKEN" "https://registry.npmjs.org/-/whoami")"
+          set -euo pipefail
+          USE_STATIC=false
+          # 响应体临时文件在脚本退出时统一收掉：`set -e` 下 curl 非零退出会直接中止本步，
+          # 逐支 rm 的写法漏掉那条路径，文件就留在 runner 上。
+          body=""
+          trap 'rm -f "$body"' EXIT
+          PASS_TOKEN="$(printf '%s' "${TOKEN:-}" | tr -d '\r\n[:space:]')"
+          if [ -n "$PASS_TOKEN" ]; then echo "::add-mask::$PASS_TOKEN"; fi
+          # 超时与重试都显式给：不给 --max-time 时一次挂起会占到 job 的 45 分钟上限才被杀；
+          # 不给 --retry 时一次瞬时抖动会落进 `*)` 分支，被判成 registry 侧异常。
+          CURL_FLAGS=(--silent --show-error --retry 3 --retry-delay 2 --max-time 30)
+          if [ -n "$PASS_TOKEN" ]; then
+            body="$(mktemp)"
+            code=$(curl "${CURL_FLAGS[@]}" -o "$body" -w "%{http_code}" -H "Authorization: Bearer $PASS_TOKEN" "https://registry.npmjs.org/-/whoami")
+            case "$code" in
+              200)
+                login=$(sed -n 's/.*"username"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$body")
+                USE_STATIC=true
+                # 响应体里是账号名，CI 日志长期留存，只印脱敏摘要。
+                if [ -n "$login" ]; then echo "whoami: HTTP 200，账号 ${login:0:2}***"; else echo "whoami: HTTP 200（响应体未解析出账号名）"; fi
+                ;;
+              401|403)
+                echo "::warning::静态 token 被 registry 拒（HTTP $code）——本次不启用它，按 OIDC 发布。这枚 secret 已失效，用完请到 Settings → Secrets 删掉，否则每次发布都留一条本行告警。"
+                PASS_TOKEN=""
+                ;;
+              *)
+                echo "whoami 返回 HTTP $code——既不是 200 也不是凭据被拒的 401/403，属 registry 侧异常，先查状态页再发"
+                exit 1
+                ;;
+            esac
           else
             echo "whoami: 跳过（走 OIDC，没有静态 token 可问；身份由 registry 在交换时核验）"
           fi
           for pkg in "@jayyuen66%2fdsh-plugin-shared"; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "https://registry.npmjs.org/$pkg")
+            code=$(curl "${CURL_FLAGS[@]}" -o /dev/null -w "%{http_code}" "https://registry.npmjs.org/$pkg")
             echo "读 $pkg：HTTP $code"
             if [ "$code" != "200" ]; then
               echo "判读：404 = 该依赖库还没发到 npmjs，先发它；本包是它的消费方，装不上依赖"
               exit 1
             fi
           done
+          # 只交结论、不交凭据：发布步据此决定导不导出 NODE_AUTH_TOKEN。
+          printf 'use_static=%s\n' "$USE_STATIC" >> "$GITHUB_OUTPUT"
       - run: pnpm install --frozen-lockfile
       - run: pnpm run check
       # Python 面不在这里另跑一遍：`check` 已经含 `check:py` 的八步链（`py:which` → `face:py` → ruff
@@ -112,20 +184,44 @@ jobs:
       # 强度只写在那一条链里：要放宽或收紧 Python 面就改该仓 `package.json` 的 `check:py`，在 CI 里另起
       # 一步就会出现两套说法互相打脸的形状（一步拦、一步只记录）。
       # prepack 会重建 host.js / client.js；产物不入库也发得出去。
-      # 凭据两条路：配了 NPM_TOKEN 就经 NODE_AUTH_TOKEN 注入；没配就交给 OIDC。
-      # setup-node 配了 registry-url 之后会设 NPM_CONFIG_USERCONFIG 指向它自己生成的那份
-      # .npmrc，npm 只读那一份，$HOME/.npmrc 会被完全忽略 —— 所以 token 必须以环境变量注入，
-      # 不能写文件。publish 那步的 if 也因此不能省：把 NODE_AUTH_TOKEN 设成空串会顶掉
-      # setup-node 注入的那一份，而 OIDC 那条路本来就不该看到它。
-      # --provenance：上面的 id-token: write 就是给它用的，不加等于白拿 OIDC；
-      # 消费方在 npm 页面就能看到这一版是从哪个仓库、哪次构建出来的。
-      # --publish-wait-timeout：等 registry 真正放出这个版本并对 tarball 回 HEAD，
-      # 于是「发出去了但装不上」在 workflow 里就红，而不是等用户报障才发现。
+      # 凭据优先级是本文件最容易读反的地方：不是「配了 NPM_TOKEN 就用它、没配才 OIDC」，
+      # 而是 OIDC 在前、token 在后（pnpm 的 publish_options.rs 原话 "OIDC takes precedence over
+      # a configured static token"）。trusted publisher 配好时下面那段 export 等于空转，
+      # registry 上该版本的 _npmUser 记成 GitHub Actions <npm-oidc-no-reply@github.com> 就是这个。
+      # 注入方式只能是环境变量：setup-node 配了 registry-url 会把 `${NODE_AUTH_TOKEN}` 占位写进
+      # RUNNER_TEMP/.npmrc 并用 NPM_CONFIG_USERCONFIG 指过去，$HOME/.npmrc 被忽略；真 token 留在
+      # 环境变量里。别往仓库里的 .npmrc 写明文——pnpm 不展开仓库级 .npmrc 里的 `${...}` 占位
+      # （npm 会展开，别照 npm 的行为读这一行）。
+      # 那个 if 不能省：把 NODE_AUTH_TOKEN 设成空串，等于给 .npmrc 里那个
+      # `${NODE_AUTH_TOKEN}` 占位塞了一个空值。
+      # 首次发布的前置顺序见上面「确认发布凭据」那一步的注释：先 token 发一版、
+      # 再去包设置页登记 trusted publisher，此后 OIDC 才可能赢过 token。
+      # --provenance 取的是另一枚 id-token（audience 为 sigstore），与 npm 交换那枚互相独立，
+      # 所以它不受 trusted publisher 是否已配影响；少了它，产物只剩 npm 自己的签名。
+      # pnpm 12 的 publish 不接受 --publish-wait-timeout（CI 实测参数解析即退 2），
+      # 因此这里不带它；发布后由 registry 逐步可见。
+      # 若要改成 staged 发布（CI 只 stage、人工 approve）：发布命令换成 `pnpm stage publish`。
+      # 切换前先到 npmjs 上该包 Settings → Trusted publishing 看一眼 Allowed actions：npm 文档在这里
+      # 两处说法不一致（网页说 `npm stage publish` 一直允许；API 却把 createStagedPackage 列成一枚
+      # 可选权限），本仓没有本地判据能判它，所以别假定默认值——stage 第一步就被拒时先回来查这一页。
+      # approve 两条入口，都要 2FA，走哪条由人决定：
+      #   本机  `pnpm stage approve <stage-id> [--otp <码>]`（多个 id 一批共用一枚 OTP）
+      #   网页  npmjs.com → 该包 → Staged Packages → Approve
       - name: 发布
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TOKEN: ${{ secrets.NPM_TOKEN }}
+          USE_STATIC: ${{ steps.precheck.outputs.use_static }}
         run: |
-          if [ -n "$NPM_TOKEN" ]; then
-            export NODE_AUTH_TOKEN="$NPM_TOKEN"
+          set -euo pipefail
+          # 只有确实拿到可用静态 token 时才导出 NODE_AUTH_TOKEN。导出空串会让 setup-node
+          # 写进 .npmrc 的 ${NODE_AUTH_TOKEN} 占位被填成空值，认证以空凭据发出——
+          # 那是「配了 OIDC 却没 token」这条正常路径上的失败，不是发布本身的失败。
+          TOKEN_TIDY="$(printf '%s' "${TOKEN:-}" | tr -d '\r\n[:space:]')"
+          if [ "$USE_STATIC" = "true" ] && [ -n "$TOKEN_TIDY" ]; then
+            echo "::add-mask::$TOKEN_TIDY"
+            export NODE_AUTH_TOKEN="$TOKEN_TIDY"
+            echo "凭据：静态 token 已就位（OIDC 交换成功时 pnpm 仍优先用 OIDC）"
+          else
+            echo "凭据：OIDC trusted publishing"
           fi
-          pnpm publish --no-git-checks --access public --provenance --publish-wait-timeout 600000
+          pnpm publish --no-git-checks --access public --provenance

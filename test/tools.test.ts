@@ -30,10 +30,10 @@ import type { CrawlJobRunner, CrawlSink, ToolSettings } from "../lib/tools.ts";
 import type { AnswerRequest, AnswerResult } from "../lib/answer.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
+import { LOCAL_PYTHON } from "./python-bin.ts";
 
 const REPO = path.resolve(import.meta.dirname, "..");
 const BRIDGE = path.join(REPO, "py", "bridge.py");
-const LOCAL_PYTHON = path.join(REPO, "_env", ".venv", "bin", "python3");
 
 /** 测试里反复用到的示例 XHR 接口 URL。 */
 const SAMPLE_API = "https://api.test/items";
@@ -237,6 +237,24 @@ describe("capText", () => {
 
   it("预算为零时也原样返回（不做无意义的截断）", () => {
     expect(capText("hello", 0, "x").text).toBe("hello");
+  });
+
+  it("非有限或不足 1 的预算回落到安全兜底，而不是静默关闭截断", () => {
+    // 本函数存在的理由就是别让超大正文整份进上下文；预算坏掉时只有两条出路——
+    // 兜底预算或显式报错。静默放行等于把闸门拆掉。
+    const body = "x".repeat(400_000);
+    for (const budget of [Number.NaN, 0, 0.5]) {
+      const result = capText(body, budget, "再取一次");
+      expect(result.truncated).toBe(true);
+      expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(200_000);
+    }
+  });
+
+  it("小数预算向下取整，尾部字节数不带小数进 TextRetainer", () => {
+    const body = "A".repeat(500) + "B".repeat(500);
+    const result = capText(body, 600.9, "再取一次");
+    expect(result.truncated).toBe(true);
+    expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(600);
   });
 
   it("超预算时做头尾截断，并给出说明省了多少", () => {
@@ -1248,6 +1266,44 @@ describe("scrapling_answer", () => {
     )) as { rendered: boolean };
     expect(fake.calls[0]?.method).toBe("render");
     expect(result.rendered).toBe(true);
+  });
+
+  it("静态支路补上 timeoutSeconds（部署级 requestTimeoutSeconds 不补就对它无效），浏览器支路不发", async () => {
+    // 两条支路都落进 Python 的 _static_params / 浏览器适配器：前者读 timeoutSeconds，
+    // 后者不读这个键 —— 发了就是「拧了没反应」的老毛病。
+    const staticFake = fakeSidecar({
+      url: SAMPLE_URL,
+      status: 200,
+      content: "a",
+      truncated: false,
+    });
+    const staticTool = createAnswerTool({
+      sidecar: staticFake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await staticTool.execute({ url: SAMPLE_URL, question: "q" }, ANSWER_EXEC);
+    expect(staticFake.calls[0]?.method).toBe("fetch");
+    const staticParams = staticFake.calls[0]?.params as Record<string, unknown> | undefined;
+    expect(staticParams?.["timeoutSeconds"]).toBe(SETTINGS.requestTimeoutSeconds);
+
+    const renderFake = fakeSidecar({
+      url: SAMPLE_URL,
+      status: 200,
+      content: "b",
+      truncated: false,
+    });
+    const renderTool = createAnswerTool({
+      sidecar: renderFake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await renderTool.execute({ url: SAMPLE_URL, question: "q", render: true }, ANSWER_EXEC);
+    expect(renderFake.calls[0]?.method).toBe("render");
+    const renderParams = renderFake.calls[0]?.params as Record<string, unknown> | undefined;
+    expect(renderParams?.["timeoutSeconds"]).toBeUndefined();
   });
 
   it("问答失败时原样抛，不把错误包成一个看起来成功的空答案", async () => {

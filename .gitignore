@@ -24,3 +24,16 @@ __pycache__/
 # 探针脚本用的虚拟环境：404MB，机器本地状态，不入库
 _env/.venv/
 
+# 本地环境文件：机器相关、常带密钥，只放行模板
+.env
+.env.*
+!.env.example
+
+# 运行期日志（工具会追加写，内容随机器与调用变化）
+*.log
+
+# Python 工具链缓存：ruff / mypy 会在各自的缓存目录里写一份 `*` 的 .gitignore，
+# 所以它们在 `git status` 里本就不出现；pytest 与打包产物没有这层自忽略，得在这里挡。
+.pytest_cache/
+*.egg-info/
+

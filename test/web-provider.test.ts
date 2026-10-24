@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { WebError } from "@deepseek-ai/dsh-web";
 import { createWebFetchProvider, PROVIDER_ID, toBodyKind } from "../lib/web-provider.ts";
+import { SidecarError } from "../lib/sidecar-error.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
 
 /** 造一个不发任何请求的 sidecar 客户端。 */
@@ -93,6 +94,40 @@ describe("fetch", () => {
     expect(result.truncated).toBe(true);
   });
 
+  it("超预算时正文真的被裁到预算以内，不只是标一个 truncated", async () => {
+    // 只置 truncated 而原样返回超长正文的话，那段正文照样进上下文与会话日志，
+    // 而 truncated: true 反而让调用方以为已经裁过了。
+    const client = stubSidecar();
+    Object.assign(client, {
+      call: async (): Promise<unknown> => ({
+        url: "u",
+        status: 200,
+        content: "y".repeat(9000),
+        truncated: false,
+      }),
+    });
+    const result = await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+    expect(Buffer.byteLength(result.body.content, "utf8")).toBeLessThanOrEqual(DEPS.maxOutputBytes);
+    expect(result.body.content.length).toBeLessThan(9000);
+  });
+
+  it("多字节正文同样按预算收口，不会靠字符数蒙混过去", async () => {
+    // 预算这一个数同时是 sidecar 的 maxContentChars（字符）与 capText 的字节预算。
+    // 中文一个字三字节，所以 3000 个中文在字节预算下确实超了：收口按字节算，如实标真截断。
+    const client = stubSidecar();
+    Object.assign(client, {
+      call: async (): Promise<unknown> => ({
+        url: "u",
+        status: 200,
+        content: "中".repeat(3000),
+        truncated: false,
+      }),
+    });
+    const result = await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+    expect(result.truncated).toBe(true);
+    expect(Buffer.byteLength(result.body.content, "utf8")).toBeLessThanOrEqual(DEPS.maxOutputBytes);
+  });
+
   it("回包不是对象时抛错，而不是补成一张空白的成功页", async () => {
     // 补成 { statusCode: 0, content: "" } 的话，调用方会把 0 当成真实状态码、把空正文
     // 当成「这个页面本来就没内容」—— 对端协议一坏，结果就是一片看着正常的空结果。
@@ -133,11 +168,11 @@ describe("fetch", () => {
     expect(seen).toStrictEqual([{ hasSignal: true }, { hasSignal: false }]);
   });
 
-  it("sidecar 抛错时包成带 code 的 WebError", async () => {
+  it("sidecar 抛错时包成带 code 的 WebError，并把 sidecar 的码带进消息", async () => {
     const client = stubSidecar();
     Object.assign(client, {
       call: async (): Promise<unknown> => {
-        throw new Error("boom");
+        throw new SidecarError("URL_BLOCKED", "blocked by the host gate");
       },
     });
     const provider = createWebFetchProvider({ ...DEPS, sidecar: client });
@@ -151,7 +186,50 @@ describe("fetch", () => {
     }
     expect(caught).toBeInstanceOf(WebError);
     expect(caught?.code).toBe("SCRAPLING_FETCH_FAILED");
-    expect(caught?.message).toContain("boom");
+    // 外层码统一是 SCRAPLING_FETCH_FAILED（WebError 的 code 是开放的 provider 码），
+    // 但内层 sidecar 码必须留在消息里：「被安全闸门拦下」与「sidecar 超时」要采取的行动不同。
+    expect(caught?.message).toContain("URL_BLOCKED");
+    expect(caught?.message).toContain("blocked by the host gate");
+  });
+
+  it("sidecar 抛的不是 SidecarError 时，消息里不带空的码前缀", async () => {
+    // 码前缀只在真有码时拼。非 sidecar 错误也拼的话，消息会以「: 」开头 —— 调用方读到的是
+    // 一段以冒号起头的文本，看不出这条错误有没有码。
+    const client = stubSidecar();
+    Object.assign(client, {
+      call: async (): Promise<unknown> => {
+        throw new Error("socket hang up");
+      },
+    });
+    let caught: (Error & { code?: string }) | undefined;
+    try {
+      await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+    } catch (error) {
+      caught = error as Error & { code?: string };
+    }
+    expect(caught).toBeInstanceOf(WebError);
+    expect(caught?.message).toBe("Error: socket hang up");
+  });
+
+  it("调用方取消时原样抛出，不被包成一次抓取失败", async () => {
+    // 包成抓取失败的话，调用方会把一次用户已经放弃的请求当成可重试的故障。
+    const client = stubSidecar();
+    const controller = new AbortController();
+    Object.assign(client, {
+      call: async (): Promise<unknown> => {
+        controller.abort();
+        throw new SidecarError("SIDECAR_ABORTED", "aborted");
+      },
+    });
+    const provider = createWebFetchProvider({ ...DEPS, sidecar: client });
+    let caught: unknown;
+    try {
+      await provider.fetch({ url: "u" }, controller.signal);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(SidecarError);
+    expect((caught as SidecarError).code).toBe("SIDECAR_ABORTED");
   });
 });
 

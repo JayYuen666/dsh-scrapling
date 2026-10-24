@@ -10,9 +10,10 @@
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { existsSync } from "node:fs";
+import { LOCAL_PYTHON } from "./python-bin.ts";
 
 const REPO = path.resolve(import.meta.dirname, "..");
-const LOCAL_PYTHON = path.join(REPO, "_env", ".venv", "bin", "python3");
 const PROBE = path.join(REPO, "py", "tests", "contract_probe.py");
 
 /** 探针记录的一个调用点：站点名与它实际发出的键。 */
@@ -132,10 +133,28 @@ export interface ProbeReport {
 /**
  * 跑一次探针。
  *
+ * 解释器与脚本都先判存在：CI 上没有 `_env/.venv` 时 `spawn` 会给一个裸 ENOENT，那句
+ * 「spawn ... ENOENT」分不清缺的是解释器还是探针脚本，而两者的修法完全不同。
+ * 判过之后再挂 `error` 监听兜住其余启动失败（例如解释器在但不可执行）。
+ *
+ * 等的是 `close` 而不是 `exit`：Node 文档明写 `exit` 触发时 stdio 流可能尚未读完，探针
+ * 输出稍大一点 `Buffer.concat` 就会拿到截断的 JSON —— 表现为随机失败，最难查。`close`
+ * 的第二个返回值是终止信号：进程被信号打死时 `code` 是 null，只报「以 null 退出」等于
+ * 把真正的死因丢掉。
+ *
  * @returns 探针报告
- * @throws 探针非零退出或输出不是 JSON
+ * @throws 探针不存在、起不来、非零退出（或被信号终止）、输出不是 JSON
  */
 export async function runProbe(): Promise<ProbeReport> {
+  if (!existsSync(LOCAL_PYTHON)) {
+    throw new Error(
+      `缺少探针解释器：${LOCAL_PYTHON} 不存在。\n` +
+        '先建好环境：pip install "scrapling[rag]>=0.5,<0.6"（CI 上由 publish.yml 那一步代劳）。',
+    );
+  }
+  if (!existsSync(PROBE)) {
+    throw new Error(`缺少探针脚本：${PROBE} 不存在。它随仓库发布，不该缺席。`);
+  }
   const child = spawn(LOCAL_PYTHON, [PROBE], { cwd: REPO, stdio: ["ignore", "pipe", "pipe"] });
   const out: Buffer[] = [];
   const err: Buffer[] = [];
@@ -146,13 +165,15 @@ export async function runProbe(): Promise<ProbeReport> {
     err.push(chunk);
   });
   // 探针不是 sidecar：它只写一行结论到 stdout，所以这里等它自己退，不超时也不杀。
-  const [code] = (await once(child, "exit")) as [number | null];
+  const [code, signal] = (await once(child, "close")) as [number | null, NodeJS.Signals | null];
   const stdout = Buffer.concat(out).toString("utf8");
   if (code !== 0) {
     // 非零退出时栈全在 stderr 那一侧，不接出来就只剩「命令失败」一句废话。
-    throw new Error(
-      `探针以 ${String(code)} 退出\nstderr:\n${Buffer.concat(err).toString("utf8").slice(-4000)}`,
-    );
+    const how =
+      signal === null
+        ? `以 ${String(code)} 退出`
+        : `被信号 ${signal} 终止（exit code ${String(code)}）`;
+    throw new Error(`探针${how}\nstderr:\n${Buffer.concat(err).toString("utf8").slice(-4000)}`);
   }
   try {
     return JSON.parse(stdout) as ProbeReport;

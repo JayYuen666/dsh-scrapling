@@ -4,11 +4,14 @@ import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 import { setImmediate } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
-import { decodeFrame, encodeFrame, FrameSplitter, pumpFrames } from "../lib/jsonl.ts";
+import {
+  decodeFrame,
+  encodeFrame,
+  FRAME_ERROR_KINDS,
+  FrameSplitter,
+  pumpFrames,
+} from "../lib/jsonl.ts";
 import { FrameError } from "../lib/frame-error.ts";
-
-/** FrameError 里「不是合法 JSON」那一类的 kind，抽成常量免得重复字面量。 */
-const UNPARSABLE_JSON = "unparsable-json";
 
 /** 什么都不做的替身。 */
 const noop = (): void => undefined;
@@ -74,7 +77,14 @@ describe("encodeFrame", () => {
   it("序列化失败时立刻抛 FrameError，而不是拖到写管道时才炸", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic["self"] = cyclic;
-    expect(kindOf(() => encodeFrame(cyclic))).toBe(UNPARSABLE_JSON);
+    expect(kindOf(() => encodeFrame(cyclic))).toBe(FRAME_ERROR_KINDS.unparsableJson);
+  });
+
+  it("序列化成 undefined 的载荷同样抛 FrameError", () => {
+    // JSON.stringify 对 undefined、函数、Symbol 不抛错，而是返回 undefined。把那个
+    // undefined 当字符串交给管道，写出的是字面量 "undefined"，对端解析成标量后按
+    // 「不是对象」丢掉 —— 症状是一帧凭空消失，而不是一条能定位的报错。
+    expect(kindOf(() => encodeFrame(undefined))).toBe(FRAME_ERROR_KINDS.unparsableJson);
   });
 });
 
@@ -84,12 +94,12 @@ describe("decodeFrame", () => {
   });
 
   it("非法 json 抛 unparsable-json", () => {
-    expect(kindOf(() => decodeFrame("not json"))).toBe(UNPARSABLE_JSON);
+    expect(kindOf(() => decodeFrame("not json"))).toBe(FRAME_ERROR_KINDS.unparsableJson);
   });
 
   it("数组与标量都算 not-an-object", () => {
     for (const line of ["[]", "123", '"x"', "null", "true"]) {
-      expect(kindOf(() => decodeFrame(line))).toBe("not-an-object");
+      expect(kindOf(() => decodeFrame(line))).toBe(FRAME_ERROR_KINDS.notAnObject);
     }
   });
 });
@@ -155,14 +165,16 @@ describe("pumpFrames", () => {
 });
 
 describe("frame splitter 上限", () => {
-  it("残片超过上限时抛 FrameError 而不是无界攒下去", () => {
+  it("残片超过上限时抛独立的 frame-too-large 分类，而不是冒充协议损坏", () => {
+    // 限流/长度一类与「JSON 解析失败」要采取的行动相反：下游按 kind 决定丢连接或重试时，
+    // 两者混成一个分类会把限流误判成对端坏了。
     const splitter = new FrameSplitter();
     const kind = kindOf(() => {
       for (let index = 0; index < 200; index += 1) {
         splitter.push("x".repeat(64 * 1024));
       }
     });
-    expect(kind).toBe(UNPARSABLE_JSON);
+    expect(kind).toBe(FRAME_ERROR_KINDS.frameTooLarge);
   });
 
   it("超限后缓冲被丢弃，下一帧正常，不会永远卡在坏状态里", () => {
@@ -173,7 +185,7 @@ describe("frame splitter 上限", () => {
           splitter.push("x".repeat(64 * 1024));
         }
       }),
-    ).toBe(UNPARSABLE_JSON);
+    ).toBe(FRAME_ERROR_KINDS.frameTooLarge);
     expect(splitter.push(`${FRAME_B}\n`)).toStrictEqual([FRAME_B]);
   });
 });

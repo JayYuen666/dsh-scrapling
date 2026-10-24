@@ -1,0 +1,329 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+  # 每周跑一次，抓的是**环境漂移**，不是依赖漂移：install 走 `--frozen-lockfile`，而
+  # @deepseek-ai/* 那族在 pnpm-workspace.yaml 的 overrides 里钉死，所以上游发新版不会改变
+  # 这一跑装到的树。会浮动的是这几样：runner 镜像自身、`version: 12` 解析到的 pnpm 补丁版、
+  # `node-version` 与 `python-version` 解析到的补丁版，以及那段
+  # `pip install "scrapling[rag]>=0.5,<0.6"` 与其传递依赖。public 仓的标准 runner 免费。
+  # 注意：public 仓 60 天无活动时，GitHub 会自动停用定时工作流——这不需要额外维护，
+  # 但「上周没跑」不等于「上周全绿」，读结论时别把它当连续证据。
+  schedule:
+    - cron: "37 3 * * 1"
+# 同一分支上后到的提交取消前一个。发布用的是另一套口径（publish.yml 的
+# cancel-in-progress: false）——发布不能中途取消。
+# 组的键里带 event_name：周度那一跑与 main 上的 push 都落在 refs/heads/main 上，
+# 只按 ref 分组会让后到的把先到的取消掉，而周度那一跑是环境漂移的唯一信号，
+# 被取消等于这一周没量到。取消只给 push 与 pull_request：同一分支连推几次时，旧那一轮
+# 的矩阵没有任何人还要它的结论；其余事件各占一组，互不覆盖。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+# 门槛只需要读代码。写成白名单而不是省略：省略会拿到仓库默认权限，而默认可能是读写。
+permissions:
+  contents: read
+jobs:
+  gate:
+    name: gate (${{ matrix.os }}, node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 不跑 win32：本仓的 py 入口是 `sh -c '… _env/.venv/bin/python …'`，那是 POSIX 形态，
+        # win32 上没有 sh，也没有 bin/ 布局。给 win32 一格会红在环境上而不是红在代码上。
+        os: [ubuntu-latest, macos-latest]
+        node: [22, 24]
+        exclude:
+          # 平台行为与 node 版本是两个正交维度：macOS 那一格只跑 node 24，
+          # 不让矩阵从 2 格变 4 格。全 9 仓的门禁在本机（darwin）上实跑通过，
+          # 所以这一格验的是真实 darwin 行为，不是重复劳动。
+          - os: macos-latest
+            node: 22
+    runs-on: ${{ matrix.os }}
+    # 官方对单 job 的上限是 6 小时，那是「系统允许」不是「应该允许」。不设这一行，
+    # 一个卡住的 install 或测试会烧满 6 小时 runner 分钟才被杀，而期间没有任何信号。
+    timeout-minutes: 35
+    # 定时触发的运行会把整个矩阵跑一遍。这里**不能**用 job 级 if 去裁矩阵：
+    # jobs.<job_id>.if 可用的上下文只有 github / needs / vars / inputs，没有 matrix，
+    # 写 matrix.os 会被判「Invalid workflow file」而让整个工作流加载失败。
+    # 想只跑主格只能放进 matrix 本身或拆成独立工作流；全矩阵每周跑一遍在 public 仓免费。
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
+          # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 12
+      # registry-url 留空：本仓 CI 不发布，装依赖走包自己的 .npmrc（@jayyuen66 指向公共 npm）。
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      # 解释器地板与 pyproject.toml 的 ruff target-version / mypy python_version 是同一件事。
+      # 这里落后于地板，Python 门禁那条 check 就永远不可能绿。
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+          # 缓存键取自下面的依赖文件；scrapling[rag] 本身不在其中，但它依赖的
+          # 那一大批轮子在这一层被复用，省掉最大的一段下载时间。
+          cache: pip
+          cache-dependency-path: py/requirements-dev.txt
+      # test/global-setup.ts 在模块加载期就要求 _env/.venv/bin/python3 存在，缺了整套件直接
+      # 抛错（刻意不跳过：跳过等于悄悄降低四项 100% 覆盖率）。那个目录被 gitignore，是机器
+      # 本地状态，所以 CI 上必须自己备一份——与 publish.yml 的「备 sidecar 解释器」同源。
+      #
+      # 装 `scrapling[rag]` 而不是 `scrapling[fetchers]`：extractionType 默认 markdown，
+      # markdownify 在 rag 这个 extra 里；装成 fetchers 的话第一次抓取就 ModuleNotFoundError。
+      # 浏览器刻意不装：没有浏览器二进制时那几节用例按档跳过，而 test:py 的检查条数下限分
+      # 两档（MIN_CHECKS_WITH_BROWSER / MIN_CHECKS_WITHOUT_BROWSER），由测试自己探测。
+      - name: 备 sidecar 解释器（Python 门禁与 global-setup 的前提）
+        run: |
+          python -m venv _env/.venv
+          _env/.venv/bin/python -m pip install --upgrade pip
+          _env/.venv/bin/python -m pip install "scrapling[rag]>=0.5,<0.6"
+          _env/.venv/bin/python -c "import scrapling; print('scrapling', scrapling.__version__)"
+      # 版本在 py/requirements-dev.txt 里精确钉：规则集随版本漂移，不钉的话「升级 ruff」与
+      # 「新写一处违规」在门禁上长得一模一样。缺这一步时 check:py 会以 "No module named ruff"
+      # 硬失败——刻意不跳过。
+      # 把 venv 顶到 PATH 上。门禁本身**不依赖**这一行：check:py / test:py 走的是 package.json
+      # 的 `py` 脚本，那个脚本在 `_env/.venv/bin/python` 可执行时直接用它的绝对路径（与根
+      # `scripts/lib/py-env.mjs` 的规则同一条），所以选中哪支解释器与 PATH 无关。留它是为了
+      # 让后续步骤里任何一处按名字调用 `python3` 的写法解析到装了 ruff 与 scrapling 的这一支，
+      # 而不是 hostedtoolcache 的解释器——那种解析只影响按名字调用的地方，不改变门禁的判据。
+      - name: 备 Python 检查工具
+        run: |
+          _env/.venv/bin/python -m pip install -r py/requirements-dev.txt
+          echo "${GITHUB_WORKSPACE}/_env/.venv/bin" >> "$GITHUB_PATH"
+      # --frozen-lockfile：lockfile 与 package.json 不一致时直接失败，而不是在 CI 里静默改一份
+      # lockfile 后继续跑——那样绿的是「CI 现场解出来的那棵树」，不是仓库里这一份。
+      - run: pnpm install --frozen-lockfile
+      # check 已含 check:py 的八步链（py:which → face:py → ruff → fmt → mypy → sidecar 端到端 →
+      # bandit → 覆盖率地板）。强度只写在那一条链里：在 CI 里另起一步就会出现两套说法互相打脸
+      # 的形状（一步拦、一步只记录），所以这里不重复跑 Python 面。
+      - run: pnpm run check
+      # 覆盖率只在一次运行的日志里滚一遍就没了，翻起来费劲。落成产物之后，
+      # 「这次为什么掉了」可以直接把报告下下来看，而不必重跑一次。
+      # 只收 ubuntu 的 node 24 那一格：其余格各传一份只会得到同样的报告。
+      - name: 上传覆盖率报告
+        if: always() && matrix.os == 'ubuntu-latest' && matrix.node == 24
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+          # 这里取 warn 而不是 error：这一步在 `if: always()` 下跑，而 coverage/
+          # 由 `pnpm run check` 里的 vitest 产出——typecheck / lint / build 任一先红时
+          # 目录根本不存在。此时判红会盖住真正的失败原因，还把后面的步骤一起中断。
+          # 缺产物本身就是「门禁没跑完」的信号，不需要这一步再报一次。
+          if-no-files-found: warn
+      # 判的是门禁有没有回头改写**被跟踪文件**：为零说明这一趟没有动到仓库内容。
+      # 必须带 always()：`pnpm run check` 中途红掉时，改写了文件的那一步照样可能已经跑过，
+      # 跳过它就会把「门禁改了仓库」和「门禁没跑完」混成同一件事。
+      # 改写面几乎全部落在 .gitignore 里（host.js / client.js / coverage/ / __pycache__），
+      # 所以这一步在现状下极少失败；它留着的理由是覆盖「产物被误提交成跟踪文件」那一档。
+      - name: 校验门禁没有改写被跟踪文件
+        if: always()
+        run: test -z "$(git status --porcelain --untracked-files=no)"
+
+      # 运行页顶部的摘要：把结果留在这一页，不必点进每一步的日志里找。
+      # 它必须排在 job 的最后一步：job.status 在执行到那一步时才求值，后面若还有判定步骤，
+      # 后续步骤失败而摘要早已写成 success——那一行会成为唯一的结论面，且是错的。
+      - name: 运行摘要
+        if: always()
+        # 脚本体是 bash 写法（`{ …; } >> "$GITHUB_STEP_SUMMARY"`），显式声明 shell 是为了让
+        # 这段脚本不依赖 runner 的默认值：ubuntu 与 macos 的默认 shell 本来都是 bash，所以
+        # 这一行在现有矩阵里是冗余的；留着它是因为将来若加非 POSIX 格（Windows 的默认是
+        # pwsh）时，那段写法会当场解析失败，而不是悄悄换一种语义。
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.os }} / node ${{ matrix.node }}"
+            echo ""
+            echo "- 门禁：${{ job.status }}"
+            echo '- 门禁命令：pnpm run check'
+          } >> "$GITHUB_STEP_SUMMARY"
+  # install-probe：门禁绿了不等于「装出去能用」。判据只能在消费侧的安装布局上，
+  # 所以这里打真包、进干净目录、真 import。Python 腿不在这一步：它验的是 JS 产物面。
+  install-probe:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # 只读。这个 job 在 PR 上也会跑，而 pnpm pack 会执行 PR 代码里的 prepack、npm install 会
+    # 执行依赖的安装脚本；给它任何写入权限，等于让 PR 里的代码决定用那权限做什么。
+    # 签来源证明需要的那两项权限留在下面的 attest job 里。
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
+          # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 12
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # 只用 pnpm pack：`npm pack` 不解析 `catalog:`，会把未解析的协议原样写进 tarball 的
+      # package.json，随后任何 `npm install` 都在
+      # EUNSUPPORTEDPROTOCOL Unsupported URL Type "catalog:" 上失败——那不是产物缺陷，
+      # 是打包器选错了。publish.yml 走的是 `pnpm publish`。
+      - name: 打包（发布器与 CI 都用 pnpm）
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pkg
+          pnpm pack --pack-destination /tmp/pkg
+      # 交给 attest job。PR 的产物不签来源证明，传上去只是多一份没人认领的字节。
+      - name: 留存 tarball 供 attest 使用
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-tarball
+          path: /tmp/pkg/**/*.tgz
+          retention-days: 7
+          if-no-files-found: error
+      - name: 干净目录安装 tarball（显式带上 optional 宿主 peer）
+        run: |
+          set -euo pipefail
+          tarball="$(find /tmp/pkg -name '*.tgz' -print -quit)"
+          # dsh-tools 是 optional peer：npm 不会自动装 optional peer，但 host.js 在运行期
+          # 按值 import 它。探针必须按 tarball 声明的精确版本把它一并装上，才能验入口面。
+          host_tools="$(node -e 'const p=require("./package.json"); process.stdout.write(p.peerDependencies["@deepseek-ai/dsh-tools"])')"
+          mkdir -p /tmp/probe && cd /tmp/probe
+          npm init -y >/dev/null
+          # 不传 --legacy-peer-deps：非 optional 的 peer 仍由默认安装语义解析。
+          npm install "$tarball" "@deepseek-ai/dsh-tools@$host_tools" --no-audit --no-fund
+      - name: 装载探针（入口形状 + bundle patch 随包 + py 侧随包）
+        run: |
+          # 单引号是刻意的：脚本体里有 JS 模板串，交给 shell 展开就坏了。
+          set -euo pipefail
+          cd /tmp/probe
+          node --input-type=module -e '
+          import { existsSync, readFileSync } from "node:fs";
+          import { createRequire } from "node:module";
+          import path from "node:path";
+          const NAME = "@jayyuen66/dsh-scrapling";
+          const mod = await import(NAME);
+          // 入口形状两态都收：本仓是纯命名导出（apply / Config / inject 平铺在模块顶层），
+          // 而同级包里也有默认导出的。写死一种形态会让另一种假红。
+          const plugin = mod.default ?? mod;
+          if (typeof plugin?.apply !== "function") throw new Error("入口没有 cordis 插件形状：缺 apply");
+          if (plugin.Config === undefined) throw new Error("入口缺 Config：设置卡不会挂载");
+          const require = createRequire(import.meta.url);
+          const pkgDir = path.dirname(require.resolve(NAME + "/package.json"));
+          const manifest = require(NAME + "/package.json");
+          const patchRel = manifest.dsh?.bundle?.patch;
+          if (!patchRel) throw new Error("package.json 缺 dsh.bundle.patch：宿主不会把它 reconcile 进层栈");
+          const patch = path.join(pkgDir, patchRel);
+          if (!existsSync(patch)) throw new Error(`bundle patch 没随包发出：${patchRel}`);
+          const text = readFileSync(patch, "utf8");
+          // 守卫要判的是「有没有一条条目按裸包名引用本包」，不是「有没有 id 行」也不是
+          // 「全文出现过这个串」：注释里的 `# - id:` 会让前者过，而 `.../settings` 子路径
+          // 条目天然包含完整包名会让后者过——两种情况下主入口都丢了，条目却照样注册不上。
+          const patchLines = text.split(/\r?\n/u);
+          const entries = [];
+          for (let i = 0; i < patchLines.length - 1; i += 1) {
+            const idHit = /^[ \t]*-[ \t]*id:[ \t]*(\S+)[ \t]*$/u.exec(patchLines[i]);
+            if (idHit === null) continue;
+            const nameHit = /^[ \t]*name:[ \t]*(?:"([^"]*)"|(\S+))[ \t]*$/u.exec(patchLines[i + 1]);
+            if (nameHit === null) continue;
+            entries.push([idHit[1], nameHit[1] ?? nameHit[2]]);
+          }
+          if (entries.length === 0) throw new Error(`bundle patch 里没有 id/name 条目：${patchRel}`);
+          if (!entries.some(([, name]) => name === NAME)) throw new Error(`bundle patch 没有按裸包名引用 ${NAME} 的条目`);
+          // Python sidecar 必须随包：发布物里没有 py/ 的话，装得上、跑不了，而所有 JS 门禁全绿。
+          const bridge = path.join(pkgDir, "py", "bridge.py");
+          if (!existsSync(bridge)) throw new Error("py/bridge.py 没随包发出：sidecar 起不来");
+          console.log("装载通过：apply / Config / bundle patch / py sidecar 均就位");
+          '
+
+  # 来源证明是给「这次运行打出来的这份产物」出的第三方可验凭据，不是多一步验证：
+  # 签在 PR 上，那张证明看起来属于本仓，指向的却是 PR 里 prepack 脚本产出的字节。
+  # 它也不能靠在同一 job 里给某一步加 if 来做——id-token 与 attestations 是 job 级权限，
+  # 挂上去就等于 PR 也拿到了写入能力，权限面不会因为某一步被跳过而收窄。所以拆成独立 job。
+  attest:
+    needs: install-probe
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # 官方 README 要求三枚：id-token 换 Sigstore 身份，attestations 落证明，
+      # artifact-metadata 建产物存储记录。少最后一枚时证明仍能签，但存储记录那一步会失败。
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      # 不检出仓库：要签的是上面那一份产物的字节，与工作树无关。
+      - name: 取回 tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-tarball
+          path: /tmp/pkg
+      - name: 生成构建来源证明
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: /tmp/pkg/**/*.tgz
+
+  # 依赖审查：只在 PR 上跑。它比的是「这个 PR 引入的依赖」与 GitHub Advisory Database，
+  # 拦的是「今天能装、明天被披露有洞」那一类。push 上没有「引入」这个概念，所以不跑。
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
+          # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
+          persist-credentials: false
+      - name: 依赖审查
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # 高危即拦；低危只记录，否则一次上游披露会把所有仓的门都堵上。
+          fail-on-severity: high
+
+  # 工作流文件自身的静态检查。它抓的是「YAML 合法但 GitHub 不接受」那一类：
+  # 未知上下文、表达式语法、事件与输入拼写、shell 片段问题。job 级 if 里写 matrix
+  # 就属于这一类——YAML 解析得过，但整份工作流在 GitHub 上加载不起来。
+  #
+  # 只读权限：这个 job 只读工作流文件，不该有写仓库的能力。
+  # 覆盖本仓全部工作流（含 publish.yml）：只忽略 SC2016（理由见下），其余提示照常判红。
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
+          # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
+          persist-credentials: false
+      - name: 跑 actionlint
+        run: |
+          set -euo pipefail
+          # 版本与字节都钉住：release 的标签可以被上游移动，而这一个 job 是「工作流文件合不合法」
+          # 的唯一判据——判据本身可换，等于没有判据。校验和取自该 release 的
+          # actionlint_<版本>_checksums.txt，与本机下载到的产物逐字节核对过。
+          version=1.7.12
+          sha256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$sha256" /tmp/actionlint.tar.gz | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          # -ignore SC2016：探针脚本刻意用单引号包住 JS（脚本体里有 JS 模板串，
+          # 交给 shell 展开就坏了）。这是 shellcheck 的误报，而 shellcheck 指令在
+          # 跨行单引号构造上不被采信（已实测），所以只忽略这一条规则。
+          # shell 先把 glob 展开，再把文件清单交给它。
+          /tmp/actionlint -ignore 'SC2016' .github/workflows/*.yml

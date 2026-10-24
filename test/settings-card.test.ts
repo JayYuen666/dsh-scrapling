@@ -185,6 +185,16 @@ describe("displayValue", () => {
     expect(displayValue(fieldOf("crawlMaxItems"), { crawlMaxItems: 42 }, {})).toBe("42");
     expect(displayValue(fieldOf("headless"), { headless: false }, {})).toBe("false");
   });
+
+  it("非法原文压过草稿与宿主值：用户敲的那半截数要原样留在控件里", () => {
+    // 若回退去显示宿主值，控件会在下一次渲染时把用户刚输的东西换掉，而保存按钮同时
+    // 是禁用的 —— 界面上看不出哪里不对，只看到自己打的字被吃了。
+    const field = fieldOf("crawlMaxItems");
+    expect(
+      displayValue(field, { crawlMaxItems: 42 }, { crawlMaxItems: 7 }, { crawlMaxItems: "1." }),
+    ).toBe("1.");
+    expect(displayValue(field, { crawlMaxItems: 42 }, {}, { crawlMaxItems: "-" })).toBe("-");
+  });
 });
 
 describe("controlType", () => {

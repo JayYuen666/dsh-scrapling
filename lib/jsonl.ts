@@ -8,10 +8,7 @@
 
 import type { Readable } from "node:stream";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
-import { FrameError } from "./frame-error.ts";
-
-/** 「不是合法 JSON」这一类帧错误的 kind；抽成常量是因为它在三处出现。 */
-const UNPARSABLE = "unparsable-json";
+import { FRAME_ERROR_KINDS, FrameError } from "./frame-error.ts";
 
 /**
  * 把任意值编码成一帧。
@@ -23,13 +20,21 @@ const UNPARSABLE = "unparsable-json";
  * @returns 不含换行的单行 JSON
  */
 export function encodeFrame(value: unknown): string {
+  let encoded: string | undefined;
   try {
-    return JSON.stringify(value);
+    encoded = JSON.stringify(value);
   } catch (error) {
-    throw new FrameError(UNPARSABLE, "frame is not JSON-serialisable", {
+    throw new FrameError(FRAME_ERROR_KINDS.unparsableJson, "frame is not JSON-serialisable", {
       cause: error,
     });
   }
+  // JSON.stringify 对 undefined、函数、Symbol 不抛错而是返回 undefined：直接把它当
+  // string 返回会在管道里写出字面量 "undefined" 或触发难以排查的写失败。序列化失败
+  // 必须在这里就炸出来。
+  if (encoded === undefined) {
+    throw new FrameError(FRAME_ERROR_KINDS.unparsableJson, "frame is not JSON-serialisable");
+  }
+  return encoded;
 }
 
 /**
@@ -43,12 +48,19 @@ export function decodeFrame(line: string): Record<string, unknown> {
   try {
     parsed = JSON.parse(line);
   } catch (error) {
-    throw new FrameError(UNPARSABLE, `frame is not valid JSON: ${line.slice(0, 120)}`, {
-      cause: error,
-    });
+    throw new FrameError(
+      FRAME_ERROR_KINDS.unparsableJson,
+      `frame is not valid JSON: ${line.slice(0, 120)}`,
+      {
+        cause: error,
+      },
+    );
   }
   if (!isRecord(parsed)) {
-    throw new FrameError("not-an-object", `frame must be a JSON object: ${line.slice(0, 120)}`);
+    throw new FrameError(
+      FRAME_ERROR_KINDS.notAnObject,
+      `frame must be a JSON object: ${line.slice(0, 120)}`,
+    );
   }
   return parsed;
 }
@@ -93,8 +105,10 @@ export class FrameSplitter {
     }
     if (this.#buffer.length > MAX_FRAME_BYTES) {
       this.#buffer = "";
+      // 长度超限按独立的分类抛，而不是「不是合法 JSON」：下游若按 kind 决定丢弃连接或
+      // 重试，把限流一类当成对端协议损坏会走向完全相反的行动。
       throw new FrameError(
-        UNPARSABLE,
+        FRAME_ERROR_KINDS.frameTooLarge,
         `a frame went over ${MAX_FRAME_BYTES} bytes without a newline`,
       );
     }
@@ -198,3 +212,4 @@ export function pumpFrames(
 
 export { FrameError } from "./frame-error.ts";
 export type { FrameErrorKind } from "./frame-error.ts";
+export { FRAME_ERROR_KINDS } from "./frame-error.ts";

@@ -92,18 +92,31 @@ function textOf(value: unknown): string {
 }
 
 /**
- * 控件里显示的字符串。草稿优先，其次宿主值，最后字段表里的默认值。
+ * 控件里显示的字符串。草稿优先，其次未保存的非法原文，再次宿主值，最后字段表里的默认值。
+ *
+ * 「非法原文」必须排在宿主值之前：用户敲了半截数（`1.`、`-`）时若回退去显示宿主值，
+ * 控件会在下一次渲染时把他刚输的东西换掉，而保存按钮同时是禁用的 —— 界面上看不出哪里
+ * 不对，只看到自己打的字被吃了。
  *
  * @param field - 字段描述
  * @param host - 宿主给的值
  * @param draft - 用户改过但还没保存的值
+ * @param invalidText - 此刻非法、不会被写出去的字段键 → 控件里的原始字符串
  * @returns 控件该显示的字符串
  */
 export function displayValue(
   field: FieldSpec,
   host: Record<string, unknown> | undefined,
   draft: Record<string, unknown>,
+  invalidText: Readonly<Partial<Record<string, string>>> = {},
 ): string {
+  // 声明成 Partial 而不是 `Record<string, string>`：没有 `noUncheckedIndexedAccess` 时
+  // 后者的下标被读成必有的 string，下面这条 undefined 判定会被判成恒真，而「没有非法
+  // 原文」恰恰是这张表的常态。
+  const typed = invalidText[field.key];
+  if (typed !== undefined) {
+    return typed;
+  }
   const edited = draft[field.key];
   if (edited !== undefined) {
     return textOf(edited);
@@ -348,14 +361,17 @@ function renderControl(props: {
     );
   }
   const input = createElement("input", {
-    type: field.kind === "number" ? "number" : controlType(field, revealed),
+    // 数字字段刻意用 text + inputMode，而不是 type="number"：后者的值由浏览器清洗，
+    // 粘贴非数字、只敲一个 `-` 或 `e` 时 event.target.value 会变成空串，于是 parseInput
+    // 读到空串判 clear、buildOps 生成 unset —— 用户输错一位就把自己那条覆盖静默删掉，
+    // 正是这份实现一路在避免的事。text 把原文完整交回来，非法与否由 parseInput 判。
+    type: controlType(field, revealed),
     value: shown,
     disabled,
+    ...(field.kind === "number" ? { inputMode: "numeric" } : {}),
     // 代理地址会被浏览器与密码管理器当成登录凭据：那会把部署方的代理密码收进一个
     // 它根本不打算保管的地方，所以这里显式关掉自动填充。
     ...(field.secret === true ? { autoComplete: "off", spellCheck: false } : {}),
-    min: field.kind === "number" ? 1 : undefined,
-    step: field.kind === "number" ? 1 : undefined,
     "aria-label": label,
     onChange: (event: { target: { value: string } }): void => {
       onChange(event.target.value);
@@ -474,9 +490,11 @@ interface Draft {
   readonly baseRevision: number | undefined;
   /** 此刻是非法输入、不会被写出去的字段键。 */
   readonly invalid: readonly string[];
+  /** 非法字段在控件里的原始字符串：控件要把它原样显示回去，否则用户看不清自己哪写错了。 */
+  readonly invalidText: Readonly<Record<string, string>>;
 }
 
-const EMPTY_DRAFT: Draft = { values: {}, baseRevision: undefined, invalid: [] };
+const EMPTY_DRAFT: Draft = { values: {}, baseRevision: undefined, invalid: [], invalidText: {} };
 
 /** 底部那一行按钮。 */
 function renderActions(props: {
@@ -556,7 +574,8 @@ export function SettingsCard(props: CardProps): ReactNode {
             const [key] = op.path;
             Reflect.deleteProperty(values, key);
           }
-          // 全发出去了就把围栏也一并清掉，否则下一次改动会继承一个已经过期的 revision。
+          // 围栏与非法原文都只对「草稿里还剩东西」有意义：清空之后就该回到干净起点，
+          // 否则下一次改动会继承一个已经过期的 revision 与一条没人再看的非法原文。
           return Object.keys(values).length === 0 ? EMPTY_DRAFT : { ...previous, values };
         });
       } else {
@@ -577,23 +596,28 @@ export function SettingsCard(props: CardProps): ReactNode {
     const parsed = parseInput(field, raw);
     setDraft((previous) => {
       const values = { ...previous.values };
+      const invalidText = { ...previous.invalidText };
       const invalid = previous.invalid.filter((key) => key !== field.key);
       // 围栏只在第一笔改动上记一次：之后同一张卡的草稿始终对着那一版配置。
       const baseRevision = previous.baseRevision ?? state.revision;
       if (parsed.kind === "invalid") {
-        // 非法输入留在控件里，但不当成「清除」：写出去的那一串操作里不含这个字段，
-        // 保存按钮也因为它在 invalid 里而不可用，用户看得见哪里没填对。
-        return { values, baseRevision, invalid: [...invalid, field.key] };
+        // 非法输入留在控件里，但不当成「清除」：这一笔既写不出去，也要把该字段**先前那版
+        // 合法草稿删掉**。留着它的话 buildOps 仍会把它算进操作串 —— 界面上显示着用户刚
+        // 敲的半截数，发出去的却是他已经放弃的旧值，注释里那句「不含这个字段」也就不成立。
+        Reflect.deleteProperty(values, field.key);
+        invalidText[field.key] = raw;
+        return { values, baseRevision, invalid: [...invalid, field.key], invalidText };
       }
+      Reflect.deleteProperty(invalidText, field.key);
       values[field.key] = parsed.kind === "clear" ? null : parsed.value;
-      return { values, baseRevision, invalid };
+      return { values, baseRevision, invalid, invalidText };
     });
   };
   const groups = SETTINGS_GROUPS.map((group) =>
     renderGroup({
       group,
       t,
-      shown: (field) => displayValue(field, state.value, draft.values),
+      shown: (field) => displayValue(field, state.value, draft.values, draft.invalidText),
       // 保存期间连控件一起锁：否则用户在 await 期间改了别的字段，成功后那笔改动会被清掉。
       disabled: !editable || saving,
       revealed: (field) => revealed.includes(field.key),

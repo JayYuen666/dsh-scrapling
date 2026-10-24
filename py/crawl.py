@@ -384,12 +384,18 @@ def _is_running(entry: dict[str, Any]) -> bool:
     """这个登记条目算不算「正在跑」。
 
     ``thread`` 为 ``None`` 表示 spider 还在构造中：它已经占了并发名额，所以算在跑。
+    ``thread.ident`` 为 ``None`` 是另一段窗口——线程对象已登记但还没 ``start()``。只按
+    ``is_alive()`` 判会在这段窗口里把条目当成已结束：并发的 :func:`crawl_run` 少算一个名额
+    （突破并发上限）、:func:`_evict_finished_crawls` 把它当历史淘汰（之后那次 ``start()``
+    就跑在没有登记项的蜘蛛上，叫不停）、:func:`crawl_stop` 判成不在跑。
 
     :param entry: 登记条目
     :returns: 是否占用名额
     """
     thread = entry.get("thread")
-    return thread is None or thread.is_alive()
+    if thread is None:
+        return True
+    return thread.ident is None or thread.is_alive()
 
 
 def _evict_finished_crawls() -> None:
@@ -461,14 +467,39 @@ def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _shrink_page(page: dict[str, Any], budget: int) -> dict[str, Any]:
+    """把单页压到 ``budget`` 字节以内。
+
+    ``maxContentChars`` 没有上界（部署侧的 ``fetchMaxOutputChars`` 只声明了 ``min(1)``），
+    所以「一页就超过回包预算」是可达的：这时 :func:`_take_pages` 若照原样把它交出去，那一帧
+    会顶过 Host 的 8 MiB 切帧线，整个 sidecar 连同正在跑的会话一起被判成坏帧拆掉。宁可回
+    一页被截断的正文，也不要拆进程。
+
+    截断量按**序列化之后**的剩余空间算：先量出除 markdown 以外的固定开销，再把 markdown
+    砍到剩下的额度。CJK 一个字在 UTF-8 里三字节，所以按字符砍之后还要复查一次字节数，
+    复查不过就继续砍，直到装得下或已砍空。
+
+    :param page: 原始页
+    :param budget: 这一页的字节预算
+    :returns: 压过的新页（不就地改原对象，state 里留全量）
+    """
+    overhead = len(json.dumps({**page, "markdown": ""}, ensure_ascii=False).encode("utf-8"))
+    room = max(0, budget - overhead)
+    markdown = str(page.get("markdown", ""))
+    clipped = markdown[:room] + "\n\n[truncated to fit the status frame budget]"
+    while len(clipped.encode("utf-8")) > room and clipped:
+        clipped = clipped[: max(0, len(clipped) - max(1, len(clipped) // 4))]
+    return {**page, "markdown": clipped, "truncated": True}
+
+
 def _take_pages(all_pages: list[dict[str, Any]], since: int) -> tuple[list[dict[str, Any]], bool]:
     """从 ``since`` 起取一段页，按 :data:`MAX_STATUS_BYTES` 封顶。
 
-    至少回一页：单页就超预算时也回它，否则调用方永远取不到下一页，轮询变成死循环。
-    单页体量由 ``max_content_chars`` 兜着，一页远小于 Host 那份 8 MiB 切帧上限。
+    至少回一页：单页就超预算时也回它，否则调用方永远取不到下一页，轮询变成死循环。但这一
+    页必须**压到预算之内**再回 —— 原样交出去的那一帧会顶过 Host 的 8 MiB 切帧线。
 
-    :param all_pages - 活页表
-    :param since - 已经读走多少页
+    :param all_pages: 活页表
+    :param since: 已经读走多少页
     :returns: (这一段的页, 后面还有没有)
     """
     if since >= len(all_pages):
@@ -477,6 +508,9 @@ def _take_pages(all_pages: list[dict[str, Any]], since: int) -> tuple[list[dict[
     spent = 0
     for index in range(since, len(all_pages)):
         size = len(json.dumps(all_pages[index], ensure_ascii=False).encode("utf-8"))
+        if size > MAX_STATUS_BYTES:
+            # 单页就超预算：压到预算内回它，并置 more 让调用方知道后面还有（或还有别的页）。
+            return [_shrink_page(all_pages[index], MAX_STATUS_BYTES)], index + 1 < len(all_pages)
         if taken and spent + size > MAX_STATUS_BYTES:
             return taken, True
         taken.append(all_pages[index])

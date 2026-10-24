@@ -1,19 +1,19 @@
 # 自动生成：catalog 键值与 overrides 取值来自根 pnpm-workspace.yaml，改根不改这里。
 autoInstallPeers: false
 catalog:
-  "@jayyuen66/dsh-plugin-shared": ^0.1.6
+  "@jayyuen66/dsh-plugin-shared": 0.1.9
   "@types/node": 26.6.5
   "@types/react": 19.3.0
   "@types/react-dom": 19.3.0
   "@vitest/coverage-v8": 5.0.5
   "eslint-plugin-sonarjs": 4.2.2
-  happy-dom: 21.0.3
-  oxfmt: 0.73.0
-  oxlint: 1.88.0
-  "oxlint-tsgolint": 7.0.2004
-  rolldown: 1.2.14
+  happy-dom: 21.0.4
+  oxfmt: 0.74.0
+  oxlint: 1.89.0
+  "oxlint-tsgolint": 7.0.2005
+  rolldown: 1.2.15
   typescript: 7.0.2
-  vite: 8.3.4
+  vite: 8.3.5
   vitest: 5.0.5
 overrides:
   "@deepseek-ai/cordis": 4.0.5
@@ -21,30 +21,38 @@ overrides:
   "@deepseek-ai/cordis-plugin-loader": 1.0.6
   "@deepseek-ai/cordis-plugin-timer": 1.1.7
   "@deepseek-ai/cosmokit": 1.8.6
-  "@deepseek-ai/dsh-client-locale": 0.2.1-rc.2
-  "@deepseek-ai/dsh-client-store": 0.2.1-rc.2
-  "@deepseek-ai/dsh-client-ui-layout": 0.2.1-rc.2
-  "@deepseek-ai/dsh-client-ui-plugin-manager": 0.2.1-rc.2
-  "@deepseek-ai/dsh-client-ui-primitives": 0.2.1-rc.2
-  "@deepseek-ai/dsh-client-ui-renderer": 0.2.1-rc.2
-  "@deepseek-ai/dsh-client-ui-settings": 0.2.1-rc.2
-  "@deepseek-ai/dsh-client-ui-slots": 0.2.1-rc.2
-  "@deepseek-ai/dsh-host-webserver": 0.2.1-rc.2
-  "@deepseek-ai/dsh-jobs": 0.2.1-rc.2
-  "@deepseek-ai/dsh-jobs-local": 0.2.1-rc.2
-  "@deepseek-ai/dsh-output-retention": 0.2.1-rc.2
-  "@deepseek-ai/dsh-package-manifest": 0.2.1-rc.2
-  "@deepseek-ai/dsh-ptc-runtime": 0.2.1-rc.2
-  "@deepseek-ai/dsh-sandbox": 0.2.1-rc.2
-  "@deepseek-ai/dsh-scope": 0.2.1-rc.2
-  "@deepseek-ai/dsh-session": 0.2.1-rc.2
-  "@deepseek-ai/dsh-settings": 0.2.1-rc.2
-  "@deepseek-ai/dsh-shell": 0.2.1-rc.2
-  "@deepseek-ai/dsh-subprocess": 0.2.1-rc.2
-  "@deepseek-ai/dsh-system-prompt": 0.2.1-rc.2
-  "@deepseek-ai/dsh-tools": 0.2.1-rc.2
-  "@deepseek-ai/dsh-user-approval": 0.2.1-rc.2
-  "@deepseek-ai/dsh-web": 0.2.1-rc.2
+  "@deepseek-ai/dsh": 0.2.1-rc.3
+  "@deepseek-ai/dsh-api-remotes": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-locale": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-store": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-ui-chat": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-ui-conversation": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-ui-layout": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-ui-plugin-manager": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-ui-primitives": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-ui-renderer": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-ui-settings": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-ui-slots": 0.2.1-rc.3
+  "@deepseek-ai/dsh-client-ui-tool": 0.2.1-rc.3
+  "@deepseek-ai/dsh-host-webserver": 0.2.1-rc.3
+  "@deepseek-ai/dsh-http-proxy": 0.2.1-rc.3
+  "@deepseek-ai/dsh-jobs": 0.2.1-rc.3
+  "@deepseek-ai/dsh-jobs-local": 0.2.1-rc.3
+  "@deepseek-ai/dsh-output-retention": 0.2.1-rc.3
+  "@deepseek-ai/dsh-package-manifest": 0.2.1-rc.3
+  "@deepseek-ai/dsh-ptc-runtime": 0.2.1-rc.3
+  "@deepseek-ai/dsh-sandbox": 0.2.1-rc.3
+  "@deepseek-ai/dsh-scope": 0.2.1-rc.3
+  "@deepseek-ai/dsh-session": 0.2.1-rc.3
+  "@deepseek-ai/dsh-settings": 0.2.1-rc.3
+  "@deepseek-ai/dsh-shell": 0.2.1-rc.3
+  "@deepseek-ai/dsh-subprocess": 0.2.1-rc.3
+  "@deepseek-ai/dsh-system-prompt": 0.2.1-rc.3
+  "@deepseek-ai/dsh-tools": 0.2.1-rc.3
+  "@deepseek-ai/dsh-user-approval": 0.2.1-rc.3
+  "@deepseek-ai/dsh-web": 0.2.1-rc.3
   "@deepseek-ai/schemastery": 3.18.5
 allowBuilds: {}
+# 发布冷却刻意为 0：内部 @jayyuen66/* 与宿主族 rc 包必须发布后即时可装；第三方新版的供应链
+# 缓冲由 catalog 与 overrides 的精确钉版承担，不靠时间窗。
 minimumReleaseAge: 0

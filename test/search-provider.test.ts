@@ -481,7 +481,11 @@ describe("search provider 边界", () => {
       controller.signal,
     );
     const options = fetchMock.mock.calls[0]?.[1] as { signal?: AbortSignal } | undefined;
-    expect(options?.signal).toBe(controller.signal);
+    // 搜索后端拿到的是「调用方取消 + 本次搜索超时」的组合信号，不是原对象本身：
+    // 只转原 signal 的话，调用方没给 signal 时这一枪就没有任何超时。
+    expect(options?.signal?.aborted).toBe(false);
+    controller.abort();
+    expect(options?.signal?.aborted).toBe(true);
     expect(calls[0]?.signal).toBe(controller.signal);
   });
 });

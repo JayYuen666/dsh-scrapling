@@ -14,6 +14,25 @@ const HOME_URL = `https://${HOST}/`;
 /** 公网示例地址。 */
 const PUBLIC_V4 = "93.184.216.34";
 
+/** 上面那份策略用的 URL 长度上限；与部署默认值一致，避免与 NAT64 判定混在一起看。 */
+const NAT64_MAX_URL_LENGTH = 2048;
+
+/**
+ * 造一份只改 NAT64 前缀表的策略。
+ *
+ * 提在模块级而不是用例内：它不捕获任何东西，写在用例体里会被
+ * consistent-function-scoping 判成该外移。
+ *
+ * @param prefixes - 声明为 NAT64 的 IPv6 前缀
+ * @returns 策略实例
+ */
+function withPrefixes(prefixes: readonly string[]): UrlPolicy {
+  return createUrlPolicy({ maxUrlLength: NAT64_MAX_URL_LENGTH, nat64Prefixes: [...prefixes] });
+}
+
+/** 一段公网 IPv6 前缀：NAT64 的 /40、/56 两档只能经部署声明的前缀生效。 */
+const PUBLIC_V6_PREFIX = "2a00:1450::/56";
+
 /** 命中私网判定时的原因码，出现多次故抽常量。 */
 const PRIVATE = "private-address";
 
@@ -171,6 +190,27 @@ describe("地址判定", () => {
 
   it("nat64 里藏的公网地址放行", () => {
     expect(defaultPolicy().isPublicAddress("64:ff9b::5db8:d818")).toBe(true);
+  });
+
+  it("nat64 的 /40 /48 /56 三档按 RFC 6052 的 u 字节布局取内嵌 ipv4", () => {
+    // 这三档的内嵌 IPv4 被下标 8 的 u 字节从中间切成两段：前半段在 u 之前、后半段在 u
+    // 之后。按起点连续切 4 字节会把 u 当成 IPv4 的一位、并漏掉最后一位 —— /56 下
+    // 192.168.1.1 会被读成 192.0.168.1（公网），那正是 SSRF 的绕过面。
+    // 期望值按 RFC 6052 §2.2 的布局独立算出，不从实现派生。
+
+    // /48：64:ff9b:1::/48 是 RFC 8215 的本地段，落在默认前缀表里，不必声明。
+    const defaults = defaultPolicy();
+    expect(defaults.isPublicAddress("64:ff9b:1:c0a8:1:100::")).toBe(false);
+    expect(defaults.isPublicAddress("64:ff9b:1:7f00:0:100::")).toBe(false);
+
+    // /56 与 /40 只能经部署声明的前缀生效，所以前缀取一段公网 IPv6 —— 否则 IPv6 层就先
+    // 被判私网，根本走不到 NAT64 这条分支。
+    expect(withPrefixes([PUBLIC_V6_PREFIX]).isPublicAddress("2a00:1450:0:c0:a8:101::")).toBe(false);
+    expect(withPrefixes([PUBLIC_V6_PREFIX]).isPublicAddress("2a00:1450:0:ac:14:101::")).toBe(false);
+    expect(withPrefixes(["2a00:1450::/40"]).isPublicAddress("2a00:1450:a:102:3::")).toBe(false);
+
+    // 内嵌公网 IPv4 时照旧放行，不能把整段一刀切掉。
+    expect(withPrefixes([PUBLIC_V6_PREFIX]).isPublicAddress("2a00:1450:0:5d:b8:d822::")).toBe(true);
   });
 
   it("ipv4-compatible（::/96）按内嵌 ipv4 重判，ipaddr 对这一段报的是 unicast", () => {

@@ -192,6 +192,28 @@ function buildNat64Table(prefixes: readonly string[]): readonly Nat64Prefix[] {
 }
 
 /**
+ * 从 IPv6 的 16 字节里按 RFC 6052 §2.2 的布局取出内嵌 IPv4。
+ *
+ * `/40`、`/48`、`/56` 这几档的 IPv4 被第 9 个字节（下标 8 的 u 字节）从中间**切断**：
+ * 前半段在 u 之前，后半段在 u 之后，并不连续。按起点连续切 4 字节会把 u 字节当成 IPv4 的
+ * 一位读进来、同时漏掉最后一位 —— `/48` 下内嵌 192.0.2.33 的地址会被读成 192.0.0.2，
+ * 于是私网地址也能被读成公网地址。
+ *
+ * `/32` 与 `/64` 的 4 字节恰好落在 u 的同一侧，按连续切本来就对；`/96` 在最后 4 字节，
+ * 与 u 无关。统一写法：取 5 字节窗口再剔除 u 字节，六档共用一条路径。
+ *
+ * @param packed - IPv6 的 16 字节
+ * @param offset - 内嵌 IPv4 的起始下标
+ * @returns 内嵌 IPv4 的 4 字节
+ */
+function nat64InnerBytes(packed: readonly number[], offset: number): number[] {
+  const window = packed.slice(offset, offset + 5);
+  // u 字节固定在总第 9 字节（下标 8）。它落在窗口里才需要剔，窗口不含它时这行是空操作。
+  const withoutU = window.filter((_byte, index) => offset + index !== 8);
+  return withoutU.slice(0, 4);
+}
+
+/**
  * 按单个 NAT64 前缀抽出内嵌 IPv4。
  *
  * @param parsed - 已解析的 IPv6
@@ -202,10 +224,9 @@ function extractNat64(parsed: ipaddr.IPv6, entry: Nat64Prefix): Nat64Match | nul
   if (!parsed.match(entry.network, entry.bits)) {
     return null;
   }
-  const { offset } = entry;
-  // slice 恒为 4 字节，故 fromByteArray 恒返回 IPv4；统一走 toIPv4Address() 归一，
+  // nat64InnerBytes 恒返 4 字节，故 fromByteArray 恒返回 IPv4；统一走 toIPv4Address() 归一，
   // 免掉一条永远为假的 instanceof 分支。
-  const inner = ipaddr.fromByteArray(parsed.toByteArray().slice(offset, offset + 4));
+  const inner = ipaddr.fromByteArray(nat64InnerBytes(parsed.toByteArray(), entry.offset));
   // 4 字节输入恒为 IPv4，所以 else 臂只为让 TS 从联合类型收窄而存在，运行期不可达。
   /* v8 ignore next 1 */
   const ipv4 = inner instanceof ipaddr.IPv4 ? inner : inner.toIPv4Address();

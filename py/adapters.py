@@ -226,7 +226,7 @@ def redact_url_secrets(raw: str) -> str:
 
 
 def _network_summary(
-    network: Any,  # noqa: ANN401 —— 上游的 NetworkRecorder
+    network: Any,  # 上游的 NetworkRecorder
     *,
     pattern: str | None,
     limit: int,
@@ -394,7 +394,7 @@ def drop_data_uris(text: str, *, html: bool = False) -> str:
     return "\n".join(out)
 
 
-def _scoped_pages(page: Any, css_selector: str | None) -> list[Any]:  # noqa: ANN401 —— 同上
+def _scoped_pages(page: Any, css_selector: str | None) -> list[Any]:  # 同上
     """按 ``css_selector`` 把清洗过的树收窄成若干棵子树；没给选择器就是整棵。
 
     口径与 Scrapling 自家 ``Convertor._extract_content`` 一致：命中 0 个元素就是空表，
@@ -663,7 +663,7 @@ _DEPLOYMENT_KNOBS: tuple[tuple[str, str, type], ...] = (
 )
 
 
-def _knob_value(kind: type, value: Any) -> Any:  # noqa: ANN401 —— 收的是部署载荷里的任意 JSON 值
+def _knob_value(kind: type, value: Any) -> Any:  # 收的是部署载荷里的任意 JSON 值
     """按声明的类型收下一枚部署旋钮值；类型不符给 None。
 
     类型必须真的对得上：这一层承载的是部署表态，把字符串塞进一个整数旋钮（或反过来）时
@@ -847,6 +847,14 @@ def _capture_once(
     from scrapling.fetchers import StealthySession
 
     session_params = _session_browser_params(args)
+    # 与 _make_session 对齐：浏览器会话的代理只能在构造期给，而 _session_browser_params
+    # 按 SESSION_ONLY_KEYS 把它连同 block_webrtc 一起过滤掉了。不在这里补，配了代理的
+    # 机器上这条路径的 Chromium 会直连 —— 泄露真实出口 IP，三条浏览器路径行为不一致。
+    proxy = guard.split_proxy(guard.default_proxy())
+    if proxy is not None:
+        session_params["proxy"] = proxy
+    # 走代理时强制为真，与 _make_session 同一条理由：WebRTC 泄露的是访客真实出口 IP。
+    session_params["block_webrtc"] = bool(args.get("blockWebrtc")) or proxy is not None
     session_params["record_requests"] = True
     fetch_params = _browser_params(args, url, level="fetch")
     # 会话的代理在构造期就定死了，逐次 fetch 再给一次只会被上游丢掉。
@@ -1161,6 +1169,11 @@ MAX_SESSIONS = 8
 # 其中最多几个可以是吃内存的浏览器会话。static 只是连接池，便宜得多。
 MAX_BROWSER_SESSIONS = 3
 
+# 等属主线程回结果的预算。这是**兜底**，不是抓取超时：单次调用的超时由它自己的
+# timeoutSeconds 管（浏览器导航可能合法地跑上几分钟），这里只负责把「线程已经不在了」
+# 从「调用很慢」里分出来。取 10 分钟是为了让最长的合法抓取仍先于它触发。
+_WORKER_RESULT_TIMEOUT_SECONDS = 600.0
+
 
 class _SessionWorker:
     """一个会话的**专属执行线程**：这份会话上的全部远端调用都在它上面排队执行。
@@ -1177,6 +1190,10 @@ class _SessionWorker:
     def __init__(self) -> None:
         self._jobs: "queue.SimpleQueue[tuple[Callable[[], Any], concurrent.futures.Future[Any]] | None]"
         self._jobs = queue.SimpleQueue()
+        # stop() 之后 _loop 已经取走哨兵并返回：此后投进来的任务永远排在一个没人消费的
+        # 队列里，而 run() 的 done.result() 没有超时 —— 调用方会永久阻塞。用这个标记把
+        # 「已停止」变成立刻可见的错误，而不是一次等不到回音的等待。
+        self._closed = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="session-worker")
         self._thread.start()
 
@@ -1195,19 +1212,30 @@ class _SessionWorker:
             except BaseException as error:  # noqa: BLE001 —— 任务异常必须回到调用方线程
                 done.set_exception(error)
 
-    def run(self, fn: Callable[[], Any]) -> Any:  # noqa: ANN401 —— 会话调用的返回形态由引擎定
+    def run(self, fn: Callable[[], Any]) -> Any:  # 会话调用的返回形态由引擎定
         """把 fn 投递到属主线程执行，并阻塞调用线程直到它结束。
 
         :param fn: 要在属主线程上执行的调用
         :returns: fn 的返回值
+        :raises AdapterError: 这条线程已经停止，投进去也没有人会执行
         :raises BaseException: fn 抛什么这里就抛什么
         """
+        # 与 stop() 之间没有锁：检查通过之后 stop() 仍可能抢先取走哨兵。那个窗口里
+        # put 进队列的任务确实没人消费，所以下面的 result 必须带超时兜底。
+        if self._closed.is_set():
+            raise AdapterError("NO_SUCH_SESSION", "session has already been closed")
         done: concurrent.futures.Future[Any] = concurrent.futures.Future()
         self._jobs.put((fn, done))
-        return done.result()
+        try:
+            return done.result(timeout=_WORKER_RESULT_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            # fn 里真实的长调用（浏览器导航、大页面抓取）不该走到这里：那个预算由它自己的
+            # 超时管。到这里说明这条线程已经不在了，继续等只会把调用方一起挂死。
+            raise AdapterError("SESSION_CLOSED", "session worker did not answer; the session is gone") from None
 
     def stop(self) -> None:
         """发哨兵收线程。队列里的任务会先跑完，所以 close 之后 stop 是安全的。"""
+        self._closed.set()
         self._jobs.put(None)
         self._thread.join(timeout=5.0)
 
@@ -1369,9 +1397,15 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
     if abandoned:
         # 构造期间已经被要求关闭（sidecar 关机走的就是 close_all_sessions）：这一份刚建好的
         # 会话绝不能登记 —— 登记了就没有任何人会再去关它，浏览器进程会活过 sidecar 自己。
-        _release_entry({"closer": closer, "type": kind, "lock": entry_lock})
+        abandoned_entry = {"closer": closer, "type": kind, "lock": entry_lock}
         if worker is not None:
+            # 浏览器会话的 close 必须在属主线程上跑：Playwright 的同步 API 与创建它的线程
+            # 绑定，跨线程调用抛 greenlet 错误，而 _release_entry 会 suppress 掉它 ——
+            # 随后 stop() 又把属主线程收掉，这个 Chromium 就再没有任何线程能关。
+            worker.run(lambda: _release_entry(abandoned_entry))
             worker.stop()
+        else:
+            _release_entry(abandoned_entry)
     return {
         "sessionId": session_id,
         "sessionType": kind,
@@ -1460,7 +1494,7 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
             response = worker.run(lambda: session.fetch(url, **params))
     except AdapterError:
         raise
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         raise AdapterError("FETCH_FAILED", f"{type(error).__name__}: {error}") from error
 
     payload = to_payload(
@@ -1514,13 +1548,17 @@ def _close_entry(session_id: Any) -> None:
     """
     with _SESSION_LOCK:
         entry = _SESSIONS.pop(session_id, None)
+        if entry is not None and entry.get("pending") is True:
+            # 墓碑必须与 pop 在同一个临界区：session_open 是在 _SESSION_LOCK 里读它的。
+            # 写在锁外会留下这个时序 —— 这里已 pop 并释放锁，构造方接着在锁内读到 False
+            # 并把建好的会话登记回 _SESSIONS，之后才轮到写 True，那条会话就没人关了。
+            entry["closed_while_pending"] = True
     if entry is None:
         return
     if entry.get("pending") is True:
         # 还没构造完：构造方自己会在成功时覆盖这一条，或在失败时把它摘掉。这里不能碰
-        # closer —— 它还不存在。但必须留下墓碑：构造方一会儿会把建好的会话登记回来，
+        # closer —— 它还不存在。但墓碑已经留下：构造方一会儿会把建好的会话登记回来，
         # 那一步要看见这次关闭，否则刚建好的浏览器没有任何人会再去关它。
-        entry["closed_while_pending"] = True
         return
     worker: _SessionWorker | None = entry.get("worker")
     if worker is not None:
@@ -1643,7 +1681,7 @@ def _session_state(args: dict[str, Any], *, saving: bool) -> dict[str, Any]:
             worker.run(lambda: session.save_state(target))
         else:
             worker.run(lambda: session.load_state(target))
-    except Exception as error:  # noqa: BLE001 —— 上游的文件/JSON 错误一律翻成可路由的码
+    except Exception as error:  # 上游的文件/JSON 错误一律翻成可路由的码
         raise AdapterError("STATE_FAILED", f"{type(error).__name__}: {error}") from error
     return {"sessionId": session_id, "path": target, "saved": saving}
 
