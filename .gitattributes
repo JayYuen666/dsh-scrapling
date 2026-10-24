@@ -1,0 +1,15 @@
+# 钉住行尾，让 `fmt:check` 判的是内容而不是检出方式：`eol=lf` 把文本文件统一成 LF，
+# 与 oxfmt.config.ts 显式声明的 endOfLine: "lf" 是同一条不变量的两侧——不写死在这里，
+# 升级 oxfmt 或改配置就会让两者重新打架，且冲突点从本文件上看不出来。
+# `text=auto` 保留按内容做的二进制探测，不会误伤二进制文件。
+#
+# 触发这条的是本地 Windows 检出（Git for Windows 的机器级 core.autocrlf=true 会把工作树
+# 换成 CRLF）；本仓 CI 矩阵只有 ubuntu 与 macos，不跑 win32，所以本地那一份是唯一会被
+# 改写的检出。
+#
+# 依赖 CRLF 的 Windows 脚本单独豁免：`*` 规则会把它们静默改成 LF，而本仓不跑 win32，
+# 改坏了没有任何一道门会红。
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

@@ -286,7 +286,14 @@ export class SidecarClient {
     }
     if (typeof frame["event"] === "string") {
       // 非 ready 的事件帧（进度、心跳…）交给调用方，不进 pending 表。
-      this.#options.onEvent?.(frame);
+      // 回调是调用方代码，它抛错只该记一条日志：pumpFrames 会把 onFrame 的异常转给
+      // onError，而那一路会 `#teardown` 整个常驻进程 —— 一个回调 bug 不该带走所有
+      // 在途请求。
+      try {
+        this.#options.onEvent?.(frame);
+      } catch (error) {
+        this.#log(`[sidecar] onEvent handler threw: ${String(error)}`);
+      }
       return;
     }
     this.#routeResponse(frame);
@@ -410,9 +417,14 @@ export class SidecarClient {
     stdin.on("error", (error: unknown) => {
       void this.#teardown(`sidecar stdin failed: ${String(error)}`, "SIDECAR_CRASHED");
     });
-    void child.done.catch((error: unknown) => {
-      void this.#teardown(`sidecar exited: ${String(error)}`, "SIDECAR_CRASHED");
-    });
+    // done 对「正常退出」与「被信号杀死」都 resolve（只有 spawn 失败才 reject）。两个
+    // 出口都要收尾：只挂 catch 的话，sidecar 自行正常退出时 #handle 仍指着已死的进程、
+    // #capabilities 仍是旧的，alive 继续报 true、ensureStarted() 也直接复用陈旧能力，
+    // 在途请求只能各自等超时 —— timeoutMs 为 null 的爬虫请求则永远挂着。
+    void child.done.then(
+      () => this.#teardown("sidecar exited", "SIDECAR_CLOSED"),
+      (error: unknown) => this.#teardown(`sidecar exited: ${String(error)}`, "SIDECAR_CRASHED"),
+    );
 
     const ready = await this.#waitForReady(this.#options.handshakeTimeoutMs);
     if (ready["protocol"] !== PROTOCOL_VERSION) {
@@ -440,11 +452,20 @@ export class SidecarClient {
     if (this.#capabilities !== undefined) {
       return this.#capabilities;
     }
-    this.#starting ??= this.#spawnOnce(signal);
+    let starting = this.#starting;
+    if (starting === undefined) {
+      starting = this.#spawnOnce(signal);
+      this.#starting = starting;
+    }
     try {
-      return await this.#starting;
+      return await starting;
     } finally {
-      this.#starting = undefined;
+      // 只清自己这一代：先前的 #teardown 或并发的 ensureStarted 可能已经把 #starting
+      // 换成了新一代的 Promise。无条件置空会把那一代也清掉，第三个调用方于是再 spawn
+      // 一个进程，而第二代的握手结果再没人复用。
+      if (this.#starting === starting) {
+        this.#starting = undefined;
+      }
     }
   }
 
@@ -487,6 +508,10 @@ export class SidecarClient {
     // `??` 会把 null 也替换掉，于是「本次不设超时」变成用默认值 —— 必须判 undefined。
     const timeoutMs =
       options.timeoutMs === undefined ? this.#options.requestTimeoutMs : options.timeoutMs;
+    // 先编码再落表：encodeFrame 对不可序列化的 params（循环引用、BigInt 之类）会抛
+    // FrameError。若先登记了 pending 条目，那条目就没有任何人会回收 —— 只能等各自
+    // 的超时，而 timeoutMs 为 null 的爬虫请求会永久留在 #pending 里。
+    const frame = `${encodeFrame({ id, method, params: outgoing })}\n`;
 
     const settled = new Promise<unknown>((resolve, reject) => {
       const entry: Pending = { resolve, reject, timer: undefined, detachAbort: undefined };
@@ -545,7 +570,17 @@ export class SidecarClient {
 
     // 一次 write 送完整的一行。Node 的 Writable.write 在同一 tick 内不会与别的 write
     // 交错，所以并发调用各自 write 也不会把两帧拼在一起。
-    stdin.write(`${encodeFrame({ id, method, params: outgoing })}\n`);
+    // write 在管道已销毁/已 end 时会同步抛：那时这条以及其它在途条目都等不到回帧，
+    // 只能在这里主动回收（#teardown 里的 #rejectAll 会把它们一起结清）。
+    if (stdin.destroyed) {
+      void this.#teardown(`failed to send ${method}: stdin is gone`, "SIDECAR_CRASHED");
+      return settled;
+    }
+    try {
+      stdin.write(frame);
+    } catch (error) {
+      void this.#teardown(`failed to send ${method}: ${String(error)}`, "SIDECAR_CRASHED");
+    }
     return settled;
   }
 

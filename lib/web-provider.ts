@@ -24,13 +24,26 @@ import type {
   WebFetchResult,
 } from "@deepseek-ai/dsh-web";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import { capText } from "./output.ts";
+import { SidecarError } from "./sidecar-error.ts";
 import type { SidecarClient } from "./sidecar.ts";
+
+/** 一次 web_fetch 被裁掉之后，模型怎么把没拿到的部分再要回来。 */
+const RECOVERY_HINT =
+  "要拿被省略的部分，请把 fetchMaxOutputChars 调大，或改用 scrapling_fetch 配 cssSelector 收窄范围。";
 
 /** 建 fetch provider 需要的参数。 */
 export interface WebProviderDeps {
   /** 已握手的 sidecar 客户端。 */
   readonly sidecar: SidecarClient;
-  /** 单次抓取的字节预算。 */
+  /**
+   * 单次抓取的输出上限。
+   *
+   * 同一个数有两个去处：作为 `maxContentChars` 发给 sidecar（字符），以及作为
+   * `capText` 的字节预算（见 lib/output.ts 说明为什么最终收口按字节）。这与本仓各工具
+   * 走的是同一条口径，代价是非 ASCII 页面在字节预算下会被裁得更早 —— 但预算必须真的
+   * 收口，只标一个 truncated 而把超长正文原样放行等于没有预算。
+   */
   readonly maxOutputBytes: number;
   /** 单次抓取的协同超时（毫秒）。 */
   readonly timeoutMs: number;
@@ -98,12 +111,22 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
           { ...(signal === undefined ? {} : { signal }), timeoutMs: deps.timeoutMs },
         );
       } catch (error: unknown) {
-        // provider 特有码：调用方只保证能容忍「不认识但可路由」的 code。
+        // 取消不是故障：sidecar 在 signal 中止时抛的是 SIDECAR_ABORTED，包成抓取失败
+        // 之后调用方看到的是「这个页面抓坏了」，于是会重试一个用户已经放弃的请求。
+        // 与 search-provider 同一口径：原样抛出。
+        if (signal?.aborted === true) {
+          throw error;
+        }
+        // provider 特有码：调用方只保证能容忍「不认识但可路由」的 code。把 sidecar 的码
+        // 带进去 —— 「被安全闸门拦下」（URL_BLOCKED）、「sidecar 超时」（SIDECAR_TIMEOUT）、
+        // 「sidecar 没起来」（SIDECAR_UNAVAILABLE）要采取的行动完全不同，只留一个
+        // SCRAPLING_FETCH_FAILED 就把这三种压成同一件事。
         // WebError 的构造签名是 (message, code) —— 顺序反了的话，这段文案会跑到 code 上，
         // 而 code 会变成一整段错误文本，调用方按码路由就全废了。
         // 与 host 的 probeFailure 一致，统一 String()：Error 会变成 "Error: msg"，
         // 少一条永远走不到的分支，消息里还多一个错误类名。
-        throw new WebError(String(error), "SCRAPLING_FETCH_FAILED");
+        const code = error instanceof SidecarError ? `${error.code}: ` : "";
+        throw new WebError(`${code}${String(error)}`, "SCRAPLING_FETCH_FAILED");
       }
 
       const payload = isRecord(raw) ? raw : undefined;
@@ -122,11 +145,14 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
         );
       }
       const { content } = payload;
-      // 两种截断都算：sidecar 自己截的，和我们自己按字节预算截的 ——
+      // 真正裁剪而不仅是标一个 truncated：超长正文原样返回的话，它会照样进上下文与会话
+      // 日志，而 truncated: true 反而让调用方以为已经裁过了。与本仓各工具同一收口
+      // （lib/output.ts 的 capText，按字节头尾截断）。
+      const capped = capText(content, deps.maxOutputBytes, RECOVERY_HINT);
+      // 两种截断都算：sidecar 自己截的，和我们自己按预算截的 ——
       // 对调用方而言语义一样，都是「正文没拿全」。
-      const truncated =
-        payload["truncated"] === true || Buffer.byteLength(content, "utf8") > deps.maxOutputBytes;
-      const body: WebFetchBody = { kind: toBodyKind(extractionType), content };
+      const truncated = payload["truncated"] === true || capped.truncated;
+      const body: WebFetchBody = { kind: toBodyKind(extractionType), content: capped.text };
       return { url: payload["url"], statusCode: payload["status"], body, truncated };
     },
   };

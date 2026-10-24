@@ -87,7 +87,7 @@ def _typed_keys(name: str) -> set[str]:
     return set(target.__annotations__)
 
 
-def _init_keys(obj: Any) -> set[str]:  # noqa: ANN401 —— 上游类，签名就是要钉的那个
+def _init_keys(obj: Any) -> set[str]:  # 上游类，签名就是要钉的那个
     """取一个类 ``__init__`` 真正接受的具名参数。"""
     return {
         name
@@ -96,12 +96,12 @@ def _init_keys(obj: Any) -> set[str]:  # noqa: ANN401 —— 上游类，签名�
     }
 
 
-def _response(url: str = URL) -> Any:  # noqa: ANN401 —— 返回上游 Response，形状由它定
+def _response(url: str = URL) -> Any:  # 返回上游 Response，形状由它定
     """造一个真 ``Response``，让 to_payload 走完整路径。"""
     return adapters._fake_response(HTML, url, 200)
 
 
-def _record(site: str, kwargs: dict[str, Any], url: str = URL) -> Any:  # noqa: ANN401 —— 同上
+def _record(site: str, kwargs: dict[str, Any], url: str = URL) -> Any:  # 同上
     """记下一个调用点实际发出的关键字，并回一个可用的响应。
 
     :param site: 调用点名字
@@ -132,7 +132,7 @@ class _StaticEngine:
     """``Fetcher`` 的替身：四个动词各自记录，返回真响应。"""
 
     @staticmethod
-    def _make(verb: str) -> Any:  # noqa: ANN401 —— 动态构造的方法，签名跟着 verb 走
+    def _make(verb: str) -> Any:  # 动态构造的方法，签名跟着 verb 走
         """造一个记录用的方法。
 
         闭包把 verb 绑成默认参数：直接引用外层循环变量会踩 B023 那一类问题（这里虽在
@@ -142,13 +142,13 @@ class _StaticEngine:
         :returns: 可挂到类上的静态方法
         """
 
-        def call(url: str, **kwargs: Any) -> Any:  # noqa: ANN401 —— 与上游签名一致
+        def call(url: str, **kwargs: Any) -> Any:  # 与上游签名一致
             """记录并返回响应。"""
             return _record(f"static.{verb}", kwargs, url)
 
         return staticmethod(call)
 
-    def __getattr__(self, name: str) -> Any:  # noqa: ANN401 —— 替身按动词现造方法
+    def __getattr__(self, name: str) -> Any:  # 替身按动词现造方法
         """按名字给出 get/post/put/delete 的记录方法。"""
         if name in ("get", "post", "put", "delete"):
             return self._make(name)
@@ -162,7 +162,7 @@ class _BrowserEngine:
         """:param site: 记录点名字"""
         self._site = site
 
-    def fetch(self, url: str, **kwargs: Any) -> Any:  # noqa: ANN401 —— 与上游签名一致
+    def fetch(self, url: str, **kwargs: Any) -> Any:  # 与上游签名一致
         """记录并返回响应。"""
         return _record(self._site, kwargs, url)
 
@@ -198,7 +198,7 @@ class _StaticSession:
 class _StaticLogic:
     """static 会话进入上下文后的请求对象（``_SyncSessionLogic`` 的替身）。"""
 
-    def get(self, url: str, **kwargs: Any) -> Any:  # noqa: ANN401 —— 与上游签名一致
+    def get(self, url: str, **kwargs: Any) -> Any:  # 与上游签名一致
         """记录并返回响应。"""
         return _record("session.fetch.static", kwargs, url)
 
@@ -229,7 +229,7 @@ class _StealthSession:
     def start(self) -> None:
         """开场（替身无事可做）。"""
 
-    def fetch(self, url: str, **kwargs: Any) -> Any:  # noqa: ANN401 —— 与上游签名一致
+    def fetch(self, url: str, **kwargs: Any) -> Any:  # 与上游签名一致
         """记录并返回响应。"""
         return _record(self._fetch_site, kwargs, url)
 
@@ -462,12 +462,12 @@ class Recording(dict):  # type: ignore[type-arg]
         """记下一次按键读取。"""
         self.seen.add(".".join([*self.path, str(key)]))
 
-    def get(self, key: str, default: Any = None) -> Any:  # noqa: ANN401 —— 与 dict.get 同形
+    def get(self, key: str, default: Any = None) -> Any:  # 与 dict.get 同形
         """取一个键并记账。"""
         self._mark(key)
         return super().get(key, default)
 
-    def __getitem__(self, key: str) -> Any:  # noqa: ANN401 —— 与 dict.__getitem__ 同形
+    def __getitem__(self, key: str) -> Any:  # 与 dict.__getitem__ 同形
         """取一个键并记账。"""
         self._mark(key)
         return super().__getitem__(key)
@@ -646,7 +646,7 @@ def _launch_args(site: str) -> list[str]:
         _close_quietly(session)
 
 
-def _close_quietly(session: Any) -> None:  # noqa: ANN401 —— 只为释放构造品
+def _close_quietly(session: Any) -> None:  # 只为释放构造品
     """关掉一个只被构造、从未 start 的会话。"""
     with suppress(Exception):
         session.close()
@@ -805,7 +805,7 @@ def facts() -> dict[str, Any]:
     }
 
 
-def _real_storage() -> Any:  # noqa: ANN401 —— 上游类，签名就是要钉的那个
+def _real_storage() -> Any:  # 上游类，签名就是要钉的那个
     """取真实存储类（不解绑 lru_cache 的包装拿不到 __init__ 的具名参数）。
 
     :returns: ``SQLiteStorageSystem`` 的原类

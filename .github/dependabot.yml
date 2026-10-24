@@ -1,0 +1,31 @@
+# 依赖更新：action 一条线。
+#
+# action 侧覆盖本仓的全部 workflow 引用：这些引用都钉了 commit SHA，Dependabot 提的 PR
+# 会把「换了哪个提交」变成一次可评审的 diff。
+#
+# 这里刻意**没有** npm 更新块：本仓依赖分三类，三类都不该由更新机器人改动。
+# 一是工具链与多数宿主依赖写成 catalog:，那条范围的真源在伞根的 pnpm-workspace.yaml；
+# 二是 31 枚写成字面版本的宿主依赖，本仓 pnpm-workspace.yaml 的 overrides 把它们钉死
+# （宿主族统一 0.2.1-rc.2 那条线），Dependabot 提的 PR 会被 overrides 解析回原版本，
+# 合进去也不改变安装树——留着只会造出「看起来升了、实际没升」的 PR；
+# 三是 8 枚既不在 catalog 也不在本仓 overrides 里的（ipaddr.js、react、@deepseek-ai/dsh
+# 与五枚未进本仓 overrides 的宿主包），它们的版本面确实会随机器人 PR 变动，但其中
+# ipaddr.js / react / @deepseek-ai/dsh 是本仓按需选的版本、宿主族那五枚要与伞根 overrides
+# 同步抬才算数，所以升版本仍只在伞根改真源、再投影下来。要升这些版本该改的是伞根。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      # 本仓引用的 action 全部放进一组，避免每个 action 各占一个 PR 去抢同一个名额。
+      # 模式按 `<owner>/<repo>` 写：通配符覆盖该仓库下的全部条目（codeql-action 的 init、
+      # analyze、upload-sarif 就是三条不同的引用），跨仓库不会互相匹配，所以两个 owner 各列一条。
+      actions:
+        patterns:
+          - "actions/*"
+          - "pnpm/*"
+          - "github/codeql-action*"
+          - "ossf/scorecard-action*"

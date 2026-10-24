@@ -806,15 +806,29 @@ async function ensureDataDir(dir: string): Promise<void> {
 }
 
 /**
- * sidecar 启动失败时的兜底文案。
+ * 数据目录建不出来时的处置。
  *
- * 统一走 String() 而不对 Error 分流：`String(new Error("x"))` 得到 "Error: x"，
- * 既带上了错误类名又带着消息，比只取 message 信息更多；少一条分支也就少一处
- * 「测试永远走不到」的代码。
+ * 目录建不出来 sidecar 的 cwd 必然 ENOENT，进程起不来 —— 与「解释器起不来」同一档，
+ * 所以跟 failFastOnMissingPython 的既有表态走：开着抛 CONFIG_INVALID 拒绝加载，不静默
+ * 降级成「设置卡能开、工具一个没有」的空壳；关着才降级，返回要 warn 的那一行。文案点名
+ * dataDir 与具体路径，不冒充 sidecar 的死因。
  *
- * @param error - 捕获到的任意值
- * @returns 可直接进日志的一行
+ * @param error - ensureDataDir 捕获到的错误
+ * @param dataDir - 已解析的数据目录
+ * @param failFast - failFastOnMissingPython 的当前表态
+ * @returns 降级路径要打的 warn；failFast 时不返回（直接抛）
  */
+function handleDataDirFailure(error: unknown, dataDir: string, failFast: boolean): string {
+  const detail = `dataDir 指向的 ${dataDir} 建不出来：${String(error)}。`;
+  if (failFast) {
+    throw new SidecarError(
+      "CONFIG_INVALID",
+      `${detail}插件已拒绝加载；把 dataDir 指向一个可写的目录，或把 failFastOnMissingPython 关掉降级运行。`,
+    );
+  }
+  return `[dsh-scrapling] ${detail}本插件不注册任何工具。`;
+}
+
 /**
  * 爬虫进度事件的路由表：crawlId → 那是哪个作业的输出环。
  *
@@ -892,33 +906,6 @@ function sinkOf(
 }
 
 /**
- * 起一个爬虫后台作业。
- *
- * 作业产出者返回的 `done` **不能 reject**：运行时会把 rejection 翻成 `failed`，而那
- * 只是记录状态、不代表工作真的停了。所有失败都走显式的 `killed` outcome，语义才准确。
- *
- * @param ctx - 宿主上下文
- * @param router - 爬虫事件路由表
- * @param label - 一行说明（模型可见）
- * @param run - 作业主体
- * @returns 作业 id
- */
-/**
- * 作业后端**真的可用**吗。
- *
- * 不能只看 `ctx.get("jobs") !== undefined`：注册表本身几乎总在（`dsh-jobs-local` 是
- * base 层的一部分），但有 controller 附着才允许 `start()`。实测两种情形都出现过——
- * host 层的 `tool-jobs` 被 `disabled: true` 时，`ctx.jobs` 在、`start()` 却抛
- * 「no job controller serves this agent」，而那句文案指向「装 tool-jobs」（装好了也没用）。
- *
- * `servesOwner` 是 private，没有公开的只读判据，所以这里用**行为探测**：起一个立即
- * 完成的空作业。成功 ⇒ controller 在位；抛错 ⇒ 不可用。探测作业当场 `remove` 掉，
- * 不占并发名额、不留记录、不产生完成通知（它在 `remove` 之前就已经 settle）。
- *
- * @param jobs - `ctx.get("jobs")` 的取值
- * @returns 可用为 true
- */
-/**
  * 作业后端能不能起作业。
  *
  * 判据是 `attachController` 在不在 —— 而不是"`ctx.jobs` 存在"（它几乎总在），也不是
@@ -966,6 +953,18 @@ function startUnderCrawlController<Spec, Id>(jobs: CrawlJobsFace<Spec, Id>, spec
   }
 }
 
+/**
+ * 起一个爬虫后台作业。
+ *
+ * 作业产出者返回的 `done` **不能 reject**：运行时会把 rejection 翻成 `failed`，而那
+ * 只是记录状态、不代表工作真的停了。所有失败都走显式的 `killed` outcome，语义才准确。
+ *
+ * @param ctx - 宿主上下文
+ * @param router - 爬虫事件路由表
+ * @param label - 一行说明（模型可见）
+ * @param run - 作业主体
+ * @returns 作业 id
+ */
 function startCrawlJob(
   ctx: Context,
   router: CrawlEventRouter,
@@ -1001,47 +1000,72 @@ function startCrawlJob(
   // detach 之后 `start()` 立刻回到被拒（实测），所以这不会改变宿主的任何既有判定。
   // jobs.start 本身是同步的；用 Promise.resolve 包一层是为了匹配工具层那条
   // async 契约 —— 免得以后真要等点什么（比如先确认会话）时再改两边。
-  return Promise.resolve(
-    startUnderCrawlController(jobs, {
-      kind: "scrapling",
-      label,
-      run: (job) => {
-        const controller = new AbortController();
-        const sink = sinkOf(job, controller.signal, router);
-        // 取消只置 signal；真正拆掉 Python 进程的是 sidecar 客户端收到 abort 后的自毁逻辑。
-        controller.signal.addEventListener(
-          "abort",
-          () => {
-            router.forget(sink);
-          },
-          { once: true },
-        );
-        const done = (async (): Promise<JobOutcome> => {
-          // 作业结束后 sidecar 仍可能推来收尾帧，它们会被写进一个已经结束的作业。清在这里，
-          // 且按出口身份清 —— 两只蜘蛛并行时不该由旧的把新的登记一起清掉。
-          try {
-            await run(sink);
-            return { status: "completed" };
-          } catch (error: unknown) {
-            return {
-              status: "killed",
-              detail: String(error),
-            };
-          } finally {
-            router.forget(sink);
-          }
-        })();
-        return {
-          cancel: (): void => {
-            controller.abort();
-          },
-          done,
-        };
-      },
-    }),
-  );
+  // attachController 与 start 在调用一刻同步抛（注册表在、controller 却没了的那一类）
+  // 也必须落成 rejection：本函数声明的是 Promise<string>，同步 throw 会从声明的缝里
+  // 漏出去，调用方的 .catch 收不到；文案与上面「jobs 不在」那支同码，裸的宿主报错
+  // 少一句模型可执行的上下文。
+  try {
+    return Promise.resolve(
+      startUnderCrawlController(jobs, {
+        kind: "scrapling",
+        label,
+        run: (job) => {
+          const controller = new AbortController();
+          const sink = sinkOf(job, controller.signal, router);
+          // 取消只置 signal；真正拆掉 Python 进程的是 sidecar 客户端收到 abort 后的自毁逻辑。
+          controller.signal.addEventListener(
+            "abort",
+            () => {
+              router.forget(sink);
+            },
+            { once: true },
+          );
+          const done = (async (): Promise<JobOutcome> => {
+            // 作业结束后 sidecar 仍可能推来收尾帧，它们会被写进一个已经结束的作业。清在这里，
+            // 且按出口身份清 —— 两只蜘蛛并行时不该由旧的把新的登记一起清掉。
+            try {
+              await run(sink);
+              return { status: "completed" };
+            } catch (error: unknown) {
+              return {
+                status: "killed",
+                detail: String(error),
+              };
+            } finally {
+              router.forget(sink);
+            }
+          })();
+          return {
+            cancel: (): void => {
+              controller.abort();
+            },
+            done,
+          };
+        },
+      }),
+    );
+  } catch (error) {
+    return Promise.reject(
+      new SidecarError(
+        "JOBS_UNAVAILABLE",
+        `作业后端在起作业那一刻抛错：${String(error)}。` +
+          "scrapling_crawl 需要一个能 attach controller 的作业后端；" +
+          "单页抓取（scrapling_fetch / extract / render）不受影响。",
+      ),
+    );
+  }
 }
 
+/**
+ * sidecar 启动失败时的兜底文案。
+ *
+ * 统一走 String() 而不对 Error 分流：`String(new Error("x"))` 得到 "Error: x"，
+ * 既带上了错误类名又带着消息，比只取 message 信息更多；少一条分支也就少一处
+ * 「测试永远走不到」的代码。
+ *
+ * @param error - 捕获到的任意值
+ * @returns 可直接进日志的一行
+ */
 function probeFailure(error: unknown): string {
   return `[dsh-scrapling] 未能启动 Python sidecar：${String(error)}`;
 }
@@ -1336,6 +1360,17 @@ function warnScraplingMissing(ctx: Context, plan: ToolPlan, python: PythonChoice
   );
 }
 
+/**
+ * 插件入口。
+ *
+ * 流程：建客户端 → 探测能力 → 按「开关 ∩ 能力」注册工具。
+ *
+ * 能力探测会真的拉起一个 Python 进程，所以 `apply` 是 async 的 ——
+ * 官方也这么做（deepseek-harness 的 `packages/fs/tool-fs-search`）。
+ *
+ * @param ctx - 宿主上下文
+ * @param config - 已由 schemastery 填满默认值的配置
+ */
 export async function apply(
   ctx: Context & SettingsFace & SystemPromptFace,
   config: Config,
@@ -1361,7 +1396,7 @@ export async function apply(
   try {
     await ensureDataDir(dataDir);
   } catch (error) {
-    ctx.logger.warn(probeFailure(error));
+    ctx.logger.warn(handleDataDirFailure(error, dataDir, config.failFastOnMissingPython.get()));
     return;
   }
 

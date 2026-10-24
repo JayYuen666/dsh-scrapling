@@ -22,7 +22,12 @@ export type SidecarErrorCode =
    * 「没人能发 method」；Python 侧再对手搓的帧拒一次。
    */
   | "WRITE_DISABLED"
-  /** 部署配置非法，插件拒绝加载（当前只有 nat64Prefixes 会走到这里）。 */
+  /**
+   * 部署配置非法，插件拒绝加载。
+   *
+   * 两个来源：URL 准入闸门的策略参数非法（`nat64Prefixes` 是唯一会在构造期抛的那一项），
+   * 以及 sidecar 的工作目录建不出来（`failFastOnMissingPython` 开着时走这里拒绝加载）。
+   */
   | "CONFIG_INVALID"
   /** 这个 profile 没有作业后端，scrapling_crawl 无法挂后台作业。 */
   | "JOBS_UNAVAILABLE"
@@ -41,9 +46,9 @@ export class SidecarError extends Error {
   /**
    * @param code - 机器可读错误码
    * @param message - 人读信息
-   * @param options - 原始异常
+   * @param options - 承载 `cause` 的选项包；原始异常放在 `options.cause` 里
    */
-  public constructor(code: SidecarErrorCode, message: string, options?: { cause?: unknown }) {
+  public constructor(code: SidecarErrorCode, message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "SidecarError";
     this.code = code;
@@ -51,14 +56,23 @@ export class SidecarError extends Error {
 }
 
 /**
- * 从未知值里取字符串，取不到就用兜底。
+ * 从未知值里取一行可读文本，取不到就用兜底。
  *
- * 直接 `String(value)` 落在对象上会得到 "[object Object]"，那种文案进了日志等于没写。
+ * 字符串只在**非空白**时算数：空串与纯空白原样放行会抛出 message 为空的错误，日志里
+ * 剩下的就是一行 `[sidecar] response error:` 这种无信息行。数字、布尔与 bigint 走
+ * String() 保留原文 —— 对端协议改动时发的裸值至少还能读；对象不走 String()，那种
+ * "[object Object]" 进了日志等于没写。
  *
  * @param value - 任意值
- * @param fallback - 取不到字符串时的兜底
+ * @param fallback - 取不到可读文本时的兜底
  * @returns 字符串或兜底
  */
 export function asText(value: unknown, fallback: string): string {
-  return typeof value === "string" ? value : fallback;
+  if (typeof value === "string") {
+    return value.trim().length > 0 ? value : fallback;
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value);
+  }
+  return fallback;
 }

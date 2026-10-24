@@ -293,7 +293,7 @@ function RowView(props: ToolCallViewProps & { readonly t: Translate }): ReactNod
             createElement(
               "span",
               { className: "dsh-scrapling-rowValue" },
-              field.valueKey ?? field.value,
+              field.valueKey === undefined ? field.value : t(field.valueKey),
             ),
           ),
         ),

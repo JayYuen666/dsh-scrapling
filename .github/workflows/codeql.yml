@@ -1,0 +1,56 @@
+# CodeQL：两格并跑。
+#
+# javascript-typescript 扫源码；actions 扫 .github/workflows/*.yml —— 后者正是
+# 本仓这一层最需要的一种检查：工作流里的表达式注入、过度权限、可被 fork PR 触发的
+# 危险形态，都是「代码全绿但门禁本身有洞」那一类。
+#
+# 不给 build-mode：JS/TS 与 actions 都走默认的 none，不需要编译。
+name: codeql
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # 手动入口：修完一条告警想立刻复验时，不必等下一周的 cron。
+  workflow_dispatch: {}
+  schedule:
+    - cron: "23 4 * * 1"
+# 组键带事件名：周度扫描与 main 上的 push 落在不同组，前者不会因为一次 push 被取消。
+# 取消只留给同分支的 push。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+# 工作流级只给读；写入权限挂在 job 上，因为只有上传 SARIF 那一步需要它。
+permissions:
+  contents: read
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # 上传 SARIF 到 code scanning 面板所必需。
+      security-events: write
+      # CodeQL 查询包要读 registry 上的 pack。
+      packages: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # 两个标识都按官方清单写死：javascript-typescript 覆盖 JS 与 TS；
+        # actions 覆盖本仓 .github/workflows 下的工作流文件。
+        language: [javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
+          # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}

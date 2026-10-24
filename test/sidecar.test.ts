@@ -19,7 +19,8 @@ import {
   parseCapabilities,
 } from "../lib/sidecar.ts";
 import type { SidecarOptions } from "../lib/sidecar.ts";
-import { SidecarError } from "../lib/sidecar-error.ts";
+import { asText, SidecarError } from "../lib/sidecar-error.ts";
+import { LOCAL_PYTHON } from "./python-bin.ts";
 
 /**
  * 空的流钩子。Node 的 Readable.read 必须返回 void，写成箭头函数返回 undefined 会被
@@ -31,7 +32,6 @@ function noop(): void {
 
 const REPO = path.resolve(import.meta.dirname, "..");
 const BRIDGE = path.join(REPO, "py", "bridge.py");
-const LOCAL_PYTHON = path.join(REPO, "_env", ".venv", "bin", "python3");
 
 /** 一个假的子进程句柄，形状对齐 SubprocessHandle 的用到部分。 */
 interface FakeHandle {
@@ -179,6 +179,23 @@ function options(overrides: Partial<SidecarOptions> = {}): SidecarOptions {
     ...overrides,
   };
 }
+
+describe("asText", () => {
+  it("非空白字符串原样返回；空白串算取不到，落兜底", () => {
+    expect(asText("boom", "fallback")).toBe("boom");
+    expect(asText("  spaced  ", "fallback")).toBe("  spaced  ");
+    expect(asText("", "fallback")).toBe("fallback");
+    expect(asText("   ", "fallback")).toBe("fallback");
+  });
+
+  it("原始类型保留原文，对象与缺失落兜底", () => {
+    expect(asText(42, "fallback")).toBe("42");
+    expect(asText(true, "fallback")).toBe("true");
+    expect(asText(1n, "fallback")).toBe("1");
+    expect(asText({ message: "m" }, "fallback")).toBe("fallback");
+    expect(asText(undefined, "fallback")).toBe("fallback");
+  });
+});
 
 describe("parseCapabilities", () => {
   it("只认真布尔，缺字段与非对象都降级成不可用", () => {
@@ -440,6 +457,37 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
+  it("事件回调抛错只记一条日志，不拆掉常驻进程", async () => {
+    // 回调是调用方代码。让它的异常沿 pumpFrames 的 onError 走，就会被当成 sidecar 崩溃
+    // 而 #teardown —— 一个回调 bug 不该带走同一进程上所有在途请求。
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const lines: string[] = [];
+    const client = new SidecarClient(
+      fakeCtx(
+        {
+          rawReply: (id) => (id === "h1" ? ['{"event":"progress","done":1}\n'] : undefined),
+          reply: okReply,
+        },
+        spawned,
+      ) as never,
+      {
+        ...options(),
+        log: (line) => {
+          lines.push(line);
+        },
+        onEvent: () => {
+          throw new Error("caller bug");
+        },
+      },
+    );
+    await client.ensureStarted();
+    // 同一请求的响应帧排在那条事件帧之后：进程若被拆掉，这一条就等不到结果了。
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    expect(client.alive).toBe(true);
+    expect(lines.some((line) => line.includes("onEvent handler threw"))).toBe(true);
+    await client.dispose();
+  });
+
   it("销毁一个从未启动的客户端不会抛", async () => {
     const spawned: { count: number; last?: FakeHandle } = { count: 0 };
     const client = new SidecarClient(fakeCtx({}, spawned) as never, options());
@@ -661,6 +709,42 @@ describe("sidecar client 与假 runtime", () => {
     await delay(20);
     spawned.last?.stdin?.emit("error", new Error("stdin pipe broke"));
     await expect(pending).rejects.toThrow(SidecarError);
+    await client.dispose();
+  });
+
+  it("写管道已销毁时主动拆进程，并结清在途请求", async () => {
+    // 已销毁的 Writable 上 write 会同步抛 ERR_STREAM_DESTROYED。这里测的是那之前的一道
+    // 判据：先看 destroyed，就地拆进程 —— 在途条目都等不到回帧，只能自己回收。
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(fakeCtx({}, spawned) as never, options());
+    await client.ensureStarted();
+    const gone = new Writable({
+      write: (_chunk, _encoding, done) => {
+        done();
+      },
+    });
+    gone.destroy();
+    Object.assign(spawned.last!, { stdin: gone });
+    await expect(client.call("ping")).rejects.toThrow(/stdin is gone/u);
+    expect(client.alive).toBe(false);
+    await client.dispose();
+  });
+
+  it("写管道同步抛错时同样收场，不把错误抛给调用方", async () => {
+    // write 在管道刚断的那一瞬间会同步抛 EPIPE。让它冒出去的话，一次抓取的失败会变成
+    // 调用栈上的一行原生异常，而 pending 条目没人回收。
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(fakeCtx({}, spawned) as never, options());
+    await client.ensureStarted();
+    Object.assign(spawned.last!, {
+      stdin: {
+        write: (): never => {
+          throw new Error("EPIPE");
+        },
+      } as unknown as Writable,
+    });
+    await expect(client.call("ping")).rejects.toThrow(/EPIPE/u);
+    expect(client.alive).toBe(false);
     await client.dispose();
   });
 

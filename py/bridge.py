@@ -35,11 +35,25 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
 import traceback
 from typing import Any, Callable
+
+# 协议帧与日志一律 UTF-8：宿主按 UTF-8 解码本进程的 stdout/stderr，而两者都是管道。
+# 管道在 Windows 上默认走本地 ANSI 代码页；`LC_ALL=C` 配上 `PYTHONUTF8=0` 这类环境
+# 也会让它们退成 ascii —— 那时 emit 里的非 ASCII 正文会抛 UnicodeEncodeError，而
+# worker 把它当请求异常吞掉，调用方拿不到任何响应，只能等到超时。
+# backslashreplace 兜住另一个方向：json.loads 能把 "\ud800" 解成孤立代理项，严格编码
+# 会让整帧写不出去，替换成转义文本至少留下可读的痕迹。
+# 用 getattr 取 reconfigure：被重定向成 io.StringIO 的流没有这个方法（测试与嵌宿主都可能
+# 这么做），缺了它不该让整个 sidecar 起不来。
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8", errors="backslashreplace")
 
 MIN_PYTHON = (3, 14)
 
@@ -66,7 +80,10 @@ if _gate_message is not None:
 
 
 # 让 py/ 目录里的 guard 能被 adapters 用 `from guard import install` 找到。
-_HERE = __file__.rsplit("/", 1)[0] or "."
+# 必须走 os.path：宿主传进来的 bridgePath 是 path.join(import.meta.dirname, "py", "bridge.py")
+# 的产物，Windows 上是反斜杠分隔，按 "/" 切会得到整个文件路径，于是 adapters/guard 全都
+# import 不到、ready 握手永远等不到。`-I` 又关掉了脚本目录自动进 sys.path，所以这一步不能省。
+_HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 

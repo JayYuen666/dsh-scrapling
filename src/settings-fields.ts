@@ -28,9 +28,9 @@ export interface FieldSpec {
   readonly key: string;
   /** 控件形态。 */
   readonly kind: FieldKind;
-  /** 中文标签。 */
+  /** 双语标签。 */
   readonly label: Copy;
-  /** 中文说明，一句话说清「改了会怎样」。 */
+  /** 双语说明，一句话说清「改了会怎样」。 */
   readonly hint: Copy;
   /** schema 里的默认值；用户把它改回这个值时保存的是「清除覆盖」而不是「写入同值」。 */
   readonly fallback: string | number | boolean;
@@ -163,8 +163,8 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         kind: "boolean",
         label: { zh: "scrapling_session_*", en: "scrapling_session_*" },
         hint: {
-          zh: "跨请求复用 cookie 与浏览器实例。",
-          en: "Reuse cookies and the browser across requests.",
+          zh: "跨请求复用 cookie 与浏览器实例，只管 open / fetch / list / close 这一组；network 与 state_* 各自有独立开关。",
+          en: "Reuse cookies and the browser across requests; covers open / fetch / list / close only. The network and state_* groups have their own switches.",
         },
         fallback: true,
       },
@@ -221,7 +221,7 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         kind: "boolean",
         label: { zh: "只保留正文", en: "Main content only" },
         hint: {
-          zh: "去掉导航、页脚、侧栏。开：更短更干净；关：抓页面控件类目标需要它。",
+          zh: "去掉导航、页脚、侧栏。开：更短更干净；关：要连同导航、按钮这类页面控件一起抓时用。",
           en: "Drop nav/footer/sidebar. On for shorter output; off when you need page chrome.",
         },
         fallback: true,
@@ -468,8 +468,8 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
     id: "answer",
     title: { zh: "页面问答", en: "Page Q&A" },
     note: {
-      zh: "三项都留空就跟随当前会话用的模型，不额外烧一份额度。",
-      en: "All blank follows the session's own model, costing no extra quota.",
+      zh: "provider 与 model 留空跟随当前会话用的模型，不额外烧一份额度；token 上限留空用默认值。",
+      en: "provider and model blank follow the session's own model, costing no extra quota; the token cap falls back to its default.",
     },
     fields: [
       {
@@ -519,7 +519,6 @@ const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = 
     undo: "撤销",
     reveal: "显示",
     conceal: "隐藏",
-    revealHint: "这一项按密码遮罩显示",
     statusLoading: "正在读取设置…",
     statusReadonly: "这个连接以只读方式运行，设置改不了。",
     statusClean: "没有未保存的改动",
@@ -535,7 +534,6 @@ const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = 
     undo: "Undo",
     reveal: "Show",
     conceal: "Hide",
-    revealHint: "this field is masked like a password",
     statusLoading: "Reading settings…",
     statusReadonly: "This connection runs read-only; settings cannot be changed here.",
     statusClean: "No unsaved changes",

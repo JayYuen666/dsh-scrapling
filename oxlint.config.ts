@@ -2,8 +2,9 @@ import { definePluginConfig } from "@jayyuen66/dsh-plugin-shared/config/oxlint";
 
 export default definePluginConfig({
   // 本包真实用到的同步写盘 API —— node/no-sync 的包内例外。
-  // 构建脚本（build-host.ts / build-client.ts）按需同步读写产物；renameSync 是原子写的
-  // 最后一步（先写临时文件再改名），同样只出现在构建脚本里。
+  // 构建脚本（build-helpers.ts 及其两个调用方）按需同步读写产物；renameSync 是原子写的
+  // 最后一步（先写临时文件再改名），readdirSync/unlinkSync 只在清理上一次中断留下的
+  // 临时文件时用到 —— 全部只出现在构建脚本里，不进运行期路径。
   syncWrites: [
     "writeFileSync",
     "readFileSync",
@@ -14,6 +15,8 @@ export default definePluginConfig({
     "accessSync",
     "chmodSync",
     "mkdtempSync",
+    "readdirSync",
+    "unlinkSync",
   ],
   titlePrefixes: [
     "ADR",

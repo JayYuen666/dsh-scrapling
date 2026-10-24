@@ -39,6 +39,7 @@ import type { Volatile } from "@deepseek-ai/cordis";
 import { Context } from "@deepseek-ai/cordis";
 import type { SidecarCapabilities } from "../lib/sidecar.ts";
 import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
+import { LOCAL_PYTHON } from "./python-bin.ts";
 
 /**
  * 造一个 volatile 引用。
@@ -287,9 +288,6 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     proxyBypass: pick("proxyBypass", ""),
   };
 }
-
-/** 本仓用来跑集成测试的 Python 解释器。 */
-const LOCAL_PYTHON = path.resolve(import.meta.dirname, "../_env/.venv/bin/python3");
 
 /** 本仓探针解释器是否就位。不就位时下面这些用例整条跳过，而不是跑起来空转。 */
 const HAS_LOCAL_PYTHON = existsSync(LOCAL_PYTHON);
@@ -583,7 +581,36 @@ describe("system prompt 指引段", () => {
 });
 
 describe("apply", () => {
-  it("数据目录建不出来时只 warn 并提前返回，不去 spawn", async () => {
+  it("数据目录建不出来时默认拒绝加载（failFast），不去 spawn", async () => {
+    let spawned = 0;
+    const ctx = {
+      get: (): undefined => undefined,
+      subprocess: {
+        resolveExecutable: async (): Promise<string> => "python3",
+        spawn: (): never => {
+          spawned += 1;
+          throw new Error(SHOULD_NOT_REACHED);
+        },
+      },
+      logger: {
+        info: (): void => undefined,
+        warn: (): void => undefined,
+        debug: (): void => undefined,
+      },
+      settings: settingsStub(),
+      systemPrompt: promptStub(),
+      effect: (): void => undefined,
+    } as unknown as never;
+    // 指向一个不可能建出来的路径：父级是文件而不是目录。
+    // 目录建不出来 = sidecar 的 cwd 必然 ENOENT，跟「解释器起不来」同一档：failFast
+    // 默认开着，所以拒绝加载而不是静默降级成「设置卡能开、工具一个没有」的空壳。
+    await expect(apply(ctx, makeConfig({ dataDir: "/dev/null/impossible" }))).rejects.toMatchObject(
+      { code: "CONFIG_INVALID" },
+    );
+    expect(spawned).toBe(0);
+  });
+
+  it("数据目录建不出来且 failFast 关着时，warn 里点名 dataDir 并提前返回", async () => {
     const warnings: string[] = [];
     let spawned = 0;
     const ctx = {
@@ -606,10 +633,16 @@ describe("apply", () => {
       systemPrompt: promptStub(),
       effect: (): void => undefined,
     } as unknown as never;
-    // 指向一个不可能建出来的路径：父级是文件而不是目录。
-    await apply(ctx, makeConfig({ dataDir: "/dev/null/impossible" }));
+    await apply(
+      ctx,
+      makeConfig({ dataDir: "/dev/null/impossible", failFastOnMissingPython: false }),
+    );
     expect(spawned).toBe(0);
-    expect(warnings.some((line) => line.includes("未能启动"))).toBe(true);
+    // 死因是目录，不是 sidecar：文案必须点名 dataDir 与具体路径，把排查引向正确的设置项。
+    expect(warnings.some((line) => line.includes("dataDir") && line.includes("/dev/null"))).toBe(
+      true,
+    );
+    expect(warnings.some((line) => line.includes("未能启动"))).toBe(false);
   });
 
   it("pythonBin 留空时回落到 python3", async () => {
@@ -1599,6 +1632,43 @@ describe("爬虫作业的取消与失败", () => {
       harness.dispose();
     }
   });
+
+  it.runIf(HAS_LOCAL_PYTHON)(
+    "作业后端在起作业那一刻同步抛错：也按 JOBS_UNAVAILABLE 拒绝，不裸传宿主报错",
+    async () => {
+      // startCrawlJob 声明的是 Promise<string>：attachController / start 的同步异常必须
+      // 翻成 rejection，且换成可执行的文案 —— 裸的宿主报错（「no job controller …」）
+      // 对模型少一句该改哪里的上下文。
+      const harness = makeJobHarness();
+      try {
+        await apply(
+          harness.ctx,
+          makeConfig({
+            pythonBin: LOCAL_PYTHON,
+            crawlEnabled: true,
+            failFastOnMissingPython: false,
+          }),
+        );
+        const crawl = harness.tools.get("scrapling_crawl");
+        expect(crawl?.execute, "后端可用时应注册 crawl").toBeDefined();
+        const mutable = harness.ctx as unknown as { get: (name: string) => unknown };
+        mutable.get = (service: string) =>
+          service === "jobs"
+            ? {
+                attachController: (): never => {
+                  throw new Error("controller registry exploded");
+                },
+                start: (): string => CRAWL_JOB_ID,
+              }
+            : undefined;
+        await expect(
+          crawl?.execute?.({ url: UNREACHABLE }, { signal: new AbortController().signal }),
+        ).rejects.toMatchObject({ code: "JOBS_UNAVAILABLE" });
+      } finally {
+        harness.dispose();
+      }
+    },
+  );
 });
 
 describe("出站 URL 闸门（Host 侧 SSRF 防线）", () => {

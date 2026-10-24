@@ -217,7 +217,7 @@ class Sidecar:
 class Handler(http.server.BaseHTTPRequestHandler):
     """只回 SPA 外壳；其余路径回一张占位图片；写方法把请求本身回显成 JSON。"""
 
-    def do_GET(self) -> None:  # noqa: N802 —— BaseHTTPRequestHandler 的命名约定
+    def do_GET(self) -> None:  # BaseHTTPRequestHandler 的命名约定
         """回一页、一张图、一段接口 JSON，或回显请求本身。"""
         if self.path == "/echo":
             self._echo()
@@ -262,15 +262,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_POST(self) -> None:  # noqa: N802 —— BaseHTTPRequestHandler 的命名约定
+    def do_POST(self) -> None:  # BaseHTTPRequestHandler 的命名约定
         """回显这次 POST。"""
         self._echo()
 
-    def do_PUT(self) -> None:  # noqa: N802 —— 同上
+    def do_PUT(self) -> None:  # 同上
         """回显这次 PUT。"""
         self._echo()
 
-    def do_DELETE(self) -> None:  # noqa: N802 —— 同上
+    def do_DELETE(self) -> None:  # 同上
         """回显这次 DELETE。"""
         self._echo()
 
@@ -1045,7 +1045,7 @@ class _SiteHandler(http.server.BaseHTTPRequestHandler):
         "/p2": "<html><head><title>P2</title></head><body><h1>P2BODY</h1><p>second page</p></body></html>",
     }
 
-    def do_GET(self) -> None:  # noqa: N802 —— BaseHTTPRequestHandler 的约定方法名
+    def do_GET(self) -> None:  # BaseHTTPRequestHandler 的约定方法名
         """回一页；未知路径回 404。"""
         body = self.PAGES.get(self.path, "").encode()
         self.send_response(200 if self.path in self.PAGES else 404)
@@ -1112,6 +1112,22 @@ def _run_crawl_happy_path(crawl: Any) -> None:
         tail = crawl.crawl_status({"crawlId": crawl_id, "since": 1})
         check("since 之后只回新增页", tail["pages"] == status["pages"][1:], repr(tail["pages"])[:120])
         check("total 仍是全部页数", tail["total"] == len(status["pages"]), str(tail["total"]))
+
+        # 单页就超过回包预算时不能让原样那一帧出去 —— 它会顶过 Host 的 8 MiB 切帧线，
+        # 把整个 sidecar 判成坏帧拆掉。maxContentChars 没有上界（部署侧只声明了 min(1)），
+        # 所以这条路径是可达的，不是理论假设。
+        oversized = "中" * (crawl.MAX_STATUS_BYTES // 2)
+        huge_pages = [{"url": "http://x/", "title": "T", "markdown": oversized}]
+        shrunk, _ = crawl._take_pages(huge_pages, 0)
+        check("超大单页被压到预算内", len(shrunk) == 1, str(len(shrunk)))
+        serialized = len(json.dumps(shrunk[0], ensure_ascii=False).encode("utf-8"))
+        check(
+            "压过之后不超过回包预算",
+            serialized <= crawl.MAX_STATUS_BYTES,
+            f"{serialized} vs {crawl.MAX_STATUS_BYTES}",
+        )
+        check("压过的那页带 truncated 标记", shrunk[0].get("truncated") is True, repr(shrunk[0].get("truncated")))
+        check("原页不被就地改动", len(huge_pages[0]["markdown"]) == len(oversized), str(len(huge_pages[0]["markdown"])))
 
         # maxPages 是**页数**闸门：再多链接也不许多收。
         capped_id = crawl.crawl_run({"url": f"{base}/", "maxPages": 1})["crawlId"]
@@ -1231,7 +1247,7 @@ def _await_crawl_end(crawl: Any, crawl_id: str, timeout: float) -> dict[str, Any
 class _SlowHandler(http.server.BaseHTTPRequestHandler):
     """每次都睡一会儿：爬虫于是停在在途请求里，叫停要等它收尾。"""
 
-    def do_GET(self) -> None:  # noqa: N802 —— 同上
+    def do_GET(self) -> None:  # 同上
         """回一张带自链的慢页。"""
         time.sleep(0.4)
         body = b"<html><body><h1>SLOW</h1><a href='/next'>next</a></body></html>"
@@ -1456,6 +1472,54 @@ def run_extraction() -> None:
         check(f"{kind} 路径保留正文", "VISIBLE-OK" in body, body[:120])
 
 
+def run_bridge_wire_encoding() -> None:
+    """协议通道的编码与 py/ 目录解析：两条都只在子进程里看得出来。
+
+    宿主按 UTF-8 解码 bridge 的 stdout/stderr，而两者都是管道。管道在 Windows 上默认走本地
+    ANSI 代码页；``LC_ALL=C`` 配上 ``PYTHONUTF8=0`` 也会让它们退成 ascii —— 那时一帧里带
+    非 ASCII 正文就会抛 ``UnicodeEncodeError``，worker 把它当请求异常吞掉，调用方收不到任何
+    响应、只能等到超时。所以这里用一组强制非 UTF-8 的环境变量起子进程，要求照常握手并回帧。
+
+    ``-I`` 关掉了脚本目录自动进 ``sys.path``，bridge 手动补的那段必须给出真正的 ``py/``
+    目录。用 "/" 切 ``__file__`` 的写法在 Windows 盘符路径上会切出整个文件路径，导入
+    adapters/guard 全部失败、ready 帧永远等不到。两条都只能量子进程的 stdout。
+
+    :returns: 无
+    """
+    env = {
+        **os.environ,
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PYTHONUTF8": "0",
+        "PYTHONIOENCODING": "ascii",
+    }
+    request = json.dumps({"id": "enc", "method": "ping", "params": {}}, ensure_ascii=False)
+    proc = subprocess.run(  # noqa: S603
+        [sys.executable, "-u", "-I", str(BRIDGE)],
+        input=request + "\n",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        timeout=120,
+        check=False,
+    )
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    check("非 UTF-8 环境变量下 bridge 正常退出", proc.returncode == 0, repr(proc.returncode))
+    check("非 UTF-8 环境变量下 stdout 仍是 UTF-8 可解的帧", len(lines) >= 2, repr(proc.stdout[:200]))
+    if len(lines) < 2:
+        return
+    ready = json.loads(lines[0])
+    check("宿主的 ready 握手拿得到能力面", ready.get("event") == "ready", repr(ready)[:200])
+    check(
+        "ready 帧里 scrapling 面存在（adapters/guard 导入成功）",
+        isinstance((ready.get("capabilities") or {}).get("scrapling"), bool),
+        repr(ready.get("capabilities"))[:200],
+    )
+    check("请求帧被正常回应", json.loads(lines[1]).get("id") == "enc", repr(lines[1])[:160])
+    check("stderr 里没有编码异常", "UnicodeEncodeError" not in proc.stderr, repr(proc.stderr[:200]))
+
+
 def run_python_floor_gate() -> None:
     """解释器地板：低于 (3, 14) 要有消息，且 bridge 在导入期非零退出、只写 stderr。
 
@@ -1618,6 +1682,11 @@ def run_proxy() -> None:
             "socks5h 是 curl 的私有写法，两边都不认",
             guard.split_proxy("socks5h://h:1") is None,
         )
+        # 这两个在 urlparse / parsed.port 上抛 ValueError。契约是「地址不可用就返 None」，
+        # 否则一个填错的 proxyUrl 会让 configure_from_env 与每个请求一起炸。
+        check("畸形 IPv6 方括号返 None 而不是抛", guard.split_proxy("http://[::1") is None)
+        check("端口越界返 None 而不是抛", guard.split_proxy("http://h:99999") is None)
+        check("端口非数字返 None 而不是抛", guard.split_proxy("http://h:abc") is None)
 
         # 判定顺序：绕过清单横切在前，设置压过环境，两者都没有才是直连。
         load()
@@ -1783,6 +1852,12 @@ def run_proxy() -> None:
             "",
         )
         check(
+            "windows: reg query 输出的 0x1 也认",
+            guard.parse_windows_proxy({"proxyenable": "0X1", "proxyserver": "127.0.0.1:7890"})
+            == {"http": "http://127.0.0.1:7890", "https": "https://127.0.0.1:7890"},
+            "",
+        )
+        check(
             "windows: ProxyEnable=0 时即便有地址也不用",
             guard.parse_windows_proxy({"proxyenable": "0", "proxyserver": "127.0.0.1:7890"}) == {},
             "",
@@ -1889,6 +1964,32 @@ def run_proxy() -> None:
             guard.is_public_address("::5db8:d818"),
         )
         check(":: 与 ::1 仍按各自的私有判定拒掉", not guard.is_public_address("::1"))
+
+        # NAT64 的默认 /96 与 /48 两档：内嵌 IP 必须按 RFC 6052 §2.2 的布局读，
+        # /48 这一档 u 字节（下标 8）夹在中间，按起点连续切 4 字节会读错。
+        for host, note in (
+            ("64:ff9b:1:c0a8:1:100::", "/48 里的私网 192.168.1.1"),
+            ("64:ff9b:1:7f00:0:100::", "/48 里的回环 127.0.0.1"),
+            ("64:ff9b::7f00:1", "/96 里的回环 127.0.0.1"),
+        ):
+            check(f"NAT64 {note} 判拒", not guard.is_public_address(host), host)
+        check(
+            "NAT64 里藏的公网地址仍放行，不能把整段一刀切掉",
+            guard.is_public_address("64:ff9b:1:5db8:d8:2200::"),
+        )
+        # /56 与 /40 只能经部署声明前缀才生效，而它们是**真正能把私网读成公网**的档位：
+        # 按起点连续切时，/56 的 192.168.1.1 会读成 192.0.168.1（公网）。所以前缀本身
+        # 必须取一段公网 IPv6，否则 IPv6 层就先被判私网，测不到 NAT64 这条分支。
+        for prefix, host, note in (
+            ("2a00:1450::/56", "2a00:1450:0:c0:a8:101::", "/56 里的私网 192.168.1.1"),
+            ("2a00:1450::/56", "2a00:1450:0:ac:14:101::", "/56 里的私网 172.20.1.1"),
+            ("2a00:1450::/40", "2a00:1450:a:102:3::", "/40 里的私网 10.1.2.3"),
+        ):
+            guard.configure(nat64_prefixes=(prefix,))
+            try:
+                check(f"NAT64 {note} 判拒", not guard.is_public_address(host), host)
+            finally:
+                guard.configure(nat64_prefixes=())
     finally:
         for key, value in saved.items():
             if value is None:
@@ -2583,8 +2684,8 @@ def _probe_session_params(adapters: Any) -> None:
         # 直接填登记表而不是 session_open：这里要验的是**入参分支**，而真会话要么起浏览器
         # 要么建 curl_cffi 连接。收尾也不能走 close_all_sessions —— 那条会去 release 这个
         # 假 session 对象（`object()` 没有 close），报错与本条断言无关。
-        adapters._SESSIONS.pop("p", None)  # noqa: SLF001 —— 直填登记表，跳过真会话的创建
-        adapters._SESSIONS["p"] = {  # noqa: SLF001
+        adapters._SESSIONS.pop("p", None)  # 直填登记表，跳过真会话的创建
+        adapters._SESSIONS["p"] = {
             "sessionId": "p",
             "type": kind,
             "session": object(),
@@ -2626,7 +2727,7 @@ def _probe_session_params(adapters: Any) -> None:
         "only applies to static" not in message,
         f"{code} / {message}",
     )
-    adapters._SESSIONS.pop("p", None)  # noqa: SLF001
+    adapters._SESSIONS.pop("p", None)
 
 
 def run_webrtc_guards() -> None:
@@ -2648,7 +2749,7 @@ def run_webrtc_guards() -> None:
 
     captured: dict[str, dict[str, Any]] = {}
 
-    def stub(tag: str) -> Any:  # noqa: ANN401 —— 替身会话类，签名就是要录的那份 kwargs
+    def stub(tag: str) -> Any:  # 替身会话类，签名就是要录的那份 kwargs
         """造一个只记构造参数的会话替身。"""
 
         class _Stub:
@@ -2663,14 +2764,14 @@ def run_webrtc_guards() -> None:
         return _Stub
 
     original = fetchers.StealthySession
-    saved = (guard.PROXY_URL, guard._BYPASS_ENTRIES)  # noqa: SLF001 —— 与本文件其它代理用例同一口径
+    saved = (guard.PROXY_URL, guard._BYPASS_ENTRIES)  # 与本文件其它代理用例同一口径
     try:
         fetchers.StealthySession = stub("stealth")  # type: ignore[misc,assignment]
 
         guard.PROXY_URL = "http://127.0.0.1:7890"
-        guard._BYPASS_ENTRIES = ()  # noqa: SLF001
+        guard._BYPASS_ENTRIES = ()
 
-        adapters._make_session("stealth", {"sessionId": "w"})  # noqa: SLF001
+        adapters._make_session("stealth", {"sessionId": "w"})
         stealth = captured["stealth"]
         check("配了代理时 stealth 会话真的挂上代理", stealth.get("proxy") is not None, repr(stealth)[:200])
         check(
@@ -2680,7 +2781,7 @@ def run_webrtc_guards() -> None:
         )
         check("走代理的会话构造不发 extra_flags", "extra_flags" not in stealth, repr(stealth)[:200])
 
-        guard._BYPASS_ENTRIES = ("*",)  # noqa: SLF001 —— 「整台机器直连」
+        guard._BYPASS_ENTRIES = ("*",)  # 「整台机器直连」
         check("绕过清单写着 * 时会话按直连开", guard.default_proxy() == "", "")
         check(
             "同一个 * 对空 URL 的 per-URL 判定却不生效（这就是两条判据的分歧点）",
@@ -2688,7 +2789,7 @@ def run_webrtc_guards() -> None:
             repr(guard.browser_proxy(""))[:120],
         )
 
-        adapters._make_session("stealth", {"sessionId": "w"})  # noqa: SLF001
+        adapters._make_session("stealth", {"sessionId": "w"})
         direct = captured["stealth"]
         check("直连的 stealth 会话不挂代理", direct.get("proxy") is None, repr(direct)[:200])
         check(
@@ -2697,12 +2798,12 @@ def run_webrtc_guards() -> None:
             repr(direct)[:200],
         )
 
-        adapters._make_session("stealth", {"sessionId": "w", "blockWebrtc": True})  # noqa: SLF001
+        adapters._make_session("stealth", {"sessionId": "w", "blockWebrtc": True})
         check("显式要求屏蔽 WebRTC 时照办", captured["stealth"].get("block_webrtc") is True, "")
 
         guard.PROXY_URL = ""
-        guard._BYPASS_ENTRIES = ()  # noqa: SLF001
-        adapters._make_session("stealth", {"sessionId": "w"})  # noqa: SLF001
+        guard._BYPASS_ENTRIES = ()
+        adapters._make_session("stealth", {"sessionId": "w"})
         clean = captured["stealth"]
         check(
             "干净环境下直连且不动 WebRTC",
@@ -2710,9 +2811,59 @@ def run_webrtc_guards() -> None:
             repr(clean)[:200],
         )
         check("直连的会话同样不发 extra_flags", "extra_flags" not in clean, repr(clean)[:200])
+
+        # capture 走的是自己的临时会话（不进注册表），代理与 WebRTC 必须与上面两条同源：
+        # 配了代理却直连，泄露的是访客真实出口 IP。
+        class _CaptureStub:
+            """替身会话：记下 kwargs，起停都是空操作。"""
+
+            def __init__(self, **kwargs: Any) -> None:
+                captured["capture"] = kwargs
+                self.network = _StubNetwork()
+
+            def start(self) -> None:
+                """不起浏览器。"""
+
+            def fetch(self, url: str, **_kwargs: Any) -> Any:  # 返回上游 Response
+                """回一份不联网的 Response。"""
+                return adapters._fake_response("<p>ok</p>", url, 200)
+
+            def close(self) -> None:
+                """无事可做。"""
+
+        saved_capture = fetchers.StealthySession
+        try:
+            guard.PROXY_URL = "http://127.0.0.1:7890"
+            guard._BYPASS_ENTRIES = ()
+
+            fetchers.StealthySession = _CaptureStub  # type: ignore[misc,assignment]
+            adapters.capture({"url": "https://example.com/"})
+            capture_kwargs = captured["capture"]
+            check(
+                "配了代理时 capture 的会话也挂上代理",
+                capture_kwargs.get("proxy") is not None,
+                repr(capture_kwargs)[:200],
+            )
+            check(
+                "走代理时 capture 的 block_webrtc 强制为真",
+                capture_kwargs.get("block_webrtc") is True,
+                repr(capture_kwargs)[:200],
+            )
+            check("capture 恒开记录", capture_kwargs.get("record_requests") is True, repr(capture_kwargs)[:200])
+
+            guard.PROXY_URL = ""
+            adapters.capture({"url": "https://example.com/"})
+            clean_capture = captured["capture"]
+            check(
+                "干净环境下 capture 直连且不动 WebRTC",
+                clean_capture.get("proxy") is None and clean_capture.get("block_webrtc") is False,
+                repr(clean_capture)[:200],
+            )
+        finally:
+            fetchers.StealthySession = saved_capture  # type: ignore[misc,assignment]
     finally:
         fetchers.StealthySession = original  # type: ignore[misc,assignment]
-        guard.PROXY_URL, guard._BYPASS_ENTRIES = saved  # noqa: SLF001
+        guard.PROXY_URL, guard._BYPASS_ENTRIES = saved
         guard.configure_from_env()
 
 
@@ -2790,17 +2941,24 @@ def run_write_gate(base: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _raiser(exc: BaseException) -> Any:  # noqa: ANN401 —— 造出来的就是可调用对象
+def _raiser(exc: BaseException) -> Any:  # 造出来的就是可调用对象
     """造一个一调用就抛 exc 的函数（用来逼出错误分支）。"""
 
-    def boom(*_args: Any, **_kwargs: Any) -> Any:  # noqa: ANN401 —— 恒抛，返回值无意义
+    def boom(*_args: Any, **_kwargs: Any) -> Any:  # 恒抛，返回值无意义
         raise exc
 
     return boom
 
 
 class _DeadThread:
-    """一个 `is_alive()` 恒假、`start()` 什么都不做的线程替身。"""
+    """一个 `is_alive()` 恒假、`start()` 什么都不做的线程替身。
+
+    `ident` 要跟着真 `threading.Thread` 走：线程跑完 `ident` 仍然是当初那个整数，
+    Python 不清它。把它省掉会让替身比真对象少一条属性，于是 :func:`crawl._is_running`
+    的 `thread.ident is None` 那半截直接抛 `AttributeError` —— 测的就不是被测代码了。
+    """
+
+    ident: int = 1
 
     def is_alive(self) -> bool:
         """恒为「已结束」。"""
@@ -2844,7 +3002,7 @@ def _session_stub(*, broken_state: bool = False) -> type:
         def start(self) -> None:
             """开场（替身不启浏览器）。"""
 
-        def fetch(self, url: str, **_kwargs: Any) -> Any:  # noqa: ANN401 —— 返回上游 Response
+        def fetch(self, url: str, **_kwargs: Any) -> Any:  # 返回上游 Response
             """回一份不带网络的 Response。"""
             return adapters._fake_response("<p>ok</p>", url, 200)
 
@@ -2978,7 +3136,7 @@ def run_inprocess_adapters() -> None:
         """取 meta 就抛的条目替身。"""
 
         @property
-        def meta(self) -> Any:  # noqa: ANN401 —— 恒抛
+        def meta(self) -> Any:  # 恒抛
             """抛。"""
             raise RuntimeError("bad item")
 
@@ -3012,7 +3170,7 @@ def run_inprocess_adapters() -> None:
     class _FakeRoot:
         """元素迭代器替身。"""
 
-        def iter(self) -> Any:  # noqa: ANN401 —— 迭代器
+        def iter(self) -> Any:  # 迭代器
             """回一个无 attrib 的元素。"""
             return iter([_FakeEl()])
 
@@ -3126,7 +3284,7 @@ def run_inprocess_browser() -> None:
     class _StubFetcher:
         """``Fetcher`` 的替身：四个动词都回一份不联网的 Response。"""
 
-        def get(self, url: str, **_kwargs: Any) -> Any:  # noqa: ANN401 —— 返回上游 Response
+        def get(self, url: str, **_kwargs: Any) -> Any:  # 返回上游 Response
             """回一份 Response。"""
             return adapters._fake_response("<p>ok</p>", url, 200)
 
@@ -3135,7 +3293,7 @@ def run_inprocess_browser() -> None:
     class _StubStealthyFetcher:
         """``StealthyFetcher`` 的替身。"""
 
-        def fetch(self, url: str, **_kwargs: Any) -> Any:  # noqa: ANN401 —— 同上
+        def fetch(self, url: str, **_kwargs: Any) -> Any:  # 同上
             """回一份 Response。"""
             return adapters._fake_response("<p>ok</p>", url, 200)
 
@@ -3637,7 +3795,7 @@ def run_inprocess_crawl() -> None:
         # worker 起手就被叫停（crawl_stop 在 spider 登记之前到）：一页都不抓
         def _mark_stop(
             url: str, limit: int, crawl_id: str, state: dict[str, Any], domains: set[str], policy: Any
-        ) -> Any:  # noqa: ANN401 —— 替身
+        ) -> Any:  # 替身
             """把该 id 的登记标成已叫停，并回一个够登记用的蜘蛛替身。"""
             crawl._CRAWLS[crawl_id]["stop_requested"] = True
             return object()
@@ -3814,6 +3972,9 @@ def main() -> int:
 
     print("\n== 解释器地板（运行时硬闸）==")
     run_python_floor_gate()
+
+    print("\n== 协议通道的编码与 py/ 目录解析 ==")
+    run_bridge_wire_encoding()
 
     print("\n== 缺可选依赖的归类 ==")
     check_dependency_missing_mapping()

@@ -155,7 +155,7 @@ def configure_from_env() -> None:
         configure(nat64_prefixes=prefixes)
 
     global SYNTHETIC_NETWORKS, PROXY_URL, PROXY_BYPASS, ALLOW_WRITE_METHODS, _BYPASS_ENTRIES  # noqa: PLW0603 —— 启动时定一次
-    global _ENV_PROXIES, _ENV_BYPASS, _SYSTEM_PROXIES, _PAC_NOTICE  # noqa: PLW0603 —— 同上
+    global _ENV_PROXIES, _ENV_BYPASS, _SYSTEM_PROXIES, _PAC_NOTICE  # 同上
     networks: list[ipaddress.IPv4Network] = []
     for item in os.environ.get(SYNTHETIC_RANGES_ENV, "").split(","):
         text = item.strip()
@@ -282,7 +282,9 @@ def parse_windows_proxy(entries: dict[str, str]) -> dict[str, str]:
     :param entries: 键是 ``ProxyEnable`` / ``ProxyServer`` / ``AutoConfigURL`` 的小写形式
     :returns: 代理表
     """
-    if entries.get("proxyenable", "0") != "1":
+    # `reg query` 对 REG_DWORD 输出的就是十六进制（`0x1`），只有部分工具会写成十进制
+    # `1`。只认后者的话这条探测在 Windows 上永远返回空表，整条系统代理路径静默失效。
+    if entries.get("proxyenable", "").strip().lower() not in ("1", "0x1"):
         return {}
     raw = entries.get("proxyserver", "").strip()
     if not raw:
@@ -470,7 +472,15 @@ def split_proxy(raw: str) -> dict[str, str] | None:
     :param raw: 代理地址
     :returns: 代理字典；地址不可用时为 None
     """
-    parsed = urlparse(raw)
+    try:
+        parsed = urlparse(raw)
+        # 提前取一次端口：越界（`:99999`）或非数字（`:abc`）的端口在这时才抛
+        # ValueError，而下面还有几处要读 `parsed.port`。畸形方括号（`http://[::1`）
+        # 在 urlparse 里就抛。两处一并按「地址不可用」处理 —— 本函数的契约是返回
+        # None 而不是抛，调用方（configure_from_env / proxy_settings）据此如实报未配置。
+        port = parsed.port
+    except ValueError:
+        return None
     scheme = (parsed.scheme or "").lower()
     if scheme not in _BROWSER_PROXY_SCHEMES or not parsed.hostname:
         return None
@@ -478,8 +488,8 @@ def split_proxy(raw: str) -> dict[str, str] | None:
     # server 里得再装回去 —— 否则 `[::1]` 会被解析成端口。
     host = parsed.hostname if ":" not in parsed.hostname else f"[{parsed.hostname}]"
     server = f"{scheme}://{host}"
-    if parsed.port:
-        server = f"{server}:{parsed.port}"
+    if port:
+        server = f"{server}:{port}"
     return {
         "server": server,
         # 凭据要 percent-decode：urlparse 不解，而 Playwright 是把这对值原样塞进
@@ -537,13 +547,36 @@ def _nat64_tables() -> tuple[tuple[ipaddress.IPv6Network, int, int], ...]:
     return tuple(tables)
 
 
+def _nat64_inner_bytes(packed: bytes, offset: int) -> bytes:
+    """按 RFC 6052 §2.2 的布局从 16 字节里取出内嵌 IPv4。
+
+    ``/40``、``/48``、``/56`` 这几档的 IPv4 被第 9 个字节（下标 8 的 u 字节）从中间切断：
+    前半段在 u 之前，后半段在 u 之后，并不连续。按起点连续切 4 字节会把 u 字节当成 IPv4
+    的一位读进来、同时漏掉最后一位 —— ``/48`` 下内嵌 192.0.2.33 的地址会被读成
+    192.0.0.2，于是私网地址能被读成公网地址。
+
+    ``/32`` 与 ``/64`` 的 4 字节恰好落在 u 的同一侧，按连续切本来就对；``/96`` 在最后
+    4 字节，与 u 无关。统一写法：取 5 字节窗口再剔除 u 字节，六档共用一条路径。
+
+    :param packed: IPv6 的 16 字节
+    :param offset: 内嵌 IPv4 的起始下标
+    :returns: 内嵌 IPv4 的 4 字节
+    """
+    window = packed[offset : offset + 5]
+    return bytes(byte for index, byte in enumerate(window) if offset + index != 8)[:4]
+
+
 def _embedded_ipv4(address: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
-    """若地址落在某个 NAT64 前缀里，抽出内嵌的 IPv4。"""
+    """若地址落在某个 NAT64 前缀里，抽出内嵌的 IPv4。
+
+    :param address: IPv6 地址
+    :returns: 内嵌的 IPv4 地址；不落在任何前缀里时返回 ``None``
+    """
     packed = address.packed
     for network, _prefixlen, offset in _nat64_tables():
         if address not in network:
             continue
-        return ipaddress.IPv4Address(packed[offset : offset + 4])
+        return ipaddress.IPv4Address(_nat64_inner_bytes(packed, offset))
     return None
 
 
