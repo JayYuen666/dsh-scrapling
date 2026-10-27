@@ -48,6 +48,12 @@ export interface SidecarCapabilities {
   readonly extract: boolean;
   /** patchright 浏览器是否就绪。0.5 起浏览器抓取只剩这一套，所以只有这一项。 */
   readonly browser: boolean;
+  /**
+   * WebSocket 握手拦不拦得住（旧 Playwright 没有 `route_web_socket` 时是 `false`）。
+   *
+   * 缺这一位表示对端没上报，既不读成「拦得住」也不读成「拦不住」。
+   */
+  readonly websocketGuard?: boolean;
   /** Scrapling 版本号。 */
   readonly version?: string;
   /** 部署是否开放写方法；两侧各判一次的前提是这一份也如实上报。 */
@@ -169,7 +175,7 @@ function parseProxySummary(value: unknown): SidecarProxySummary | null {
 export function parseCapabilities(value: unknown): SidecarCapabilities {
   const record = isRecord(value) ? value : {};
   const flag = (key: string): boolean => record[key] === true;
-  const { version, proxy } = record;
+  const { version, proxy, websocketGuard } = record;
   const summary = parseProxySummary(proxy);
   return {
     scrapling: flag("scrapling"),
@@ -177,9 +183,40 @@ export function parseCapabilities(value: unknown): SidecarCapabilities {
     extract: flag("extract"),
     browser: flag("browser"),
     writeMethods: flag("writeMethods"),
+    ...(typeof websocketGuard === "boolean" ? { websocketGuard } : {}),
     ...(typeof version === "string" ? { version } : {}),
     ...(summary === null ? {} : { proxy: summary }),
   };
+}
+
+/**
+ * 把模型交进来的每一个 URL 送去判，归一过的写进一份新的参数对象。
+ *
+ * crawl 的 payload 里 URL 不止一处：`url` 之外还有 `sitemapUrl`、`feedUrl`。只筛 `params.url`
+ * 就等于让宿主这道闸门对后两者不存在，而 Python 那道只按地址判。顺序判、判否即止：一次拒绝
+ * 之后不再为后面的 URL 做解析。
+ */
+async function gateRequestUrls(
+  params: object,
+  gate: (url: string) => Promise<string | undefined>,
+): Promise<object> {
+  const one = async (target: object, key: string): Promise<object> => {
+    const value: unknown = Reflect.get(target, key);
+    if (typeof value !== "string" || value.length === 0) {
+      return target;
+    }
+    const normalized = await gate(value);
+    // 闸门可能把 URL 归一过。判的和连的必须是同一个字符串，否则归一化就成了绕过面。
+    // 换新的参数对象而不是就地改：params 可能是调用方复用的对象，就地改会把上一次的归一
+    // 结果带进下一次调用。
+    if (typeof normalized !== "string" || normalized === value) {
+      return target;
+    }
+    return { ...target, [key]: normalized };
+  };
+  const start = await one(params, "url");
+  const withSitemap = await one(start, "sitemapUrl");
+  return one(withSitemap, "feedUrl");
 }
 
 /** sidecar 客户端。 */
@@ -267,8 +304,14 @@ export class SidecarClient {
     }
     const rawError = frame["error"];
     const message = isRecord(rawError) ? rawError["message"] : undefined;
+    const code =
+      isRecord(rawError) && typeof rawError["code"] === "string"
+        ? rawError["code"]
+        : "SIDECAR_REQUEST_FAILED";
+    const details =
+      isRecord(rawError) && isRecord(rawError["details"]) ? rawError["details"] : undefined;
     entry.reject(
-      new SidecarError("SIDECAR_REQUEST_FAILED", asText(message, "unknown sidecar error")),
+      new SidecarError(code, asText(message, "unknown sidecar error"), undefined, details),
     );
   }
 
@@ -299,8 +342,26 @@ export class SidecarClient {
     this.#routeResponse(frame);
   }
 
-  /** 拆掉当前进程：所有在途请求作废。 */
-  async #teardown(reason: string, code: SidecarErrorCode): Promise<void> {
+  /**
+   * 拆掉当前进程：所有在途请求作废。
+   *
+   * @param reason - 拆掉的原因，进日志与在途请求的错误消息
+   * @param code - 在途请求拿到的错误码
+   * @param origin - 触发这次拆除的子进程句柄。管道错误与退出通知都来自**某一个具体
+   *   进程**，而这里会先 terminate 再 await waitForExit —— 这段让出执行权的窗口里，
+   *   ensureStarted() 可能已经拉起新一代进程。旧代晚到的退出/管道事件若无条件拆除，
+   *   就会把新进程连同它的在途请求一起带走。带上 origin，就只许拆自己那一代。
+   */
+  async #teardown(
+    reason: string,
+    code: SidecarErrorCode,
+    origin?: SubprocessHandle,
+  ): Promise<void> {
+    if (origin !== undefined && this.#handle !== origin) {
+      // #handle 已经被换成新一代（或已被本次拆除置空）—— 旧代的事件到此为止。
+      this.#log(`[sidecar] ignoring stale teardown: ${reason}`);
+      return;
+    }
     this.#log(`[sidecar] teardown: ${reason}`);
     this.#stopPump?.();
     this.#stopPump = undefined;
@@ -399,7 +460,7 @@ export class SidecarClient {
       // 管道报错、帧超限或帧处理抛错都归到这里。少一个 error 监听时这些都是未捕获异常，
       // 会直接掀翻宿主进程，所以这里把 sidecar 拆掉，并让在途请求以一个明确的错误收场。
       (error: unknown) => {
-        void this.#teardown(`sidecar stream failed: ${String(error)}`, "SIDECAR_CRASHED");
+        void this.#teardown(`sidecar stream failed: ${String(error)}`, "SIDECAR_CRASHED", child);
       },
     );
     child.stderr?.setEncoding("utf8");
@@ -412,18 +473,19 @@ export class SidecarClient {
     });
     // stderr 与 stdin 同理：它们也是子进程管道，报错同样会变成未捕获异常。
     child.stderr?.on("error", (error: unknown) => {
-      void this.#teardown(`sidecar stderr failed: ${String(error)}`, "SIDECAR_CRASHED");
+      void this.#teardown(`sidecar stderr failed: ${String(error)}`, "SIDECAR_CRASHED", child);
     });
     stdin.on("error", (error: unknown) => {
-      void this.#teardown(`sidecar stdin failed: ${String(error)}`, "SIDECAR_CRASHED");
+      void this.#teardown(`sidecar stdin failed: ${String(error)}`, "SIDECAR_CRASHED", child);
     });
     // done 对「正常退出」与「被信号杀死」都 resolve（只有 spawn 失败才 reject）。两个
     // 出口都要收尾：只挂 catch 的话，sidecar 自行正常退出时 #handle 仍指着已死的进程、
     // #capabilities 仍是旧的，alive 继续报 true、ensureStarted() 也直接复用陈旧能力，
     // 在途请求只能各自等超时 —— timeoutMs 为 null 的爬虫请求则永远挂着。
     void child.done.then(
-      () => this.#teardown("sidecar exited", "SIDECAR_CLOSED"),
-      (error: unknown) => this.#teardown(`sidecar exited: ${String(error)}`, "SIDECAR_CRASHED"),
+      () => this.#teardown("sidecar exited", "SIDECAR_CLOSED", child),
+      (error: unknown) =>
+        this.#teardown(`sidecar exited: ${String(error)}`, "SIDECAR_CRASHED", child),
     );
 
     const ready = await this.#waitForReady(this.#options.handshakeTimeoutMs);
@@ -484,17 +546,7 @@ export class SidecarClient {
   ): Promise<unknown> {
     // URL 准入先于一切：判否就不必拉起子进程、更不必写管道。
     const gate = this.#options.urlGate;
-    const target = (params as { url?: unknown }).url;
-    let outgoing = params;
-    if (gate !== undefined && typeof target === "string" && target.length > 0) {
-      const normalized = await gate(target);
-      // 闸门可能把 URL 归一过。判的和连的必须是同一个字符串，否则归一化就成了绕过面。
-      // 换新的 params 对象而不是就地改：params 可能是调用方复用的对象，就地改会把
-      // 上一次的归一结果带进下一次调用。
-      if (typeof normalized === "string" && normalized !== target) {
-        outgoing = { ...params, url: normalized };
-      }
-    }
+    const outgoing = gate === undefined ? params : await gateRequestUrls(params, gate);
     await this.ensureStarted(options.signal);
     const stdin = this.#handle?.stdin;
     // ensureStarted 成功即意味着 spawn 时拿到了管道（缺管道它自己就抛了），

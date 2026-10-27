@@ -10,9 +10,10 @@
 // 能换的只有执行后端。这条缝是 dsh-web 官方提供的 —— tool-web 只管模型侧 schema 与排版，
 // provider 选择与网络访问都在 ctx.web 里。
 //
-// 为什么 available() 要看搜索端点：注册了第二个「可用」的 search provider 而部署侧没配
-// searchProvider，内置 web_search 会直接不可用（WEB_PROVIDER_AMBIGUOUS）。所以 provideWebSearch
-// 虽然默认开，available() 在没配搜索端点时仍返回 false —— 只开开关不会误接管 web_search。
+// 为什么 available() 要看「有没有可用的发现后端」：注册了第二个「可用」的 search provider 而
+// 部署侧没配 searchProvider，内置 web_search 会直接不可用（WEB_PROVIDER_AMBIGUOUS）。所以
+// provideWebSearch 虽然默认开，available() 在 auto 既没 key、没 SearXNG、又没开公共回退时
+// 返回 false —— 只开开关不会误接管 web_search，也不会把查询词悄悄发给公共引擎（spec D10）。
 import { WebError } from "@deepseek-ai/dsh-web";
 import type {
   WebSearchProvider,
@@ -27,17 +28,44 @@ import { SidecarError } from "./sidecar-error.ts";
 /** 本 provider 在 ctx.web 的 search 接缝里的 id。 */
 export const SEARCH_PROVIDER_ID = "scrapling";
 
+/** 发现层后端。Brave/Serper/DDG/SearXNG 没有本机证据，不在这一档里。 */
+export type SearchBackend =
+  | "auto"
+  | "tavily"
+  | "bing"
+  | "brave"
+  | "serper"
+  | "duckduckgo"
+  | "searxng";
+
 /** 建 search provider 需要的参数。 */
 export interface SearchProviderDeps {
   /** 已握手的 sidecar 客户端。 */
   readonly sidecar: SidecarClient;
   /**
-   * 搜索后端端点（部署级）。留空 = 不提供搜索能力，available() 返回 false。
-   *
-   * 期望是 SearXNG 兼容的 JSON 接口：GET `<endpoint>?q=<query>&format=json`，
-   * 返回 `{"results": [{"url", "title", "content"}]}`。别的后端只要能出这个形状也行。
+   * 发现后端：auto 依次尝试配了 key 的 API 后端与 SearXNG，两者都没有时按
+   * {@link SearchProviderDeps.publicFallback} 决定是否回落到公共引擎。
    */
-  readonly searchEndpoint: string;
+  readonly backend: SearchBackend;
+  /** Tavily / Brave / Serper 各自的 API key；空串表示没配。 */
+  readonly apiKey: string;
+  readonly braveApiKey: string;
+  readonly serperApiKey: string;
+  /** 各后端的端点（测试或部署覆盖）。 */
+  readonly apiEndpoint: string;
+  readonly bingEndpoint: string;
+  readonly braveEndpoint: string;
+  readonly serperEndpoint: string;
+  readonly duckduckgoEndpoint: string;
+  /** SearXNG 实例地址；空串表示这条后端不可用。 */
+  readonly searxngEndpoint: string;
+  /**
+   * auto 后端是否允许回落到公共引擎（DuckDuckGo → Bing）。
+   *
+   * 默认 false（spec D10）：公共引擎会把查询词发给第三方，属于要部署方明确同意的行为。
+   * 显式把 backend 设成公共引擎时这一项不参与判断 —— 那已经是明确选择。
+   */
+  readonly publicFallback: boolean;
   /** 搜索结果里前几条要真的抓下来渲染。 */
   readonly renderTopN: number;
   /** 单次抓取的字节预算。 */
@@ -64,51 +92,32 @@ export interface ParsedSearchHit {
 }
 
 /**
- * 取出搜索后端的条目数组。
- *
- * 认两种形状：SearXNG 的 `results`，以及更常见的 `items`。
- *
- * @param payload - 已确认是对象的回包
- * @returns 条目数组；两种键都不是数组时给空数组
- */
-function resultList(payload: Record<string, unknown>): unknown[] {
-  const { results, items } = payload;
-  if (Array.isArray(results)) {
-    return results;
-  }
-  if (Array.isArray(items)) {
-    return items;
-  }
-  return [];
-}
-
-/**
- * 从搜索后端的回包里挑出可用的结果条目。
+ * 从 sidecar 的 `search.discover` 回包里挑出可用条目。
  *
  * 条目是对象、url 是非空字符串才算数。**URL 的安全判定不在这里做** —— 真正去读它们时
  * sidecar 的 URL 闸门会逐条判，放在解析层等于把一份安全策略复制一遍。
  *
- * @param payload - 解析后的 JSON
- * @returns 命中的条目（可能为空）
+ * @param payload - sidecar 的 result
+ * @returns 命中的条目
+ * @throws WebError - 回包形状不是协议声明的那一个
  */
-export function parseSearchResults(payload: unknown): ParsedSearchHit[] {
-  if (!isRecord(payload)) {
-    return [];
+function hitsOf(payload: unknown): ParsedSearchHit[] {
+  if (!isRecord(payload) || !Array.isArray(payload["hits"])) {
+    throw new WebError("search discovery returned no hits array", "SCRAPLING_SEARCH_FAILED");
   }
-  return resultList(payload).flatMap((item) => {
+  return payload["hits"].flatMap((item) => {
     if (!isRecord(item)) {
       return [];
     }
-    const { url, title, content, snippet } = item;
+    const { url, title, snippet } = item;
     if (typeof url !== "string" || url.length === 0) {
       return [];
     }
-    const text = content ?? snippet;
     return [
       {
         url,
         ...(typeof title === "string" && title.length > 0 ? { title } : {}),
-        ...(typeof text === "string" && text.length > 0 ? { snippet: text } : {}),
+        ...(typeof snippet === "string" && snippet.length > 0 ? { snippet } : {}),
       },
     ];
   });
@@ -130,46 +139,68 @@ function absolutize(raw: string, endpoint: string): string {
 }
 
 /**
- * 打一次搜索后端，取回它的条目。
+ * 调 sidecar 的发现层，取回条目。
  *
- * @param endpoint - 搜索端点
+ * SEARCH_* 错误码原样保留：Tavily 没配 key 是 SEARCH_AUTH，用户要能据此改配置；
+ * 折成通用的失败码只会让「没配 key」和「后端挂了」看起来一样。
+ *
+ * @param deps - provider 依赖
  * @param query - 已 trim 过的查询词
+ * @param maxResults - 候选条数
  * @param signal - 取消信号
- * @param timeoutMs - 单次搜索的协同超时；到点即中止这次请求
- * @returns 命中的条目
- * @throws WebError - 端点不是 http(s)、后端非 2xx、或回包不可解析
+ * @returns 命中的条目与相对 URL 的基准端点
  */
-async function querySearchBackend(
-  endpoint: string,
+/** 每条后端只认自己那把 key；拼错后端名不会把 Tavily 的 key 递给 Brave。 */
+function selectKey(deps: SearchProviderDeps): string {
+  if (deps.backend === "brave") {
+    return deps.braveApiKey;
+  }
+  if (deps.backend === "serper") {
+    return deps.serperApiKey;
+  }
+  return deps.apiKey;
+}
+
+async function discover(
+  deps: SearchProviderDeps,
   query: string,
+  maxResults: number,
   signal: AbortSignal | undefined,
-  timeoutMs: number,
-): Promise<ParsedSearchHit[]> {
-  // 超时与调用方取消是两个来源：只转发 signal 的话，接缝没给 signal（该参数本就是可选的）
-  // 时一次卡住的后端会让整次搜索永久挂起，而且没有任何可观测的超时错误。
-  const timeout = AbortSignal.timeout(timeoutMs);
-  const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
+): Promise<{ hits: ParsedSearchHit[]; base: string }> {
   try {
-    const searchUrl = new URL(endpoint);
-    if (searchUrl.protocol !== "http:" && searchUrl.protocol !== "https:") {
-      throw new Error(`search endpoint must be http(s): ${searchUrl.protocol}`);
-    }
-    searchUrl.searchParams.set("q", query);
-    searchUrl.searchParams.set("format", "json");
-    const response = await fetch(searchUrl, {
-      signal: combined,
-      headers: { accept: "application/json" },
-    });
-    if (!response.ok) {
-      throw new Error(`search backend answered HTTP ${response.status}`);
-    }
-    return parseSearchResults(await response.json());
+    const raw = await deps.sidecar.call(
+      "search.discover",
+      {
+        backend: deps.backend,
+        query,
+        maxResults,
+        apiKey: selectKey(deps),
+        apiEndpoint: deps.apiEndpoint,
+        bingEndpoint: deps.bingEndpoint,
+        braveEndpoint: deps.braveEndpoint,
+        serperEndpoint: deps.serperEndpoint,
+        duckduckgoEndpoint: deps.duckduckgoEndpoint,
+        searxngEndpoint: deps.searxngEndpoint,
+        publicFallback: deps.publicFallback,
+        timeoutSeconds: deps.timeoutMs / 1000,
+      },
+      { ...(signal === undefined ? {} : { signal }), timeoutMs: deps.timeoutMs },
+    );
+    const backend =
+      isRecord(raw) && typeof raw["backend"] === "string" ? raw["backend"] : deps.backend;
+    return {
+      hits: hitsOf(raw),
+      base: backend === "tavily" ? deps.apiEndpoint : deps.bingEndpoint,
+    };
   } catch (error: unknown) {
-    // 取消不是故障：调用方改主意了，语义是「这次调用作废」。把它包成 provider 失败码，
-    // seam 那头看到的就成了一次搜索失败，日志与用户提示都会指错方向。原样抛出。
-    // 超时同理：它是这次搜索的结局，而不是「后端回了坏东西」。
-    if (signal?.aborted === true || timeout.aborted) {
+    if (signal?.aborted === true) {
       throw error;
+    }
+    if (error instanceof WebError) {
+      throw error;
+    }
+    if (error instanceof SidecarError && error.code.startsWith("SEARCH_")) {
+      throw new WebError(error.message, error.code);
     }
     throw new WebError(String(error), "SCRAPLING_SEARCH_FAILED");
   }
@@ -339,20 +370,31 @@ async function renderBody(
  * @returns provider
  */
 export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProvider {
-  const endpoint = deps.searchEndpoint.trim();
   return {
     id: SEARCH_PROVIDER_ID,
 
     /**
-     * 本地可用性判断。契约要求**不得发网络请求**，所以只看 sidecar 是否握手成功、
-     * 以及部署侧有没有配搜索端点。
+     * 本地可用性判断。契约要求**不得发网络请求**，所以只看 sidecar 是否握手成功。
+     *
+     * Tavily 没配 key 仍然算可用：让 search() 报 SEARCH_AUTH，用户才知道该去补哪一项；
+     * 在这里静默降级就等于把「配置错了」伪装成「这个 provider 不存在」。
      *
      * @returns 是否可用
      */
     available(): boolean {
-      return (
-        endpoint.length > 0 && deps.sidecar.alive && deps.sidecar.capabilities?.scrapling === true
-      );
+      if (!(deps.sidecar.alive && deps.sidecar.capabilities?.scrapling === true)) {
+        return false;
+      }
+      if (deps.backend !== "auto") {
+        // 显式后端：key 缺了也要让 search() 报 SEARCH_AUTH，用户才知道补哪一项；
+        // 在这里静默退回“不可用”就等于把配置错误伪装成 provider 不存在。
+        return true;
+      }
+      // auto：只有存在一条真正的发现路径才算可用。公共引擎不是默认路径 —— 它要
+      // searchPublicFallback 明确打开，否则查询词会被悄悄发给第三方（spec D10）。
+      // 判据与 py/search.py 的 auto 解析保持一致：auto 只看 Tavily key 与 SearXNG
+      // 端点，brave/serper 的 key 属于显式选择那些后端的场景。
+      return deps.apiKey.length > 0 || deps.searxngEndpoint.length > 0 || deps.publicFallback;
     },
 
     /**
@@ -372,14 +414,12 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
       }
       const maxResults = boundResults(request.maxResults);
 
-      const hits = await querySearchBackend(endpoint, query, signal, deps.timeoutMs);
+      const { hits, base } = await discover(deps, query, maxResults, signal);
       // sources 也要过准入闸门：搜索后端的回包是外部输入，它尽可以回一条内网地址；
       // 不过闸的话，那条地址就原样出现在模型眼前，而本包对同一地址的抓取会被拦下。
       // 候选先截到 MAX_SOURCES 再过闸 —— 闸门每条一次 DNS，封顶必须落在过闸之前。
       const candidates = hits.slice(0, MAX_SOURCES);
-      const gated = await Promise.all(
-        candidates.map((hit) => toSource(hit, endpoint, deps.urlGate)),
-      );
+      const gated = await Promise.all(candidates.map((hit) => toSource(hit, base, deps.urlGate)));
       const sources = gated.flat();
       // 一条都不剩时必须报错，而不是回一次「成功但没有结果」的搜索：后端只回了内网地址
       // 与「搜不到东西」是两件完全不同的事，后者才是用户想看到的那一种。

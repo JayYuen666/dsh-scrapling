@@ -10,13 +10,18 @@ import { once } from "node:events";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { ToolArgsError } from "@deepseek-ai/dsh-tools";
+import { pageToText, rowToText } from "../lib/crawl-output.ts";
 import { capText } from "../lib/output.ts";
+import { CRAWL_MODE_PARAMS } from "../lib/tool-params.ts";
 import {
   createAnswerTool,
   createCaptureXhrTool,
   createCrawlTool,
   createExtractTool,
   createFetchTool,
+  createLinksTool,
+  createLocateTool,
   createRenderTool,
   createSessionCloseTool,
   createSessionFetchTool,
@@ -26,7 +31,13 @@ import {
   createSessionStateLoadTool,
   createSessionStateSaveTool,
 } from "../lib/tools.ts";
-import type { CrawlJobRunner, CrawlSink, ToolSettings } from "../lib/tools.ts";
+import type { CrawlJobRunner, CrawlJobStarter, CrawlSink, ToolSettings } from "../lib/tools.ts";
+import {
+  createDownloadTool,
+  createScreenshotTool,
+  createSessionActTool,
+  createSessionReadTool,
+} from "../lib/browser-tools.ts";
 import type { AnswerRequest, AnswerResult } from "../lib/answer.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
@@ -79,6 +90,22 @@ async function fakeJobStarter(label: string, run: CrawlJobRunner): Promise<strin
   return "job-1";
 }
 
+/** 把作业输出收进数组的起作业回调。 */
+function recordingStarter(appended: string[]): CrawlJobStarter {
+  return async (_label: string, run: CrawlJobRunner): Promise<string> => {
+    await run({
+      append: (text: string) => {
+        appended.push(text);
+      },
+      progress: () => {
+        // 只关心 append。
+      },
+      signal: new AbortController().signal,
+    });
+    return "job-1";
+  };
+}
+
 /**
  * 一个不调模型的问答替身：把收到的正文回显成固定答案。
  *
@@ -120,6 +147,8 @@ const SETTINGS: ToolSettings = {
   recordRequests: false,
   maxRecordedRequests: 100,
   sessionStateDir: "",
+  adaptiveStorage: "sqlite",
+  redisUrl: "redis://127.0.0.1:6379/0",
   crawlRespectRobots: false,
   crawlDownloadDelayMs: 0,
   crawlConcurrentRequests: 4,
@@ -130,6 +159,8 @@ const SETTINGS: ToolSettings = {
   // 关的那一支在下面 `scrapling_fetch 的写方法闸门` 那一组里逐条钉。
   allowWriteMethods: true,
   stripInlineImages: true,
+  downloadDir: "/tmp/scrapling-downloads",
+  downloadMaxBytes: 10_000_000,
 };
 
 /** 假 sidecar：按 method 回固定结果，并记录收到的参数。 */
@@ -469,6 +500,103 @@ describe("scrapling_fetch", () => {
     );
     expect(JSON.stringify(blocks)).toContain("(Content truncated.)");
   });
+
+  it("请求件参数与 metadata 都按帧投影，缺省键不出现", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      status: 200,
+      content: "ok",
+      truncated: false,
+      metadata: {
+        contentType: "application/json",
+        encoding: "utf8",
+        redirects: 1,
+        method: "POST",
+      },
+    });
+    const tool = createFetchTool({
+      sidecar: fake.client,
+      settings: { ...SETTINGS, allowWriteMethods: true },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      {
+        url: SAMPLE_URL,
+        method: "POST",
+        extractionType: "json",
+        params: { query: "x" },
+        form: { field: "1" },
+        defaultEncoding: "latin-1",
+        retryDelay: 2,
+        stealthyHeaders: false,
+        includeMetadata: true,
+      },
+      exec,
+    )) as { metadata?: Record<string, unknown> };
+    expect(fake.calls[0]?.params).toMatchObject({
+      extractionType: "json",
+      params: { query: "x" },
+      form: { field: "1" },
+      defaultEncoding: "latin-1",
+      retryDelay: 2,
+      stealthyHeaders: false,
+      includeMetadata: true,
+    });
+    expect(result.metadata).toMatchObject({ contentType: "application/json" });
+    const rendered = tool.output.render(
+      { url: SAMPLE_URL },
+      {
+        url: SAMPLE_URL,
+        statusCode: 200,
+        extractionType: "json",
+        content: "{}",
+        truncated: false,
+        notice: "",
+        metadata: { contentType: "application/json", method: "POST", redirects: 1 },
+      },
+    ) as { text: string }[];
+    expect(rendered[0]?.text).toContain("contentType: application/json");
+    expect(rendered[0]?.text).toContain("redirects: 1");
+
+    await tool.execute({ url: SAMPLE_URL }, exec);
+    for (const key of [
+      "params",
+      "form",
+      "json",
+      "defaultEncoding",
+      "retryDelay",
+      "stealthyHeaders",
+      "includeMetadata",
+    ]) {
+      expect(fake.calls[1]?.params).not.toHaveProperty(key);
+    }
+  });
+
+  it("fetch 的 timeoutSeconds 调用值优先，缺省用部署值", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "ok", truncated: false });
+    const tool = createFetchTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL, timeoutSeconds: 30 }, exec);
+    expect(fake.calls[0]?.params).toMatchObject({ timeoutSeconds: 30 });
+    await tool.execute({ url: SAMPLE_URL }, exec);
+    expect(fake.calls[1]?.params).toMatchObject({
+      timeoutSeconds: SETTINGS.requestTimeoutSeconds,
+    });
+    expect(fake.calls[1]?.params).toMatchObject({ timeoutSeconds: 120 });
+    // 参数面里真有这一格，否则模型给的值会被 schema 挡在外面。
+    expect(
+      Object.keys(
+        (tool.parameters as { properties?: Record<string, unknown> } | undefined)?.properties ?? {},
+      ),
+    ).toContain("timeoutSeconds");
+  });
 });
 
 /**
@@ -499,7 +627,7 @@ function gated(allowWriteMethods: boolean): {
  * @param tool - 工具定义
  * @returns 参数名列表
  */
-function parameterNames(tool: ReturnType<typeof createFetchTool>): string[] {
+function parameterNames(tool: { parameters?: unknown }): string[] {
   const compiled = tool.parameters as { properties?: Record<string, unknown> } | undefined;
   return Object.keys(compiled?.properties ?? {});
 }
@@ -624,6 +752,20 @@ describe("scrapling_extract", () => {
     ]);
   });
 
+  it("crawl 的 mode 面收 shopify，并原样上线", async () => {
+    expect(CRAWL_MODE_PARAMS.mode.enum).toContain("shopify");
+    const fake = fakeSidecar({ crawlId: "c-1" });
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    await tool.execute({ url: "https://shop.example.com/", mode: "shopify", maxPages: 3 }, exec);
+    expect(fake.calls[0]?.params).toMatchObject({ mode: "shopify", maxPages: 3 });
+  });
+
   it("请求里带着字符预算：limit 数条数，预算管总长度", async () => {
     // 少了它就等于 matches 完全不封顶：一个 5MB 的 html 命中几万个节点时，整份会
     // 原样进模型上下文 —— 那是本工具唯一没有上限的一路。
@@ -644,6 +786,7 @@ describe("scrapling_extract", () => {
       attribute: null,
       includeAttributes: false,
       maxContentChars: SETTINGS.maxOutputBytes,
+      deployment: { adaptiveStorage: SETTINGS.adaptiveStorage, redisUrl: SETTINGS.redisUrl },
     });
   });
 
@@ -806,6 +949,51 @@ describe("scrapling_extract", () => {
     expect(result.matches).toStrictEqual([{ tag: "", text: "" }]);
   });
 
+  it("回包里带了 html 就原样透传，缺少时也不注入这个键", async () => {
+    // py/extraction.py 在 includeHtml 且没给 attribute 时会单独写一份 outerHTML。
+    // 接口注释（Match.html）与 EXTRACT_OUTPUT_SCHEMA 都声明了这个字段 —— 不搬的话
+    // 声明就是空话，模型永远收不到 html。
+    const fake = fakeSidecar({
+      count: 2,
+      truncated: false,
+      matches: [
+        { tag: "li", html: "<li class='x'>A</li>" },
+        { tag: "li", text: "B", html: "<li>B</li>" },
+      ],
+    });
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    const result = (await tool.execute(
+      { html: "<ul></ul>", selector: "li", includeHtml: true },
+      exec,
+    )) as { matches: Record<string, unknown>[] };
+    // 只有 html 而没有正文的匹配是合法的：仍按既有规则补一个空正文，html 不许丢。
+    expect(result.matches[0]).toStrictEqual({
+      tag: "li",
+      html: "<li class='x'>A</li>",
+      text: "",
+    });
+    expect(result.matches[1]).toStrictEqual({ tag: "li", text: "B", html: "<li>B</li>" });
+
+    // 没有 html 的时候也不许注入空串/undefined：字段在 schema 里是可选的。
+    const plain = fakeSidecar({ count: 1, truncated: false, matches: [{ tag: "li", text: "B" }] });
+    const plainTool = createExtractTool({
+      sidecar: plain.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const plainResult = (await plainTool.execute({ html: "<ul></ul>", selector: "li" }, exec)) as {
+      matches: Record<string, unknown>[];
+    };
+    expect(plainResult.matches[0]).not.toHaveProperty("html");
+  });
+
   it("status 缺失或不是非负整数时报可读错误，而不是补成一个 0", async () => {
     // 补成 0 的话，宿主与模型看到的是一条真实的状态码 0 —— 而对端协议其实已经坏了。
     // 补齐让破损静默，报错才让人知道该去修 Python 那一侧。
@@ -859,6 +1047,609 @@ describe("scrapling_extract", () => {
     const exec = { signal: new AbortController().signal } as never;
     const result = (await tool.execute({ url: SAMPLE_URL }, exec)) as { truncated: boolean };
     expect(result.truncated).toBe(true);
+  });
+
+  it("fields 行原样回传，缺字段是 null", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({
+      count: 1,
+      truncated: false,
+      notice: "",
+      rows: [{ name: "P1", href: "https://e.test/p1", missing: null }],
+    });
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      { html: "<article></article>", selector: "article", fields: { name: "h3::text" } },
+      exec,
+    )) as { rows: Record<string, unknown>[] };
+    expect(result.rows[0]).toStrictEqual({
+      name: "P1",
+      href: "https://e.test/p1",
+      missing: null,
+    });
+    expect(fake.calls[0]?.params).toMatchObject({
+      fields: { name: "h3::text" },
+    });
+    const rendered = tool.output.render(
+      { html: "", selector: "article", fields: { name: "h3::text" } },
+      { count: 1, truncated: false, matches: [], rows: [{ name: "P1" }] },
+    ) as { type: string; text: string }[];
+    expect(rendered[0]?.text).toContain('"name":"P1"');
+  });
+
+  it("rows 的嵌套对象与数组逐层归一；无法 JSON 化的值退成空串", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({
+      count: 1,
+      truncated: false,
+      rows: [
+        {
+          nested: { items: [1, true, null] },
+          list: [{ label: "x" }, 2],
+          odd: undefined,
+        },
+        null,
+      ],
+    });
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      { html: "<p>x</p>", selector: "p", fields: { name: "p" } },
+      exec,
+    )) as { rows: Record<string, unknown>[] };
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toStrictEqual({
+      nested: { items: [1, true, null] },
+      list: [{ label: "x" }, 2],
+      odd: "",
+    });
+  });
+
+  it("空 rows 渲染成 no rows；非空 notice 在执行与渲染两侧都保留", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({
+      count: 0,
+      truncated: false,
+      matches: [],
+      rows: [],
+      notice: "relocated",
+    });
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      { html: "<p>x</p>", selector: "p", fields: { name: "p" } },
+      exec,
+    )) as { rows?: unknown[]; notice?: string };
+    expect(result.rows).toStrictEqual([]);
+    expect(result.notice).toBe("relocated");
+    const rendered = tool.output.render(
+      { html: "", selector: "p" },
+      { count: 0, truncated: false, matches: [], rows: [], notice: "relocated" },
+    ) as { text: string }[];
+    expect(rendered[0]?.text).toContain("no rows");
+    expect(rendered[0]?.text).toContain("relocated");
+  });
+
+  it("新参数只在给出时上线；旧载荷逐字节不变", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({ count: 0, truncated: false, matches: [] });
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute(
+      {
+        html: "<p>x</p>",
+        selector: "p",
+        queryType: "regex",
+        adaptiveSave: true,
+        adaptiveRelocate: true,
+        identifier: "price",
+        percentage: 50,
+        resolveUrls: true,
+        includeHtml: true,
+      },
+      exec,
+    );
+    expect(fake.calls[0]?.params).toMatchObject({
+      queryType: "regex",
+      adaptiveSave: true,
+      adaptiveRelocate: true,
+      identifier: "price",
+      percentage: 50,
+      resolveUrls: true,
+      includeHtml: true,
+    });
+    await tool.execute({ html: "<p>x</p>", selector: "p" }, exec);
+    expect(fake.calls[1]?.params).not.toHaveProperty("queryType");
+    expect(fake.calls[1]?.params).not.toHaveProperty("fields");
+    expect(fake.calls[1]?.params).not.toHaveProperty("adaptiveSave");
+    expect(fake.calls[1]?.params).not.toHaveProperty("includeHtml");
+  });
+
+  it("extract 的 maxContentChars 调用值优先，缺省仍是部署预算", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({ count: 0, truncated: false, matches: [] });
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute({ html: "<p>x</p>", selector: "p", maxContentChars: 500 }, exec);
+    expect(fake.calls[0]?.params).toMatchObject({ maxContentChars: 500 });
+    await tool.execute({ html: "<p>x</p>", selector: "p" }, exec);
+    expect(fake.calls[1]?.params).toMatchObject({ maxContentChars: SETTINGS.maxOutputBytes });
+    expect(fake.calls[1]?.params).toMatchObject({ maxContentChars: 4000 });
+  });
+});
+
+const LINK_HTML = "<a href='/a'>A</a>";
+const LINK_BASE = "https://e.test/";
+const LINK_A = "https://e.test/a";
+const LINK_NEXT = "https://e.test/?page=2";
+const LOCATE_HTML = "<h3>P1</h3>";
+const P1_XPATH = "//*[@id='p1']";
+
+describe("scrapling_locate / scrapling_links", () => {
+  it("scrapling_locate 发送查询并渲染生成选择器", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({
+      count: 1,
+      truncated: false,
+      matches: [
+        {
+          tag: "h3",
+          text: "P1",
+          attributes: {},
+          cssSelector: "#p1",
+          xpathSelector: P1_XPATH,
+          fullCssSelector: "body > #p1",
+          fullXpathSelector: "/html/body/*[@id='p1']",
+          ancestors: [{ tag: "article", attributes: {} }],
+        },
+      ],
+    });
+    const tool = createLocateTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      { html: LOCATE_HTML, selector: "P1", queryType: "text" },
+      exec,
+    )) as { matches: { cssSelector: string }[] };
+    expect(fake.calls[0]?.method).toBe("locate");
+    expect(result.matches[0]?.cssSelector).toBe("#p1");
+    const rendered = tool.output.render(
+      { html: "", selector: "P1", queryType: "text" },
+      {
+        count: 1,
+        truncated: false,
+        matches: [
+          {
+            tag: "h3",
+            text: "P1",
+            attributes: {},
+            cssSelector: "#p1",
+            xpathSelector: P1_XPATH,
+            fullCssSelector: "",
+            fullXpathSelector: "",
+            ancestors: [],
+          },
+        ],
+      },
+    ) as { type: string; text: string }[];
+    expect(rendered[0]?.text).toContain("#p1");
+  });
+
+  it("scrapling_links 回传 URL 与分页候选", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({
+      count: 1,
+      truncated: false,
+      links: [{ url: LINK_A }],
+      nextCandidates: [{ url: LINK_NEXT, text: "Next", reason: "text:next" }],
+    });
+    const tool = createLinksTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ html: LINK_HTML, baseUrl: LINK_BASE }, exec)) as {
+      links: { url: string }[];
+      nextCandidates: { reason: string }[];
+    };
+    expect(fake.calls[0]?.method).toBe("links");
+    expect(result.links).toStrictEqual([{ url: LINK_A }]);
+    expect(result.nextCandidates[0]?.reason).toBe("text:next");
+  });
+
+  it("scrapling_locate 的全参数、缺省值与结果视图都按协议走", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({
+      count: 1,
+      truncated: false,
+      matches: [
+        {
+          tag: "h3",
+          text: "P1",
+          attributes: { id: "p1" },
+          cssSelector: "#p1",
+          xpathSelector: P1_XPATH,
+          fullCssSelector: "body > #p1",
+          fullXpathSelector: "/html/body/*[@id='p1']",
+          ancestors: [{ tag: "article", attributes: { class: "p" } }, null],
+        },
+        { cssSelector: "" },
+      ],
+      notice: "relocated",
+    });
+    const tool = createLocateTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      {
+        html: LOCATE_HTML,
+        selector: "P1",
+        queryType: "text",
+        url: LINK_BASE,
+        partial: true,
+        caseSensitive: true,
+        cleanMatch: false,
+        similarityThreshold: 0.5,
+        ignoreAttributes: ["class"],
+        matchText: true,
+        limit: 5,
+        includeAncestors: false,
+        generateSelectors: false,
+      },
+      exec,
+    )) as {
+      matches: {
+        tag: string;
+        text: string;
+        attributes: Record<string, unknown>;
+        cssSelector: string;
+        fullXpathSelector: string;
+        ancestors: { tag: string }[];
+      }[];
+      notice?: string;
+    };
+    expect(fake.calls[0]?.params).toMatchObject({
+      queryType: "text",
+      url: LINK_BASE,
+      partial: true,
+      caseSensitive: true,
+      cleanMatch: false,
+      similarityThreshold: 0.5,
+      ignoreAttributes: ["class"],
+      matchText: true,
+      limit: 5,
+      includeAncestors: false,
+      generateSelectors: false,
+    });
+    // 缺字段的命中由 stringOrEmpty / attributesOf / toAncestors 收宽，不把 undefined 漏给模型。
+    expect(result.matches[1]).toStrictEqual({
+      tag: "",
+      text: "",
+      attributes: {},
+      cssSelector: "",
+      xpathSelector: "",
+      fullCssSelector: "",
+      fullXpathSelector: "",
+      ancestors: [],
+    });
+    expect(result.notice).toBe("relocated");
+
+    const rendered = tool.output.render(
+      { html: "", selector: "P1" },
+      { count: 0, truncated: false, matches: [], notice: "relocated" },
+    ) as { text: string }[];
+    expect(rendered[0]?.text).toContain("no matches");
+    expect(rendered[0]?.text).toContain("relocated");
+    expect(
+      tool.output.presentationMeta?.(
+        { html: "", selector: "P1" },
+        { count: 1, truncated: false, matches: [] },
+      ),
+    ).toStrictEqual({ count: 1 });
+    expect(tool.presentCall?.({ html: "", selector: "P1" })).toStrictEqual({
+      card: "generic",
+      title: "P1",
+      kind: "search",
+    });
+    expect(tool.isConcurrencySafe?.({ html: "", selector: "P1" })).toBe(true);
+    expect(tool.timeoutMs).toBe(SETTINGS.timeoutMs);
+
+    await tool.execute({ html: LOCATE_HTML, selector: "P1" }, exec);
+    expect(fake.calls[1]?.params).toMatchObject({
+      queryType: "css",
+      limit: 200,
+      includeAncestors: true,
+      generateSelectors: true,
+    });
+    expect(fake.calls[1]?.params).not.toHaveProperty("url");
+    expect(fake.calls[1]?.params).not.toHaveProperty("partial");
+    expect(fake.calls[1]?.params).not.toHaveProperty("cleanMatch");
+    expect(fake.calls[1]?.params).not.toHaveProperty("ignoreAttributes");
+  });
+
+  it("locate 的 by/query 落到协议键上，缺查询目标按 BAD_ARGS 拒绝", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({ count: 0, truncated: false, matches: [] });
+    const tool = createLocateTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    // 模型面只给新名字：帧上仍是 Python 读的 queryType/selector。
+    await tool.execute({ html: LOCATE_HTML, by: "text", query: "P1", maxContentChars: 123 }, exec);
+    expect(fake.calls[0]?.params).toMatchObject({
+      queryType: "text",
+      selector: "P1",
+      maxContentChars: 123,
+    });
+    // 老名字照旧能跑；缺省方式仍是 css，字符预算回部署值。
+    await tool.execute({ html: LOCATE_HTML, selector: "h3" }, exec);
+    expect(fake.calls[1]?.params).toMatchObject({
+      queryType: "css",
+      selector: "h3",
+      maxContentChars: SETTINGS.maxOutputBytes,
+    });
+    // 新老同时给时以新名为准，不因兼容别名把新参数覆盖掉。
+    await tool.execute(
+      { html: LOCATE_HTML, by: "regex", query: String.raw`P\d`, selector: "h3", queryType: "css" },
+      exec,
+    );
+    expect(fake.calls[2]?.params).toMatchObject({
+      queryType: "regex",
+      selector: String.raw`P\d`,
+    });
+    // 两个查询目标都没给：Host 先拦成 BAD_ARGS（Python 侧同样报这个码），文案点名 query。
+    const refused = tool.execute({ html: LOCATE_HTML }, exec);
+    await expect(refused).rejects.toBeInstanceOf(SidecarError);
+    await expect(refused).rejects.toMatchObject({ code: "BAD_ARGS" });
+    await expect(refused).rejects.toThrow(/query/u);
+    // 被拦下的调用没有发出去。
+    expect(fake.calls).toHaveLength(3);
+    expect(tool.presentCall?.({ html: LOCATE_HTML, query: "P1" })).toStrictEqual({
+      card: "generic",
+      title: "P1",
+      kind: "search",
+    });
+    // 老调用只给 selector：标题走旧名字的非空兜底（不是空串）。
+    expect(tool.presentCall?.({ html: LOCATE_HTML, selector: "#main" })).toStrictEqual({
+      card: "generic",
+      title: "#main",
+      kind: "search",
+    });
+    // 两个都给时标题仍取新名字 query，不被 selector 顶掉。
+    expect(tool.presentCall?.({ html: LOCATE_HTML, query: "P1", selector: "#main" })).toStrictEqual(
+      { card: "generic", title: "P1", kind: "search" },
+    );
+    // 两个查询目标都没有时标题兜底成空串：卡片只回显模型给的参数，不替它编查询词。
+    expect(tool.presentCall?.({ html: LOCATE_HTML })).toStrictEqual({
+      card: "generic",
+      title: "",
+      kind: "search",
+    });
+  });
+
+  it("scrapling_links 的全参数、缺省值与结果视图都按协议走", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({
+      count: 1,
+      truncated: false,
+      links: [{ url: LINK_A }],
+      nextCandidates: [{ url: LINK_NEXT }],
+    });
+    const tool = createLinksTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      {
+        html: LINK_HTML,
+        baseUrl: LINK_BASE,
+        allow: ["/a"],
+        deny: ["/b"],
+        allowDomains: ["e.test"],
+        denyDomains: ["x.test"],
+        restrictCss: "main",
+        restrictXpath: "//main",
+        tags: ["a"],
+        attrs: ["href"],
+        canonicalize: false,
+        strip: false,
+        keepFragment: true,
+        denyExtensions: ["pdf"],
+        limit: 7,
+        findNext: false,
+      },
+      exec,
+    )) as { nextCandidates: { url: string; text: string; reason: string }[] };
+    expect(fake.calls[0]?.params).toMatchObject({
+      baseUrl: LINK_BASE,
+      allow: ["/a"],
+      deny: ["/b"],
+      allowDomains: ["e.test"],
+      denyDomains: ["x.test"],
+      restrictCss: "main",
+      restrictXpath: "//main",
+      tags: ["a"],
+      attrs: ["href"],
+      canonicalize: false,
+      strip: false,
+      keepFragment: true,
+      denyExtensions: ["pdf"],
+      limit: 7,
+      findNext: false,
+    });
+    // 候选缺 text/reason 时补空串，而不是把 undefined 写进渲染。
+    expect(result.nextCandidates[0]).toStrictEqual({
+      url: "https://e.test/?page=2",
+      text: "",
+      reason: "",
+    });
+
+    const rendered = tool.output.render(
+      { html: LINK_HTML, baseUrl: LINK_BASE },
+      {
+        count: 1,
+        truncated: false,
+        links: [{ url: LINK_A }],
+        nextCandidates: [{ url: LINK_NEXT, text: "Next", reason: "text:next" }],
+      },
+    ) as { text: string }[];
+    expect(rendered[0]?.text).toContain(`next: Next -> ${LINK_NEXT} (text:next)`);
+    const empty = tool.output.render(
+      { html: LINK_HTML },
+      { count: 0, truncated: false, links: [], nextCandidates: [] },
+    ) as { text: string }[];
+    expect(empty[0]?.text).toBe("no links");
+    expect(
+      tool.output.presentationMeta?.(
+        { html: LINK_HTML },
+        { count: 1, truncated: false, links: [], nextCandidates: [] },
+      ),
+    ).toStrictEqual({ count: 1 });
+    expect(tool.presentCall?.({ html: LINK_HTML, baseUrl: LINK_BASE })).toStrictEqual({
+      card: "generic",
+      title: LINK_BASE,
+      kind: "search",
+    });
+    expect(tool.presentCall?.({ html: LINK_HTML })).toStrictEqual({
+      card: "generic",
+      title: "links",
+      kind: "search",
+    });
+    expect(tool.isConcurrencySafe?.({ html: LINK_HTML })).toBe(true);
+    expect(tool.timeoutMs).toBe(SETTINGS.timeoutMs);
+
+    await tool.execute({ html: LINK_HTML }, exec);
+    expect(fake.calls[1]?.params).toMatchObject({
+      baseUrl: "",
+      limit: 200,
+      findNext: true,
+    });
+    expect(fake.calls[1]?.params).not.toHaveProperty("allow");
+    expect(fake.calls[1]?.params).not.toHaveProperty("canonicalize");
+    expect(fake.calls[1]?.params).not.toHaveProperty("denyExtensions");
+  });
+
+  it("scrapling_locate 的命中项不是对象时报可读错误", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({ count: 1, truncated: false, matches: [null] });
+    const tool = createLocateTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(tool.execute({ html: "<p>x</p>", selector: "p" }, exec)).rejects.toThrow(
+      /locate match is not an object/u,
+    );
+  });
+
+  it("scrapling_links 的候选不是对象、URL 不是字符串时都报可读错误", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const badCandidate = fakeSidecar({
+      count: 1,
+      truncated: false,
+      links: [],
+      nextCandidates: [null],
+    });
+    const candidateTool = createLinksTool({
+      sidecar: badCandidate.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(candidateTool.execute({ html: LINK_HTML }, exec)).rejects.toThrow(
+      /next candidate is not an object/u,
+    );
+
+    const badLink = fakeSidecar({
+      count: 1,
+      truncated: false,
+      links: [{ url: 7 }],
+      nextCandidates: [],
+    });
+    const linkTool = createLinksTool({
+      sidecar: badLink.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(linkTool.execute({ html: LINK_HTML }, exec)).rejects.toThrow(
+      /link entry is not an object/u,
+    );
+  });
+
+  it("scrapling_locate 的回包缺 matches 时报可读错误，不补空列表", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({ count: 0, truncated: false });
+    const tool = createLocateTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(tool.execute({ html: "<p>x</p>", selector: "p" }, exec)).rejects.toThrow(
+      /missing an array field: matches/u,
+    );
+  });
+
+  it("scrapling_links 的数组项不是对象时报可读错误，不静默丢弃", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({ count: 1, truncated: false, links: [null], nextCandidates: [] });
+    const tool = createLinksTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(tool.execute({ html: LINK_HTML, baseUrl: LINK_BASE }, exec)).rejects.toThrow(
+      /link entry is not an object/u,
+    );
+  });
+
+  it("scrapling_links 的回包缺 nextCandidates 时报可读错误，不补空列表", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({ count: 0, truncated: false, links: [] });
+    const tool = createLinksTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(tool.execute({ html: LINK_HTML, baseUrl: LINK_BASE }, exec)).rejects.toThrow(
+      /missing an array field: nextCandidates/u,
+    );
   });
 });
 
@@ -1034,6 +1825,65 @@ describe("scrapling_render", () => {
     });
   });
 
+  it("浏览器请求参数与 metadata 按层上线，缺省键不出现", async () => {
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      status: 200,
+      content: "ok",
+      truncated: false,
+      metadata: { contentType: "text/html", redirects: 0 },
+    });
+    const tool = createRenderTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    const result = (await tool.execute(
+      {
+        url: SAMPLE_URL,
+        cookies: [{ name: "a", value: "b" }],
+        disableResources: true,
+        loadDom: false,
+        waitSelectorState: "visible",
+        blockedDomains: ["ads.test"],
+        googleSearch: false,
+        retries: 2,
+        retryDelay: 3,
+        includeMetadata: true,
+      },
+      exec,
+    )) as { metadata?: Record<string, unknown> };
+    expect(fake.calls[0]?.params).toMatchObject({
+      cookies: [{ name: "a", value: "b" }],
+      disableResources: true,
+      loadDom: false,
+      waitSelectorState: "visible",
+      blockedDomains: ["ads.test"],
+      googleSearch: false,
+      retries: 2,
+      retryDelay: 3,
+      includeMetadata: true,
+    });
+    expect(result.metadata).toMatchObject({ contentType: "text/html" });
+
+    await tool.execute({ url: SAMPLE_URL }, exec);
+    for (const key of [
+      "cookies",
+      "disableResources",
+      "loadDom",
+      "waitSelectorState",
+      "blockedDomains",
+      "googleSearch",
+      "retries",
+      "retryDelay",
+      "includeMetadata",
+    ]) {
+      expect(fake.calls[1]?.params).not.toHaveProperty(key);
+    }
+  });
+
   it("没给 waitSelector 时不把空串塞给 sidecar", async () => {
     const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "x", truncated: false });
     const tool = createRenderTool({
@@ -1045,6 +1895,42 @@ describe("scrapling_render", () => {
     const exec = { signal: new AbortController().signal } as never;
     await tool.execute({ url: SAMPLE_URL }, exec);
     expect(fake.calls[0]?.params).not.toHaveProperty("waitSelector");
+  });
+
+  it("render 的 timeoutMs 调用值优先、超过部署上限时封顶，非法值不静默改写", async () => {
+    const exec = { signal: new AbortController().signal } as never;
+    const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "x", truncated: false });
+    const tool = createRenderTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL, timeoutMs: 5000 }, exec);
+    expect(fake.calls[0]?.params).toMatchObject({ timeoutMs: 5000 });
+    // 缺省仍是部署值。
+    await tool.execute({ url: SAMPLE_URL }, exec);
+    expect(fake.calls[1]?.params).toMatchObject({ timeoutMs: SETTINGS.pageTimeoutMs });
+    // 部署的 pageTimeoutMs 是天花板：给十倍也只能等到上限。
+    await tool.execute({ url: SAMPLE_URL, timeoutMs: SETTINGS.pageTimeoutMs * 10 }, exec);
+    expect(fake.calls[2]?.params).toMatchObject({ timeoutMs: SETTINGS.pageTimeoutMs });
+    // 非法值原样透传：由 Python 的 _positive_int 报 BAD_ARGS，不在 Host 静默夹成合法值。
+    await tool.execute({ url: SAMPLE_URL, timeoutMs: 0 }, exec);
+    expect(fake.calls[3]?.params).toMatchObject({ timeoutMs: 0 });
+    await tool.execute({ url: SAMPLE_URL, timeoutMs: -5 }, exec);
+    expect(fake.calls[4]?.params).toMatchObject({ timeoutMs: -5 });
+    // 这一格只加给 render：capture_xhr 的参数面不被顺手扩充。
+    expect(parameterNames(tool)).toContain("timeoutMs");
+    expect(
+      parameterNames(
+        createCaptureXhrTool({
+          sidecar: fake.client,
+          settings: SETTINGS,
+          startCrawlJob: fakeJobStarter,
+          answer: fakeAnswer,
+        }),
+      ),
+    ).not.toContain("timeoutMs");
   });
 
   it("结果的每个键都在 schema 里声明过——schema 写着 additionalProperties: false", async () => {
@@ -1268,6 +2154,34 @@ describe("scrapling_answer", () => {
     expect(result.rendered).toBe(true);
   });
 
+  it("render 时把 cssSelector/waitSelector 交给抓取路径", async () => {
+    const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "page", truncated: false });
+    const tool = createAnswerTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      {
+        url: SAMPLE_URL,
+        question: "price?",
+        render: true,
+        cssSelector: "main",
+        waitSelector: ".loaded",
+        waitSelectorState: "visible",
+      },
+      ANSWER_EXEC,
+    )) as { answer: string };
+    expect(fake.calls[0]?.method).toBe("render");
+    expect(fake.calls[0]?.params).toMatchObject({
+      cssSelector: "main",
+      waitSelector: ".loaded",
+      waitSelectorState: "visible",
+    });
+    expect(result.answer).toContain("fake-answer:price?");
+  });
+
   it("静态支路补上 timeoutSeconds（部署级 requestTimeoutSeconds 不补就对它无效），浏览器支路不发", async () => {
     // 两条支路都落进 Python 的 _static_params / 浏览器适配器：前者读 timeoutSeconds，
     // 后者不读这个键 —— 发了就是「拧了没反应」的老毛病。
@@ -1283,10 +2197,16 @@ describe("scrapling_answer", () => {
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
     });
-    await staticTool.execute({ url: SAMPLE_URL, question: "q" }, ANSWER_EXEC);
+    await staticTool.execute(
+      { url: SAMPLE_URL, question: "q", waitSelector: ".loaded" },
+      ANSWER_EXEC,
+    );
     expect(staticFake.calls[0]?.method).toBe("fetch");
     const staticParams = staticFake.calls[0]?.params as Record<string, unknown> | undefined;
     expect(staticParams?.["timeoutSeconds"]).toBe(SETTINGS.requestTimeoutSeconds);
+    // waitSelector 只属于浏览器支路：静态 fetch 的 Python 侧根本不读它。
+    expect(staticParams?.["waitSelector"]).toBeUndefined();
+    expect(staticParams?.["waitSelectorState"]).toBeUndefined();
 
     const renderFake = fakeSidecar({
       url: SAMPLE_URL,
@@ -1617,6 +2537,13 @@ describe("scrapling_session_network", () => {
         includeBody: true,
         networkLimit: 5,
         maxBodyChars: 50,
+        method: null,
+        status: null,
+        resourceType: null,
+        includeStatic: false,
+        afterId: 0,
+        includeHeaders: false,
+        requestId: null,
       },
     });
     expect(result.sessionId).toBe("s1");
@@ -1640,8 +2567,63 @@ describe("scrapling_session_network", () => {
       includeBody: false,
       networkLimit: null,
       maxBodyChars: null,
+      method: null,
+      status: null,
+      resourceType: null,
+      includeStatic: false,
+      afterId: 0,
+      includeHeaders: false,
+      requestId: null,
     });
     expect(tool.isConcurrencySafe?.({ sessionId: "s1" })).toBe(false);
+  });
+
+  it("过滤参数上网线，条目 id 与 headers 投影到结果", async () => {
+    const fake = fakeSidecar({
+      sessionId: "s1",
+      count: 1,
+      matches: [
+        {
+          id: 7,
+          url: SAMPLE_API,
+          status: 200,
+          bytes: 12,
+          method: "POST",
+          resourceType: "fetch",
+          headers: { "Content-Type": "application/json" },
+        },
+      ],
+    });
+    const tool = createSessionNetworkTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      {
+        sessionId: "s1",
+        method: "POST",
+        status: 200,
+        resourceType: "fetch",
+        includeStatic: true,
+        afterId: 3,
+        includeHeaders: true,
+        requestId: 7,
+      },
+      sessionExec(),
+    )) as { matches: { id?: number; headers?: Record<string, unknown> }[] };
+    expect(fake.calls[0]?.params).toMatchObject({
+      method: "POST",
+      status: 200,
+      resourceType: "fetch",
+      includeStatic: true,
+      afterId: 3,
+      includeHeaders: true,
+      requestId: 7,
+    });
+    expect(result.matches[0]?.id).toBe(7);
+    expect(result.matches[0]?.headers).toStrictEqual({ "Content-Type": "application/json" });
   });
 
   it("回包条目带 bodyNote / body / bodyTruncated 时，三个可选字段都留在归一结果里", async () => {
@@ -2046,6 +3028,57 @@ describe("会话工具", () => {
     expect(result.sessionType).toBe("static");
   });
 
+  it("open 把构造期扩展参数上线，缺省时不发", async () => {
+    const fake = fakeSidecar({ sessionId: "s1", sessionType: "stealth", createdAt: "T" });
+    const tool = createSessionOpenTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute(
+      {
+        sessionType: "static",
+        sessionId: "s9",
+        cookies: [{ name: "a", value: "b" }],
+        disableResources: true,
+        loadDom: false,
+        blockedDomains: ["ads.test"],
+        googleSearch: false,
+        retries: 2,
+        retryDelay: 3,
+        maxPages: 2,
+      },
+      sessionExec(),
+    );
+    expect(fake.calls[0]?.params).toMatchObject({
+      sessionId: "s9",
+      cookies: [{ name: "a", value: "b" }],
+      disableResources: true,
+      loadDom: false,
+      blockedDomains: ["ads.test"],
+      googleSearch: false,
+      retries: 2,
+      retryDelay: 3,
+      maxPages: 2,
+    });
+
+    await tool.execute({ sessionType: "static" }, sessionExec());
+    for (const key of [
+      "sessionId",
+      "cookies",
+      "disableResources",
+      "loadDom",
+      "blockedDomains",
+      "googleSearch",
+      "retries",
+      "retryDelay",
+      "maxPages",
+    ]) {
+      expect(fake.calls[1]?.params).not.toHaveProperty(key);
+    }
+  });
+
   it("open 缺 sessionId 时报可读错误", async () => {
     const fake = fakeSidecar({ sessionType: "static" });
     const tool = createSessionOpenTool({
@@ -2075,6 +3108,69 @@ describe("会话工具", () => {
     expect(result.sessionId).toBe("s1");
   });
 
+  it("fetch 把 fetch 层与 static 键上线，不发 session_open 专属键", async () => {
+    const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "body", truncated: false });
+    const tool = createSessionFetchTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute(
+      {
+        sessionId: "s1",
+        url: SAMPLE_URL,
+        waitSelectorState: "visible",
+        disableResources: true,
+        loadDom: false,
+        blockedDomains: ["ads.test"],
+        googleSearch: false,
+        includeMetadata: true,
+        timeoutSeconds: 30,
+        params: { query: "x" },
+        cookies: [{ name: "a", value: "b" }],
+      },
+      sessionExec(),
+    );
+    expect(fake.calls[0]?.params).toMatchObject({
+      waitSelectorState: "visible",
+      disableResources: true,
+      loadDom: false,
+      blockedDomains: ["ads.test"],
+      googleSearch: false,
+      includeMetadata: true,
+      timeoutSeconds: 30,
+      params: { query: "x" },
+      cookies: [{ name: "a", value: "b" }],
+    });
+    expect(fake.calls[0]?.params).not.toHaveProperty("maxPages");
+    expect(fake.calls[0]?.params).not.toHaveProperty("retryDelay");
+  });
+
+  it("fetch 不给 blockedDomains / disableResources 时载荷里没有这两个键", async () => {
+    // 报告 2.1：Host 不许给这两个键注入默认值。协议上「没给」与 undefined 同义，
+    // 一旦这里补一个空数组 / 默认开关，部署侧的决定就被一枚显式表态盖掉。
+    const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "body", truncated: false });
+    const tool = createSessionFetchTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute({ sessionId: "s1", url: SAMPLE_URL }, sessionExec());
+    expect(fake.calls[0]?.params).not.toHaveProperty("blockedDomains");
+    expect(fake.calls[0]?.params).not.toHaveProperty("disableResources");
+    // 同一帧、同一工具里显式给时必须照发 —— 证明上一条不是「这两个键永远不发」。
+    await tool.execute(
+      { sessionId: "s1", url: SAMPLE_URL, blockedDomains: [], disableResources: false },
+      sessionExec(),
+    );
+    expect(fake.calls[1]?.params).toMatchObject({
+      blockedDomains: [],
+      disableResources: false,
+    });
+  });
+
   it("list 归一每一条并渲染", async () => {
     const fake = fakeSidecar({
       sessions: [
@@ -2097,6 +3193,49 @@ describe("会话工具", () => {
       { sessionId: "s2", sessionType: "unknown", createdAt: "" },
     ]);
     expect(JSON.stringify(tool.output.render({}, result))).toContain("s1 (static)");
+  });
+
+  it("list 原样透传 alive/settings/poolStats，没给就不注入", async () => {
+    const fake = fakeSidecar({
+      sessions: [
+        {
+          sessionId: "s1",
+          sessionType: "browser",
+          createdAt: "t1",
+          alive: true,
+          settings: { sessionType: "browser", headless: true, locale: "zh-CN" },
+          poolStats: { pages: 2, reusable: 1 },
+        },
+        { sessionId: "s2", sessionType: "static", createdAt: "t2" },
+      ],
+    });
+    const tool = createSessionListTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({}, sessionExec())) as { sessions: unknown[] };
+    // 给了的三枚面逐字段原样出现（不重新归一并丢字段），没给的那一条一个键都不补。
+    expect(result.sessions).toStrictEqual([
+      {
+        sessionId: "s1",
+        sessionType: "browser",
+        createdAt: "t1",
+        alive: true,
+        settings: { sessionType: "browser", headless: true, locale: "zh-CN" },
+        poolStats: { pages: 2, reusable: 1 },
+      },
+      { sessionId: "s2", sessionType: "static", createdAt: "t2" },
+    ]);
+    // schema 必须声明这三枚，否则 additionalProperties:false 会把它们判成未声明字段。
+    const schema = tool.output.schema as unknown as {
+      properties: { sessions: { items: { properties: Record<string, unknown> } } };
+    };
+    const declared = Object.keys(schema.properties.sessions.items.properties);
+    for (const key of ["alive", "settings", "poolStats"]) {
+      expect(declared).toContain(key);
+    }
   });
 
   it("open 回包缺 sessionType/createdAt 时补默认值", async () => {
@@ -2271,6 +3410,371 @@ describe("会话工具", () => {
   });
 });
 
+describe("浏览器会话读/动作/媒体工具", () => {
+  const exec = { signal: new AbortController().signal } as never;
+
+  it("session_read 读当前页并渲染标题", async () => {
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      title: "T",
+      content: "BODY",
+      truncated: false,
+      notice: "",
+    });
+    const tool = createSessionReadTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ sessionId: "s1" }, exec)) as {
+      title: string;
+      content: string;
+    };
+    expect(fake.calls[0]?.method).toBe("session.read");
+    expect(result).toMatchObject({ title: "T", content: "BODY" });
+    expect(JSON.stringify(tool.output.render({}, result))).toContain("BODY");
+  });
+
+  it("session_act 透传动作数组并回显完成数", async () => {
+    const fake = fakeSidecar({ completed: 2, finalUrl: SAMPLE_URL, title: "T" });
+    const tool = createSessionActTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const actions = [{ type: "click", target: "#go" }];
+    const result = (await tool.execute({ sessionId: "s1", actions, slowly: true }, exec)) as {
+      completed: number;
+    };
+    expect(fake.calls[0]?.params).toMatchObject({ actions, slowly: true });
+    expect(result.completed).toBe(2);
+  });
+
+  it("download 返回路径与哈希，不返回文件内容", async () => {
+    const fake = fakeSidecar({
+      path: "/tmp/x/a.png",
+      bytes: 1024,
+      sha256: "a".repeat(64),
+      contentType: "image/png",
+      status: 200,
+    });
+    const tool = createDownloadTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ url: SAMPLE_URL, filename: "a.png" }, exec)) as Record<
+      string,
+      unknown
+    >;
+    expect(fake.calls[0]?.params).toMatchObject({
+      filename: "a.png",
+      deployment: {
+        downloadDir: SETTINGS.downloadDir,
+        downloadMaxBytes: SETTINGS.downloadMaxBytes,
+      },
+    });
+    expect(result).not.toHaveProperty("content");
+    expect(result["sha256"]).toBe("a".repeat(64));
+  });
+
+  it("download 的 maxBytes 被部署上限夹住，非法值原样透传", async () => {
+    // 报告 2.4：downloadMaxBytes 是部署侧的天花板，模型提的 maxBytes 只能往下调。
+    // 不夹的话，模型写一个大数就能突破部署的下载字节预算。
+    const fake = fakeSidecar({
+      path: "/tmp/x",
+      bytes: 1,
+      sha256: "s",
+      contentType: "",
+      status: 200,
+    });
+    const tool = createDownloadTool({
+      sidecar: fake.client,
+      settings: { ...SETTINGS, downloadMaxBytes: 5000 },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    // 不给：用部署值（天花板本身）。
+    await tool.execute({ url: SAMPLE_URL }, exec);
+    expect(fake.calls[0]?.params).toMatchObject({ maxBytes: 5000 });
+    // 给得比天花板小：原值，不抬到天花板上。
+    await tool.execute({ url: SAMPLE_URL, maxBytes: 1234 }, exec);
+    expect(fake.calls[1]?.params).toMatchObject({ maxBytes: 1234 });
+    // 给得比天花板大：夹到天花板。
+    await tool.execute({ url: SAMPLE_URL, maxBytes: 999_999_999 }, exec);
+    expect(fake.calls[2]?.params).toMatchObject({ maxBytes: 5000 });
+    // 0 与负数不是「夹成 1」：原样透传，由 Python 的 _max_bytes 报 BAD_ARGS ——
+    // 静默改成一次合法下载等于把明确的参数错误藏起来。
+    await tool.execute({ url: SAMPLE_URL, maxBytes: 0 }, exec);
+    expect(fake.calls[3]?.params).toMatchObject({ maxBytes: 0 });
+    await tool.execute({ url: SAMPLE_URL, maxBytes: -5 }, exec);
+    expect(fake.calls[4]?.params).toMatchObject({ maxBytes: -5 });
+  });
+
+  it("session_read 的视图、metadata 与坏回包", async () => {
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      title: "T",
+      content: "BODY",
+      truncated: false,
+      notice: "n",
+      metadata: { nested: { items: [1, true, null] }, bad: () => "x" },
+    });
+    const tool = createSessionReadTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ sessionId: "s1" }, exec)) as {
+      notice: string;
+      metadata: { nested: { items: unknown[] }; bad: unknown };
+    };
+    expect(result.notice).toContain("n");
+    expect(result.metadata.nested.items).toStrictEqual([1, true, null]);
+    expect(result.metadata.bad).toBeNull();
+    expect(
+      (
+        tool.output.render({ sessionId: "s1" }, result as never) as {
+          text: string;
+        }[]
+      )[0]?.text,
+    ).toContain("BODY");
+    expect(tool.output.presentationMeta?.({ sessionId: "s1" }, result as never)).toStrictEqual({
+      url: SAMPLE_URL,
+      truncated: false,
+    });
+    expect(tool.isConcurrencySafe?.({ sessionId: "s1" })).toBe(false);
+    expect(tool.presentCall?.({ sessionId: "s1" })).toStrictEqual({
+      card: "generic",
+      title: "s1",
+      kind: "fetch",
+    });
+
+    const missing = createSessionReadTool({
+      sidecar: fakeSidecar({ url: SAMPLE_URL, title: "T", truncated: false }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(missing.execute({ sessionId: "s1" }, exec)).rejects.toThrow(
+      /missing a string field: content/u,
+    );
+    const badBool = createSessionReadTool({
+      sidecar: fakeSidecar({ url: SAMPLE_URL, title: "T", content: "x", truncated: "no" }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(badBool.execute({ sessionId: "s1" }, exec)).rejects.toThrow(
+      /missing a boolean field: truncated/u,
+    );
+    const notObject = createSessionReadTool({
+      sidecar: fakeSidecar("nope").client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(notObject.execute({ sessionId: "s1" }, exec)).rejects.toMatchObject({
+      code: "SIDECAR_REQUEST_FAILED",
+    });
+  });
+
+  it("session_act 的视图与坏回包", async () => {
+    const fake = fakeSidecar({ completed: 1, finalUrl: SAMPLE_URL, title: "T" });
+    const tool = createSessionActTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const view = {
+      completed: 1,
+      finalUrl: SAMPLE_URL,
+      title: "T",
+    };
+    expect(
+      (
+        tool.output.render({ sessionId: "s1", actions: [] }, view) as {
+          text: string;
+        }[]
+      )[0]?.text,
+    ).toContain("completed 1");
+    expect(tool.output.presentationMeta?.({ sessionId: "s1", actions: [] }, view)).toStrictEqual({
+      count: 1,
+    });
+    expect(tool.isConcurrencySafe?.({ sessionId: "s1", actions: [] })).toBe(false);
+    expect(tool.presentCall?.({ sessionId: "s1", actions: [] })).toStrictEqual({
+      card: "generic",
+      title: "s1",
+      kind: "search",
+    });
+
+    const bad = createSessionActTool({
+      sidecar: fakeSidecar({ finalUrl: SAMPLE_URL, title: "T" }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(bad.execute({ sessionId: "s1", actions: [] }, exec)).rejects.toThrow(
+      /missing an integer field: completed/u,
+    );
+  });
+
+  it("download 的视图、缺省参数与坏回包", async () => {
+    const empty = fakeSidecar({
+      path: "/tmp/x",
+      bytes: 1,
+      sha256: "s",
+      contentType: "",
+      status: 200,
+    });
+    const tool = createDownloadTool({
+      sidecar: empty.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL }, exec);
+    expect(empty.calls[0]?.params).toMatchObject({
+      filename: "",
+      maxBytes: SETTINGS.downloadMaxBytes,
+      headers: null,
+      cookies: null,
+      impersonate: "",
+      useBrowser: false,
+    });
+    const view = { path: "/tmp/x", bytes: 1, sha256: "s", contentType: "", status: 200 };
+    expect(
+      (
+        tool.output.render({ url: SAMPLE_URL }, view) as {
+          text: string;
+        }[]
+      )[0]?.text,
+    ).toContain("(unknown)");
+    expect(tool.output.presentationMeta?.({ url: SAMPLE_URL }, view)).toStrictEqual({
+      url: "/tmp/x",
+      statusCode: 200,
+    });
+    expect(tool.isConcurrencySafe?.({ url: SAMPLE_URL })).toBe(true);
+    expect(tool.presentCall?.({ url: SAMPLE_URL })).toStrictEqual({
+      card: "generic",
+      title: SAMPLE_URL,
+      kind: "fetch",
+    });
+
+    const bad = createDownloadTool({
+      sidecar: fakeSidecar({ path: "/tmp/x", bytes: 1, sha256: "s", status: 200 }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(bad.execute({ url: SAMPLE_URL }, exec)).rejects.toThrow(
+      /missing a string field: contentType/u,
+    );
+  });
+
+  it("screenshot 的视图、attachment 缺失与坏 mediaType", async () => {
+    const noAttachment = createScreenshotTool({
+      sidecar: fakeSidecar({}).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(noAttachment.execute({ sessionId: "s1" }, exec)).rejects.toMatchObject({
+      code: "ATTACHMENT_UNAVAILABLE",
+    });
+
+    const badType = createScreenshotTool({
+      sidecar: fakeSidecar({ mediaType: "text/plain", base64: "aGk=", width: 1, height: 1 }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+      attachments: {
+        saveImage: async () => ({ attachmentId: "a" }),
+      },
+    });
+    await expect(badType.execute({ sessionId: "s1" }, exec)).rejects.toMatchObject({
+      code: "SIDECAR_REQUEST_FAILED",
+    });
+
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      mediaType: "image/jpeg",
+      base64: "aGk=",
+      width: 2,
+      height: 3,
+    });
+    const saved: string[] = [];
+    const tool = createScreenshotTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+      attachments: {
+        saveImage: async (input) => {
+          saved.push(input.name ?? "");
+          return { attachmentId: "a2", mediaType: input.mediaType };
+        },
+      },
+    });
+    const result = (await tool.execute({ sessionId: "s1", imageType: "jpeg" }, exec)) as {
+      attachment: unknown;
+    };
+    expect(saved).toStrictEqual(["screenshot.jpg"]);
+    expect(
+      (
+        tool.output.render({ sessionId: "s1" }, result as never) as {
+          type: string;
+          text?: string;
+        }[]
+      )[1]?.text,
+    ).toContain("2x3");
+    expect(tool.output.presentationMeta?.({ sessionId: "s1" }, result as never)).toStrictEqual({
+      url: SAMPLE_URL,
+    });
+    expect(tool.isConcurrencySafe?.({ sessionId: "s1" })).toBe(false);
+    expect(tool.presentCall?.({ sessionId: "s1" })).toStrictEqual({
+      card: "generic",
+      title: "s1",
+      kind: "fetch",
+    });
+  });
+
+  it("screenshot 把字节交给 attachment 并渲染图片块", async () => {
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      mediaType: "image/png",
+      base64: Buffer.from("hello").toString("base64"),
+      width: 2,
+      height: 3,
+    });
+    const saved: { bytes: number; mediaType: string }[] = [];
+    const tool = createScreenshotTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+      attachments: {
+        saveImage: async (input) => {
+          saved.push({ bytes: input.data.byteLength, mediaType: input.mediaType });
+          return { attachmentId: "a1", mediaType: input.mediaType, bytes: 5, width: 2, height: 3 };
+        },
+      },
+    });
+    const result = (await tool.execute({ sessionId: "s1", imageType: "png" }, exec)) as {
+      attachment: unknown;
+    };
+    expect(saved).toStrictEqual([{ bytes: 5, mediaType: "image/png" }]);
+    expect(JSON.stringify(result.attachment)).toContain("a1");
+    const blocks = tool.output.render({}, result as never) as { type: string }[];
+    expect(blocks[0]?.type).toBe("image");
+  });
+});
+
 describe("scrapling_crawl", () => {
   it("立刻返回作业 id，而不是等爬完", async () => {
     const fake = fakeSidecar({ crawlId: "c1" });
@@ -2311,6 +3815,143 @@ describe("scrapling_crawl", () => {
         },
       },
     });
+  });
+
+  it("透传 feed 参数，并按 rows 输出", async () => {
+    const fake = fakeSidecar({ crawlId: "c1" });
+    let runParams: Record<string, unknown> | undefined;
+    Object.assign(fake.client, {
+      call: async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+        if (method === "crawl.run") {
+          runParams = params;
+          return { crawlId: "c1" };
+        }
+        return {
+          mode: "feed",
+          running: false,
+          more: false,
+          error: null,
+          pages: [],
+          rows: [{ title: "A", price: "1" }],
+          total: 1,
+          expired: false,
+          stats: { requests_count: 1 },
+        };
+      },
+    });
+    const appended: string[] = [];
+    const progress: string[] = [];
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: async (_label, run) => {
+        await run({
+          append: (text: string): void => {
+            appended.push(text);
+          },
+          progress: (line: string): void => {
+            progress.push(line);
+          },
+          signal: new AbortController().signal,
+        });
+        return "job-1";
+      },
+      answer: fakeAnswer,
+    });
+    await tool.execute(
+      {
+        url: SAMPLE_URL,
+        mode: "feed",
+        feedType: "xml",
+        feedUrl: `${SAMPLE_URL}/feed.xml`,
+        itertag: "item",
+        fields: { title: "title" },
+      },
+      sessionExec(),
+    );
+    expect(runParams).toMatchObject({
+      mode: "feed",
+      feedType: "xml",
+      feedUrl: `${SAMPLE_URL}/feed.xml`,
+      itertag: "item",
+      fields: { title: "title" },
+    });
+    expect(appended.join("")).toContain('"title":"A"');
+    expect(progress.at(-1)).toBe("1 row(s) crawled");
+  });
+
+  it("透传 CSS 与 allow/deny 规则，并在结束时写一行统计", async () => {
+    const appended: string[] = [];
+    const starter = recordingStarter(appended);
+    const fake = fakeSidecar({
+      crawlId: "c1",
+      running: false,
+      pages: [],
+      total: 0,
+      more: false,
+      error: null,
+      expired: false,
+      stats: {
+        requests_count: 2,
+        failed_requests_count: 0,
+        blocked_requests_count: 0,
+        offsite_requests_count: 0,
+        robots_disallowed_count: 0,
+        items_scraped: 2,
+        elapsed_seconds: 0.1,
+        response_bytes: 100,
+        response_status_count: { status_200: 2 },
+      },
+    });
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: starter,
+      answer: fakeAnswer,
+    });
+    const exec = { signal: new AbortController().signal } as never;
+    await tool.execute(
+      {
+        url: SAMPLE_URL,
+        cssSelector: "main",
+        mainContentOnly: false,
+        includePatterns: ["/a"],
+        excludePatterns: ["/b"],
+      },
+      exec,
+    );
+    expect(fake.calls[0]?.params).toMatchObject({
+      cssSelector: "main",
+      mainContentOnly: false,
+      includePatterns: ["/a"],
+      excludePatterns: ["/b"],
+    });
+    expect(fake.calls.some((call) => call.method === "crawl.status")).toBe(true);
+    expect(
+      appended.some((line) => line.includes("crawl stats:") && line.includes('"requests_count":2')),
+    ).toBe(true);
+  });
+
+  it("把每页正文写进作业输出", async () => {
+    const appended: string[] = [];
+    const starter = recordingStarter(appended);
+    const fake = fakeSidecar({
+      crawlId: "c1",
+      running: false,
+      pages: [{ url: SAMPLE_URL, title: "T", markdown: "PAGE-BODY" }],
+      total: 1,
+      more: false,
+      error: null,
+      expired: false,
+    });
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: starter,
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL }, { signal: new AbortController().signal } as never);
+    expect(appended.some((line) => line.includes("PAGE-BODY"))).toBe(true);
   });
 
   it("maxPages 缺省时用 20", async () => {
@@ -2357,6 +3998,27 @@ describe("scrapling_crawl", () => {
     };
     expect(result.maxPages).toBe(0);
   });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    "maxPages 为 %s 时被参数校验拒绝，不静默回落到默认值",
+    async (invalid) => {
+      // defineTool 的 integer 校验在 userExecute 之前拒收这两个值。这条用例钉住入口层：
+      // 一旦有人绕过包装把它们送进 JSON.stringify，它们会被序列化成 null，而 Python 的
+      // _positive_int 会把 null 当成“没给”回落到 20——那才是静默失败。
+      const fake = fakeSidecar({ crawlId: "c1" });
+      const tool = createCrawlTool({
+        sidecar: fake.client,
+        settings: SETTINGS,
+        startCrawlJob: fakeJobStarter,
+        answer: fakeAnswer,
+      });
+      const exec = { signal: new AbortController().signal } as never;
+      await expect(
+        tool.execute({ url: SAMPLE_URL, maxPages: invalid }, exec),
+      ).rejects.toBeInstanceOf(ToolArgsError);
+      expect(fake.calls).toHaveLength(0);
+    },
+  );
 
   it("渲染结果告诉模型怎么观察作业", () => {
     const tool = createCrawlTool({
@@ -2442,6 +4104,50 @@ describe("scrapling_crawl", () => {
     expect(appended).toHaveLength(2);
     expect(appended[1]).toContain("#2");
     expect(progress.at(-1)).toBe("2 page(s) crawled");
+  });
+
+  it("爬虫还在跑时按轮询间隔再取一次，直到 running 为假", async () => {
+    // 这条钉的是 drainCrawl 的「等一拍再来」那一支：只靠真爬虫的耗时去覆盖，
+    // 快机器上第一轮就可能已经收尾，那一支会随机漏测（macOS runner 上就是这么红的）。
+    let statusCalls = 0;
+    const progress: string[] = [];
+    const fake = fakeSidecar({ crawlId: "c1" });
+    Object.assign(fake.client, {
+      call: async (method: string): Promise<unknown> => {
+        if (method === "crawl.run") {
+          return { crawlId: "c1" };
+        }
+        statusCalls += 1;
+        return statusCalls === 1
+          ? { running: true, more: false, error: null, pages: [] }
+          : {
+              running: false,
+              more: false,
+              error: null,
+              pages: [{ url: `${SAMPLE_URL}#1`, title: "t", markdown: "m" }],
+            };
+      },
+    });
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: async (_label, run) => {
+        await run({
+          append: (): void => undefined,
+          progress: (line: string): void => {
+            progress.push(line);
+          },
+          signal: new AbortController().signal,
+        });
+        return "job-1";
+      },
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL, maxPages: 5 }, {
+      signal: new AbortController().signal,
+    } as never);
+    expect(statusCalls).toBe(2);
+    expect(progress.at(-1)).toBe("1 page(s) crawled");
   });
 });
 
@@ -2577,6 +4283,18 @@ describe("取消信号的合成", () => {
       signal: execController.signal,
     } as never);
     expect(seen[0]?.aborted).toBe(true);
+  });
+});
+
+describe("crawl-output 对跨语言回包的字段类型", () => {
+  it("crawl-output 对跨语言回包逐字段判类型", () => {
+    // 对端形状是跨语言进程拼的：非字符串字段必须按空串落地，
+    // String({}) 的 "[object Object]" 不许混进模型上下文。
+    expect(pageToText({ url: "u", title: "t", markdown: "m" })).toBe("## t\nu\n\nm\n");
+    expect(pageToText({ url: "u" })).toBe("## u\nu\n\n\n");
+    expect(pageToText({})).toBe("## \n\n\n\n");
+    expect(pageToText({ url: 1, title: null, markdown: { a: 1 } })).toBe("## \n\n\n\n");
+    expect(rowToText({ a: 1, name: "x" })).toBe('- {"a":1,"name":"x"}\n');
   });
 });
 

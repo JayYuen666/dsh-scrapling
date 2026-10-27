@@ -3,12 +3,11 @@
 # 升级 oxfmt 或改配置就会让两者重新打架，且冲突点从本文件上看不出来。
 # `text=auto` 保留按内容做的二进制探测，不会误伤二进制文件。
 #
-# 触发这条的是本地 Windows 检出（Git for Windows 的机器级 core.autocrlf=true 会把工作树
-# 换成 CRLF）；本仓 CI 矩阵只有 ubuntu 与 macos，不跑 win32，所以本地那一份是唯一会被
-# 改写的检出。
+# 触发这条的是 Windows 检出（Git for Windows 的机器级 core.autocrlf=true 会把工作树换成
+# CRLF），CI 的 windows-latest 格与本地那份都算；门禁两侧（oxfmt 的 fmt:check、Python 的
+# ruff format --check）都按 LF 判，检出方式不该改变结论。
 #
-# 依赖 CRLF 的 Windows 脚本单独豁免：`*` 规则会把它们静默改成 LF，而本仓不跑 win32，
-# 改坏了没有任何一道门会红。
+# 依赖 CRLF 的 Windows 脚本单独豁免：`*` 规则会把它们静默改成 LF。
 * text=auto eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf

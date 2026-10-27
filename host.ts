@@ -12,27 +12,49 @@
 // proxy **绝不**进任何模型可见 schema。浏览器侧的 SSRF 守卫由 Python 侧用自己写的
 // 回调注册（见 py/guard.py），模型只能传数据，不能传代码。
 
-import { accessSync, constants } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Context, Volatile } from "@deepseek-ai/cordis";
 import type { JobOutcome } from "@deepseek-ai/dsh-jobs";
 import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
-import type { WebFetchBody } from "@deepseek-ai/dsh-web";
+import type { WebFetchBody, WebSearchProvider } from "@deepseek-ai/dsh-web";
 import Schema from "@deepseek-ai/schemastery";
 import { createSidecar } from "./lib/sidecar.ts";
 import { SidecarError } from "./lib/sidecar-error.ts";
+import { resolveRuntime } from "./lib/runtime.ts";
+import { installRuntimeRemote } from "./lib/runtime-remote.ts";
+import type { RuntimeJobs } from "./lib/runtime-remote.ts";
+import { defaultInstallerIO, installCapabilityPack } from "./lib/installer.ts";
 import { createUrlPolicy } from "./lib/url-policy.ts";
 import { createWebFetchProvider, PROVIDER_ID } from "./lib/web-provider.ts";
 import { createWebSearchProvider, SEARCH_PROVIDER_ID } from "./lib/search-provider.ts";
+import {
+  createMcpImageSink,
+  mcpSearchTool,
+  mcpToolEntries,
+  startMcpServer,
+} from "./lib/mcp-server.ts";
+import type { McpServerHandle } from "./lib/mcp-server.ts";
+import { DEFAULT_MCP_PORT, MCP_MODES, MCP_TOKEN_ENV } from "./lib/mcp-contract.ts";
+import type { McpMode } from "./lib/mcp-contract.ts";
+import { officialMcpHint } from "./lib/official-mcp.ts";
+import type { SearchBackend } from "./lib/search-provider.ts";
 import { createAnswerer, profileRoute } from "./lib/answer.ts";
+import {
+  createDownloadTool,
+  createScreenshotTool,
+  createSessionActTool,
+  createSessionReadTool,
+} from "./lib/browser-tools.ts";
 import {
   createAnswerTool,
   createCaptureXhrTool,
   createCrawlTool,
   createExtractTool,
   createFetchTool,
+  createLinksTool,
+  createLocateTool,
   createRenderTool,
   createSessionCloseTool,
   createSessionFetchTool,
@@ -42,7 +64,13 @@ import {
   createSessionStateLoadTool,
   createSessionStateSaveTool,
 } from "./lib/tools.ts";
-import type { CrawlJobRunner, CrawlSink, ToolDeps, ToolSettings } from "./lib/tools.ts";
+import type {
+  AttachmentSaver,
+  CrawlJobRunner,
+  CrawlSink,
+  ToolDeps,
+  ToolSettings,
+} from "./lib/tools.ts";
 import type { SidecarCapabilities, SidecarClient } from "./lib/sidecar.ts";
 
 /**
@@ -63,7 +91,7 @@ export type WaitSelectorState = "attached" | "detached" | "hidden" | "visible";
  */
 export interface Config {
   // ---- 环境定位（用户可改）----
-  /** Python 解释器名或绝对路径；留空则依次探仓内 `_env/.venv` 与 PATH 上的 `python3`。 */
+  /** Python 解释器名或绝对路径；留空则依次探仓内 `_env/.venv` 与 PATH 上的解释器。 */
   pythonBin: Volatile<string>;
   /**
    * 选中的解释器起不来时是否直接拒绝加载（true）还是降级为「所有工具不可用」。
@@ -76,6 +104,8 @@ export interface Config {
   // ---- 每工具开关（用户可改）----
   fetchEnabled: Volatile<boolean>;
   extractEnabled: Volatile<boolean>;
+  locateEnabled: Volatile<boolean>;
+  linksEnabled: Volatile<boolean>;
   renderEnabled: Volatile<boolean>;
   captureXhrEnabled: Volatile<boolean>;
   /** scrapling_session_network（读已开会话的网络历史）总开关。 */
@@ -86,6 +116,16 @@ export interface Config {
   crawlEnabled: Volatile<boolean>;
   /** scrapling_answer（页面问答）总开关。 */
   answerEnabled: Volatile<boolean>;
+  sessionReadEnabled: Volatile<boolean>;
+  sessionActionsEnabled: Volatile<boolean>;
+  downloadEnabled: Volatile<boolean>;
+  screenshotEnabled: Volatile<boolean>;
+  /** 部署级动作门禁；关时动作工具不注册，Python 也硬拒。 */
+  allowBrowserActions: boolean;
+  /** 部署级下载门禁；关时下载工具不注册，Python 也硬拒。 */
+  allowFileDownloads: boolean;
+  /** 单次下载的字节上限。 */
+  downloadMaxBytes: number;
 
   // ---- 抽取与封顶（用户可改，直接影响模型看到的 token 成本）----
   extractionType: Volatile<ExtractionType>;
@@ -143,6 +183,12 @@ export interface Config {
    * Python 侧再独立硬拒一次 —— 两道判断各管一侧，不依赖对方。
    */
   allowWriteMethods: boolean;
+  /** 三种互斥模式；`mcp` 与 `official-mcp` 都不注册原生工具。 */
+  integrationMode: McpMode;
+  /** 本插件 MCP server 的端口；要与 profile 里 dsh-mcp-client 条目的 URL 同值。 */
+  mcpPort: number;
+  /** 官方 MCP 模式的开关，与 setup 的 `--accept-risk` 是同一次表态。 */
+  officialMcpEnabled: boolean;
   /**
    * 浏览器二进制路径；留空表示用 Playwright 自带的 chromium。
    *
@@ -190,6 +236,10 @@ export interface Config {
    * （不能带路径），等于不给它一个任意文件写入口。
    */
   sessionStateDir: string;
+  /** adaptive 指纹库的后端：sqlite（同目录文件）或 redis。部署级，模型改不了。 */
+  adaptiveStorage: "sqlite" | "redis";
+  /** Redis 后端的连接串；adaptiveStorage=redis 时才读。 */
+  redisUrl: string;
   /** sidecar 的工作目录；留空则用 ~/.dsh-scrapling。需要可写 —— adaptive 的库落这里。 */
   dataDir: Volatile<string>;
   /**
@@ -203,8 +253,9 @@ export interface Config {
   /**
    * 爬虫是否遵守 robots.txt。默认关（沿用 Scrapling spider 的默认值）。部署级。
    *
-   * **打开后取不到 robots.txt 会阻塞该域**：Python 侧把「读不到」当成「不可遵循」处理，
-   * 宁可跳过该域也不越界。这是部署方对目标站点的表态，模型入参到不了这里。
+   * 打开后的取数口径（上游 `spiders/robotstxt.py`）：抓取**异常或 5xx** 时该域按
+   * 全面禁止处理——宁可跳过也不越界；站点**没有** robots.txt（HTTP 404）视作允许全部，
+   * 这是最常见的形态，不会被阻塞。
    */
   crawlRespectRobots: boolean;
   /** 爬虫两次请求之间的间隔（毫秒）。默认 0。部署级。 */
@@ -223,26 +274,46 @@ export interface Config {
   crawlCheckpointDir: string;
   /** 是否注册成 ctx.web 的 fetch provider；默认开，但部署侧仍要配 fetchProvider 才真正接管。 */
   provideWebFetch: Volatile<boolean>;
-  /** 是否注册成 ctx.web 的 search provider；默认开，但还要求配了 searchEndpoint。 */
+  /** 是否注册成 ctx.web 的 search provider。 */
   provideWebSearch: Volatile<boolean>;
   /**
-   * 搜索后端端点；留空 = 不提供搜索能力。
-   *
-   * 部署级：期望 SearXNG 兼容的 JSON 接口（`?q=<query>&format=json`）。Scrapling 自己
-   * 不是搜索引擎，检索这一段必须由外部后端做，渲染那一段才由本插件做。
+   * 发现后端：auto 依次尝试「配了 key 的 API 后端」与 SearXNG，两条都没有时**只有**
+   * searchPublicFallback 为 true 才回落到公共引擎（DuckDuckGo → Bing）。默认关（spec D10）。
    */
-  searchEndpoint: string;
+  searchBackend: Volatile<SearchBackend>;
+  /**
+   * auto 后端是否允许回落到公共引擎（DuckDuckGo / Bing）。
+   *
+   * 默认 false：公共引擎会把查询词发给第三方，属于部署方要明确同意的行为。显式把
+   * searchBackend 设成某个公共后端时这一项不参与判断 —— 那本身就是明确同意。
+   */
+  searchPublicFallback: Volatile<boolean>;
+  /** Tavily API key；空串表示没配，Tavily 后端会在 search 时报 SEARCH_AUTH。 */
+  tavilyApiKey: Volatile<string>;
+  /** Brave Search API key（`searchBackend=brave` 时必填）。 */
+  braveApiKey: Volatile<string>;
+  /** Serper.dev API key（`searchBackend=serper` 时必填）。 */
+  serperApiKey: Volatile<string>;
+  /** SearXNG 实例地址（`searchBackend=searxng` 时必填），例如 `https://searx.example.com`。 */
+  searxngEndpoint: Volatile<string>;
+  /** DuckDuckGo HTML 端点（测试或部署覆盖）。 */
+  duckduckgoEndpoint: string;
+  /** Tavily 端点（部署级；测试或代理可覆盖）。 */
+  tavilyApiEndpoint: string;
+  /** Bing 端点（部署级；测试或代理可覆盖）。 */
+  bingEndpoint: string;
   /** 搜索结果里前几条要真的抓下来渲染；0 表示只给链接列表。 */
   searchRenderTopN: number;
   /**
    * scrapling_answer 用哪个 provider 路由。
    *
    * 留空 = 跟随**当前会话的模型**（`session.requestHeader().config`，会话中途换模型也跟着
-   * 变），这与官方内置 web_search 的做法一致，也让插件不额外烧另一份额度。填了就固定用
-   * 这一条 —— 想让「读网页」和「写代码」分给不同模型时用得上。
+   * 变），这与官方内置 web_search 的做法一致，也让插件不额外烧另一份额度。provider 与
+   * model 必须同时填；只填一项时按未填处理，继续跟随会话模型 —— 想让「读网页」和「写代码」
+   * 分给不同模型时两项一起填。
    */
   answerProvider: Volatile<string>;
-  /** 配合 answerProvider 的模型 id；answerProvider 为空时这一项也不看。 */
+  /** 配合 answerProvider 的模型 id；answerProvider 为空或这一项为空时都不生效。 */
   answerModel: Volatile<string>;
   /** 单次回答的 token 上限。 */
   answerMaxTokens: Volatile<number>;
@@ -290,6 +361,8 @@ const configSchema = Schema.object({
 
   fetchEnabled: Schema.boolean().default(true).volatile(),
   extractEnabled: Schema.boolean().default(true).volatile(),
+  locateEnabled: Schema.boolean().default(true).volatile(),
+  linksEnabled: Schema.boolean().default(true).volatile(),
   renderEnabled: Schema.boolean().default(true).volatile(),
   captureXhrEnabled: Schema.boolean().default(true).volatile(),
   networkEnabled: Schema.boolean().default(true).volatile(),
@@ -299,6 +372,15 @@ const configSchema = Schema.object({
   // startCrawlJob 会当场报 JOBS_UNAVAILABLE —— 缺东西是点名失败，不是一次静默的假成功。
   crawlEnabled: Schema.boolean().default(true).volatile(),
   answerEnabled: Schema.boolean().default(true).volatile(),
+  sessionReadEnabled: Schema.boolean().default(true).volatile(),
+  sessionActionsEnabled: Schema.boolean().default(true).volatile(),
+  downloadEnabled: Schema.boolean().default(true).volatile(),
+  screenshotEnabled: Schema.boolean().default(true).volatile(),
+  allowBrowserActions: Schema.boolean().default(false),
+  allowFileDownloads: Schema.boolean().default(false),
+  downloadMaxBytes: Schema.natural()
+    .min(1)
+    .default(10 * 1024 * 1024),
 
   extractionType: Schema.union(["markdown", "html", "text"]).default("markdown").volatile(),
   mainContentOnly: Schema.boolean().default(true).volatile(),
@@ -337,6 +419,15 @@ const configSchema = Schema.object({
   // config: 块里明确表态 —— 刻意不进设置卡，因为设置卡是模型之外的人共享的界面，而这一档
   // 表态属于「这台部署允许什么」，属于部署方而不是某次会话。
   allowWriteMethods: Schema.boolean().default(false),
+  // 模式互斥，切换后必须重启：native 注册原生工具，mcp 只起本插件的 MCP server，
+  // official-mcp 连 server 都不起、只由 setup 给 dsh-mcp-client 生成官方条目配置。
+  // 这一档刻意是部署级而不是会话级 —— 一个模型不该在回合里决定自己被怎么接进去。
+  integrationMode: Schema.union([...MCP_MODES]).default("native"),
+  // 端口要与 profile 里那条 dsh-mcp-client 的 URL 同值；改完必须重跑 setup，doctor 会查。
+  mcpPort: Schema.natural().default(DEFAULT_MCP_PORT),
+  // 官方那 16 个工具含 browser_evaluate、不经本插件 guard，所以默认关，
+  // 且要 setup 的 --accept-risk 同一次表态才生成配置。
+  officialMcpEnabled: Schema.boolean().default(false),
   // 浏览器二进制路径：给装在非标准位置的企业镜像 / 便携版 Chromium 用的。
   browserExecutablePath: Schema.string().default(""),
   // CDP 端点：让浏览器连到一个已在运行的实例（如带着登录态的调试浏览器）。留空表示由
@@ -353,6 +444,10 @@ const configSchema = Schema.object({
   maxRecordedRequests: Schema.natural().min(1).default(100),
   // 登录态文件目录：空 = 禁用存取这对工具。写文件的能力，路径由部署方定死。
   sessionStateDir: Schema.string().default(""),
+  // adaptive 指纹库放哪：默认沿用 SQLite（随 dataDir），redis 让多进程/多机共享同一份指纹。
+  // 只认这两档；拼错的值落在 schema 校验上，而不是运行时静默回退。
+  adaptiveStorage: Schema.union(["sqlite", "redis"]).default("sqlite"),
+  redisUrl: Schema.string().default("redis://127.0.0.1:6379/0"),
   // 爬虫礼仪与顺序：全是部署方对目标站点的表态，模型入参到不了这里。默认沿用 Scrapling
   // spider 的取值（不遵守 robots.txt、无间隔、并发 4、不自动限速、bfs、不落断点）。
   crawlRespectRobots: Schema.boolean().default(false),
@@ -365,8 +460,25 @@ const configSchema = Schema.object({
   dataDir: Schema.string().default("").volatile(),
   provideWebFetch: Schema.boolean().default(true).volatile(),
   provideWebSearch: Schema.boolean().default(true).volatile(),
-  // 搜索后端端点（部署级）。空 = 不提供搜索能力，search provider 的 available() 为 false。
-  searchEndpoint: Schema.string().default(""),
+  searchBackend: Schema.union([
+    "auto",
+    "tavily",
+    "bing",
+    "brave",
+    "serper",
+    "duckduckgo",
+    "searxng",
+  ])
+    .default("auto")
+    .volatile(),
+  searchPublicFallback: Schema.boolean().default(false).volatile(),
+  tavilyApiKey: Schema.string().default("").volatile(),
+  braveApiKey: Schema.string().default("").volatile(),
+  serperApiKey: Schema.string().default("").volatile(),
+  searxngEndpoint: Schema.string().default("").volatile(),
+  duckduckgoEndpoint: Schema.string().default("https://html.duckduckgo.com/html/"),
+  tavilyApiEndpoint: Schema.string().default("https://api.tavily.com/search"),
+  bingEndpoint: Schema.string().default("https://www.bing.com/search"),
   // 搜索结果里前几条要真的抓下来渲染。渲染正是这半个需求的价值：内置 web_fetch 结构上
   // 读不到 SPA，这里走的是带浏览器的路径。
   searchRenderTopN: Schema.natural().min(0).default(3),
@@ -449,6 +561,8 @@ interface SystemPromptFace {
 export interface ToolFlags {
   fetch: boolean;
   extract: boolean;
+  locate: boolean;
+  links: boolean;
   render: boolean;
   captureXhr: boolean;
   network: boolean;
@@ -456,6 +570,10 @@ export interface ToolFlags {
   sessionState: boolean;
   crawl: boolean;
   answer: boolean;
+  sessionRead: boolean;
+  sessionActions: boolean;
+  download: boolean;
+  screenshot: boolean;
 }
 
 /**
@@ -471,6 +589,8 @@ export function snapshotFlags(config: Config): ToolFlags {
   return {
     fetch: config.fetchEnabled.get(),
     extract: config.extractEnabled.get(),
+    locate: config.locateEnabled.get(),
+    links: config.linksEnabled.get(),
     render: config.renderEnabled.get(),
     captureXhr: config.captureXhrEnabled.get(),
     network: config.networkEnabled.get(),
@@ -478,6 +598,11 @@ export function snapshotFlags(config: Config): ToolFlags {
     sessionState: config.sessionStateEnabled.get(),
     crawl: config.crawlEnabled.get(),
     answer: config.answerEnabled.get(),
+    sessionRead: config.sessionReadEnabled.get(),
+    // 部署门禁压过卡片开关：关着时工具不注册，模型看不见一个必然被 Python 拒的旋钮。
+    sessionActions: config.sessionActionsEnabled.get() && config.allowBrowserActions,
+    download: config.downloadEnabled.get() && config.allowFileDownloads,
+    screenshot: config.screenshotEnabled.get(),
   };
 }
 
@@ -497,6 +622,10 @@ const GUIDANCE: Record<keyof ToolFlags, string> = {
     "- 读一个网页的正文优先用 scrapling_fetch：静态、快、不吃内存。页面靠脚本渲染、它只取回空壳时再换浏览器类工具。",
   extract:
     "- 手上已经有一段 HTML（别的工具给的、本地文件读的）时用 scrapling_extract，不要为它发一次网络请求。",
+  locate:
+    "- 不知道稳定选择器时先用 scrapling_locate 按文本/正则/相似元素定位；它返回可用选择器，不保存指纹。",
+  links:
+    "- 要列出页面链接或找下一页候选时用 scrapling_links；它只回 URL 与候选，不替模型决定分页。",
   render:
     "- scrapling_render 把页面跑完再取正文，比静态抓取慢一个数量级也更吃内存；只有确认内容靠脚本渲染出来才用它。" +
     "站点对自动化痕迹敏感、普通浏览器抓取拿不到内容时，也在这里打开 solveCloudflare / hideCanvas / blockWebrtc 那几枚开关（0.5 起反检测已并入本工具，不再有单独的 stealth 抓取）。",
@@ -511,6 +640,14 @@ const GUIDANCE: Record<keyof ToolFlags, string> = {
   crawl: "- 要整站而不是单页时用 scrapling_crawl；它是后台作业，边跑边出进度，且只遵守起始域。",
   answer:
     "- 想让模型基于某个页面作答时用 scrapling_answer，它把正文当数据处理，不会照搬页面里的指令。",
+  sessionRead:
+    "- 动作或抓取之后要读会话当前页时用 scrapling_session_read；它不再发请求，读的是当前 DOM。",
+  sessionActions:
+    "- 要在会话页上点击、输入或等待时用 scrapling_session_act；只接受结构化动作，不执行任意 JS。",
+  download:
+    "- 要把一个 URL 的字节存到本机时用 scrapling_download；它不覆盖已有文件，也不回传文件内容。",
+  screenshot:
+    "- 要看页面长什么样时用 scrapling_screenshot；截图不经文本清洗，可能带上页面上的敏感视觉信息。",
 };
 
 /** 一个工具对运行环境的最低要求。 */
@@ -531,7 +668,7 @@ export interface ToolSpec {
 }
 
 /**
- * 十三个工具的登记表。
+ * 十九个工具的登记表。
  *
  * 顺序即注册顺序，也方便测试逐条对照。构造器直接挂在每一项上，而不是另开一张
  * 「名字 → 构造器」表：两张表只要有一处对不上，`apply` 就会拿不到构造器而跳过那条，
@@ -541,6 +678,8 @@ export interface ToolSpec {
 export const TOOL_SPECS: readonly ToolSpec[] = [
   { name: "scrapling_fetch", flag: "fetch", requires: "scrapling", build: createFetchTool },
   { name: "scrapling_extract", flag: "extract", requires: "scrapling", build: createExtractTool },
+  { name: "scrapling_locate", flag: "locate", requires: "scrapling", build: createLocateTool },
+  { name: "scrapling_links", flag: "links", requires: "scrapling", build: createLinksTool },
   {
     name: "scrapling_render",
     flag: "render",
@@ -599,7 +738,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     requires: "scrapling",
     build: createSessionCloseTool,
   },
-  // 爬虫是唯一需要**作业后端**的工具：它把整站抓取挂到 ctx.jobs 上跑，其余 12 个工具
+  // 爬虫是唯一需要**作业后端**的工具：它把整站抓取挂到 ctx.jobs 上跑，其余工具
   // 都是一次性调用。没有作业后端时它必然在 start() 那一刻失败，因此按能力跳过。
   { name: "scrapling_crawl", flag: "crawl", requires: "jobs", build: createCrawlTool },
   {
@@ -607,6 +746,30 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     flag: "answer",
     requires: "scrapling",
     build: createAnswerTool,
+  },
+  {
+    name: "scrapling_session_read",
+    flag: "sessionRead",
+    requires: "browser",
+    build: createSessionReadTool,
+  },
+  {
+    name: "scrapling_session_act",
+    flag: "sessionActions",
+    requires: "browser",
+    build: createSessionActTool,
+  },
+  {
+    name: "scrapling_download",
+    flag: "download",
+    requires: "scrapling",
+    build: createDownloadTool,
+  },
+  {
+    name: "scrapling_screenshot",
+    flag: "screenshot",
+    requires: "browser",
+    build: createScreenshotTool,
   },
 ];
 
@@ -662,7 +825,11 @@ export function outputBudgetOf(config: Config, toolName: string): number {
   if (toolName === "scrapling_fetch") {
     return config.fetchMaxOutputChars.get();
   }
-  if (toolName === "scrapling_extract") {
+  if (toolName === "scrapling_extract" || toolName === "scrapling_session_read") {
+    return config.extractMaxOutputChars.get();
+  }
+  // locate / links 也只解析调用方给的 HTML，产出体量与 extract 同档。
+  if (toolName === "scrapling_locate" || toolName === "scrapling_links") {
     return config.extractMaxOutputChars.get();
   }
   if (toolName === "scrapling_capture_xhr") {
@@ -675,7 +842,12 @@ export function outputBudgetOf(config: Config, toolName: string): number {
 const NONE = "none" as const;
 
 /** 一个工具没被注册的原因。 */
-export type SkipReason = "disabled" | "scrapling-missing" | "browser-missing" | "jobs-unavailable";
+export type SkipReason =
+  | "disabled"
+  | "scrapling-missing"
+  | "browser-missing"
+  | "jobs-unavailable"
+  | "attachments-missing";
 
 /** 注册计划的结果。 */
 export interface ToolPlan {
@@ -700,6 +872,7 @@ export function planTools(
   flags: ToolFlags,
   capabilities: SidecarCapabilities | undefined,
   jobsReady = false,
+  attachmentsReady = true,
 ): ToolPlan {
   const ready: string[] = [];
   const skipped: { name: string; reason: SkipReason }[] = [];
@@ -723,15 +896,15 @@ export function planTools(
   for (const spec of TOOL_SPECS) {
     const missing = satisfied(spec.requires);
     const enabled = flags[spec.flag];
-    if (missing === NONE) {
-      // 环境满足：开关开就注册，关就记 disabled。
-      if (enabled) {
-        ready.push(spec.name);
-      } else {
-        skipped.push({ name: spec.name, reason: "disabled" });
-      }
-    } else {
+    if (missing !== NONE) {
       skipped.push({ name: spec.name, reason: missing });
+    } else if (!enabled) {
+      skipped.push({ name: spec.name, reason: "disabled" });
+    } else if (spec.name === "scrapling_screenshot" && !attachmentsReady) {
+      // 环境满足、开关也开，但截图没有落库去处：不注册，免得模型点开一个必然失败的按钮。
+      skipped.push({ name: spec.name, reason: "attachments-missing" });
+    } else {
+      ready.push(spec.name);
     }
   }
   return { ready, skipped };
@@ -756,40 +929,44 @@ export function resolveDataDir(configured: string): string {
 }
 
 /** 仓内解释器相对包根的路径；与根 `scripts/lib/py-env.mjs` 的 `VENV_REL` 同一套规则。 */
-const VENV_PYTHON = path.join("_env", ".venv", "bin", "python");
 
 /** 选中的解释器，以及它为什么被选中。 */
 export interface PythonChoice {
   /** 交给 `ctx.subprocess.resolveExecutable` 的那个名字或绝对路径。 */
   readonly path: string;
-  /** 选中来源：显式配置 / 仓内 venv / PATH。 */
-  readonly via: "configured" | "_env/.venv" | "PATH";
+  /** 选中来源：显式配置 / 托管 runtime / 仓内 venv / PATH。 */
+  readonly via: "configured" | "managed" | "_env/.venv" | "PATH";
 }
 
 /**
  * 定下这次用哪个 Python。
  *
- * 三条规则，按优先级：设置卡填了就用它；没填时**先看仓内 venv**（`py:setup` 建的那份，
- * 可执行才算 —— 文件在但跑不起来的 venv 是坏掉的机器本地态）；都没有才落 PATH 上的
- * `python3`。判据与根 `scripts/lib/py-env.mjs` 的 `resolvePython` 逐条一致：两处答得不
- * 一样时，门禁判绿的解释器就不是插件真用的那个。
+ * 三条规则，按优先级：设置卡填了就用它；没填时**先看仓内 venv**（`py:setup` 建的那份；
+ * POSIX 认可执行位，Windows 认文件是否存在——那边没有可执行位）；都没有才落 PATH 上的
+ * 解释器（POSIX 是 `python3`，Windows 是 `python.exe`）。判据与根 `scripts/lib/py-env.mjs`
+ * 的 `resolvePython` 逐条一致：两处答得不一样时，门禁判绿的解释器就不是插件真用的那个。
  *
  * @param configured - 设置卡上的 `pythonBin`；空白表示没表态
  * @param packageRoot - 包根目录（`host.js` 所在的那一层）
  * @returns 选中的解释器与来源
  */
-export function resolvePythonBin(configured: string, packageRoot: string): PythonChoice {
-  const explicit = configured.trim();
-  if (explicit.length > 0) {
-    return { path: explicit, via: "configured" };
+export function resolvePythonBin(
+  configured: string,
+  packageRoot: string,
+  dataDir = "",
+): PythonChoice {
+  const runtime = resolveRuntime({
+    pythonBin: configured,
+    dataDir,
+    repoRoot: packageRoot,
+  });
+  if (runtime.via === "repo") {
+    return { path: runtime.pythonPath, via: "_env/.venv" };
   }
-  const venv = path.join(packageRoot, VENV_PYTHON);
-  try {
-    accessSync(venv, constants.X_OK);
-    return { path: venv, via: "_env/.venv" };
-  } catch {
-    return { path: "python3", via: "PATH" };
+  if (runtime.via === "path") {
+    return { path: runtime.pythonPath, via: "PATH" };
   }
+  return { path: runtime.pythonPath, via: runtime.via };
 }
 
 /**
@@ -1172,37 +1349,133 @@ function registerFetchProvider(ctx: Context, sidecar: SidecarClient, config: Con
 /**
  * 把本插件注册成 ctx.web 的 search provider，让内置 web_search 走「检索 + 渲染」。
  *
- * 需要同时具备两样东西：sidecar 可用，以及部署侧配了 searchEndpoint —— 检索这一段
- * Scrapling 自己做不到（它不是搜索引擎），只有渲染那一段归本插件。
+ * 只看 sidecar 是否可用。Tavily 没配 key 仍然注册：让 search() 报 SEARCH_AUTH，
+ * 比在可用性阶段静默降级更容易定位配置问题。
  *
  * @param ctx - 宿主上下文
  * @param sidecar - 已握手的 sidecar 客户端
  * @param config - 已解析的设置
  * @param urlGate - 出站 URL 闸门；与 sidecar 共用同一个，两侧才对同一个地址下结论
  */
-function registerSearchProvider(
-  ctx: Context,
-  sidecar: SidecarClient,
+function searchProviderOf(
   config: Config,
+  sidecar: SidecarClient,
   urlGate: (url: string) => Promise<string>,
-): void {
-  const provider = createWebSearchProvider({
+): WebSearchProvider {
+  const backend = config.searchBackend.get();
+  return createWebSearchProvider({
     sidecar,
-    searchEndpoint: config.searchEndpoint,
+    backend,
+    apiKey: config.tavilyApiKey.get(),
+    braveApiKey: config.braveApiKey.get(),
+    serperApiKey: config.serperApiKey.get(),
+    apiEndpoint: config.tavilyApiEndpoint,
+    bingEndpoint: config.bingEndpoint,
+    braveEndpoint: "https://api.search.brave.com/res/v1/web/search",
+    serperEndpoint: "https://google.serper.dev/search",
+    duckduckgoEndpoint: config.duckduckgoEndpoint,
+    searxngEndpoint: config.searxngEndpoint.get(),
+    publicFallback: config.searchPublicFallback.get(),
     renderTopN: config.searchRenderTopN,
     maxOutputBytes: config.fetchMaxOutputChars.get(),
     timeoutMs: config.fetchTimeoutMs.get(),
     urlGate,
   });
+}
+
+/**
+ * `mcp` 模式的装配：把同一份工具表端给 MCP server，原生工具一个都不注册。
+ *
+ * 截图在这一侧不落宿主 attachment 库，而是走 {@link createMcpImageSink}：MCP 客户端要的
+ * 是 image content，而外部连接没有所属会话可以挂附件。
+ *
+ * @param ctx - 宿主上下文
+ * @param config - 已解析的设置（端口与模式都在这里）
+ * @param plan - 与 native 同一份注册计划
+ * @param depsFor - 按工具补好预算后的依赖包
+ * @param search - 搜索发现层；不可用时 MCP 侧也不端 `search`
+ * @param env - 读 token 用的环境，测试可注入
+ */
+/** 装配工具面所需的一切；模式判据与 MCP server 共用同一份。 */
+export interface SurfaceArgs {
+  readonly ctx: Context;
+  readonly config: Config;
+  readonly plan: ToolPlan;
+  readonly depsFor: (spec: ToolSpec) => ToolDeps;
+  readonly search: WebSearchProvider;
+  readonly env: NodeJS.ProcessEnv;
+}
+
+export async function startMcpSurface(args: SurfaceArgs): Promise<McpServerHandle> {
+  const { config, ctx, depsFor, env, plan, search } = args;
+  const sink = createMcpImageSink();
+  const ready = new Set(plan.ready);
+  const tools: { name: string; definition: ToolDefinition }[] = [];
+  for (const spec of TOOL_SPECS) {
+    if (ready.has(spec.name)) {
+      tools.push({
+        name: spec.name,
+        definition: spec.build({ ...depsFor(spec), attachments: sink }),
+      });
+    }
+  }
+  const entries = mcpToolEntries(tools, search.available() ? mcpSearchTool(search) : undefined);
+  const token = (env[MCP_TOKEN_ENV] ?? "").trim();
+  const handle = await startMcpServer({
+    port: config.mcpPort,
+    entries,
+    imageSink: sink,
+    ...(token.length > 0 ? { token } : {}),
+  });
+  ctx.effect(() => () => handle.close());
+  const notice = token.length > 0 ? " · 需要 bearer token" : " · 无 token，只绑回环";
+  ctx.logger.info(
+    `[dsh-scrapling] MCP server：${handle.url} · ${String(entries.length)} 个工具${notice}`,
+  );
+  return handle;
+}
+
+/**
+ * 按模式装配工具面（spec §4.3 的互斥在这里落）：native 注册原生工具，`mcp` 把同一份表
+ * 端给 MCP server，`official-mcp` 两样都不做。模式只在装配时读一次，改完必须重启。
+ */
+async function registerSurface(args: SurfaceArgs): Promise<void> {
+  const { config, ctx, depsFor, plan } = args;
+  if (config.integrationMode === "mcp") {
+    await startMcpSurface(args);
+    return;
+  }
+  if (config.integrationMode === "official-mcp") {
+    ctx.logger.info(
+      `[dsh-scrapling] integrationMode=official-mcp：不注册原生工具，也不起本插件的 MCP server。${officialMcpHint(
+        config.officialMcpEnabled,
+      )}`,
+    );
+    return;
+  }
+  const ready = new Set(plan.ready);
+  for (const spec of TOOL_SPECS) {
+    if (ready.has(spec.name)) {
+      ctx.tools.register(spec.build(depsFor(spec)));
+    }
+  }
+}
+
+function registerSearchProvider(
+  ctx: Context,
+  provider: WebSearchProvider,
+  backend: SearchBackend,
+): void {
   if (!provider.available()) {
     ctx.logger.warn(
-      "[dsh-scrapling] 跳过注册 search provider：需要 sidecar 可用且配置了 searchEndpoint",
+      "[dsh-scrapling] 跳过注册 search provider：sidecar 不可用，或 auto 后端没有任何可用发现路径" +
+        "（未配 key / SearXNG，且 searchPublicFallback 为 false）",
     );
     return;
   }
   ctx.web.registerSearchProvider(provider);
   ctx.logger.info(
-    `[dsh-scrapling] 已注册 ctx.web search provider（id=${SEARCH_PROVIDER_ID}）。` +
+    `[dsh-scrapling] 已注册 ctx.web search provider（id=${SEARCH_PROVIDER_ID}, backend=${backend}）。` +
       '内置 web_search 要真正走它，部署配置里还需写 searchProvider: "scrapling"。',
   );
 }
@@ -1221,8 +1494,10 @@ type BaseSettings = Omit<ToolSettings, "maxOutputBytes">;
  * @param config - 已解析的设置
  * @returns 除输出预算之外的那一份设置
  */
-function baseSettingsOf(config: Config): BaseSettings {
+function baseSettingsOf(config: Config, dataDir: string): BaseSettings {
   return {
+    downloadDir: path.join(dataDir, "downloads"),
+    downloadMaxBytes: config.downloadMaxBytes,
     extractionType: config.extractionType.get(),
     mainContentOnly: config.mainContentOnly.get(),
     timeoutMs: config.fetchTimeoutMs.get(),
@@ -1243,6 +1518,8 @@ function baseSettingsOf(config: Config): BaseSettings {
     recordRequests: config.recordRequests,
     maxRecordedRequests: config.maxRecordedRequests,
     sessionStateDir: config.sessionStateDir,
+    adaptiveStorage: config.adaptiveStorage,
+    redisUrl: config.redisUrl,
     crawlRespectRobots: config.crawlRespectRobots,
     crawlDownloadDelayMs: config.crawlDownloadDelayMs,
     crawlConcurrentRequests: config.crawlConcurrentRequests,
@@ -1293,6 +1570,8 @@ function makeSidecar(options: {
       // 写方法这一档同样两侧各判一次：这一份送过去让 Python 硬拒，而 Host 这边直接不把
       // method/body 摆到模型面前。给 "0" 而不是留空，是为了在进程环境里一眼读得出表态。
       DSH_SCRAPLING_ALLOW_WRITE_METHODS: config.allowWriteMethods ? "1" : "0",
+      DSH_SCRAPLING_ALLOW_BROWSER_ACTIONS: config.allowBrowserActions ? "1" : "0",
+      DSH_SCRAPLING_ALLOW_FILE_DOWNLOADS: config.allowFileDownloads ? "1" : "0",
     },
     log: (line) => {
       ctx.logger.debug(line);
@@ -1321,7 +1600,7 @@ function makeSidecar(options: {
 /**
  * 作业后端不可用时把**怎么修**写出来。
  *
- * 这条路径上只少了 scrapling_crawl 一个工具，其余十二个照常，所以它不是致命错误；
+ * 这条路径上只少了 scrapling_crawl 一个工具，其余照常注册，所以它不是致命错误；
  * 但宿主那条报错文案会说「装 dsh-tool-jobs」，而那个包通常早就装好了 —— 真正被关掉的
  * 是 host 层的装载条目。照抄这条建议能直接解决。
  *
@@ -1336,7 +1615,7 @@ function warnJobsUnavailable(ctx: Context, plan: ToolPlan): void {
     "[dsh-scrapling] scrapling_crawl 不注册：这个 profile 的作业后端没有 controller 附着。" +
       "修法是在 profile 的 cordis.patch.yml 里显式启用 host 层的 tool-jobs：" +
       "`- id: tool-jobs` / `  name: '@deepseek-ai/dsh-tool-jobs'` / `  disabled: false`，" +
-      "改完重启宿主。其余十二个工具不受影响。",
+      "改完重启宿主。其余工具不受影响。",
   );
 }
 
@@ -1388,7 +1667,7 @@ export async function apply(
   const dataDir = resolveDataDir(config.dataDir.get());
   // 选中哪支解释器每一次都要说出来：这台机器上「仓内 venv 有 scrapling、PATH 上的 python3
   // 没有」是常态，而两者的症状完全一样（工具一个都不注册），日志里没有这一行就只能靠猜。
-  const python = resolvePythonBin(config.pythonBin.get(), import.meta.dirname);
+  const python = resolvePythonBin(config.pythonBin.get(), import.meta.dirname, dataDir);
   ctx.logger.info(`[dsh-scrapling] Python 解释器：${python.path}（${python.via}）`);
   // 闸门建一次、两处共用：sidecar 每次调用过它，search provider 的 sources 也过它。
   const urlGate = createUrlGate(config);
@@ -1398,6 +1677,21 @@ export async function apply(
   } catch (error) {
     ctx.logger.warn(handleDataDirFailure(error, dataDir, config.failFastOnMissingPython.get()));
     return;
+  }
+
+  // 运行环境远程面先于 sidecar 注册：sidecar 探测失败并降级（failFastOnMissingPython=false）
+  // 时卡片仍能安装/修复。failFast=true 时插件本身不加载，首次安装走 CLI。
+  // 它同时也是设置卡上“安装/修复/取消”的唯一入口，注册失败只该少掉这一栏。
+  const runtimeRemote = installRuntimeRemote(ctx, {
+    dataDir,
+    repoRoot: import.meta.dirname,
+    pythonBin: config.pythonBin.get(),
+    io: defaultInstallerIO,
+    jobsOf: (): RuntimeJobs | undefined => ctx.get("jobs"),
+    installPackFn: installCapabilityPack,
+  });
+  if (!runtimeRemote) {
+    ctx.logger.warn("[dsh-scrapling] 运行环境远程面未注册：当前上下文没有服务注册口");
   }
 
   const sidecar = makeSidecar({ ctx, config, python, urlGate, crawlEvents });
@@ -1425,7 +1719,11 @@ export async function apply(
   // 探测走行为（见 probeJobsReady 的注释）：`ctx.jobs` 在、但 `start()` 被拒是真实存在
   // 的一态（host 层的 tool-jobs 被 disabled 时），只看对象在不在会把一个必挂的工具注册出去。
   const jobsReady = probeJobsReady(ctx.get("jobs"));
-  const plan = planTools(flags, capabilities, jobsReady);
+  // 宿主 attachment 服务比截图需要的那一面大；这里只取 saveImage 这一项，
+  // 签名由截图工具的实际调用验证。
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+  const attachments = ctx.get("attachments") as AttachmentSaver | undefined;
+  const plan = planTools(flags, capabilities, jobsReady, attachments !== undefined);
   for (const item of plan.skipped) {
     if (item.reason !== "disabled") {
       ctx.logger.warn(`[dsh-scrapling] ${item.name} 不注册：${item.reason}`);
@@ -1455,19 +1753,18 @@ export async function apply(
     fallback: defaultSelection,
     maxTokens: config.answerMaxTokens.get(),
   });
-  const baseSettings = baseSettingsOf(config);
-  const ready = new Set(plan.ready);
-  for (const spec of TOOL_SPECS) {
-    if (ready.has(spec.name)) {
-      // 预算按工具分别给：静态抓取的正文、浏览器渲染后的正文、XHR 快照三者体量差一个
-      // 数量级，共用一份预算等于把三档调节压成一档——调 fetch 的旋钮会连带改掉 render。
-      const settings: ToolSettings = {
-        ...baseSettings,
-        maxOutputBytes: outputBudgetOf(config, spec.name),
-      };
-      ctx.tools.register(spec.build({ sidecar, settings, startCrawlJob: startJob, answer }));
-    }
-  }
+  const baseSettings = baseSettingsOf(config, dataDir);
+  const searchProvider = searchProviderOf(config, sidecar, urlGate);
+  // 预算按工具分别给：静态抓取的正文、浏览器渲染后的正文、XHR 快照三者体量差一个
+  // 数量级，共用一份预算等于把三档调节压成一档——调 fetch 的旋钮会连带改掉 render。
+  const depsFor = (spec: ToolSpec): ToolDeps => ({
+    sidecar,
+    settings: { ...baseSettings, maxOutputBytes: outputBudgetOf(config, spec.name) },
+    startCrawlJob: startJob,
+    answer,
+    attachments,
+  });
+  await registerSurface({ ctx, config, plan, depsFor, search: searchProvider, env: process.env });
 
   // 指引段按**装配时**的开关与「这个 scope 真注册着哪些工具」现取文本：设置卡关掉某个工具，
   // 或这台机器没装 Chromium（planTools 把 render / capture_xhr 跳过了），下一次装配就没有那
@@ -1491,7 +1788,7 @@ export async function apply(
   }
 
   if (config.provideWebSearch.get()) {
-    registerSearchProvider(ctx, sidecar, config, urlGate);
+    registerSearchProvider(ctx, searchProvider, config.searchBackend.get());
   }
 
   ctx.logger.info(

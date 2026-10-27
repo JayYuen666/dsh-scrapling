@@ -19,8 +19,10 @@ css/xpath。浏览器引擎是**一次性 session**：每次调用开进程、�
 
 from __future__ import annotations
 
+import codecs
 import concurrent.futures
 import contextlib
+import json
 import queue
 import re
 import sys
@@ -28,10 +30,13 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from typing import Any, Callable, NamedTuple
 
+import extraction
 import guard
+import media
+import search
+from redact import redact_url_secrets
 
 # Scrapling 缺失时不要让整个 sidecar 起不来：桥接层会把它报成能力缺失，
 # 而不是让 Host 侧只看到一个「进程崩了」。
@@ -51,7 +56,7 @@ DEFAULT_MAX_CONTENT_CHARS = 200_000
 # 量级，而这份摘要是给模型看的 —— 两个预算都由本包定，不由上游存了多少决定。
 DEFAULT_NETWORK_ENTRIES = 50
 DEFAULT_NETWORK_BODY_CHARS = 20_000
-EXTRACTION_TYPES = ("markdown", "html", "text")
+EXTRACTION_TYPES = ("markdown", "html", "text", "json")
 # adaptive 指纹库的文件名。**相对路径**：bridge 由宿主以部署侧的 dataDir 为工作目录拉起
 # （见 host.ts 的 sidecar env），相对路径正好把库落进 dataDir —— Scrapling 自己的默认值
 # 是包目录内的绝对路径，那在只读的 site-packages 里写不了，也不是用户该找的地方。
@@ -61,9 +66,10 @@ ADAPTIVE_STORAGE_FILE = "elements_storage.db"
 class AdapterError(RuntimeError):
     """带机器可读错误码的抓取失败。"""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.details = details or {}
 
 
 def _require(engine: object) -> None:
@@ -83,6 +89,20 @@ def _positive_int(value: Any, field: str, default: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise AdapterError("BAD_ARGS", f"{field} must be a positive integer")
     return value
+
+
+def _bounded_int(value: Any, field: str, default: int, maximum: int) -> int:
+    """取一个 ``1..maximum`` 的整数。
+
+    上限不是本包随口定的：上游把浏览器会话的这两个键写成 ``RetriesCount = Annotated[int,
+    Meta(ge=1, le=10)]`` 与 ``PagesCount = Annotated[int, Meta(ge=1, le=50)]``，越界值不在
+    Scrapling 里被拒，而是在它的 msgspec 校验层炸成 ``TypeError``，再由本包归成一次抓取失败。
+    这里先判，是为了把「旋钮拧过了」说成一句参数错误。
+    """
+    number = _positive_int(value, field, default)
+    if number > maximum:
+        raise AdapterError("BAD_ARGS", f"{field} must be between 1 and {maximum}")
+    return number
 
 
 def _positive_number(value: Any, field: str, default: float) -> float:
@@ -128,110 +148,22 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-# 查询串里这些名字的参数装的是凭据而不是筛选条件。XHR 摘要是**给模型看的**——它进会话
-# 上下文、进日志、进第三方 provider——而真实站点把 access token、会话 id、签名都放在
-# 查询串里。抓到一条就等于把凭据抄进上下文，而模型既用不上它、也拦不住它被复述出来。
-# 值的部分一律换成固定占位符：定位接口靠的是路径与参数名，不是那个 token。
-_SECRET_QUERY_KEYS = frozenset(
-    {
-        "access_token",
-        "api_key",
-        "apikey",
-        "auth",
-        "auth_token",
-        "authorization",
-        "code",
-        "credential",
-        "id_token",
-        "key",
-        "password",
-        "pwd",
-        "refresh_token",
-        "secret",
-        "session",
-        "sessionid",
-        "session_id",
-        "sig",
-        "signature",
-        "sign",
-        "token",
-    }
-)
+# 查询串与 authority 的凭据脱敏在 py/redact.py：guard 的日志与网络摘要共用同一份。
+
+_SENSITIVE_HEADERS = frozenset({"set-cookie", "cookie", "authorization", "proxy-authorization"})
 
 
-def _redacted_query(text: str) -> str:
-    """把一段查询串里像凭据的参数值换成占位符；没有命中时原样返回。
-
-    与 :func:`redact_url_secrets` 同一套参数名判据，片段也复用它 —— OAuth2 隐式流程把
-    令牌放在 ``#access_token=`` 里，那同样是「给模型看就等于抄进上下文」的凭据。
-
-    :param text: 查询串（或片段的查询部分）
-    :returns: 脱敏后的文本
-    """
-    if not text:
-        return text
-    pairs: list[tuple[str, str]] = []
-    changed = False
-    for name, value in parse_qsl(text, keep_blank_values=True):
-        if name.strip().lower() in _SECRET_QUERY_KEYS:
-            pairs.append((name, "<redacted>"))
-            changed = True
-        else:
-            pairs.append((name, value))
-    if not changed:
-        return text
-    return urlencode(pairs)
-
-
-def _redacted_fragment(fragment: str) -> str:
-    """把片段里像查询串的那一段脱敏；没有命中时原样返回。
-
-    片段有两种藏令牌的写法：OAuth2 隐式流程把整个片段当查询串（``#access_token=…``），
-    单页应用的路由则是先路径后查询（``#!/list?token=…``）。两种都要覆盖。
-
-    :param fragment: URL 的 fragment 段
-    :returns: 脱敏后的 fragment
-    """
-    head, separator, query = fragment.partition("?")
-    if separator:
-        return f"{head}?{_redacted_query(query)}"
-    return _redacted_query(fragment)
-
-
-def redact_url_secrets(raw: str) -> str:
-    """把 URL 里像凭据的部分替换成占位符。
-
-    三处各藏一类凭据：查询串与片段的查询部分按**参数名**判（真实站点把 access token、
-    会话 id、签名放在那里），authority 里的 ``user:pass@`` 整段丢掉（代理与 Basic 认证
-    的接口都爱这么写）。值的部分一律换成固定占位符：定位接口靠的是路径与参数名，不是
-    那个 token。
-
-    只按参数名判断、不看值 —— 值本身无法可靠判定（短 token 与普通 id 长得一样）。
-    认不出来的参数原样保留：把 ``?page=2`` 也涂掉只会让摘要失去意义，而那不是凭据。
-
-    :param raw: 原始 URL
-    :returns: 已脱敏的 URL；解析不出或没有可脱敏的部分时原样返回
-    """
-    try:
-        parsed = urlsplit(raw)
-    except ValueError:
-        return raw
-    # rpartition 取最后一段：IPv6 字面量与端口都留在主机那一侧，只把用户信息摘掉。
-    netloc = parsed.netloc.rpartition("@")[2]
-    query = _redacted_query(parsed.query)
-    fragment = _redacted_fragment(parsed.fragment)
-    if netloc == parsed.netloc and query == parsed.query and fragment == parsed.fragment:
-        return raw
-    return urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
+def _safe_headers(headers: Any) -> dict[str, str]:
+    """只回非凭据响应头；cookie 与鉴权头一律不出口。"""
+    if not isinstance(headers, dict):
+        return {}
+    return {str(key): str(value) for key, value in headers.items() if str(key).lower() not in _SENSITIVE_HEADERS}
 
 
 def _network_summary(
     network: Any,  # 上游的 NetworkRecorder
     *,
-    pattern: str | None,
-    limit: int,
-    include_body: bool,
-    max_body_chars: int,
+    query: _NetworkQuery,
 ) -> list[dict[str, Any]]:
     """把会话网络历史压成给模型看的条目。
 
@@ -248,7 +180,19 @@ def _network_summary(
     """
     summary: list[dict[str, Any]] = []
     try:
-        records = network.search(url_pattern=pattern, limit=limit, include_static=False)
+        if query.request_id is not None:
+            record = network.get(query.request_id)
+            records = [] if record is None else [record]
+        else:
+            records = network.search(
+                url_pattern=query.pattern,
+                method=query.method,
+                resource_type=query.resource_type,
+                status=query.status,
+                after_id=query.after_id,
+                limit=query.limit,
+                include_static=query.include_static,
+            )
     except Exception:  # noqa: BLE001 —— 记录器未启用或上游改了口径：当成「没有历史」
         return summary
     for item in records:
@@ -256,24 +200,30 @@ def _network_summary(
             meta = item.meta if isinstance(item.meta, dict) else {}
             body = item.body
             entry: dict[str, Any] = {
+                "id": int(meta.get("network_id") or 0),
                 "url": redact_url_secrets(str(item.url)),
                 "status": item.status,
                 "bytes": len(body),
-                "method": str(meta.get("method") or item.request_headers.get("method") or "GET"),
+                # 上游把方法记在 Response.method 上；从 meta / request_headers 读会退化成 GET，
+                # POST 的 XHR 在摘要里一律显示成 GET（V5 已复现）。
+                "method": str(getattr(item, "method", "GET")),
                 "resourceType": str(meta.get("resource_type") or ""),
             }
+            if query.include_headers:
+                entry["headers"] = _safe_headers(getattr(item, "headers", {}))
             if not body:
                 note = meta.get("body_note")
                 if isinstance(note, str) and note:
                     entry["bodyNote"] = note
-            elif include_body:
+            elif query.include_body:
                 text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
-                clipped, truncated = clip(text, max_body_chars)
+                clipped, truncated = clip(text, query.body_chars)
                 entry["body"] = clipped
                 if truncated:
                     entry["bodyTruncated"] = True
             summary.append(entry)
-        except Exception:  # noqa: BLE001 —— 单条摘要失败不该拖垮整次读取
+        # 单条摘要失败不该拖垮整次读取；继续处理下一条。
+        except Exception:  # noqa: BLE001, S112  # nosec B112
             continue
     return summary
 
@@ -411,6 +361,30 @@ def _scoped_pages(page: Any, css_selector: str | None) -> list[Any]:  # 同上
     return list(page.css(css_selector))
 
 
+def _header_value(headers: Any, name: str) -> str:
+    """按大小写不敏感读一个响应头；缺失给空串。"""
+    if not isinstance(headers, dict):
+        return ""
+    wanted = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == wanted:
+            return str(value)
+    return ""
+
+
+def _response_metadata(response: Any, redirects: int) -> dict[str, Any]:
+    """只收安全子集：不返回 cookie、set-cookie 或任何鉴权头。"""
+    headers = getattr(response, "headers", {}) or {}
+    request = getattr(response, "request", None)
+    return {
+        "contentType": _header_value(headers, "content-type"),
+        "encoding": str(getattr(response, "encoding", "") or ""),
+        "reason": str(getattr(response, "reason", "") or ""),
+        "redirects": redirects,
+        "method": str(getattr(request, "method", "GET")),
+    }
+
+
 def to_payload(
     response: Any,
     *,
@@ -419,43 +393,64 @@ def to_payload(
     main_content_only: bool,
     max_content_chars: int,
     strip_inline_images: bool = True,
+    include_metadata: bool = False,
 ) -> dict[str, Any]:
     """把 Scrapling 的 ``Response`` 归一成协议载荷。
 
     反注入清洗对三条提取路径都无条件发生（``Convertor._strip_noise_tags`` +
     ``_sanitize_for_ai``）—— 这里**不提供关闭它的开关**。官方 MCP server 在
     ``main_content_only=False`` 时会绕过清洗，本插件不重复这个错。
-    """
-    if extraction_type == "html":
-        page = _sanitized_page(response, main_content_only=main_content_only)
-        _strip_active_content(page)
-        content = "\n".join(element.html_content for element in _scoped_pages(page, css_selector))
-    elif extraction_type == "text":
-        page = _sanitized_page(response, main_content_only=main_content_only)
-        content = "\n".join(
-            element.get_all_text(
-                strip=True,
-                ignore_tags=("script", "style", "noscript", "svg", "iframe"),
-            )
-            for element in _scoped_pages(page, css_selector)
-        )
-    else:
-        content = response.markdown(css_selector=css_selector, main_content_only=main_content_only)
 
-    text = str(content)
-    # 先剥再封顶：被剥掉的那几十 KB 不该占 max_content_chars 的额度，否则一页内联图就能把
-    # 真正文挤出预算 —— 顺序反了等于白剥。
-    if strip_inline_images:
-        text = drop_data_uris(text, html=extraction_type == "html")
-    clipped, truncated = clip(text, max_content_chars)
+    ``json`` 是数据而不是正文：直接解析并序列化，不过 markdown 反注入清洗；但序列化后的
+    文本照旧剥 data URI（内联图片对模型不可读，还会白吃 ``maxContentChars`` 的额度）并受
+    同一个 ``maxContentChars`` 封顶——与 html/text/markdown 三条路径同一套收口（spec:363）。
+    """
+    if extraction_type == "json":
+        try:
+            parsed = response.json()
+        except Exception as error:
+            raw = getattr(response, "html_content", "") or getattr(response, "text", "")
+            raise AdapterError("NOT_JSON", f"response is not JSON: {str(raw)[:200]}") from error
+        text = json.dumps(parsed, ensure_ascii=False)
+        # spec:363 —— JSON 文本与正文走同一条剥图/清洗再封顶的路径：序列化之后的 data URI
+        # 同样会白吃 maxContentChars 的额度，而且内联图片是模型读不懂的字节。
+        if strip_inline_images:
+            text = drop_data_uris(text)
+        clipped, truncated = clip(text, max_content_chars)
+    else:
+        if extraction_type == "html":
+            page = _sanitized_page(response, main_content_only=main_content_only)
+            _strip_active_content(page)
+            content = "\n".join(element.html_content for element in _scoped_pages(page, css_selector))
+        elif extraction_type == "text":
+            page = _sanitized_page(response, main_content_only=main_content_only)
+            content = "\n".join(
+                element.get_all_text(
+                    strip=True,
+                    ignore_tags=("script", "style", "noscript", "svg", "iframe"),
+                )
+                for element in _scoped_pages(page, css_selector)
+            )
+        else:
+            content = response.markdown(css_selector=css_selector, main_content_only=main_content_only)
+        text = str(content)
+        # 先剥再封顶：被剥掉的那几十 KB 不该占 max_content_chars 的额度，否则一页内联图就能把
+        # 真正文挤出预算 —— 顺序反了等于白剥。
+        if strip_inline_images:
+            text = drop_data_uris(text, html=extraction_type == "html")
+        clipped, truncated = clip(text, max_content_chars)
+
+    redirects = len(getattr(response, "history", ()) or ())
     payload: dict[str, Any] = {
         "url": response.url,
         "status": response.status,
         "extractionType": extraction_type,
         "content": clipped,
         "truncated": truncated,
-        "redirects": len(getattr(response, "history", ()) or ()),
+        "redirects": redirects,
     }
+    if include_metadata:
+        payload["metadata"] = _response_metadata(response, redirects)
     return payload
 
 
@@ -500,12 +495,105 @@ def _static_params(args: dict[str, Any], url: str) -> dict[str, Any]:
     return params
 
 
+def _object_param(value: Any, field: str) -> dict[str, Any] | None:
+    """取一个可选的对象参数；类型不对就报错。"""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise AdapterError("BAD_ARGS", f"{field} must be an object or null")
+    return value
+
+
+def _string_set(value: Any, field: str) -> set[str] | None:
+    """取一个可选的字符串数组并转成集合。"""
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise AdapterError("BAD_ARGS", f"{field} must be an array of non-empty strings or null")
+    return set(value)
+
+
+def _cookie_list(value: Any) -> list[dict[str, Any]] | None:
+    """校验 Playwright 兼容的 cookie 列表；只要求 name/value 是字符串。"""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise AdapterError("BAD_ARGS", "cookies must be an array or null")
+    cookies: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise AdapterError("BAD_ARGS", "cookies must contain objects")
+        name = item.get("name")
+        cookie_value = item.get("value")
+        if not isinstance(name, str) or not name or not isinstance(cookie_value, str):
+            raise AdapterError("BAD_ARGS", "each cookie needs string name and value fields")
+        cookies.append(dict(item))
+    return cookies
+
+
 def _url(args: dict[str, Any]) -> str:
     """取必填的 url 参数。"""
     url = args.get("url")
     if not isinstance(url, str) or not url:
         raise AdapterError("BAD_ARGS", "url is required")
     return url
+
+
+def _static_request_payload(args: dict[str, Any], method: str) -> dict[str, Any]:
+    """静态请求的查询串、请求体、编码与重试细节。
+
+    先校验再交给写方法门禁：``form`` 与 ``json`` 同时给出是参数错误（``BAD_ARGS``），
+    不该被写方法那条部署表态盖掉。
+    """
+    query = _object_param(args.get("params"), "params")
+    form = _object_param(args.get("form"), "form")
+    json_body = args.get("json")
+    if form is not None and json_body is not None:
+        raise AdapterError("BAD_ARGS", "form and json are mutually exclusive")
+    if args.get("body") is not None and (form is not None or json_body is not None):
+        raise AdapterError("BAD_ARGS", "body cannot be combined with form or json")
+    default_encoding = args.get("defaultEncoding")
+    if default_encoding is not None and not isinstance(default_encoding, str):
+        raise AdapterError("BAD_ARGS", "defaultEncoding must be a string or null")
+    retry_delay = _positive_int(args.get("retryDelay"), "retryDelay", 1) if args.get("retryDelay") is not None else None
+    stealthy_headers = args.get("stealthyHeaders", True)
+    if not isinstance(stealthy_headers, bool):
+        raise AdapterError("BAD_ARGS", "stealthyHeaders must be a boolean")
+
+    payload: dict[str, Any] = {}
+    if query is not None:
+        payload["params"] = query
+    cookies = _string_map(args.get("cookies"), "cookies")
+    if cookies is not None:
+        payload["cookies"] = cookies
+    if isinstance(default_encoding, str) and default_encoding:
+        # default_encoding 不在 Scrapling 声明的 GET/POST 参数面里，它是 _merge_request_args
+        # 原样透传给 curl_cffi 的 Session.request 的那一位；编码名先经 codecs 归一，
+        # 但 curl_cffi 若改名，这一位会由它自己报错而不是在这里被拦住。
+        try:
+            payload["default_encoding"] = codecs.lookup(default_encoding).name
+        except LookupError as error:
+            raise AdapterError("BAD_ARGS", f"defaultEncoding is not a known encoding: {default_encoding}") from error
+    if retry_delay is not None:
+        payload["retry_delay"] = retry_delay
+    if stealthy_headers is False:
+        payload["stealthy_headers"] = False
+
+    if method != "GET":
+        if form is not None:
+            payload["data"] = form
+        elif json_body is not None:
+            payload["json"] = _jsonable(json_body)
+        else:
+            body = args.get("body")
+            if isinstance(body, str):
+                payload["data"] = body
+            elif body is not None:
+                # 数组、数字、布尔也是合法的 JSON 请求体（curl_cffi 的 ``json=`` 照收）。此前只有
+                # dict 走 json、str 走 data，其余**静默丢弃** —— 模型发一个 `body: [1, 2]`，请求照
+                # 发、对端收到空体，而回包上没有一行能看出这件事。
+                payload["json"] = _jsonable(body)
+    return payload
 
 
 def fetch(args: dict[str, Any]) -> dict[str, Any]:
@@ -518,18 +606,10 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
     _require(Fetcher)
     url = _url(args)
     extraction_type, css_selector, main_content_only, limit = _extraction(args)
-    params = _static_params(args, url)
-
-    cookies = _string_map(args.get("cookies"), "cookies")
-    if cookies is not None:
-        params["cookies"] = cookies
-    impersonate = args.get("impersonate")
-    if isinstance(impersonate, str) and impersonate:
-        params["impersonate"] = impersonate
-
     method = str(args.get("method", "GET")).upper()
     if method not in ("GET", "POST", "PUT", "DELETE"):
         raise AdapterError("BAD_ARGS", f"unsupported method: {method}")
+    request_payload = _static_request_payload(args, method)
     if method != "GET" and not guard.ALLOW_WRITE_METHODS:
         # 这一侧是硬拒，不依赖 Host 有没有把入参摆出来：手搓一帧 stdin 也写不出去。
         raise AdapterError(
@@ -537,15 +617,11 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
             f"{method} changes state on the remote side; the deployment must set "
             f"allowWriteMethods (env {guard.ALLOW_WRITE_METHODS_ENV}) to allow it",
         )
-    if method != "GET":
-        body = args.get("body")
-        if isinstance(body, str):
-            params["data"] = body
-        elif body is not None:
-            # 数组、数字、布尔也是合法的 JSON 请求体（curl_cffi 的 ``json=`` 照收）。此前只有
-            # dict 走 json、str 走 data，其余**静默丢弃** —— 模型发一个 `body: [1, 2]`，请求照
-            # 发、对端收到空体，而回包上没有一行能看出这件事。
-            params["json"] = _jsonable(body)
+    params = _static_params(args, url)
+    params.update(request_payload)
+    impersonate = args.get("impersonate")
+    if isinstance(impersonate, str) and impersonate:
+        params["impersonate"] = impersonate
 
     # Host 侧闸门判过之后到 curl_cffi 真解析、真建连之间隔着一个进程边界（TOCTOU），
     # 所以这里在发车之前用同一份 guard 复判一次 —— 浏览器路径由 page.route 逐请求兜住，
@@ -562,6 +638,7 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
         main_content_only=main_content_only,
         max_content_chars=limit,
         strip_inline_images=_strip_inline_images(args),
+        include_metadata=bool(args.get("includeMetadata", False)),
     )
 
 
@@ -629,12 +706,17 @@ SESSION_ONLY_KEYS = frozenset(
         "allow_webgl",
         "block_ads",
         "block_webrtc",
+        "blocked_domains",
         "cdp_url",
+        "cookies",
+        "disable_resources",
         "dns_over_https",
         "executable_path",
+        "google_search",
         "headless",
         "hide_canvas",
         "init_script",
+        "load_dom",
         "locale",
         "max_pages",
         "max_recorded_requests",
@@ -645,6 +727,7 @@ SESSION_ONLY_KEYS = frozenset(
         "timezone_id",
         "useragent",
         "user_data_dir",
+        "wait_selector_state",
     }
 )
 
@@ -717,12 +800,30 @@ def _browser_params(args: dict[str, Any], url: str, *, level: str = "session") -
         "headless": bool(args.get("headless", True)),
         "timeout": _positive_int(args.get("timeoutMs"), "timeoutMs", DEFAULT_TIMEOUT_MS),
         "block_ads": bool(args.get("blockAds", False)),
-        "blocked_domains": None,
-        "disable_resources": False,
+        # 这里刻意**不**预置 blocked_domains / disable_resources：见上方 docstring。模型
+        # 显式给了才在下面按条件覆盖；没给就交给上游沿用会话配置。
     }
     proxy = guard.browser_proxy(url)
     if proxy is not None:
         params["proxy"] = proxy
+    cookies = _cookie_list(args.get("cookies"))
+    if cookies is not None:
+        params["cookies"] = cookies
+    blocked_domains = _string_set(args.get("blockedDomains"), "blockedDomains")
+    if blocked_domains is not None:
+        params["blocked_domains"] = blocked_domains
+    if isinstance(args.get("disableResources"), bool):
+        params["disable_resources"] = args["disableResources"]
+    if isinstance(args.get("loadDom"), bool):
+        params["load_dom"] = args["loadDom"]
+    if isinstance(args.get("googleSearch"), bool):
+        params["google_search"] = args["googleSearch"]
+    if args.get("retries") is not None:
+        params["retries"] = _bounded_int(args.get("retries"), "retries", 3, 10)
+    if args.get("retryDelay") is not None:
+        params["retry_delay"] = _positive_int(args.get("retryDelay"), "retryDelay", 1)
+    if args.get("maxPages") is not None:
+        params["max_pages"] = _bounded_int(args.get("maxPages"), "maxPages", 1, 50)
     if args.get("networkIdle"):
         params["network_idle"] = True
     for key, name in (
@@ -805,20 +906,59 @@ def render(args: dict[str, Any]) -> dict[str, Any]:
         main_content_only=main_content_only,
         max_content_chars=limit,
         strip_inline_images=_strip_inline_images(args),
+        include_metadata=bool(args.get("includeMetadata", False)),
     )
 
 
-def _network_read(args: dict[str, Any]) -> tuple[str | None, int, bool, int]:
-    """抽出「读网络历史」的四个参数并校验。
+class _NetworkQuery(NamedTuple):
+    """一次网络历史读取的全部过滤与投影参数。"""
+
+    pattern: str | None
+    limit: int
+    include_body: bool
+    body_chars: int
+    method: str | None
+    status: int | None
+    resource_type: str | None
+    include_static: bool
+    after_id: int
+    include_headers: bool
+    request_id: int | None
+
+
+def _network_read(args: dict[str, Any]) -> _NetworkQuery:
+    """抽出「读网络历史」的过滤与投影参数并校验。
 
     :param args: 协议参数
-    :returns: (URL 过滤正则, 条数上限, 是否回传正文, 单条正文预算)
+    :returns: 归一后的查询参数
     """
-    return (
-        _url_pattern(args),
-        _positive_int(args.get("networkLimit"), "networkLimit", DEFAULT_NETWORK_ENTRIES),
-        bool(args.get("includeBody", False)),
-        _positive_int(args.get("maxBodyChars"), "maxBodyChars", DEFAULT_NETWORK_BODY_CHARS),
+    method = args.get("method")
+    if method is not None and (not isinstance(method, str) or not method):
+        raise AdapterError("BAD_ARGS", "method must be a non-empty string or null")
+    status = args.get("status")
+    if status is not None and (not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599):
+        raise AdapterError("BAD_ARGS", "status must be an integer between 100 and 599")
+    resource_type = args.get("resourceType")
+    if resource_type is not None and (not isinstance(resource_type, str) or not resource_type):
+        raise AdapterError("BAD_ARGS", "resourceType must be a non-empty string or null")
+    after_id = args.get("afterId", 0)
+    if not isinstance(after_id, int) or isinstance(after_id, bool) or after_id < 0:
+        raise AdapterError("BAD_ARGS", "afterId must be a non-negative integer")
+    request_id = args.get("requestId")
+    if request_id is not None and (not isinstance(request_id, int) or isinstance(request_id, bool) or request_id <= 0):
+        raise AdapterError("BAD_ARGS", "requestId must be a positive integer or null")
+    return _NetworkQuery(
+        pattern=_url_pattern(args),
+        limit=_positive_int(args.get("networkLimit"), "networkLimit", DEFAULT_NETWORK_ENTRIES),
+        include_body=bool(args.get("includeBody", False)),
+        body_chars=_positive_int(args.get("maxBodyChars"), "maxBodyChars", DEFAULT_NETWORK_BODY_CHARS),
+        method=method.upper() if isinstance(method, str) else None,
+        status=status,
+        resource_type=resource_type,
+        include_static=bool(args.get("includeStatic", False)),
+        after_id=after_id,
+        include_headers=bool(args.get("includeHeaders", False)),
+        request_id=request_id,
     )
 
 
@@ -826,10 +966,7 @@ def _capture_once(
     args: dict[str, Any],
     *,
     url: str,
-    pattern: str | None,
-    entries: int,
-    include_body: bool,
-    body_chars: int,
+    query: _NetworkQuery,
 ) -> tuple[Any, list[dict[str, Any]]]:
     """在一个临时会话里抓一次，并把这次抓取记下的网络条目一起读出来。
 
@@ -838,10 +975,7 @@ def _capture_once(
 
     :param args: 协议参数
     :param url: 要抓的地址
-    :param pattern: URL 过滤正则
-    :param entries: 最多回多少条
-    :param include_body: 是否回传响应体
-    :param body_chars: 单条正文的字符预算
+    :param query: 网络历史的过滤与投影参数
     :returns: (response, 网络条目)
     """
     from scrapling.fetchers import StealthySession
@@ -864,13 +998,7 @@ def _capture_once(
     try:
         session.start()
         response = session.fetch(url, **fetch_params)
-        records = _network_summary(
-            session.network,
-            pattern=pattern,
-            limit=entries,
-            include_body=include_body,
-            max_body_chars=body_chars,
-        )
+        records = _network_summary(session.network, query=query)
     finally:
         # 这条会话不进注册表，所以没有别人会替它收尸 —— 成败都要在这里关掉。
         with contextlib.suppress(Exception):
@@ -893,22 +1021,13 @@ def capture(args: dict[str, Any]) -> dict[str, Any]:
     _require(StealthyFetcher)
     url = _url(args)
     extraction_type, css_selector, main_content_only, limit = _extraction(args)
-    pattern, entries, include_body, body_chars = _network_read(args)
+    query = _network_read(args)
 
     # 整条链路投到一条专属线程上：patchright 的同步 API 与创建它的线程绑定（greenlet），
     # 而 bridge 的 worker 线程是「谁抢到帧谁处理」，所以这里建一条自己的、用完就收。
     worker = _SessionWorker()
     try:
-        response, records = worker.run(
-            lambda: _capture_once(
-                args,
-                url=url,
-                pattern=pattern,
-                entries=entries,
-                include_body=include_body,
-                body_chars=body_chars,
-            )
-        )
+        response, records = worker.run(lambda: _capture_once(args, url=url, query=query))
     finally:
         worker.stop()
 
@@ -919,13 +1038,18 @@ def capture(args: dict[str, Any]) -> dict[str, Any]:
         main_content_only=main_content_only,
         max_content_chars=limit,
         strip_inline_images=_strip_inline_images(args),
+        include_metadata=bool(args.get("includeMetadata", False)),
     )
     payload["xhr"] = records
     return payload
 
 
 def _fake_response(html: str, url: str, status: int) -> Any:
-    """造一个不带网络的 ``Response``，给离线抽取用。"""
+    """造一个不带网络的 ``Response``，让已有 HTML 走与抓取同一条归一管线。
+
+    调用方是 :mod:`session_page`（读会话当前页的 DOM）与测试夹具：正文清洗与截断只写在
+    :func:`to_payload` 一处，离线进来的 HTML 不许绕过它。
+    """
     from scrapling.engines.toolbelt.custom import Response
 
     return Response(
@@ -939,45 +1063,33 @@ def _fake_response(html: str, url: str, status: int) -> Any:
     )
 
 
-def extract(args: dict[str, Any]) -> dict[str, Any]:
-    """对一段已有 HTML 做抽取，不发任何网络请求。
+def _adaptive_kwargs(args: dict[str, Any], url: str) -> dict[str, Any]:
+    """按部署表态给出 adaptive 指纹库的 storage 与 storage_args。
 
-    :param args: 协议参数
-    :returns: 归一后的载荷
+    ``deployment.adaptiveStorage`` 只认 ``sqlite``（默认）与 ``redis``；Redis 那一支把连接
+    串与按注册域分桶的 ``url`` 一起交给 ``RedisStorageSystem``，客户端不可达时翻成带码的
+    ``ADAPTIVE_STORAGE_UNAVAILABLE``，而不是让整次抽取以裸异常收场。
     """
-    html = args.get("html")
-    if not isinstance(html, str):
-        raise AdapterError("BAD_ARGS", "html must be a string")
-    extraction_type, css_selector, main_content_only, limit = _extraction(args)
-    status = args.get("status", 200)
-    if not isinstance(status, int) or isinstance(status, bool):
-        raise AdapterError("BAD_ARGS", "status must be an integer")
-    response = _fake_response(html, str(args.get("url") or "about:blank"), status)
-    return to_payload(
-        response,
-        extraction_type=extraction_type,
-        css_selector=css_selector,
-        main_content_only=main_content_only,
-        max_content_chars=limit,
-        strip_inline_images=_strip_inline_images(args),
-    )
+    deployment = args.get("deployment")
+    settings = deployment if isinstance(deployment, dict) else {}
+    backend = settings.get("adaptiveStorage")
+    if backend is None or backend == "sqlite":
+        return {"storage_args": {"storage_file": ADAPTIVE_STORAGE_FILE, "url": url}}
+    if backend != "redis":
+        raise AdapterError("BAD_ARGS", f"unknown adaptiveStorage: {backend}")
+    redis_url = settings.get("redisUrl")
+    if redis_url is not None and not isinstance(redis_url, str):
+        raise AdapterError("BAD_ARGS", "redisUrl must be a string")
+    from redis_storage import DEFAULT_REDIS_URL, RedisStorageSystem
+
+    return {
+        "storage": RedisStorageSystem,
+        "storage_args": {"redis_url": redis_url or DEFAULT_REDIS_URL, "url": url},
+    }
 
 
 def select(args: dict[str, Any]) -> dict[str, Any]:
-    """对已有 HTML 做 CSS/XPath 选择，返回命中的文本与少量属性。
-
-    这正是 dsh 内置 ``web_fetch`` 结构上做不到的那部分：它只能给一整块 Markdown，
-    这里给的是选择器命中的具体内容。
-
-    ``adaptive`` 打开时走 Scrapling 的自愈选择器：命中成功就把首个元素的指纹存库，
-    站点改版后同一个选择器直接命中失败时，按指纹重定位。存储文件固定在 sidecar 的
-    工作目录（部署侧的 ``dataDir``），键按 ``url`` 的注册域分桶 —— 所以重定位还要求
-    给 ``url``；不给就全落在 ``default`` 桶里，跨站点共用一份指纹。
-
-    ``maxContentChars`` 是这条路径的预算，与抓取类工具同源：``limit`` 数的是**条数**，
-    而十条十万字的正文照样能把模型上下文撑爆。所以逐条累计字符，超了就地截断并置
-    ``truncated`` —— 总条数与单条长度是两根独立的轴，只压一根等于没压。
-    """
+    """对已有 HTML 做选择，返回命中文本、属性或多字段行。"""
     from scrapling.parser import Selector
 
     html = args.get("html")
@@ -989,35 +1101,126 @@ def select(args: dict[str, Any]) -> dict[str, Any]:
     attribute = args.get("attribute")
     if attribute is not None and not isinstance(attribute, str):
         raise AdapterError("BAD_ARGS", "attribute must be a string or null")
-    adaptive = bool(args.get("adaptive", False))
     url = args.get("url")
     if url is not None and not isinstance(url, str):
         raise AdapterError("BAD_ARGS", "url must be a string or null")
 
+    use_xpath = bool(args.get("useXpath", False))
+    query_type = args.get("queryType")
+    if query_type is not None and not isinstance(query_type, str):
+        raise AdapterError("BAD_ARGS", "queryType must be a string")
+    query_type = query_type or ("xpath" if use_xpath else "css")
+    if query_type not in ("css", "xpath", "text", "regex", "similar"):
+        raise AdapterError("BAD_ARGS", f"unknown queryType: {query_type}")
+
+    adaptive_alias = bool(args.get("adaptive", False))
+    adaptive_save = bool(args.get("adaptiveSave", False)) or adaptive_alias
+    adaptive_relocate = bool(args.get("adaptiveRelocate", False)) or adaptive_alias
+    adaptive = adaptive_save or adaptive_relocate
+    if adaptive and query_type not in ("css", "xpath"):
+        raise AdapterError("BAD_ARGS", "adaptive currently requires queryType css or xpath")
+
+    identifier = args.get("identifier")
+    if identifier is not None and not isinstance(identifier, str):
+        raise AdapterError("BAD_ARGS", "identifier must be a string or null")
+    percentage = args.get("percentage")
+    if percentage is not None and (
+        not isinstance(percentage, int) or isinstance(percentage, bool) or not 1 <= percentage <= 100
+    ):
+        raise AdapterError("BAD_ARGS", "percentage must be an integer between 1 and 100")
+    similarity_threshold = args.get("similarityThreshold")
+    if similarity_threshold is not None and (
+        not isinstance(similarity_threshold, (int, float))
+        or isinstance(similarity_threshold, bool)
+        or not 0 <= similarity_threshold <= 1
+    ):
+        raise AdapterError("BAD_ARGS", "similarityThreshold must be a number between 0 and 1")
+    ignore_attributes = args.get("ignoreAttributes")
+    if ignore_attributes is None:
+        ignore_attributes = ("href", "src")
+    elif not isinstance(ignore_attributes, (list, tuple)) or not all(
+        isinstance(item, str) for item in ignore_attributes
+    ):
+        raise AdapterError("BAD_ARGS", "ignoreAttributes must be an array of strings")
+
+    def query_nodes(target: Any, *, use_adaptive: bool) -> tuple[Any, str]:
+        """在给好的 Selector 上跑一次查询；``use_adaptive`` 决定带不带指纹参数。
+
+        降级路径要能拿**同一个**查询再跑一遍，所以查询本身收进闭包：自适应与普通两条路
+        必须跑的是同一套 rules，否则「降级」会悄悄改变语义。
+        """
+        if query_type in ("css", "xpath"):
+            method = target.xpath if query_type == "xpath" else target.css
+            selected = method(
+                selector,
+                identifier=identifier or "",
+                adaptive=adaptive_relocate if use_adaptive else False,
+                auto_save=adaptive_save if use_adaptive else False,
+                percentage=percentage if percentage is not None else 40,
+            )
+            return selected, ""
+        found, user_notice = extraction.query_nodes(
+            target,
+            selector,
+            query_type,
+            use_xpath=use_xpath,
+            partial=bool(args.get("partial", False)),
+            case_sensitive=bool(args.get("caseSensitive", False)),
+            clean_match=bool(args.get("cleanMatch", True)),
+            similarity_threshold=float(similarity_threshold) if similarity_threshold is not None else 0.2,
+            ignore_attributes=ignore_attributes,
+            match_text=bool(args.get("matchText", False)),
+        )
+        return found, user_notice
+
+    notice = ""
     if adaptive:
         # storage_args 必须把 url 一起带上：Scrapling 对「给了部分 storage_args」是整体
         # 替换而不是补齐，漏了 url 全部指纹都会落进 default 桶。url 为空时也显式传空串，
         # 存储层把它归入 default 桶（StorageSystemMixin 对空值有兜底）。
-        page = Selector(
-            html,
-            url=url or "",
-            adaptive=True,
-            storage_args={"storage_file": ADAPTIVE_STORAGE_FILE, "url": url or ""},
-        )
+        #
+        # spec §7.2 / §12.2：存储故障**不使抽取失败** —— 降级为不带 adaptive 的普通
+        # Selector 再抽一次，正文照常返回，notice 带 ADAPTIVE_STORAGE_FAILED 与原因。
+        # sqlite 与 redis 两侧同解：指纹库坏了不该让模型连正文都拿不到。
+        try:
+            page = Selector(html, url=url or "", adaptive=True, **_adaptive_kwargs(args, url or ""))
+            nodes, notice = query_nodes(page, use_adaptive=True)
+        except AdapterError:
+            raise
+        except Exception as error:  # noqa: BLE001 —— 存储后端的异常类型由它自己决定
+            page = Selector(html, url=url or "")
+            nodes, notice = query_nodes(page, use_adaptive=False)
+            notice = f"ADAPTIVE_STORAGE_FAILED: {type(error).__name__}: {error}"
     else:
-        page = Selector(html)
+        page = Selector(html, url=url or "")
+        nodes, notice = query_nodes(page, use_adaptive=False)
 
-    # 命中成功时 auto_save 存指纹，命中失败且 adaptive 打开时按存过的指纹重定位 ——
-    # 两个开关都必须在**调用**上再打开一次：Scrapling 的 adaptive 是构造器与调用两级
-    # 开关，只开构造器的话，重定位会被静默跳过。
-    use_xpath = bool(args.get("useXpath", False))
-    if use_xpath:
-        nodes = page.xpath(selector, adaptive=adaptive, auto_save=adaptive)
-    else:
-        nodes = page.css(selector, adaptive=adaptive, auto_save=adaptive)
     limit = _positive_int(args.get("limit"), "limit", 200)
     budget = _positive_int(args.get("maxContentChars"), "maxContentChars", DEFAULT_MAX_CONTENT_CHARS)
     include_attributes = bool(args.get("includeAttributes", False))
+    include_html = bool(args.get("includeHtml", False))
+    resolve_urls = bool(args.get("resolveUrls", False))
+    fields = args.get("fields")
+
+    if fields is not None:
+        if not isinstance(fields, dict):
+            raise AdapterError("BAD_ARGS", "fields must be an object or null")
+        try:
+            rows, fields_truncated = extraction.collect_fields(
+                list(nodes)[:limit],
+                fields,
+                page=page,
+                max_content_chars=budget,
+                resolve_urls=resolve_urls,
+            )
+        except ValueError as error:
+            raise AdapterError("BAD_ARGS", str(error)) from error
+        return {
+            "count": len(nodes),
+            "truncated": fields_truncated or len(nodes) > limit,
+            "rows": _jsonable(rows),
+            "notice": notice,
+        }
 
     matches: list[dict[str, Any]] = []
     spent = 0
@@ -1025,18 +1228,24 @@ def select(args: dict[str, Any]) -> dict[str, Any]:
     for node in nodes:
         if len(matches) >= limit:
             break
-        item: dict[str, Any] = {"tag": node.tag}
+        item = extraction.serialize_match(
+            node,
+            page=page,
+            attribute=attribute,
+            include_attributes=include_attributes,
+            include_html=include_html,
+            resolve_urls=resolve_urls,
+        )
         field = "value" if attribute else "text"
-        item[field] = str(node.attrib.get(attribute, "")) if attribute else str(node.get_all_text(strip=True))
-        if include_attributes:
-            item["attributes"] = {str(key): str(value) for key, value in node.attrib.items()}
+        value = str(item.get(field, ""))
         # 先按剩余额度截再计入已花：一条超长正文不该把整份预算吃光，也不该在预算只剩
         # 一位时还能整条通过。
         room = max(0, budget - spent)
-        if len(item[field]) > room:
-            item[field] = item[field][:room]
+        if len(value) > room:
+            value = value[:room]
             clipped = True
-        spent += len(item[field])
+        item[field] = value
+        spent += len(value)
         matches.append(item)
         if spent >= budget:
             clipped = True
@@ -1045,6 +1254,7 @@ def select(args: dict[str, Any]) -> dict[str, Any]:
         "count": len(nodes),
         "truncated": clipped or len(nodes) > len(matches),
         "matches": _jsonable(matches),
+        "notice": notice,
     }
 
 
@@ -1095,6 +1305,21 @@ def _probe_browser(module_name: str) -> bool:
     return True
 
 
+def _websocket_guard_capability() -> bool:
+    """不启浏览器就判断 WebSocket 握手拦不拦得住。
+
+    ``route_web_socket`` 挂在 Page 类上而不是实例上，所以握手那一刻就能答，不必等第一
+    个页面建起来 —— 而 README 承诺的正是「能力报告里如实标出覆盖面」。
+
+    :returns: 当前安装的 patchright 是否支持拦截 WebSocket 握手（缺包算不支持）
+    """
+    try:
+        from patchright.sync_api import Page
+    except ImportError:
+        return False
+    return guard.websocket_guard_supported(Page)
+
+
 def capabilities() -> dict[str, Any]:
     """报告本进程当前具备的能力，供 Host 侧决定注册哪些工具。"""
     report: dict[str, Any] = {
@@ -1112,10 +1337,34 @@ def capabilities() -> dict[str, Any]:
     # 0.5 只剩 patchright 那一套浏览器，所以这一项就是「浏览器抓取能不能用」的全部答案 ——
     # 0.4.15 时代那两个「普通浏览器 / 反检测浏览器」各自探测的口径已经没有第二个引擎可标。
     report["browser"] = _probe_browser("patchright.sync_api")
+    # 浏览器守卫覆盖面的那一半（WebSocket 握手）在这里报出：拦不住时 install 只会往 stderr
+    # 记一行，而那要等第一个页面建起来才看得见 —— 排障的人得在装载阶段就知道。
+    report["websocketGuard"] = _websocket_guard_capability()
     # 出口如实上报：用户得能一眼看出抓取会从哪里出去、以及本包到底有没有在管这件事。
     # server 只含 scheme://host:port，凭据不出现（见 guard.proxy_settings）。
     report["proxy"] = guard.proxy_settings()
     return report
+
+
+def _wrap_extraction(fn: Callable[[dict[str, Any]], dict[str, Any]], args: dict[str, Any]) -> dict[str, Any]:
+    """把 extraction 的 ValueError 归成协议里的 BAD_ARGS。"""
+    try:
+        return fn(args)
+    except ValueError as error:
+        raise AdapterError("BAD_ARGS", str(error)) from error
+
+
+def _wrap_search(fn: Callable[[dict[str, Any]], dict[str, Any]], args: dict[str, Any]) -> dict[str, Any]:
+    """把 SearchError 的码原样转成协议错误。"""
+    try:
+        return fn(args)
+    except search.SearchError as error:
+        raise AdapterError(error.code, str(error)) from error
+
+
+def search_discover(args: dict[str, Any]) -> dict[str, Any]:
+    """协议入口：检索发现。"""
+    return _wrap_search(search.discover, args)
 
 
 METHODS = {
@@ -1124,8 +1373,10 @@ METHODS = {
     "fetch": fetch,
     "render": render,
     "capture": capture,
-    "extract": extract,
     "select": select,
+    "locate": lambda args: _wrap_extraction(extraction.locate, args),
+    "links": lambda args: _wrap_extraction(extraction.links, args),
+    "search.discover": search_discover,
 }
 
 
@@ -1238,6 +1489,10 @@ class _SessionWorker:
         self._closed.set()
         self._jobs.put(None)
         self._thread.join(timeout=5.0)
+
+    def alive(self) -> bool:
+        """属主线程是否还在跑（T10 的 ``alive`` 判据：只读，不改动任何状态）。"""
+        return not self._closed.is_set() and self._thread.is_alive()
 
 
 def _new_session_id() -> str:
@@ -1388,6 +1643,9 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
                 "closer": closer,  # 关它用的对象（static 是 wrapper，浏览器是自身）
                 "type": kind,
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                # T10 的非敏感设置摘要：在开场时把生效值记下来，session.list 不必回头去
+                # 猜（凭据面永远不进这份摘要）。
+                "settings": _session_settings(kind, args),
                 # 同一把锁：占位时建的那把，盖回来而不是新建 —— 新建会让构造期与使用期各锁各的。
                 "lock": entry_lock,
                 # browser/stealth 的专属执行线程；static 为 None（见 _SessionWorker 的说明）。
@@ -1445,6 +1703,9 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
     session = entry["session"]
     extraction_type, css_selector, main_content_only, limit = _extraction(args)
     url = _url(args)
+    # 这两枚在载荷阶段才用到；提前读一次，让协议对表看到它们不是死键。
+    strip_inline_images = _strip_inline_images(args)
+    include_metadata = bool(args.get("includeMetadata", False))
 
     # 一份会话同一时刻只服务一个请求：static 靠 entry 锁，浏览器会话靠属主线程天然串行。
     # 两种实现也都对「多线程同时用同一份会话」零容忍 —— Playwright 的同步 API 靠 greenlet
@@ -1458,7 +1719,19 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
                 allowed, reason = guard.url_allowed(url)
                 if not allowed:
                     raise AdapterError("URL_BLOCKED", f"{url}: {reason}")
-                response = session.get(url, **_static_params(args, url))
+                # form/json 是 POST 的请求体：没有写方法表态时按写意图拒绝，而不是把
+                # 它们塞进一次 GET（那会变成「发出去但语义错了」，比报错更难查）。
+                write_body = args.get("form") is not None or args.get("json") is not None
+                static_method = "POST" if write_body else "GET"
+                if static_method != "GET" and not guard.ALLOW_WRITE_METHODS:
+                    raise AdapterError(
+                        "WRITE_DISABLED",
+                        "form/json change the request into POST; the deployment must set "
+                        f"allowWriteMethods (env {guard.ALLOW_WRITE_METHODS_ENV}) to allow it",
+                    )
+                static_params = _static_params(args, url)
+                static_params.update(_static_request_payload(args, static_method))
+                response = getattr(session, static_method.lower())(url, **static_params)
         else:
             # 浏览器会话的代理在开场时就定死了（见 _make_session），这里不再逐 URL
             # 覆盖 —— 覆盖的做法是新建 context，cookie 与登录态会随之清空。
@@ -1480,7 +1753,14 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
             #
             # 空的没给（`{}` / `[]` / null）不算写意图：模型「不带任何请求头」时传的就是空表，
             # 为它报一条错等于把一个无害的调用说成非法。
-            for key, hint in (("headers", "extraHeaders"), ("retries", "scrapling_session_open")):
+            for key, hint in (
+                ("headers", "extraHeaders"),
+                ("retries", "scrapling_session_open"),
+                ("cookies", "scrapling_session_open"),
+                ("params", "a static session"),
+                ("form", "a static session"),
+                ("json", "a static session"),
+            ):
                 if args.get(key) not in (None, {}, []):
                     raise AdapterError(
                         "BAD_ARGS",
@@ -1503,14 +1783,170 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
         css_selector=css_selector,
         main_content_only=main_content_only,
         max_content_chars=limit,
-        strip_inline_images=_strip_inline_images(args),
+        strip_inline_images=strip_inline_images,
+        include_metadata=include_metadata,
     )
     payload["sessionId"] = args.get("sessionId")
     return payload
 
 
+def session_read(args: dict[str, Any]) -> dict[str, Any]:
+    """读浏览器会话当前页的正文，不再发一次请求。"""
+    entry = _get_session(args.get("sessionId"))
+    if entry["type"] == "static":
+        raise AdapterError("BAD_ARGS", "only browser sessions keep a current page")
+    extraction_type, css_selector, main_content_only, limit = _extraction(args)
+    worker: _SessionWorker | None = entry["worker"]
+    if worker is None:  # pragma: no cover —— 浏览器条目必有属主线程
+        raise AdapterError("NO_SUCH_SESSION", "session has no owner thread")
+    from session_page import read_current_page
+
+    return worker.run(
+        lambda: read_current_page(
+            entry["session"],
+            extraction_type=extraction_type,
+            css_selector=css_selector,
+            main_content_only=main_content_only,
+            max_content_chars=limit,
+            include_metadata=bool(args.get("includeMetadata", False)),
+            strip_inline_images=_strip_inline_images(args),
+        )
+    )
+
+
+def session_act(args: dict[str, Any]) -> dict[str, Any]:
+    """在一个浏览器会话的当前页上执行结构化动作。"""
+    if not guard.ALLOW_BROWSER_ACTIONS:
+        raise AdapterError(
+            "ACTION_DISABLED",
+            f"browser actions are disabled; the deployment must set {guard.ALLOW_BROWSER_ACTIONS_ENV}",
+        )
+    entry = _get_session(args.get("sessionId"))
+    if entry["type"] == "static":
+        raise AdapterError("BAD_ARGS", "only browser sessions support actions")
+    max_actions = _positive_int(args.get("maxActions"), "maxActions", 20)
+    if max_actions > 50:
+        raise AdapterError("BAD_ARGS", "maxActions cannot exceed 50")
+    timeout_ms = _positive_int(args.get("timeoutMs"), "timeoutMs", DEFAULT_TIMEOUT_MS)
+    worker: _SessionWorker | None = entry["worker"]
+    if worker is None:  # pragma: no cover —— 浏览器条目必有属主线程
+        raise AdapterError("NO_SUCH_SESSION", "session has no owner thread")
+    from session_page import run_actions
+
+    return worker.run(
+        lambda: run_actions(
+            entry["session"],
+            actions=args.get("actions"),
+            slowly=args.get("slowly") is True,
+            max_actions=max_actions,
+            timeout_ms=timeout_ms,
+        )
+    )
+
+
+def download(args: dict[str, Any]) -> dict[str, Any]:
+    """受门禁保护的下载入口。"""
+    return media.download(args)
+
+
+def screenshot(args: dict[str, Any]) -> dict[str, Any]:
+    """截当前会话页；不会新建浏览器。"""
+    entry = _get_session(args.get("sessionId"))
+    if entry["type"] == "static":
+        raise AdapterError("BAD_ARGS", "only browser sessions can take screenshots")
+    image_type = args.get("imageType", "png")
+    if not isinstance(image_type, str):
+        raise AdapterError("BAD_ARGS", "imageType must be a string")
+    selector = args.get("selector")
+    if selector is not None and not isinstance(selector, str):
+        raise AdapterError("BAD_ARGS", "selector must be a string or null")
+    quality = args.get("quality")
+    timeout_ms = _positive_int(args.get("timeoutMs"), "timeoutMs", DEFAULT_TIMEOUT_MS)
+    worker: _SessionWorker | None = entry["worker"]
+    if worker is None:  # pragma: no cover —— 浏览器条目必有属主线程
+        raise AdapterError("NO_SUCH_SESSION", "session has no owner thread")
+    return worker.run(
+        lambda: media.screenshot(
+            entry["session"],
+            image_type=image_type,
+            full_page=args.get("fullPage") is True,
+            quality=quality,
+            selector=selector,
+            timeout_ms=timeout_ms,
+        )
+    )
+
+
+def _session_settings(kind: str, args: dict[str, Any]) -> dict[str, Any]:
+    """会话的非敏感设置摘要（T10）。
+
+    只收「这次会话是怎么配的」的开关，绝不包含 cookies、代理凭据或任何 key —— 这份
+    摘要会被模型读到。静态会话没有浏览器那一组开关，逐项给 null。
+
+    :param kind: 会话类型
+    :param args: session.open 的协议参数
+    :returns: 可 JSON 序列化的摘要
+    """
+    deployment = args.get("deployment")
+    knobs = deployment if isinstance(deployment, dict) else {}
+    browser = kind != "static"
+    headless = args.get("headless", True)
+    locale = args.get("locale")
+    timezone_id = args.get("timezoneId")
+    recorded = browser and (args.get("recordNetwork") is True or _knob_value(bool, knobs.get("recordRequests")) is True)
+    return {
+        "type": kind,
+        "headless": bool(headless) if browser else None,
+        "recordNetwork": recorded,
+        "maxRecordedRequests": _knob_value(int, knobs.get("maxRecordedRequests")),
+        "locale": locale if isinstance(locale, str) and locale else None,
+        "timezone": timezone_id if isinstance(timezone_id, str) and timezone_id else None,
+    }
+
+
+def _session_alive(entry: dict[str, Any]) -> bool:
+    """会话是否还能用：构造中的占位不算，浏览器会话还要属主线程活着。
+
+    :param entry: 登记条目
+    :returns: 是否可用
+    """
+    if entry.get("pending") is True:
+        return False
+    worker = entry.get("worker")
+    if worker is not None:
+        return worker.alive() is True
+    return entry.get("session") is not None
+
+
+def _pool_stats(entry: dict[str, Any]) -> dict[str, int] | None:
+    """浏览器会话的页池统计；没有这条能力或取不到时给 None（绝不抛）。
+
+    T10 的 ``poolStats`` 是可选字段：一只已经跑完开始收尾的会话也可能在取统计的一瞬
+    出错，那不该把整个 session.list 变成一次失败。
+
+    :param entry: 登记条目
+    :returns: 页池统计，或 None
+    """
+    if entry.get("type") == "static":
+        return None
+    session = entry.get("session")
+    getter = getattr(session, "get_pool_stats", None)
+    if not callable(getter):
+        return None
+    try:
+        stats = getter()
+    except Exception:  # noqa: BLE001 —— T10：统计拿不到时省略，不许让 list 整体失败
+        return None
+    if not isinstance(stats, dict):
+        return None
+    return {str(key): value for key, value in stats.items() if isinstance(value, int) and not isinstance(value, bool)}
+
+
 def session_list(_args: dict[str, Any]) -> dict[str, Any]:
     """列出当前所有会话（不含任何凭据）。
+
+    每行除 id / type / createdAt 之外还带 ``alive``、``settings``（非敏感设置摘要）与
+    ``poolStats``（浏览器会话取得到页池统计时才给；取不到就省略，绝不因此让 list 失败）。
 
     :param _args: 协议参数，本方法不用
     :returns: 会话列表
@@ -1518,15 +1954,21 @@ def session_list(_args: dict[str, Any]) -> dict[str, Any]:
     # 字典遍历期间被别的线程插入/删除会抛 RuntimeError，而那正是 bridge 多 worker 下的
     # 常态。进锁里把清单复制出来，遍历就与并发改写无关。
     with _SESSION_LOCK:
-        rows = [
-            {
-                "sessionId": session_id,
-                "sessionType": entry["type"],
-                # 构造中的条目还没有创建时间；报空串而不是 KeyError。
-                "createdAt": entry.get("created_at", ""),
-            }
-            for session_id, entry in _SESSIONS.items()
-        ]
+        entries = list(_SESSIONS.items())
+    rows: list[dict[str, Any]] = []
+    for session_id, entry in entries:
+        row: dict[str, Any] = {
+            "sessionId": session_id,
+            "sessionType": entry["type"],
+            # 构造中的条目还没有创建时间；报空串而不是 KeyError。
+            "createdAt": entry.get("created_at", ""),
+            "alive": _session_alive(entry),
+            "settings": entry.get("settings") or _session_settings(str(entry.get("type", "")), {}),
+        }
+        stats = _pool_stats(entry)
+        if stats is not None:
+            row["poolStats"] = stats
+        rows.append(row)
     return {"sessions": rows}
 
 
@@ -1604,7 +2046,7 @@ def session_network(args: dict[str, Any]) -> dict[str, Any]:
     entry = _get_session(session_id)
     if entry["type"] == "static":
         raise AdapterError("BAD_ARGS", "static sessions keep no network history")
-    pattern, entries, include_body, body_chars = _network_read(args)
+    query = _network_read(args)
     recorder = getattr(entry["session"], "network", None)
     if recorder is None or not getattr(recorder, "enabled", False):
         raise AdapterError(
@@ -1615,15 +2057,7 @@ def session_network(args: dict[str, Any]) -> dict[str, Any]:
     worker: _SessionWorker | None = entry["worker"]
     if worker is None:  # pragma: no cover —— 浏览器条目必有属主线程
         raise AdapterError("NO_SUCH_SESSION", "session has no owner thread")
-    matches = worker.run(
-        lambda: _network_summary(
-            recorder,
-            pattern=pattern,
-            limit=entries,
-            include_body=include_body,
-            max_body_chars=body_chars,
-        )
-    )
+    matches = worker.run(lambda: _network_summary(recorder, query=query))
     return {"sessionId": session_id, "count": len(matches), "matches": matches}
 
 
@@ -1679,6 +2113,10 @@ def _session_state(args: dict[str, Any], *, saving: bool) -> dict[str, Any]:
     try:
         if saving:
             worker.run(lambda: session.save_state(target))
+            # spec §11.6：登录态文件是凭据面（cookie / localStorage / IndexedDB），落盘后
+            # 收到 0600。Windows 上 chmod 只动只读位，失败也不该让存取整体失败。
+            with contextlib.suppress(OSError):
+                Path(target).chmod(0o600)
         else:
             worker.run(lambda: session.load_state(target))
     except Exception as error:  # 上游的文件/JSON 错误一律翻成可路由的码
@@ -1723,6 +2161,10 @@ METHODS.update(
         "session.list": session_list,
         "session.close": session_close,
         "session.network": session_network,
+        "session.read": session_read,
+        "session.act": session_act,
+        "download": download,
+        "screenshot": screenshot,
         "session.state_save": session_state_save,
         "session.state_load": session_state_load,
     }

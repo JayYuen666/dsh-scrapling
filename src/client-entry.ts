@@ -38,6 +38,7 @@ import {
   localeDictionaries,
 } from "./settings-fields.ts";
 import { SettingsCard, browserDocument, installStyle, installStyles } from "./settings-card.ts";
+import { createRuntimeReader } from "./runtime-reader.ts";
 import type {
   CardProps,
   DocumentFace,
@@ -81,6 +82,8 @@ export interface RowSpec {
 export const ROW_TOOLS: readonly string[] = [
   "scrapling_fetch",
   "scrapling_extract",
+  "scrapling_locate",
+  "scrapling_links",
   "scrapling_render",
   "scrapling_capture_xhr",
   "scrapling_answer",
@@ -92,6 +95,10 @@ export const ROW_TOOLS: readonly string[] = [
   "scrapling_session_list",
   "scrapling_session_close",
   "scrapling_crawl",
+  "scrapling_session_read",
+  "scrapling_session_act",
+  "scrapling_download",
+  "scrapling_screenshot",
 ];
 
 /** 把任意值转成字符串；非字符串/非数字一律给空串。 */
@@ -116,6 +123,35 @@ function firstText(...candidates: unknown[]): string {
   return "";
 }
 
+/** extract / locate 的结果行：选择器进标题，命中数落在 row.matched。 */
+function selectorRow(
+  tool: string,
+  parameters: Record<string, unknown>,
+  projected: Record<string, unknown>,
+): RowSpec {
+  const selector = text(parameters["selector"]);
+  return {
+    tool,
+    title: selector === "" ? tool : `${tool} ${selector}`,
+    fields: [{ labelKey: "row.matched", value: text(projected["count"]) }],
+  };
+}
+
+/** links 的结果行：有 baseUrl 时一并展示，否则只给链接数。 */
+function linksRow(
+  tool: string,
+  parameters: Record<string, unknown>,
+  projected: Record<string, unknown>,
+): RowSpec {
+  const fields: RowField[] = [];
+  const baseUrl = text(parameters["baseUrl"]);
+  if (baseUrl !== "") {
+    fields.push({ labelKey: "row.url", value: baseUrl });
+  }
+  fields.push({ labelKey: "row.matched", value: text(projected["count"]) });
+  return { tool, title: tool, fields };
+}
+
 /**
  * 从一次工具调用的参数与投影里抽出要展示的行。
  *
@@ -132,13 +168,11 @@ export function buildRow(tool: string, args: unknown, meta: unknown): RowSpec {
   const projected = isRecord(meta) ? meta : {};
   const url = firstText(projected["url"], parameters["url"]);
 
-  if (tool === "scrapling_extract") {
-    const selector = text(parameters["selector"]);
-    return {
-      tool,
-      title: selector === "" ? tool : `${tool} ${selector}`,
-      fields: [{ labelKey: "row.matched", value: text(projected["count"]) }],
-    };
+  if (tool === "scrapling_extract" || tool === "scrapling_locate") {
+    return selectorRow(tool, parameters, projected);
+  }
+  if (tool === "scrapling_links") {
+    return linksRow(tool, parameters, projected);
   }
   if (tool === "scrapling_session_list") {
     return {
@@ -209,6 +243,7 @@ export function buildRow(tool: string, args: unknown, meta: unknown): RowSpec {
 /** 结果行用得到的参数键。视图是惰性的，只挑这几个读才不会物化整段参数 JSON。 */
 const ARG_KEYS: readonly string[] = [
   "url",
+  "baseUrl",
   "selector",
   "sessionType",
   "sessionId",
@@ -353,6 +388,8 @@ interface ClientFace {
     register: (ns: string, locale: string, dict: Record<string, string>) => () => void;
     bind: (ns: string) => Translate;
   };
+  /** 显式读一个可选客户端服务；运行环境读面走它取 remote，不写进 inject。 */
+  readonly get?: (name: string, strict?: boolean) => unknown;
   readonly effect: Context["effect"];
 }
 
@@ -439,9 +476,10 @@ function apply(ctx: ClientFace): void {
     };
     let disposeCard: (() => void) | undefined;
     ctx.slots.inject("plugins.bundle.config", () => {
+      const runtime = createRuntimeReader(ctx);
       disposeCard = ctx.slots.register(
         { name: "plugins.bundle.config", key: BUNDLE_PACKAGE_NAME, locale: LOCALE_NS },
-        (props: CardProps) => createElement(SettingsCard, { ...props, t, form: source }),
+        (props: CardProps) => createElement(SettingsCard, { ...props, t, form: source, runtime }),
       );
     });
     return (): void => {

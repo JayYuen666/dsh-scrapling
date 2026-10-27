@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@jayyuen66/dsh-scrapling"><img src="https://img.shields.io/npm/v/@jayyuen66/dsh-scrapling?style=flat-square&logo=npm&logoColor=white" alt="npm version" /></a>
-  <a href="https://www.npmjs.com/package/@jayyuen66/dsh-scrapling"><img src="https://img.shields.io/npm/dm/@jayyuen66/dsh-scrapling?style=flat-square" alt="npm downloads" /></a>
+  <a href="https://www.npmjs.com/package/@jayyuen66/dsh-scrapling"><img src="https://img.shields.io/npm/d18m/@jayyuen66/dsh-scrapling?style=flat-square" alt="npm downloads (total)" /></a>
   <a href="https://github.com/JayYuen666/dsh-scrapling/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-scrapling/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D22.12-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
@@ -33,11 +33,13 @@
 
 - [What it does](#what-it-does)
 - [Install](#install)
+- [Runtime packs (macOS arm64)](#runtime-packs-macos-arm64)
 - [Verify it is live](#verify-it-is-live)
 - [What it does not provide](#what-it-does-not-provide)
 - [Enabling it in dsh](#enabling-it-in-dsh)
 - [The tools](#the-tools)
 - [Replacing the built-in fetch and search](#replacing-the-builtin-fetch-and-search)
+- [MCP mode](#mcp-mode)
 - [Settings](#settings)
 - [Proxies](#proxies)
 - [Security](#security)
@@ -75,7 +77,7 @@ Remove with `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`. The pack
 
 - **Requires Node.js `>= 22.12`.** This is an ESM-only package; that Node floor is what makes `require()` of an ESM entry work at all, which is why `engines.node` is declared.
 - **Requires host `dsh` at the `0.2.1-rc.3` line.** The requirement the host actually reads is `engines.dsh` (`^0.2.1-rc.3`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`.
-- **Requires Python 3.14+ with Scrapling installed** — in the repository's `_env/.venv`, or reachable from `PATH`, or named by `pythonBin`. In an installed package the `_env/.venv` leg does not exist, so the interpreter is the `python3` on your `PATH`; whichever one is chosen is logged at load time, and a missing Scrapling reports an error carrying the install line to copy.
+- **Requires Python 3.14+ with Scrapling installed** — in the repository's `_env/.venv`, or reachable from `PATH`, or named by `pythonBin`. In an installed package the `_env/.venv` leg does not exist, so the interpreter is the `python3` on your `PATH` (`python` on Windows); whichever one is chosen is logged at load time, and a missing Scrapling reports an error carrying the install line to copy.
 
 ```sh
 pip install "scrapling[rag]>=0.5,<0.6"
@@ -84,13 +86,31 @@ python -m patchright install chromium
 
 - **Why `rag` and not `fetchers`:** `rag` is `fetchers` plus `markdownify`, and the default `extractionType` is `markdown` — with plain `fetchers` the first fetch raises `ModuleNotFoundError` at the Markdown conversion.
 - **Version range:** developed and verified against Scrapling **0.5**, through interfaces that are not stable API surface (`Selector`, `Spider`, `SessionManager`, and the converter's noise-stripping helpers). The upper bound is pinned below `0.6`; outside the range the guards still run, but the anti-injection cleaning and the crawl path may not behave as documented. In 0.5 the browser backend is patchright only (the old standalone stealth fetch is gone; its anti-detection arguments live on `scrapling_render`), `capture_xhr` became session-level recording (hence `scrapling_session_network`), and `extra_flags` became additive — this package sends none, and WebRTC leak protection is carried by the `blockWebrtc` switch.
-- **Browser engines are entirely your responsibility.** The plugin downloads nothing. Without a browser it simply does not register the browser-dependent tools, so the model never wastes a turn calling them.
+- **Without the installer, the browser engine is yours.** The optional CLI can install the verified macOS arm64 set; the plugin itself downloads nothing at load time. Without a browser it simply does not register the browser-dependent tools, so the model never wastes a turn calling them.
 - **No `@deepseek-ai/*` under `dependencies`, by contract** (`test/publish-manifest.test.ts` enforces it). Consumer profiles install with `nodeLinker: hoisted` and `autoInstallPeers: false`, so a host package there becomes a real second copy whose module-level state splits from the running host's — every native tool call then throws while build and tests stay green. The host packages the artifact imports for value are required peers and stay externalized; the gate imports the built artifact and asserts that no host package body is inlined.
 - **The artifact is ESM-only and never committed** — `prepack` rebuilds it, so what ships is always what the current source produces.
 
 ### <img src="https://api.iconify.design/lucide/arrow-down-to-line.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Shared version floor
 
 If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entry, that pin must be at least the version this package declares. A lower pin installs a copy without the names the sources use, and the host then reports `N entries did not activate` together with `does not provide an export named ...` at boot - the package installs fine and never loads, and no per-repository CI run can see it.
+
+## Runtime packs (macOS arm64)
+
+The package ships `bin/dsh-scrapling.mjs`. It installs the ability packs into `dataDir/runtime` (default `~/.dsh-scrapling`) — never into system Python and never into the user's Playwright cache. There is **no `postinstall`**; nothing is downloaded when the plugin loads.
+
+```sh
+dsh-scrapling setup --feature core --apply
+dsh-scrapling setup --feature browser --apply
+dsh-scrapling setup --status
+```
+
+- `core` installs managed Python 3.14.9, Scrapling 0.5 and its pinned wheels; `browser` adds the full Chromium build (not the headless shell).
+- `search`, `media`, `mcp` and `adaptive-redis` all ride on `core`'s venv: `mcp` brings the official `scrapling-mcp` server (the `mcp` package, 16 tools) that `official-mcp` mode needs, and `adaptive-redis` brings the `redis` client behind `adaptiveStorage: redis`. Every pack is installable; the settings card reports each as `ready`, `missing`, `corrupt` or `installing`.
+- `--feature` is a dry run by default; `--apply` writes. `--repair` re-installs without touching user data, and `--uninstall <pack> [--purge]` removes runtime files; only `--purge` removes `elements_storage.db` and `downloads/`.
+- `--offline <dir>` installs with no network at all: `<dir>` must hold the Python archive named exactly as the manifest URL's last segment (browser and `curl -O` both keep `cpython-3.14.9+…-install_only.tar.gz`, and the percent-encoded spelling is accepted too) plus a `wheels/` directory with one wheel per pinned requirement - `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <dir>/wheels` produces it. The hash check on the Python archive is the same one the networked path runs, and pip is invoked with `--no-index`; a missing archive or wheelhouse fails as `INSTALL_OFFLINE_ASSETS` instead of silently going online.
+- The settings card can start the same install/repair/cancel actions through the `scraplingRuntime` remote when the profile has both a remote surface and a jobs backend; otherwise it prints the CLI command.
+- `integrationMode` is deployment-only; `setup --mode` prints or writes the client entry for the two MCP shapes and `doctor` checks a profile against it — see [MCP mode](#mcp-mode). `official-mcp` starts `scrapling-mcp` from the managed venv, which the `mcp` pack provisions (`setup --feature mcp --apply`).
+- Only **macOS arm64** is verified. Windows, Linux and macOS x64 are blocked (B1/B2): every pack reports `blocked` and the installer refuses rather than guessing an asset path.
 
 ## <img src="https://api.iconify.design/lucide/circle-check.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Verify it is live
 
@@ -102,10 +122,10 @@ If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entr
 
 ## <img src="https://api.iconify.design/lucide/circle-slash.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> What it does not provide
 
-- **It is not a search engine.** Scrapling only sets a Google referer header for its `google_search` option; discovery needs a deployment-level `searchEndpoint` (see [Settings](#settings)). Without one the search provider stays unavailable and the built-in `web_search` keeps its behaviour.
-- **It downloads nothing.** The Python interpreter and the browser engine are supplied by you; missing pieces remove the matching tools instead of being fetched.
+- **It is not a search engine.** Discovery runs in the Python sidecar against one of six backends (`searchBackend`: `auto` / `tavily` / `bing` / `brave` / `serper` / `duckduckgo` / `searxng`); Scrapling's own `google_search` option only sets a referer header. Each backend needs its own setting (`tavilyApiKey`, `braveApiKey`, `serperApiKey`, `searxngEndpoint`) — a backend that is selected but not configured reports `SEARCH_AUTH` instead of silently switching to another one.
+- **The npm tarball bundles no interpreter or browser.** They come from your machine or from the optional CLI installer, which downloads the verified macOS arm64 set into `dataDir/runtime`; missing pieces remove the matching tools instead of being fetched at load time.
 - **It opens no HTTP route of its own.** The settings card is a host config form; there is no `/api` surface from this package.
-- **It adds no CLI subcommand.**
+- **It adds no dsh subcommand.** The package's own `dsh-scrapling` CLI only manages runtime packs.
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
 
@@ -118,16 +138,22 @@ If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entr
 
 ## <img src="https://api.iconify.design/lucide/globe.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> The tools
 
-Thirteen tools, each behind one settings switch, all exercised by the test suite:
+Nineteen tools, behind fifteen settings switches (the seven session/state tools share switches), all exercised by the test suite:
 
 | Tool | Backend | Needs a browser | Concurrency |
 |---|---|---|---|
 | `scrapling_fetch` | `Fetcher` (curl_cffi) | no | concurrent; write verbs are serialised once `allowWriteMethods` is on |
 | `scrapling_extract` | `Selector` + CSS/XPath + `adaptive` | no | concurrent |
+| `scrapling_locate` | text / regex / similar-element lookup; returns generated selectors | no | concurrent |
+| `scrapling_links` | `LinkExtractor` plus next-page candidates | no | concurrent |
 | `scrapling_render` | `StealthySession` (patchright) | yes | serialised; the anti-detection switches (`solveCloudflare` / `hideCanvas` / `blockWebrtc`) live here |
 | `scrapling_capture_xhr` | one throwaway session, page-level recording | yes | serialised |
 | `scrapling_session_open` / `scrapling_session_fetch` / `scrapling_session_network` / `scrapling_session_state_save` / `scrapling_session_state_load` / `scrapling_session_list` / `scrapling_session_close` | Scrapling session classes | browser sessions only | serialised |
-| `scrapling_crawl` | Scrapling Spider framework, runs as a job | no | serialised |
+| `scrapling_session_read` | current DOM of a browser session page | yes | serialised |
+| `scrapling_session_act` | structured actions on a session page (deployment gate) | yes | serialised |
+| `scrapling_download` | byte download into `dataDir/downloads` (deployment gate) | no | concurrent |
+| `scrapling_screenshot` | PNG/JPEG screenshot handed to the attachment service | yes | serialised |
+| `scrapling_crawl` | Scrapling Spider framework (`content` / `sitemap` / `feed` / `shopify`) as a job | no | serialised |
 | `scrapling_answer` | any fetch path plus `ctx.llm` | with `render: true` | serialised |
 
 - **Quotas.** At most 8 open sessions (3 of them browser sessions, each a real Chromium process), 2 crawls in flight, per-page bodies clipped by `*MaxOutputChars`, 8 MB per protocol frame, 16 queued frames. A ceiling answers with a specific code (`SESSION_LIMIT` / `CRAWL_BUSY` / `BAD_FRAME`) the model can back off from.
@@ -156,9 +182,89 @@ A configured id wins over auto-selection, which is why step 2 is required — an
 - **If you later remove the plugin but leave the line in**, the built-in tools report `WEB_PROVIDER_CONFIGURED_MISSING` — go back and remove `fetchProvider` / `searchProvider` too.
 - **The fetch provider really applies the output budget**: a body over `fetchMaxOutputChars` is cut to a head/tail window and flagged `truncated`, not passed through with a flag. Failures keep the sidecar code prefix (`URL_BLOCKED`, `SIDECAR_TIMEOUT`, `SIDECAR_UNAVAILABLE`), so a policy refusal is distinguishable from a crash or a timeout.
 
-Search is split in two, because Scrapling is not a search engine: **discovery** goes to a deployment-level `searchEndpoint`, expected to be SearXNG-compatible JSON (`GET <endpoint>?q=<query>&format=json` returning `{"results": [{"url", "title", "content"}]}` — any backend producing that shape works); **reading** is this plugin's — the first `searchRenderTopN` results are actually fetched and, with a browser, rendered, so one `web_search` call returns both which pages matter and what they say. Every returned URL goes through the same gate as a fetch; a page that fails to read is skipped alone, because search results routinely contain dead links.
+Search is split in two, because Scrapling is not a search engine: **discovery** runs in the Python sidecar against the backend `searchBackend` names — Tavily, Bing HTML, Brave (API), Serper (API), DuckDuckGo HTML or SearXNG (JSON API); **reading** is this plugin's — the first `searchRenderTopN` results are actually fetched and, with a browser, rendered, so one `web_search` call returns both which pages matter and what they say. `auto` uses Tavily when `tavilyApiKey` is set, SearXNG when `searxngEndpoint` is set, and with neither configured it only goes to a public engine (Bing; DuckDuckGo when that backend is named explicitly) if `searchPublicFallback` is on — otherwise the provider is unavailable and `web_search` reports `SEARCH_BACKEND_MISSING` instead of querying anyone. Only Tavily and Bing have been exercised against the real endpoints here; Brave, Serper, DuckDuckGo and SearXNG are implemented to their documented request/response shapes and verified against local stubs, with real keys and real instances still unverified. Every returned URL goes through the same gate as a fetch; a page that fails to read is skipped alone, because search results routinely contain dead links.
 
 One consequence to know: `dsh-web`'s fetch body is a **closed** union of `html | text` with no `markdown` kind, and adding one is a cross-package change a plugin cannot make. The fetch provider therefore reports Scrapling's Markdown as `text`, which the built-in renderer displays normally. Use `scrapling_fetch` directly when you need `html` or a CSS selector.
+
+## <img src="https://api.iconify.design/lucide/plug-zap.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> MCP mode
+
+`integrationMode` selects one of three mutually exclusive tool surfaces. It is deployment configuration (the `config:` block of `cordis.patch.yml`), it is read once when the plugin is assembled, and changing it requires a restart.
+
+| Mode | What it registers |
+|---|---|
+| `native` (default) | the `scrapling_*` tools listed above |
+| `mcp` | no native tools; the plugin serves the same tool table over MCP |
+| `official-mcp` | no native tools and no server from this plugin; `setup` only generates the `dsh-mcp-client` entry for the official `scrapling-mcp`, which runs in its own process, with its own sessions, and **without this plugin's URL guard** |
+
+In `mcp` mode the server runs inside the plugin's own host process and calls the same sidecar, so the URL guard, sessions, jobs and adaptive storage are the same ones the native tools use — there is no second implementation to drift.
+
+- **Endpoint** `http://127.0.0.1:<mcpPort>/mcp` (`mcpPort`, default `39217`). Only loopback is bound; a request whose declared body exceeds 1 MiB is refused with `413`, and any other path gets `404`. The server is stateless: each request gets its own protocol instance, so nothing survives across them.
+- **Auth** off by default. Set the environment variable `DSH_SCRAPLING_MCP_TOKEN` and every request must then carry `Authorization: Bearer <token>`. The token is only ever read from the environment, never from the profile, so it does not land in a config file.
+- **Tools** are the same `ToolDefinition` objects native registers: same JSON Schema, same argument validation, same renderers. `scrapling_answer` is not served — it routes through the model of the hosting session, which an external client does not have. `search` exists only on this surface, because an MCP client has no `ctx.web` seam. The gates are identical: with `allowBrowserActions=false` there is no `session_act`, with `allowFileDownloads=false` there is no `download`, and `search` is absent when no search backend is available.
+- **Results** are text content; a screenshot comes back as MCP image content instead of a host attachment. A failing tool returns `isError` with a readable message rather than dropping the connection.
+- **Names**: the MCP raw name is the tool name without the `scrapling_` prefix, and dsh's MCP client shows it as `mcp__scrapling__<raw>`.
+
+| Native tool | MCP raw name |
+|---|---|
+| `scrapling_fetch` | `fetch` |
+| `scrapling_extract` | `extract` |
+| `scrapling_locate` | `locate` |
+| `scrapling_links` | `links` |
+| `scrapling_render` | `render` |
+| `scrapling_capture_xhr` | `capture_xhr` |
+| `scrapling_session_open` | `session_open` |
+| `scrapling_session_fetch` | `session_fetch` |
+| `scrapling_session_network` | `session_network` |
+| `scrapling_session_state_save` | `session_state_save` |
+| `scrapling_session_state_load` | `session_state_load` |
+| `scrapling_session_list` | `session_list` |
+| `scrapling_session_close` | `session_close` |
+| `scrapling_crawl` | `crawl` |
+| `scrapling_session_read` | `session_read` |
+| `scrapling_session_act` | `session_act` |
+| `scrapling_download` | `download` |
+| `scrapling_screenshot` | `screenshot` |
+| — (`ctx.web` only) | `search` |
+
+Connecting dsh needs `@deepseek-ai/dsh-mcp-client`, which this plugin deliberately does not depend on. Pin the build that matches the current host — npm `latest` is older than the host's own line and the host rejects the mismatch:
+
+```bash
+dsh plugin --profile <name> add @deepseek-ai/dsh-mcp-client@0.2.1-rc.3
+```
+
+Then add one entry to that profile's `cordis.patch.yml` — this is exactly what `dsh-scrapling setup --mode mcp` prints, so you can also let the CLI write it (drop `headers` when no token is configured):
+
+```yaml
+- insert:
+    - id: scrapling-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: scrapling
+        transport: streamable-http
+        url: http://127.0.0.1:39217/mcp
+        failOnStartupError: false
+        # only with DSH_SCRAPLING_MCP_TOKEN set:
+        # headers:
+        #   Authorization: !!js '`Bearer ${process.env.DSH_SCRAPLING_MCP_TOKEN}`'
+```
+
+`mcpPort` and that URL have to say the same thing; after changing the port, re-apply the entry.
+
+`failOnStartupError` is `false` here on purpose: the port only starts listening once the plugin has finished handshaking with the Python sidecar, and the client throws its fiber on the **first** failed connect (`Version negotiation probe failed: connect ECONNREFUSED` → the host reports `1 entry did not activate`). Its own reconnect is on by default (500ms backoff, 10 attempts), so a first-attempt refusal is meant to be absorbed - setting this to `true` would let fiber start order decide whether the mode works. The official `stdio` entry keeps `true`: there the client spawns the server itself, so a failed connect is a real failure and should be loud.
+
+### <img src="https://api.iconify.design/lucide/wrench.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> `setup --mode` and `doctor`
+
+`setup --mode` writes that entry text; it never edits a profile. Without `--apply` it is a dry run, and with `--apply` it drops the text in `<dataDir>/mcp/<mode>.patch.yml` and prints the path - applying it to `cordis.patch.yml` stays your action, because the host offers no safe append API for that file (`dsh --dump-config` rewrites the profile's root config).
+
+```sh
+dsh-scrapling setup --mode mcp --port 45991 --with-auth --apply
+dsh-scrapling setup --mode native --apply     # a file that deliberately contains no entry
+dsh-scrapling doctor --mode mcp --profile <profileDir>
+```
+
+`doctor` reads what the profile actually says - `cordis.patch.yml` plus that profile's `package.json` - and prints one line per problem: two entries under `serverName: scrapling`, this plugin's entry next to an official `stdio` one, entries that do not match the mode, an entry whose port disagrees with `--port`, a profile without `@deepseek-ai/dsh-mcp-client` or with it pinned to something other than `0.2.1-rc.3` / `next`, and an official entry while `officialMcpEnabled` is off. Exit `0` is "consistent", `1` names at least one problem, `2` is a bad argument. `integrationMode` itself is a plugin setting the CLI cannot read, so `--mode` is the claim being checked and has to match the deployment.
+
+`official-mcp` asks for two separate statements before it produces anything: `officialMcpEnabled: true` in the profile and `--accept-risk` on the command line; missing either one prints `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED` and writes nothing. The entry it generates starts `<dataDir>/runtime/venv/bin/scrapling-mcp`, so run `setup --feature mcp --apply` first - see [Runtime packs](#runtime-packs-macos-arm64). When that binary is missing, `setup` prints a line saying so.
 
 ## <img src="https://api.iconify.design/lucide/sliders-horizontal.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Settings
 
@@ -166,9 +272,9 @@ Settings live on the **scrapling** card in the plugin detail page, grouped by pu
 
 | Field | Type | Default | Purpose |
 | --- | --- | --- | --- |
-| `pythonBin` | string | `""` | Interpreter name or absolute path. Empty = the repository `_env/.venv` when executable, otherwise `python3` on `PATH` |
+| `pythonBin` | string | `""` | Interpreter name or absolute path. Empty = the repository `_env/.venv` when usable, otherwise `python3` on `PATH` (`python` on Windows) |
 | `failFastOnMissingPython` | boolean | `true` | Refuses to load when the sidecar process cannot start (wrong path, protocol mismatch, handshake timeout). An interpreter that starts but lacks Scrapling always degrades to "tools unavailable" with the path named in the log, whatever this switch says |
-| `fetchEnabled` / `extractEnabled` / `renderEnabled` / `captureXhrEnabled` / `networkEnabled` / `sessionEnabled` / `sessionStateEnabled` / `crawlEnabled` / `answerEnabled` | boolean | `true` | One kill switch per tool or tool pair. `sessionStateEnabled` gates the state save / load pair, which also needs a deployment-side `sessionStateDir` |
+| `fetchEnabled` / `extractEnabled` / `locateEnabled` / `linksEnabled` / `renderEnabled` / `captureXhrEnabled` / `networkEnabled` / `sessionEnabled` / `sessionStateEnabled` / `crawlEnabled` / `answerEnabled` / `sessionReadEnabled` / `sessionActionsEnabled` / `downloadEnabled` / `screenshotEnabled` | boolean | `true` | One kill switch per tool or tool pair. `sessionStateEnabled` gates the state save / load pair, which also needs a deployment-side `sessionStateDir` |
 | `extractionType` | enum | `markdown` | `markdown` / `html` / `text`; all three run the same anti-injection cleaning, and `html` additionally strips event-handler attributes, so it is not byte-for-byte raw HTML |
 | `mainContentOnly` | boolean | `true` | Extraction scope |
 | `*MaxOutputChars` | natural | fetch / extract / render `200000`, xhr `120000` | Per-tool output caps. The sidecar clips by characters, the host then trims to a byte budget |
@@ -181,6 +287,11 @@ Settings live on the **scrapling** card in the plugin detail page, grouped by pu
 | `sidecarHandshakeTimeoutMs` / `fetchTimeoutMs` / `sidecarGraceMs` | natural | `30000` / `120000` / `5000` | Handshake budget, per-call cooperative timeout (declared on the tools' `timeoutMs`), and how long the client waits for the process to exit before forcing it down. `scrapling_crawl` passes no timeout — a crawl is measured in minutes |
 | `dataDir` | string | `""` | Sidecar working directory (the `adaptive` fingerprint database lands here); empty = `~/.dsh-scrapling`. If it cannot be created, `failFastOnMissingPython` decides whether the plugin refuses to load or degrades to no tools |
 | `provideWebFetch` / `provideWebSearch` | boolean | `true` | Whether the `ctx.web` providers are registered at all — see [Replacing the built-in fetch and search](#replacing-the-builtin-fetch-and-search) |
+| `searchBackend` / `tavilyApiKey` | enum / secret | `auto` / `""` | Discovery backend (`auto` / `tavily` / `bing` / `brave` / `serper` / `duckduckgo` / `searxng`) and the Tavily key. `auto` uses Tavily when a key is set, SearXNG when `searxngEndpoint` is set, and only falls back to public engines when `searchPublicFallback` is on (otherwise it reports `SEARCH_BACKEND_MISSING`); a backend selected without its own key (or instance) reports `SEARCH_AUTH` |
+| `searchPublicFallback` | boolean | `false` | Lets `auto` fall back to public engines (DuckDuckGo / Bing) when neither a key nor SearXNG is configured. Off by default on purpose: turning it on sends query strings to third-party public engines |
+| `braveApiKey` / `serperApiKey` | secret | `""` | Keys for the Brave Search and Serper.dev backends |
+| `searxngEndpoint` | string | `""` | Base URL of a SearXNG instance (`…/search?format=json` is appended); empty means the backend is unusable and reports `SEARCH_AUTH` |
+| `duckduckgoEndpoint` | string | `https://html.duckduckgo.com/html/` | DuckDuckGo HTML endpoint; override for a mirror or a test stub |
 | `answerProvider` / `answerModel` / `answerMaxTokens` | string / natural | `""` / `""` / `2000` | The model `scrapling_answer` routes to and the per-reply token cap. Provider and model left empty mean "follow the model the current session is already using" |
 | `allowedHosts` | string | `""` | Extra host names that skip the public-address check (comma-separated). Pointing it at an intranet address means giving up SSRF protection for those targets on purpose |
 | `syntheticDnsRanges` | string | `""` | Manual fallback for synthetic DNS: a comma-separated CIDR list of your proxy's fake-IP pool, for resolvers that mix synthetic and real answers. Invalid entries are dropped — a broken fallback degrades to "stay strict", not to a crash |
@@ -198,11 +309,14 @@ Settings live on the **scrapling** card in the plugin detail page, grouped by pu
 | `browserRealChrome` / `browserDnsOverHttps` | `false` | Use the locally installed Google Chrome; route the browser's DNS over HTTPS (useful with a proxy to avoid DNS leaks) |
 | `recordRequests` / `maxRecordedRequests` | `false` / `100` | Whether browser sessions record network history by default (the model can turn it on per session with `recordNetwork`), and how many entries a session keeps |
 | `sessionStateDir` | `""` | Directory for Playwright-compatible login-state files. The model can only pass a **plain file name**, so the directory stays a deployment decision; empty disables the state save / load pair |
+| `adaptiveStorage` | `sqlite` | Where `adaptive` fingerprints live: `sqlite` (one file under `dataDir`) or `redis` (one keyspace, shareable across processes and hosts). Deployment-only - the model only ever says "save" or "relocate" |
+| `redisUrl` | `redis://127.0.0.1:6379/0` | Connection string read when `adaptiveStorage: redis`. The password never reaches logs or error text; an unreachable server fails as `ADAPTIVE_STORAGE_UNAVAILABLE` |
 | `crawlMaxRuntimeSeconds` | `1800` | Wall-clock ceiling of one crawl — the page cap says nothing about a site that takes a minute per page |
-| `crawlRespectRobots` | `false` | Obey robots.txt; with it on, a domain whose robots.txt cannot be fetched is **blocked** rather than assumed permitted |
+| `crawlRespectRobots` | `false` | Obey robots.txt; with it on, a domain whose robots.txt fetch **fails** (network error or HTTP 5xx) is blocked rather than assumed permitted, while a **missing** robots.txt (HTTP 404, the common case) is treated as allowing everything |
 | `crawlDownloadDelayMs` / `crawlConcurrentRequests` / `crawlAutothrottle` / `crawlStrategy` | `0` / `4` / `false` / `bfs` | Gap between requests, parallelism, adaptive throttling, breadth- or depth-first order |
 | `crawlCheckpointDir` | `""` | Persist the crawl queue so a restarted crawl resumes instead of going back to the start URL |
-| `searchEndpoint` / `searchRenderTopN` | `""` / `3` | The SearXNG-compatible discovery backend, and how many of its results are actually fetched and rendered (`0` = link list only) |
+| `tavilyApiEndpoint` / `bingEndpoint` / `searchRenderTopN` | `https://api.tavily.com/search` / `https://www.bing.com/search` / `3` | Discovery endpoints (overridable for tests or proxies), and how many results are actually fetched and rendered (`0` = link list only) |
+| `allowBrowserActions` / `allowFileDownloads` / `downloadMaxBytes` | `false` / `false` / `10485760` | Deployment-only gates for structured actions and downloads, plus the per-download byte cap. Both gates default off and also hide their tools from the model |
 
 ## <img src="https://api.iconify.design/lucide/network.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Proxies
 
@@ -236,13 +350,13 @@ Details worth knowing:
 
 ## <img src="https://api.iconify.design/lucide/shield-alert.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Security
 
-- **SSRF.** Scrapling itself has no SSRF protection. This package adds a URL policy on the host side — scheme allowlist, rejection of URLs with embedded credentials, length cap, rejection of an authority containing a backslash or control characters, DNS resolution with a whole-answer-set public-address check, IPv4-mapped and NAT64 addresses reclassified by their embedded IPv4 — and enforces it again on the Python side. **What is judged is what gets sent**: the gate decides on the WHATWG-normalised form and the sidecar forwards that same string, otherwise "judged A, connected to B" would be a bypass in its own right. The host-side policy is enforced in one place (`SidecarClient.call`), so it covers every tool and the `web_fetch` provider alike, with a rejection throwing `URL_BLOCKED` before the request reaches the pipe; the `web_search` provider runs the same gate over the URLs it is about to return, so a hit the gate rejects never becomes a citeable source. The browser-side guard covers navigation, subresources, XHR and WebSocket handshakes.
+- **SSRF.** Scrapling itself has no SSRF protection. This package adds a URL policy on the host side — scheme allowlist, rejection of URLs with embedded credentials, length cap, rejection of an authority containing a backslash or control characters, DNS resolution with a whole-answer-set public-address check, IPv4-mapped and NAT64 addresses reclassified by their embedded IPv4 — and enforces the scheme, credential and address rules again on the Python side (the length cap stays with the host policy, because it is a deployment setting). Outbound paths accept only `http`/`https` and reject embedded credentials; `ws`/`wss` are judged by address alone in the WebSocket-handshake check. **What is judged is what gets sent**: the gate decides on the WHATWG-normalised form and the sidecar forwards that same string, otherwise "judged A, connected to B" would be a bypass in its own right. The host-side policy is enforced in one place (`SidecarClient.call`), and that one place screens every URL the model can hand over — `url`, plus crawl's `sitemapUrl` and `feedUrl` — so it covers every tool and the `web_fetch` provider alike, with a rejection throwing `URL_BLOCKED` before the request reaches the pipe; the `web_search` provider runs the same gate over the URLs it is about to return, so a hit the gate rejects never becomes a citeable source. The browser-side guard covers navigation, subresources, XHR and WebSocket handshakes.
 - Known gaps, stated in the open:
   - **Connection pinning** (an undici-level technique) is unavailable for a non-Node transport, leaving a TOCTOU window between validation and connect. Static fetches are covered by curl_cffi's `follow_redirects="safe"`; browser fetches by a route handler on the Python side.
   - **NAT64 prefixes are not discovered dynamically.** The two standardized prefixes are covered; operator-specific ones must be declared via `nat64Prefixes`, otherwise a private IPv4 hidden inside IPv6 is judged as an ordinary public IPv6.
   - **No port allowlist** (any port allowed by default), matching dsh's own built-in fetch provider.
   - **The crawl re-checks every page twice** before it enters the result set — once against the guard (the final URL may still have landed somewhere private) and once against the start domain, because Scrapling's `allow_domains` is a string comparison over links found in the page, not redirect targets. The crawl session uses `follow_redirects="safe"` so curl_cffi refuses a jump into a private range.
-  - **WebSocket coverage depends on the Playwright version.** The guard intercepts handshakes via `route_web_socket`; older builds lack that method, WebSocket is then outside the guard, and the plugin says so in the log and the capability report rather than degrading silently.
+  - **WebSocket coverage depends on the Playwright version.** The guard intercepts handshakes via `route_web_socket`; older builds lack that method, WebSocket is then outside the guard, and the plugin reports that as `websocketGuard` in the handshake capabilities (the startup log prints the probed capabilities) rather than degrading silently.
 - **No code execution from model input.** `page_action`, `page_setup`, `selector_config`, `proxy`, `executablePath` and `cdpUrl` never appear in any tool schema, and the browser-side network guard is installed by plugin code. The strong browser capabilities and `allowWriteMethods` come only from deployment config.
 - **Write verbs are off by default.** With `allowWriteMethods` off, `method` and `body` are absent from `scrapling_fetch`'s parameter surface, and the sidecar independently refuses a non-GET with `WRITE_DISABLED` — two halves that do not rely on each other. The gate, the proxy decision and `follow_redirects="safe"` bound **where** a request goes, not **what it does once there**; prompt-injected page text can ask for a POST, so turn it on only where the task really is to submit data. `headers` and `cookies` stay available either way — anything handed to them lands in the model context by design.
 - **Prompt-injection scrubbing runs unconditionally** on all three extraction paths; there is no model-facing switch to turn it off.
@@ -252,7 +366,7 @@ Details worth knowing:
 | Aspect | Content |
 | --- | --- |
 | On disk | The sidecar working directory (`dataDir`, default `~/.dsh-scrapling`) holds Scrapling's `adaptive` fingerprint database; login-state files are written under `sessionStateDir` when it is configured. Settings values live in the host settings document. Nothing else is written |
-| Network | Fetches go to the URLs the model supplies, through the configured proxy if any. Search queries go to the deployment-level `searchEndpoint`. `scrapling_answer` sends the fetched page text and the question through the host `llm` service — that content leaves the machine when the routed model is remote |
+| Network | Fetches go to the URLs the model supplies, through the configured proxy if any. Search queries go from the Python sidecar to Tavily or Bing (the configured `tavilyApiKey` is sent to Tavily and never logged). `scrapling_answer` sends the fetched page text and the question through the host `llm` service — that content leaves the machine when the routed model is remote |
 | Logs | The chosen interpreter, the probed capabilities, and the proxy summary (`scheme://host:port` plus which rung answered — never credentials) |
 | In memory | Sessions, cookies and recorded network history live in the sidecar process and disappear with it |
 | Telemetry | None |
@@ -267,6 +381,13 @@ Registered honestly, one entry per class.
 - **`headers` and `retries` on `scrapling_session_fetch` belong to static sessions.** Upstream silently drops both for browser sessions, so this package refuses them with `BAD_ARGS` naming the knob to use instead — a silent no-op is the failure mode it exists to eliminate.
 - **Browser identity knobs only live on the tools that can apply them.** `useragent` / `locale` / `timezoneId` / `headless` are model-visible on the one-shot browser tools and on `scrapling_session_open` — they take effect at session construction, and passing them per request is silently dropped upstream.
 - **Network history is session-level.** Recording is a construction-time setting (`recordRequests` deployment default, or `recordNetwork` per `scrapling_session_open`); a session that is not recording answers an error, not an empty list.
+- **`scrapling_screenshot` bypasses text cleaning.** Screenshots capture whatever the page renders in the viewport — including visual secrets (tokens, private messages, data behind a login) that never appear in the DOM text the other tools clean. They are stored through the host attachment service and are only available when that service is mounted. What comes back is the service's **normalized** reference: a declared PNG can be persisted as `image/jpeg` at a smaller raster, with `originalDimensions` carrying what the page actually produced (host contract: `saveImage` in `@deepseek-ai/dsh-attachment`). `scrapling_download` writes bytes under `dataDir/downloads`, never overwrites an existing file, and refuses path components in `filename`.
+- **`scrapling_locate` and `scrapling_links` are offline parsers.** Both take HTML and never fetch; `scrapling_links` keeps relative links only when `baseUrl` is supplied — with an empty `baseUrl` it returns no links rather than guessing absolute URLs. Both share `extractMaxOutputChars`.
+- **Adaptive relocation is best-effort.** Scrapling saves only the first matching element, and a near-identical sibling can be chosen when the original attributes change. Treat a relocated match as a hint and verify it; `scrapling_locate` never saves fingerprints.
+- **Runtime packs are verified on macOS arm64 only.** Windows, Linux and macOS x64 report every pack as `blocked`; the installer refuses rather than guessing an asset path (B1/B2).
+- **The `adaptive-redis` pack is a client, not a storage engine.** Upstream ships only `SQLiteStorageSystem`; the Redis backend here is this plugin's `py/redis_storage.py`, a `StorageSystemMixin` subclass keyed by registered domain. Enabling it changes where fingerprints live, so treat it as a deployment decision, not a per-call switch. The plugin's own MCP server is separate — it runs in-process and needs no pack.
+- **Shopify crawl mode walks the store's JSON API.** `mode=shopify` uses the store's `/collections.json` and each collection's `/products.json` (upstream's `ShopifySpider`) and yields one row per variant — `name` (product + variant, minus `Default Title`), `price`, `sku`, `stock` (`null` when available, `0` when not), `identifier`, `brand`, `category`, `image_url`, `url`, `barcode`, `old_price`, `description`. It never scrapes product HTML, and it obeys the same URL gate, robots setting, delay and concurrency knobs as the other crawl modes. Verified against a local fixture store; a real Shopify store has not been exercised (B11).
+- **`official-mcp` generates configuration only.** `integrationMode=official-mcp` registers no native tool and starts no server from this plugin; `setup --mode official-mcp --accept-risk` produces the `dsh-mcp-client` entry for the official server, whose binary comes from the `mcp` pack (B10 is the risk decision that entry stands on).
 
 ## <img src="https://api.iconify.design/lucide/circle-help.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> FAQ
 
@@ -276,7 +397,7 @@ Registered honestly, one entry per class.
 | After enabling a proxy, every fetch is blocked | A fake-IP proxy resolves every domain into a non-public range; the gate auto-detects that class and relaxes to the known pools. A self-built pool outside them goes into `syntheticDnsRanges`. Private and loopback addresses stay blocked on purpose |
 | `web_fetch` reports `WEB_PROVIDER_CONFIGURED_UNAVAILABLE` / `_MISSING` | The deployment line points at this plugin: either the sidecar is down (interpreter or Scrapling — see the startup log), or the plugin was removed and the `fetchProvider` / `searchProvider` line is still there. Remove the line too |
 | The model cannot POST a form | `allowWriteMethods` is off by default and deployment-only — it decides whether the model may change state on a remote host |
-| `web_search` returns nothing | Scrapling is not a search engine. Point the deployment-level `searchEndpoint` at a SearXNG-compatible JSON backend |
+| `web_search` reports `SEARCH_AUTH` | The selected backend has no credential: Tavily/Brave/Serper need their key, SearXNG needs `searxngEndpoint`. Set it, or switch `searchBackend`. With `searchBackend=auto` and no key and no `searxngEndpoint`, the plugin reports `SEARCH_BACKEND_MISSING` — set a key / endpoint, or turn on `searchPublicFallback` to allow public engines |
 | The numbers on a chart are missing | SVG tick labels do not survive the Markdown conversion in any tool. Use `scrapling_capture_xhr` to find the JSON endpoint behind the chart |
 
 ## <img src="https://api.iconify.design/lucide/wrench.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Development
@@ -287,9 +408,9 @@ pnpm run check     # typecheck → lint → client build → host build → test
 pnpm run test:py   # end-to-end check of the Python sidecar
 ```
 
-- **The Python half is gated like the TypeScript half.** `check` ends with `check:py`: an interpreter report, a face count (the shipped `.py` files and the test directory must both be there — a missing test directory makes "clean" and "untested" indistinguishable), ruff check, ruff format, mypy, the sidecar end-to-end, bandit (medium and above), and a coverage floor measured **only over the modules that ship**. Dev tools: `pip install -r py/requirements-dev.txt` into the interpreter `test:py` uses.
+- **The Python half is gated like the TypeScript half.** `check` ends with `check:py`: an interpreter report, a face count (the shipped `.py` files and the test directory must both be there — a missing test directory makes "clean" and "untested" indistinguishable), a dependency consistency check, ruff check, ruff format, mypy, the sidecar end-to-end, bandit (all severities; `# nosec` only for justified false positives), and a coverage floor measured **only over the modules that ship**. Dev tools: `pip install -r py/requirements-dev.txt` into the interpreter `test:py` uses.
 - **The Python 3.14 floor is one fact in four places:** both READMEs, the ruff and mypy targets, and a runtime gate in `py/bridge.py` that exits before any Scrapling import with a clean stdout — stdout is protocol frames, so an old interpreter shows the exit code and a stderr line instead of garbage.
-- **mypy runs non-strict on purpose.** Playwright's `page` / `route` / `websocket` objects have no shape until runtime, and a strict profile would buy a pile of `ignore` comments that exist only to silence it.
+- **mypy checks untyped bodies and rejects unannotated defs and unused ignores.** Playwright's `page` / `route` / `websocket` objects have no shape until runtime, so `ignore_missing_imports` and `ANN401` stay off; those three checks are on, not the full `strict` profile.
 - Sources are TypeScript. `host.js` and `client.js` are **build artifacts** and deliberately `.js`: Node refuses to strip types for packages inside `node_modules`, which is exactly where dsh loads the plugin from. The artifact is ESM-only; `require()` will not get you the plugin, and that is deliberate.
 - Gates that pin the published shape: `test/publish-manifest.test.ts` (entry targets covered by `files`, no source file as an entry point, `dsh-*` pins exact and uniform, no host package body inlined, no dates or bad bytes in comments or documents) and `test/readme-parity.test.ts` (the two READMEs name every tool and every settings-card knob, and their section structures match).
 - Publishing runs through [`.github/workflows/publish.yml`](./.github/workflows/publish.yml) (manual, OIDC trusted publishing plus `--provenance`).

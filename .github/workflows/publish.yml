@@ -60,9 +60,8 @@ jobs:
       # 是 `fetchers` 不是 `rag`：后者才是本插件要的——`extractionType` 默认 markdown，而
       # markdownify 在 rag 里、不在 fetchers 里。装成 fetchers 的话第一次抓取就抛
       # ModuleNotFoundError，爬虫那条则因为等一个永远不会出现的产出而变成 20s 超时。
-      # 浏览器**不装**：runner 上没有浏览器二进制时，那次运行里除上面两条外 292 条全过，
-      # 依赖浏览器的是 runIf 门控的占位用例。运行期要用 render / capture_xhr / stealth 时
-      # 才需要浏览器，那是用户侧的运行时依赖，不是测试门槛。
+      # 浏览器在下面的单独步骤里装完整 Chromium；不用 --only-shell —— Scrapling 的 stealth
+      # 路径在 headless shell 上起不来（实测），而 test:py 的浏览器档需要它。
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
@@ -87,6 +86,8 @@ jobs:
         run: |
           _env/.venv/bin/python -m pip install -r py/requirements-dev.txt
           echo "${GITHUB_WORKSPACE}/_env/.venv/bin" >> "$GITHUB_PATH"
+      - name: 装 Chromium（Python 浏览器档）
+        run: _env/.venv/bin/python -m patchright install --with-deps chromium
       # 首次发布必须先有 token：Trusted Publisher 只能在 npmjs.com 的**包设置页**配置，而那个页面
       # 只有包已发布后才存在（registry 上查不到本包时，配置入口根本无处可点）。因此顺序是：
       # ① 配 secrets.NPM_TOKEN，发第一版；② 到包设置页登记 Trusted Publisher；
@@ -179,10 +180,10 @@ jobs:
           printf 'use_static=%s\n' "$USE_STATIC" >> "$GITHUB_OUTPUT"
       - run: pnpm install --frozen-lockfile
       - run: pnpm run check
-      # Python 面不在这里另跑一遍：`check` 已经含 `check:py` 的八步链（`py:which` → `face:py` → ruff
-      # 检查/格式 → mypy → sidecar 端到端 → bandit → 覆盖率地板），解释器由该仓 `py` 入口的解析规则选定。
-      # 强度只写在那一条链里：要放宽或收紧 Python 面就改该仓 `package.json` 的 `check:py`，在 CI 里另起
-      # 一步就会出现两套说法互相打脸的形状（一步拦、一步只记录）。
+      # Python 面不在这里另跑一遍：`check` 已经含 `check:py` 的链条（`py:which` → `face:py` →
+      # `deps:py` → ruff 检查/格式 → mypy → sidecar 端到端 → bandit → 覆盖率地板），解释器由该仓
+      # `py` 入口的解析规则选定。强度只写在那一条链里：要放宽或收紧 Python 面就改该仓
+      # `package.json` 的 `check:py`，在 CI 里另起一步就会出现两套说法互相打脸的形状（一步拦、一步只记录）。
       # prepack 会重建 host.js / client.js；产物不入库也发得出去。
       # 凭据优先级是本文件最容易读反的地方：不是「配了 NPM_TOKEN 就用它、没配才 OIDC」，
       # 而是 OIDC 在前、token 在后（pnpm 的 publish_options.rs 原话 "OIDC takes precedence over

@@ -11,6 +11,9 @@ import { BUNDLE_PACKAGE_NAME, LOCALE_NS, SETTINGS_ENTRY_ID } from "../src/settin
 /** 测试里反复用到的示例地址。 */
 const SAMPLE = "https://example.test/a";
 
+/** 离线解析类结果行共用的命中数标签。 */
+const MATCHED_LABEL = "row.matched";
+
 /** claimApply 写在 globalThis 上的 HMR 幂等标记；每个用例开始前都要复位。 */
 const GLOBAL_FLAG = "__dshScraplingToolviewApplied";
 
@@ -82,7 +85,7 @@ describe("buildRow", () => {
   it("extract 带选择器标题与匹配数", () => {
     const row = buildRow("scrapling_extract", { selector: "table td" }, { count: 7 });
     expect(row.title).toBe("scrapling_extract table td");
-    expect(row.fields).toStrictEqual([{ labelKey: "row.matched", value: "7" }]);
+    expect(row.fields).toStrictEqual([{ labelKey: MATCHED_LABEL, value: "7" }]);
   });
 
   it("extract 没有选择器时只给工具名", () => {
@@ -137,6 +140,20 @@ describe("buildRow", () => {
     ]);
   });
 
+  it("locate 展示选择器与命中数", () => {
+    const row = buildRow("scrapling_locate", { selector: "P1" }, { count: 2 });
+    expect(row.title).toBe("scrapling_locate P1");
+    expect(row.fields).toStrictEqual([{ labelKey: MATCHED_LABEL, value: "2" }]);
+  });
+
+  it("links 展示 baseUrl 与链接数", () => {
+    const row = buildRow("scrapling_links", { baseUrl: "https://example.test/" }, { count: 3 });
+    expect(row.fields).toStrictEqual([
+      { labelKey: "row.url", value: "https://example.test/" },
+      { labelKey: MATCHED_LABEL, value: "3" },
+    ]);
+  });
+
   it("每个登记的工具都能产出一行", () => {
     for (const tool of ROW_TOOLS) {
       const row = buildRow(tool, { url: "u", selector: "s" }, { url: "u", statusCode: 200 });
@@ -164,6 +181,7 @@ describe("readArgs", () => {
     });
     expect(args).toStrictEqual({ url: "https://a", maxPages: 20 });
     expect(seen.filter((entry) => entry.endsWith(":selector"))).not.toHaveLength(0);
+    expect(seen, "links 的 baseUrl 也要被惰性视图读到").toContain("text:baseUrl");
   });
 
   it("text() 命中时不再问 value()", () => {

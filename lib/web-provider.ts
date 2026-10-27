@@ -65,6 +65,29 @@ export function toBodyKind(extractionType: string): WebFetchBody["kind"] {
 }
 
 /**
+ * 把回包原值压成一段可读的一行，供「形状不对」的错误文案使用。
+ *
+ * 不能直接 `JSON.stringify(raw).slice(...)`：`JSON.stringify` 对不可序列化的值
+ * （`undefined`、函数、symbol）**返回 undefined**，对循环引用会抛。两种情况下
+ * 那一行的 `.slice` 会先炸成 TypeError，于是本该报「sidecar 回包坏了」的路径
+ * 变成了一条没有 code 的崩溃 —— 调用方按码路由就失去了这条失败。
+ *
+ * @param raw - sidecar 回来的原值
+ * @returns 最多 120 字符的描述
+ */
+function describeRaw(raw: unknown): string {
+  try {
+    const text = JSON.stringify(raw);
+    if (typeof text === "string") {
+      return text.slice(0, 120);
+    }
+  } catch {
+    // 循环引用一类不可序列化的形状：落到下面的 String() 兜底。
+  }
+  return String(raw).slice(0, 120);
+}
+
+/**
  * 建一个 ctx.web fetch provider。
  *
  * @param deps - 依赖
@@ -140,7 +163,7 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
         typeof payload["content"] !== "string"
       ) {
         throw new WebError(
-          `sidecar returned a malformed fetch reply: ${JSON.stringify(raw).slice(0, 120)}`,
+          `sidecar returned a malformed fetch reply: ${describeRaw(raw)}`,
           "SCRAPLING_FETCH_FAILED",
         );
       }

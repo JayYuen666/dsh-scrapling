@@ -11,8 +11,14 @@
 // 不产 .d.ts：插件包对外没有 TS API —— dsh 按包名载入运行，没有人 import 它。
 //
 // 产物做压缩（minify）：源码注释是写给维护者的推理——为什么这么判、哪条路试过不行——它们
-// 留在发出去的包里既外泄内部设计讨论，又把包撑大一倍。压缩后体积约减半，注释从八百多行
-// 降到个位数。标识符也随之压缩，调试时栈里的名字不再可读，这是为体积与不外泄付的代价；
+// 留在发出去的包里既外泄内部设计讨论，又把包撑大一倍。压缩后注释从八百多行降到个位数。
+//
+// 但**标识符不压**（compress 开、mangle 关）。宿主网关在没有 typert strict 描述符时按 SRC
+// 回退，wire 名取自运行期函数参数名（deepseek-harness 的 api/gateway/src/index.ts 里
+// methodParameterNames 用 Function.prototype.toString 读参数表），而客户端描述符写的就是参数名
+// 本身。mangle 把 installPack 的 request 压成单字母之后，宿主按 arguments-invalid 拒绝每一次
+// 调用 —— 现象是设置卡数据照常显示、三颗按钮必失败。代价是产物比全量压缩大约多四分之一
+// （实测 132942 与 106138 字符），换来 wire 名与源码一致；test/build-signature.test.ts 钉住这条。
 // `test/publish-manifest.test.ts` 会真的 import 产物并断言导出面，改坏对外契约时它会红。
 
 import path from "node:path";
@@ -75,7 +81,12 @@ export async function buildHost(): Promise<string> {
     resolve: { extensions: [".ts", ".mjs", ".js"] },
   });
   try {
-    const { output } = await bundle.generate({ format: "esm", minify: true });
+    // 不能写成 true：mangle 会改掉 Remote 方法的参数名，而宿主 SRC 分支把它当 wire 名（见文件
+    // 头的「标识符不压」），于是客户端按 request 发、宿主按单字母收，gateway/arguments-invalid。
+    const { output } = await bundle.generate({
+      format: "esm",
+      minify: { compress: true, mangle: false },
+    });
     // `//#region` 行的路径由 rolldown 按 process.cwd() 算出 ⇒ 同一份源码有两种字节
     // （cwd=包根 写 `lib/x.ts`，cwd=plugins/ 写 `<包名>/lib/x.ts`）。折成 canonical 必须
     // 落在返回值之前：新鲜度测试拿内存构建与磁盘产物逐字节比，只在一侧折就永远红。

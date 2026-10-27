@@ -48,9 +48,27 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包通过它们的
 | 依赖 | 版本 | 许可 | 引入方 |
 | --- | --- | --- | --- |
 | `scrapling` | 0.5 | BSD-3-Clause | Python sidecar |
-| `playwright` | 1.63.0 | Apache-2.0（Microsoft） | 网络守卫 |
-| `patchright` | 1.63.0 | Apache-2.0（Microsoft，patch 由 Kaliiiiiiiiii-Vinyzu 提供） | 浏览器渲染与网络守卫 |
+| `browserforge` | 1.2.4 | MIT | Scrapling 静态抓取的浏览器头生成 |
+| `apify-fingerprint-datapoints` | 0.15.0 | Apache-2.0 | browserforge 的指纹数据 |
+| `playwright` | 1.64.1 | Apache-2.0（Microsoft） | 网络守卫 |
+| `patchright` | 1.64.2 | Apache-2.0（Microsoft，patch 由 Kaliiiiiiiiii-Vinyzu 提供） | 浏览器渲染与网络守卫 |
 | `ipaddr.js` | 2.5.0 | MIT | Host 侧 URL 策略的地址分类 |
+
+其余随 venv 安装的固定版本（含 `click`、`protego`、`curl_cffi`、`lxml` 等）见
+`py/runtime-requirements.txt`，每一行都带 SHA256；本文件不复述整张表。
+
+## 运行时下载的资产（不随 npm 分发）
+
+安装器按需下载下面两项到 `dataDir/runtime`，它们**不在 npm tarball 内**，因此不属于本包
+分发的第三方内容：
+
+- **Python 3.14.9**：来自 `astral-sh/python-build-standalone` 的
+  `cpython-3.14.9+20261021-aarch64-apple-darwin-install_only.tar.gz`；URL、体积与 SHA256
+  钉在 `runtime-manifest.json`，下载后先校验再解压。
+- **完整 Chromium**：由 `patchright install chromium` 从 Playwright 的 CDN 下载；不含
+  `--only-shell`，因为 headless shell 的组件不足以跑 `StealthyFetcher`（V2）。
+
+许可文本随这两个上游产物各自提供；本包只负责下载、校验与落盘。
 
 `patchright` 是 Playwright 的补丁分支，与 `playwright` 并存安装：两者是不同的 Python 包，
 本包按能力探测判断浏览器抓取能不能用。

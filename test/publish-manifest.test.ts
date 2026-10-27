@@ -20,8 +20,11 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
+import { MCP_SERVER_NAME } from "../lib/mcp-contract.ts";
+import { MCP_SERVER_VERSION } from "../lib/mcp-server.ts";
 
 const pkgDir = path.join(import.meta.dirname, "..");
+const PACKAGE_JSON = "package.json";
 
 /**
  * 只在注释与文档里禁的东西：写下来的时刻、列表序号、以及坏字节。
@@ -64,10 +67,12 @@ const SKIP_DIRS = new Set([
 
 /** package.json 里与入口面有关的形状；其余字段本门禁不关心。 */
 interface Manifest {
+  readonly version?: string;
   readonly main?: string;
   readonly types?: string;
   readonly exports?: Record<string, unknown>;
   readonly files?: readonly string[];
+  readonly bin?: Record<string, string>;
   readonly publishConfig?: Record<string, unknown>;
   readonly dependencies?: Record<string, string>;
   readonly peerDependencies?: Record<string, string>;
@@ -163,7 +168,7 @@ function entryFiles(manifest: Manifest): readonly { label: string; file: string 
 
 /** 发布器无条件附带的文件：不受 `files` 约束，但也不该由门禁去断言它在 `files` 里。 */
 const ALWAYS_SHIPPED = [
-  "package.json",
+  PACKAGE_JSON,
   "README.md",
   "README.zh.md",
   "README.zh-CN.md",
@@ -178,7 +183,7 @@ const ALWAYS_SHIPPED = [
  */
 async function readSurface(): Promise<{ manifest: Manifest; shipped: Set<string> }> {
   const manifest = JSON.parse(
-    await readFile(path.join(pkgDir, "package.json"), "utf8"),
+    await readFile(path.join(pkgDir, PACKAGE_JSON), "utf8"),
   ) as unknown as Manifest;
   const groups = await Promise.all((manifest.files ?? []).map((entry) => expand(shapeOf(entry))));
   const attached = ALWAYS_SHIPPED.filter((name) => existsSync(path.join(pkgDir, name)));
@@ -230,6 +235,35 @@ function commentLines(file: string, text: string): string[] {
 }
 
 describe("发布形态", () => {
+  it("files 覆盖运行模块、CLI 与运行时资产，bin 指向产物", async () => {
+    const pkg = JSON.parse(await readFile(path.join(pkgDir, PACKAGE_JSON), "utf8")) as Manifest;
+    const pyEntries = await readdir(path.join(pkgDir, "py"));
+    const runtimePy = pyEntries
+      .filter((name) => name.endsWith(".py"))
+      .toSorted()
+      .map((name) => `py/${name}`);
+    expect(runtimePy.length, "py/ 下不该没有运行模块").toBeGreaterThan(0);
+    const required = [
+      ...runtimePy,
+      "py/runtime-requirements.txt",
+      "runtime-manifest.json",
+      "bin/dsh-scrapling.mjs",
+    ];
+    const files = pkg.files ?? [];
+    expect(required.filter((entry) => !files.includes(entry))).toStrictEqual([]);
+    expect(pkg.bin?.["dsh-scrapling"]).toBe("./bin/dsh-scrapling.mjs");
+  });
+
+  it("mcp server 自述的版本与包版本同值，SDK 是声明过的运行期依赖", async () => {
+    const pkg = JSON.parse(await readFile(path.join(pkgDir, PACKAGE_JSON), "utf8")) as Manifest;
+    expect(MCP_SERVER_NAME).toBe("scrapling");
+    // 版本号写死在代码里，靠这条断言跟着 package.json 走：发布时忘了抬，红在这里而不是让客户
+    // 连上一个自称旧版的 server。
+    expect(pkg.version, "package.json 该有版本号").toBeDefined();
+    expect(MCP_SERVER_VERSION).toBe(pkg.version);
+    expect(pkg.dependencies?.["@modelcontextprotocol/sdk"], "mcp 模式的运行期依赖").toBeDefined();
+  });
+
   it("files 覆盖全部入口目标（换个发布器也不会发出悬空入口）", async () => {
     const { manifest, shipped } = await readSurface();
     const targets = entryFiles(manifest);
@@ -254,6 +288,11 @@ describe("发布形态", () => {
     for (const key of Object.keys(manifest.publishConfig ?? {})) {
       expect(ALLOWED_PUBLISH_CONFIG.has(key), `publishConfig.${key} 会被 npm 忽略`).toBe(true);
     }
+  });
+
+  it("py/extraction.py 在 files 里", async () => {
+    const { manifest } = await readSurface();
+    expect(manifest.files).toContain("py/extraction.py");
   });
 });
 
@@ -336,7 +375,7 @@ describe("构建产物可载入", () => {
 
   it("产物里的真实逻辑还能跑（压缩改形状时这条会红）", async () => {
     // 产物是压缩过的：标识符改名、注释剥掉。只断言「导出一个叫 apply 的函数」太弱，
-    // 压缩把内部逻辑改坏它照样绿。这里让**产物自己**跑一遍注册计划：十三个工具、两条
+    // 压缩把内部逻辑改坏它照样绿。这里让**产物自己**跑一遍注册计划：十九个工具、两条
     // 分支都要给出正确结果。任何依赖名字（constructor.name 之类）或模块级状态的压缩
     // 手法，都会在这里露出来，而不是等到装进 dsh 才发现。
     const artifact = (await import(pathToFileURL(path.join(pkgDir, "host.js")).href)) as {
@@ -360,13 +399,19 @@ describe("构建产物可载入", () => {
       browser: true,
       version: "0.5",
     };
-    expect(artifact.TOOL_SPECS).toHaveLength(13);
+    expect(artifact.TOOL_SPECS).toHaveLength(19);
     const { ready } = artifact.planTools(allOn, full, true);
-    // 有浏览器时十三个全注册；会话类各自独立，所以总数与工具数相等。
-    expect(ready).toHaveLength(13);
+    // 有浏览器时十九个全注册；会话类各自独立，所以总数与工具数相等。
+    expect(ready).toHaveLength(19);
     // 关掉浏览器的分支同样要成立，且恰好少掉那两个依赖浏览器的工具。写成差集而不是
     // 写死个数：以后往登记表里加工具，这个断言仍然成立，而不会因为数字对不上而失败。
-    const BROWSER_TOOLS = new Set(["scrapling_render", "scrapling_capture_xhr"]);
+    const BROWSER_TOOLS = new Set([
+      "scrapling_render",
+      "scrapling_capture_xhr",
+      "scrapling_session_read",
+      "scrapling_session_act",
+      "scrapling_screenshot",
+    ]);
     const { ready: withoutBrowser } = artifact.planTools(allOn, { ...full, browser: false }, true);
     expect(withoutBrowser).toStrictEqual(ready.filter((name) => !BROWSER_TOOLS.has(name)));
     expect(BROWSER_TOOLS.has("scrapling_render")).toBe(true);

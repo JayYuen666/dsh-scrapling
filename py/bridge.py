@@ -50,10 +50,12 @@ from typing import Any, Callable
 # 会让整帧写不出去，替换成转义文本至少留下可读的痕迹。
 # 用 getattr 取 reconfigure：被重定向成 io.StringIO 的流没有这个方法（测试与嵌宿主都可能
 # 这么做），缺了它不该让整个 sidecar 起不来。
+# newline="\n"：协议帧以 LF 分帧，而 Windows 的文本模式会把 "\n" 翻成 "\r\n"；宿主侧虽然
+# 容忍行尾的 \r，但那是容忍，不该由协议来依赖。
 for _stream in (sys.stdout, sys.stderr):
     _reconfigure = getattr(_stream, "reconfigure", None)
     if callable(_reconfigure):
-        _reconfigure(encoding="utf-8", errors="backslashreplace")
+        _reconfigure(encoding="utf-8", errors="backslashreplace", newline="\n")
 
 MIN_PYTHON = (3, 14)
 
@@ -135,15 +137,19 @@ def ok(request_id: Any, result: Any) -> dict[str, Any]:
     return {"id": request_id, "ok": True, "result": result}
 
 
-def fail(request_id: Any, code: str, message: str) -> dict[str, Any]:
+def fail(request_id: Any, code: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
     """构造失败响应帧。
 
     :param request_id - 原样回传请求的 id
     :param code - 机器可读错误码
     :param message - 人读信息
+    :param details - 可选的机器可读细节（例如动作失败的下标）
     :returns: 响应帧
     """
-    return {"id": request_id, "ok": False, "error": {"code": code, "message": message}}
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details:
+        error["details"] = details
+    return {"id": request_id, "ok": False, "error": error}
 
 
 def handle(frame: dict[str, Any]) -> dict[str, Any]:
@@ -172,7 +178,7 @@ def handle(frame: dict[str, Any]) -> dict[str, Any]:
         try:
             return ok(request_id, handler(params))
         except adapters.AdapterError as error:
-            return fail(request_id, error.code, str(error))
+            return fail(request_id, error.code, str(error), error.details)
         except ModuleNotFoundError as error:
             # 缺的是可选依赖，不是抓取失败。落到下面的 FETCH_FAILED 会把它说成「请求出错」，
             # 而模型与用户对这两种情况的正确反应完全不同：前者该退避重试，后者该去装包。
@@ -253,6 +259,21 @@ def _ensure_worker(count: int) -> None:
             worker = threading.Thread(target=_worker, daemon=True, name="bridge-worker")
             _WORKERS.append(worker)
             worker.start()
+
+
+def _shutdown_crawls() -> None:
+    """退出前叫停全部爬虫，并给它们的线程一点收尾时间。
+
+    蜘蛛跑在自己的线程里：进程退出它们才退，中间还能往 stdout 推事件帧 —— 那时宿主已经
+    不读这一路了，帧落进管道就是没人认领的字节。所以爬虫要在会话之前关：蜘蛛自己也要用
+    浏览器，先把会话抽走只会让它在下一次请求里抛。
+    """
+    try:
+        import crawl
+
+        crawl.close_all_crawls()
+    except Exception as error:  # noqa: BLE001 —— 关不掉也不能拖住关机
+        log(f"failed to stop crawls: {type(error).__name__}: {error}")
 
 
 def _shutdown_sessions() -> None:
@@ -340,6 +361,7 @@ def read_loop() -> int:
             _drain_before_exit()
             # 与 EOF 路径同一套收尾：浏览器会话是独立进程，不显式关掉就会活过 sidecar
             # 本身。宿主的优雅关闭走的就是这一帧（见 lib/sidecar.ts 的 dispose）。
+            _shutdown_crawls()
             _shutdown_sessions()
             return 0
         # 顺序要紧：先入队再起 worker。反过来的话，新起的线程可能立刻醒来、
@@ -364,6 +386,7 @@ def read_loop() -> int:
         _ensure_worker(min(depth, MAX_INFLIGHT))
     log("stdin closed")
     _drain_before_exit()
+    _shutdown_crawls()
     _shutdown_sessions()
     return 0
 

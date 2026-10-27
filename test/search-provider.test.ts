@@ -1,61 +1,95 @@
 // dsh-scrapling/test/search-provider.test.ts —— ctx.web search provider（检索 + 渲染一体）。
 //
-// 覆盖重点：可用性判断不发网络请求、搜索后端的两种回包形状、抓取时确实走了带渲染的路径、
-// 单条失败不该拖垮整次搜索、以及 provider 特有错误码真的落在 code 上。
+// 检索由 sidecar 的 search.discover 完成（Tavily/Bing 两条已验证路径），Host 只负责过闸、
+// 截断与渲染前 N 条。覆盖重点：错误码原样透出、key 不回显、闸门与正文失败的语义。
 
-import { describe, expect, it, vi } from "vitest";
-import {
-  SEARCH_PROVIDER_ID,
-  createWebSearchProvider,
-  parseSearchResults,
-} from "../lib/search-provider.ts";
+import { describe, expect, it } from "vitest";
+import { SEARCH_PROVIDER_ID, createWebSearchProvider } from "../lib/search-provider.ts";
 import type { SearchProviderDeps } from "../lib/search-provider.ts";
 import type { SidecarClient } from "../lib/sidecar.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
 
-const ENDPOINT = "http://search.example/api";
 const PAGE_A = "https://a.test/1";
 const PAGE_B = "https://b.test/2";
 const PAGE_C = "https://c.test/3";
 const SEARCH_FAILED = "SCRAPLING_SEARCH_FAILED";
+const DISCOVER = "search.discover";
+const API_ENDPOINT = "https://api.tavily.test/search";
+const BING_ENDPOINT = "https://bing.test/search";
 
 /** 假 sidecar 的一次调用记录。 */
 interface SidecarCall {
   readonly method: string;
   readonly url: string;
+  readonly params: Record<string, unknown>;
   readonly signal: AbortSignal | undefined;
   readonly extractionType: unknown;
 }
 
-/** 建一个不发网络请求的假 sidecar，并记录它被怎么调。 */
+/** 默认能力面：能抓取、有浏览器。 */
 const DEFAULT_CAPS = { scrapling: true, browser: true };
 
-function fakeSidecar(calls: SidecarCall[], capabilities?: Record<string, unknown>): SidecarClient {
-  const caps = capabilities ?? DEFAULT_CAPS;
+interface SidecarOptions {
+  readonly hits?: unknown[];
+  readonly discovery?: unknown;
+  readonly capabilities?: Record<string, unknown>;
+  readonly onDiscover?: (params: Record<string, unknown>) => unknown;
+  readonly onFetch?: (method: string, params: Record<string, unknown>) => unknown;
+  readonly calls?: SidecarCall[];
+}
+
+/** 建一个不发网络请求的假 sidecar：search.discover 与 fetch/render 分开回。 */
+function makeSidecar(options: SidecarOptions = {}): SidecarClient {
+  const calls = options.calls ?? [];
+  const caps = options.capabilities ?? DEFAULT_CAPS;
   return {
     alive: true,
     capabilities: caps,
     call: (
       method: string,
       params: Record<string, unknown>,
-      options?: { signal?: AbortSignal },
+      callOptions?: { signal?: AbortSignal },
     ): Promise<unknown> => {
-      const url = String(params["url"]);
+      const url = typeof params["url"] === "string" ? params["url"] : "";
       calls.push({
         method,
         url,
-        signal: options?.signal,
+        params,
+        signal: callOptions?.signal,
         extractionType: params["extractionType"],
       });
-      return Promise.resolve({ url, status: 200, content: `BODY-OF ${url}`, truncated: false });
+      if (method === DISCOVER) {
+        return Promise.resolve(
+          options.onDiscover?.(params) ??
+            options.discovery ?? { backend: "bing", hits: options.hits ?? [] },
+        );
+      }
+      return Promise.resolve(
+        options.onFetch?.(method, params) ?? {
+          url,
+          status: 200,
+          content: `BODY-OF ${url}`,
+          truncated: false,
+        },
+      );
     },
   } as unknown as SidecarClient;
 }
 
 function deps(over?: Partial<SearchProviderDeps>): SearchProviderDeps {
   return {
-    sidecar: fakeSidecar([]),
-    searchEndpoint: ENDPOINT,
+    sidecar: makeSidecar(),
+    backend: "bing",
+    apiKey: "",
+    braveApiKey: "",
+    serperApiKey: "",
+    apiEndpoint: API_ENDPOINT,
+    bingEndpoint: BING_ENDPOINT,
+    braveEndpoint: "https://api.search.brave.com/res/v1/web/search",
+    serperEndpoint: "https://google.serper.dev/search",
+    duckduckgoEndpoint: "https://html.duckduckgo.com/html/",
+    searxngEndpoint: "",
+    publicFallback: false,
     renderTopN: 2,
     maxOutputBytes: 100_000,
     timeoutMs: 30_000,
@@ -81,25 +115,11 @@ function blockList(blocked: readonly string[]): (url: string) => Promise<string 
   };
 }
 
-/** 让全局 fetch 返回一段固定的搜索结果。 */
-function stubSearchJson(body: unknown, ok?: boolean, status?: number): ReturnType<typeof vi.fn> {
-  const mock = vi.fn<() => Promise<unknown>>(() =>
-    Promise.resolve({
-      ok: ok ?? true,
-      status: status ?? 200,
-      json: async (): Promise<unknown> => body,
-    }),
-  );
-  vi.stubGlobal("fetch", mock);
-  return mock;
-}
-
 /**
  * 跑一次必须失败的调用，取出它抛出的错误。
  *
- * 用 `.then(成功分支抛错, 取错误)` 而不是 `rejects.toMatchObject`：后者对 Error 实例
- * 不成立（比的是可枚举自有属性），而 WebError 的 code 一旦写错位置它仍然是 WebError，
- * 断言照样「通过」—— 那样就等于没断。
+ * 用 try/catch 而不是 `rejects.toMatchObject`：后者对 Error 实例不成立（比的是可枚举
+ * 自有属性），code 写错位置时它仍然是 Error，断言照样「通过」。
  *
  * @param run - 触发失败的操作
  * @returns 抛出的错误
@@ -113,127 +133,170 @@ async function failureOf(run: () => Promise<unknown>): Promise<Error & { code?: 
   throw new Error("expected this call to fail, but it resolved");
 }
 
-/** 同上，但返回的是「有没有以某个码失败」—— 调用方不必自己解引用。 */
-
-describe("parseSearchResults", () => {
-  it("认 SearXNG 的 results 形状", () => {
-    const hits = parseSearchResults({
-      results: [{ url: PAGE_A, title: "A", content: "SA" }],
-    });
-    expect(hits).toStrictEqual([{ url: PAGE_A, title: "A", snippet: "SA" }]);
-  });
-
-  it("认 items 形状，丢掉 url 为空与不是对象的条目", () => {
-    const hits = parseSearchResults({ items: [{ url: PAGE_B }, { url: "" }, 7] });
-    expect(hits).toStrictEqual([{ url: PAGE_B }]);
-  });
-
-  it("不是对象 / 缺列表时给空数组，不抛", () => {
-    expect(parseSearchResults("nope")).toStrictEqual([]);
-    expect(parseSearchResults({})).toStrictEqual([]);
-    expect(parseSearchResults({ results: "not-an-array" })).toStrictEqual([]);
-  });
-});
-
-describe("search provider", () => {
+describe("search provider 可用性", () => {
   it("id 与 fetch provider 同一个，部署侧只写一处心智", () => {
     expect(SEARCH_PROVIDER_ID).toBe("scrapling");
     expect(createWebSearchProvider(deps()).id).toBe("scrapling");
   });
 
-  it("没配端点时不可用，且不为此发任何网络请求", () => {
-    const fetchMock = stubSearchJson({});
-    expect(createWebSearchProvider(deps({ searchEndpoint: "   " })).available()).toBe(false);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
+  it("sidecar 没握手或没有 scrapling 能力时不可用，且不发任何网络请求", () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({ calls });
+    expect(createWebSearchProvider(deps({ sidecar })).available()).toBe(true);
+    expect(calls).toStrictEqual([]);
 
-  it("sidecar 没握手、或没报 scrapling 能力时都不可用", () => {
-    const base = {
-      alive: true,
+    const dead = {
+      alive: false,
       capabilities: DEFAULT_CAPS,
       call: async (): Promise<unknown> => ({}),
-    };
-    const dead = { alive: false, capabilities: DEFAULT_CAPS, call: base.call };
-    const noCap = { alive: true, capabilities: undefined, call: base.call };
-    expect(
-      createWebSearchProvider(deps({ sidecar: dead as unknown as SidecarClient })).available(),
-    ).toBe(false);
-    expect(
-      createWebSearchProvider(deps({ sidecar: noCap as unknown as SidecarClient })).available(),
-    ).toBe(false);
-    // capabilities 在，但没有 scrapling:true —— 只认浏览器不算具备抓取能力。
-    const browserOnly = fakeSidecar([], { browser: true });
+    } as unknown as SidecarClient;
+    expect(createWebSearchProvider(deps({ sidecar: dead })).available()).toBe(false);
+    const noCap = {
+      alive: true,
+      capabilities: undefined,
+      call: async (): Promise<unknown> => ({}),
+    } as unknown as SidecarClient;
+    expect(createWebSearchProvider(deps({ sidecar: noCap })).available()).toBe(false);
+    const browserOnly = makeSidecar({ capabilities: { browser: true } });
     expect(createWebSearchProvider(deps({ sidecar: browserOnly })).available()).toBe(false);
   });
 
-  it("检索 → 渲染一体：浏览器可用时对前 N 条走 render", async () => {
-    stubSearchJson({
-      results: [
-        { url: PAGE_A, title: "A" },
+  it("auto 没有任何发现路径时不可用 —— 公共引擎不是默认路径（spec D10）", () => {
+    expect(createWebSearchProvider(deps({ backend: "auto" })).available()).toBe(false);
+    expect(
+      createWebSearchProvider(
+        deps({ backend: "auto", searxngEndpoint: "https://searx.test" }),
+      ).available(),
+    ).toBe(true);
+    expect(createWebSearchProvider(deps({ backend: "auto", apiKey: "tvly-x" })).available()).toBe(
+      true,
+    );
+    expect(
+      createWebSearchProvider(deps({ backend: "auto", publicFallback: true })).available(),
+    ).toBe(true);
+  });
+
+  it("显式选后端就算可用：key 缺了交给 search 报 SEARCH_AUTH，而不是静默消失", () => {
+    for (const backend of ["tavily", "brave", "serper", "bing", "duckduckgo", "searxng"] as const) {
+      expect(createWebSearchProvider(deps({ backend, apiKey: "" })).available()).toBe(true);
+    }
+  });
+});
+
+describe("search provider 检索与渲染", () => {
+  it("走 sidecar 的 search.discover，前 N 条用 render 渲染", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({
+      hits: [
+        { url: PAGE_A, title: "A", snippet: "SA" },
         { url: PAGE_B, title: "B" },
         { url: PAGE_C, title: "C" },
       ],
+      calls,
     });
-    const calls: SidecarCall[] = [];
-    const result = await createWebSearchProvider(
-      deps({ sidecar: fakeSidecar(calls), renderTopN: 2 }),
-    ).search({ query: "hello", maxResults: 8 });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 2 })).search({
+      query: "hello",
+      maxResults: 8,
+    });
 
+    expect(calls[0]?.method).toBe(DISCOVER);
+    expect(calls[0]?.params).toMatchObject({ backend: "bing", query: "hello", maxResults: 8 });
+
+    // publicFallback 是 discovery 的输入，必须随载荷下发；sidecar 才不会自己决定发公共查询。
+    const fallbackCalls: SidecarCall[] = [];
+    await createWebSearchProvider(
+      deps({
+        sidecar: makeSidecar({ hits: [], calls: fallbackCalls }),
+        backend: "auto",
+        publicFallback: true,
+        renderTopN: 0,
+      }),
+    ).search({ query: "hello" });
+    expect(fallbackCalls[0]?.params).toMatchObject({ backend: "auto", publicFallback: true });
     expect(result.sources.map((source) => source.url)).toStrictEqual([PAGE_A, PAGE_B, PAGE_C]);
-    // 只有前两条被抓，且走 render（浏览器路径）；第三条只出现在 sources 里。
-    expect(calls.map((call) => call.url)).toStrictEqual([PAGE_A, PAGE_B]);
-    expect(calls.map((call) => call.method)).toStrictEqual(["render", "render"]);
+    expect(calls.slice(1).map((call) => call.url)).toStrictEqual([PAGE_A, PAGE_B]);
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["render", "render"]);
     expect(result.content).toContain(`BODY-OF ${PAGE_A}`);
     expect(result.content).not.toContain(`BODY-OF ${PAGE_C}`);
     expect(result.truncated).toBe(false);
   });
 
-  it("没有浏览器时退回静态抓取，仍是 markdown 抽取", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A }] });
+  it("tavily 的 key 只进 sidecar 参数，不进入结果", async () => {
+    const key = "super-secret-key-123";
     const calls: SidecarCall[] = [];
-    await createWebSearchProvider(
-      deps({ sidecar: fakeSidecar(calls, { scrapling: true, browser: false }), renderTopN: 1 }),
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A, title: "A" }],
+      calls,
+    });
+    const result = await createWebSearchProvider(
+      deps({ sidecar, backend: "tavily", apiKey: key, renderTopN: 0 }),
     ).search({ query: "q" });
-    expect(calls.map((call) => call.method)).toStrictEqual(["fetch"]);
-    expect(calls[0]?.extractionType).toBe("markdown");
+    expect(calls[0]?.params["apiKey"]).toBe(key);
+    expect(JSON.stringify(result)).not.toContain(key);
+  });
+
+  it("每条后端只把自家 key 递给 sidecar", async () => {
+    const tavilyKey = "tavily-key";
+    const cases = [
+      { backend: "brave", key: "brave-key", over: { braveApiKey: "brave-key" } },
+      { backend: "serper", key: "serper-key", over: { serperApiKey: "serper-key" } },
+      { backend: "tavily", key: tavilyKey, over: { apiKey: tavilyKey } },
+    ] as const;
+    await Promise.all(
+      cases.map(async (item) => {
+        const calls: SidecarCall[] = [];
+        const sidecar = makeSidecar({ calls });
+        await createWebSearchProvider(
+          deps({ sidecar, backend: item.backend, apiKey: tavilyKey, renderTopN: 0, ...item.over }),
+        ).search({ query: "q" });
+        expect(calls[0]?.params).toMatchObject({ backend: item.backend, apiKey: item.key });
+      }),
+    );
+  });
+
+  it("没有浏览器时退回静态抓取，仍是 markdown 抽取", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      capabilities: { scrapling: true, browser: false },
+      calls,
+    });
+    await createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({ query: "q" });
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["fetch"]);
+    expect(calls[1]?.extractionType).toBe("markdown");
   });
 
   it("renderTopN=0 时只给链接，不发任何抓取", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A }] });
     const calls: SidecarCall[] = [];
-    const result = await createWebSearchProvider(
-      deps({ sidecar: fakeSidecar(calls), renderTopN: 0 }),
-    ).search({ query: "q" });
-    expect(calls).toStrictEqual([]);
+    const sidecar = makeSidecar({ hits: [{ url: PAGE_A }], calls });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({
+      query: "q",
+    });
+    expect(calls.map((call) => call.method)).toStrictEqual([DISCOVER]);
     expect(result.content).toBeUndefined();
     expect(result.sources).toHaveLength(1);
   });
 
   it("单条抓取失败只跳过那一条，整次搜索仍然成功", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A }, { url: PAGE_B }] });
-    const seen: string[] = [];
-    const sidecar = {
-      alive: true,
-      capabilities: { scrapling: true, browser: true },
-      call: (_method: string, params: Record<string, unknown>): Promise<unknown> => {
-        const url = String(params["url"]);
-        seen.push(url);
-        return url === PAGE_A
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }, { url: PAGE_B }],
+      onFetch: (_method, params) =>
+        params["url"] === PAGE_A
           ? Promise.reject(new Error("boom"))
-          : Promise.resolve({ content: "ok" });
-      },
-    } as unknown as SidecarClient;
+          : Promise.resolve({ content: "ok" }),
+    });
     const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 2 })).search({
       query: "q",
     });
-    expect(seen).toStrictEqual([PAGE_A, PAGE_B]);
     expect(result.sources).toHaveLength(2);
     expect(result.content).toContain("ok");
   });
 
   it("maxResults 截断 sources 并置 truncated", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A }, { url: PAGE_B }, { url: PAGE_C }] });
-    const result = await createWebSearchProvider(deps({ renderTopN: 0 })).search({
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }, { url: PAGE_B }, { url: PAGE_C }],
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({
       query: "q",
       maxResults: 2,
     });
@@ -242,47 +305,46 @@ describe("search provider", () => {
   });
 
   it("源地址全部过准入闸门：判否的条目不进 sources", async () => {
-    // 搜索后端的回包是外部输入，它尽可以回一条内网地址。不过闸门的话，那条地址就原样
-    // 出现在模型眼前，而本包对同一地址的抓取是会被拦下的 —— 一边给结果、一边说不可抓。
-    stubSearchJson({ results: [{ url: PAGE_A }, { url: PAGE_B }, { url: PAGE_C }] });
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }, { url: PAGE_B }, { url: PAGE_C }],
+    });
     const result = await createWebSearchProvider(
-      deps({ renderTopN: 0, urlGate: blockList([PAGE_B]) }),
+      deps({ sidecar, renderTopN: 0, urlGate: blockList([PAGE_B]) }),
     ).search({ query: "q" });
     expect(result.sources.map((source) => source.url)).toStrictEqual([PAGE_A, PAGE_C]);
   });
 
   it("一条都不剩时报错，而不是回一次「成功但没有结果」的搜索", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A }, { url: PAGE_B }] });
+    const sidecar = makeSidecar({ hits: [{ url: PAGE_A }, { url: PAGE_B }] });
     const error = await failureOf(() =>
-      createWebSearchProvider(deps({ renderTopN: 0, urlGate: blockList([PAGE_A, PAGE_B]) })).search(
-        { query: "q" },
-      ),
+      createWebSearchProvider(
+        deps({ sidecar, renderTopN: 0, urlGate: blockList([PAGE_A, PAGE_B]) }),
+      ).search({ query: "q" }),
     );
     expect(error.code).toBe(SEARCH_FAILED);
     expect(error.message).toContain("URL gate");
   });
 
   it("闸门归一过的地址，sources 与真正去抓的都是那一个", async () => {
-    // 判的与引用的必须是同一个串，否则归一化又成一条绕过面。
     const normalized = "https://a.test/normalized";
-    stubSearchJson({ results: [{ url: PAGE_A }] });
     const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({ hits: [{ url: PAGE_A }], calls });
     const result = await createWebSearchProvider(
       deps({
-        sidecar: fakeSidecar(calls),
+        sidecar,
         renderTopN: 1,
         urlGate: async (): Promise<string | undefined> => normalized,
       }),
     ).search({ query: "q" });
     expect(result.sources[0]?.url).toBe(normalized);
-    expect(calls[0]?.url).toBe(normalized);
+    expect(calls[1]?.url).toBe(normalized);
   });
 
   it("后端一条都没回时是正常的空搜索，不过闸也不报错", async () => {
-    stubSearchJson({ results: [] });
+    const sidecar = makeSidecar({ hits: [] });
     const seen: string[] = [];
     const result = await createWebSearchProvider(
-      deps({ renderTopN: 1, urlGate: passGate(seen) }),
+      deps({ sidecar, renderTopN: 1, urlGate: passGate(seen) }),
     ).search({ query: "q" });
     expect(result.sources).toStrictEqual([]);
     expect(seen).toStrictEqual([]);
@@ -290,13 +352,14 @@ describe("search provider", () => {
   });
 
   it("maxResults 不是正整数时直接判否，不夹成一条空结果", async () => {
-    // 夹成 0 的话，这次调用会变成一次「成功但一条结果都没有」的搜索：模型与用户都看不出
-    // 是入参不对，只会以为搜不到东西。
-    stubSearchJson({ results: [{ url: PAGE_A }] });
+    const sidecar = makeSidecar({ hits: [{ url: PAGE_A }] });
     const codes = await Promise.all(
       [0, -3, 2.5].map(async (maxResults) => {
         const error = await failureOf(() =>
-          createWebSearchProvider(deps({ renderTopN: 1 })).search({ query: "q", maxResults }),
+          createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({
+            query: "q",
+            maxResults,
+          }),
         );
         expect(error.message).toContain("maxResults");
         return error.code;
@@ -305,86 +368,105 @@ describe("search provider", () => {
     expect(codes).toStrictEqual([SEARCH_FAILED, SEARCH_FAILED, SEARCH_FAILED]);
   });
 
-  it("搜索后端非 2xx 时抛 provider 特有码，且 code 不是那段文案", async () => {
-    stubSearchJson({}, false, 503);
-    const error = await failureOf(() =>
-      createWebSearchProvider(deps({ renderTopN: 0 })).search({ query: "q" }),
-    );
-    expect(error.code).toBe(SEARCH_FAILED);
-    expect(error.message).toContain("503");
-  });
-
   it("闸门扇出封顶：命中超过 100 条时只把前 100 条拿去过闸", async () => {
-    // 闸门每条一次 DNS：封顶必须落在过闸之前，一万条命中不该触发一万次解析。
-    // 上限值与 lib/search-provider.ts 的 MAX_SOURCES 对齐。
     const hits = Array.from({ length: 150 }, (_unused, index) => ({
       url: `https://h.test/${index}`,
     }));
-    stubSearchJson({ results: hits });
+    const sidecar = makeSidecar({ hits });
     const seen: string[] = [];
-    await createWebSearchProvider(deps({ renderTopN: 0, urlGate: passGate(seen) })).search({
-      query: "q",
-      maxResults: 3,
-    });
+    await createWebSearchProvider(deps({ sidecar, renderTopN: 0, urlGate: passGate(seen) })).search(
+      { query: "q", maxResults: 3 },
+    );
     expect(seen).toHaveLength(100);
   });
 
-  it("端点不是 http(s) 时拒绝，不去读本地文件", async () => {
-    stubSearchJson({ results: [] });
+  it("空查询直接判否，不打 sidecar", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({ calls });
     const error = await failureOf(() =>
-      createWebSearchProvider(deps({ searchEndpoint: "file:///etc/passwd", renderTopN: 0 })).search(
-        {
-          query: "q",
-        },
-      ),
+      createWebSearchProvider(deps({ sidecar })).search({ query: "   " }),
     );
     expect(error.code).toBe(SEARCH_FAILED);
-    expect(error.message).toContain("http(s)");
-  });
-
-  it("空查询直接判否，不打后端", async () => {
-    const fetchMock = stubSearchJson({});
-    const error = await failureOf(() => createWebSearchProvider(deps()).search({ query: "   " }));
-    expect(error.code).toBe(SEARCH_FAILED);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(calls).toStrictEqual([]);
   });
 });
 
-describe("search provider 边界", () => {
-  it("不带 signal 调用也能走通", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A, title: "A", content: "SA" }] });
-    const result = await createWebSearchProvider(deps()).search({ query: "q" });
-    expect(result.sources[0]).toStrictEqual({ url: PAGE_A, title: "A", snippet: "SA" });
-    expect(result.content).toContain(`BODY-OF ${PAGE_A}`);
+describe("search provider 错误与取消", () => {
+  it("tavily 没配 key 时 SEARCH_AUTH 原样透出，不静默换后端", async () => {
+    const key = "super-secret-key-123";
+    const sidecar = makeSidecar({
+      onDiscover: () => Promise.reject(new SidecarError("SEARCH_AUTH", "tavily needs an API key")),
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, backend: "tavily", renderTopN: 0 })).search({
+        query: "q",
+      }),
+    );
+    expect(error.code).toBe("SEARCH_AUTH");
+    expect(error.message).not.toContain(key);
+  });
+
+  it("发现层回包缺 hits 数组时报 SCRAPLING_SEARCH_FAILED", async () => {
+    const sidecar = makeSidecar({ discovery: { backend: "bing" } });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({ query: "q" }),
+    );
+    expect(error.code).toBe(SEARCH_FAILED);
+    expect(error.message).toContain("hits");
+  });
+
+  it("发现层的非 SEARCH_* sidecar 错误折成通用失败码", async () => {
+    const sidecar = makeSidecar({
+      onDiscover: () => Promise.reject(new SidecarError("SIDECAR_CLOSED", "pipe gone")),
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({ query: "q" }),
+    );
+    expect(error.code).toBe(SEARCH_FAILED);
   });
 
   it("URL 归一不出来的条目被丢掉，其余照常", async () => {
-    stubSearchJson({ results: [{ url: "http://[" }, { url: PAGE_A }] });
-    const result = await createWebSearchProvider(deps({ renderTopN: 0 })).search({ query: "q" });
+    const sidecar = makeSidecar({ hits: [{ url: "http://[" }, { url: PAGE_A }] });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({
+      query: "q",
+    });
     expect(result.sources.map((source) => source.url)).toStrictEqual([PAGE_A]);
   });
 
+  it("丢掉非对象条目与空 URL 条目", async () => {
+    const sidecar = makeSidecar({ hits: [7, { url: "" }, { url: PAGE_A }] });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({
+      query: "q",
+    });
+    expect(result.sources.map((source) => source.url)).toStrictEqual([PAGE_A]);
+  });
+
+  it("sidecar 没回 backend 时按配置的后端选基准", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({ discovery: { hits: [{ url: "/relative" }] }, calls });
+    await createWebSearchProvider(deps({ sidecar, backend: "bing", renderTopN: 1 })).search({
+      query: "q",
+    });
+    expect(calls[1]?.url).toBe(new URL("/relative", BING_ENDPOINT).toString());
+  });
+
   it("条目缺 title/snippet 时 sources 只带 url", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A }] });
-    const result = await createWebSearchProvider(deps({ renderTopN: 0 })).search({ query: "q" });
+    const sidecar = makeSidecar({ hits: [{ url: PAGE_A }] });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({
+      query: "q",
+    });
     expect(result.sources[0]).toStrictEqual({ url: PAGE_A });
   });
 
-  it("sidecar 回的不是对象、或 content 非字符串时整次搜索报错，而不是返回空成功", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A }] });
-    const notObject = {
-      alive: true,
-      capabilities: { scrapling: true, browser: false },
-      call: (): Promise<unknown> => Promise.resolve("not-an-object"),
-    } as unknown as SidecarClient;
-    const badContent = {
-      alive: true,
-      capabilities: { scrapling: true, browser: false },
-      call: (): Promise<unknown> => Promise.resolve({ content: 12_345, status: 200 }),
-    } as unknown as SidecarClient;
-
-    // 有 sources 却一条正文都没读到 = 故障，不是一次「成功但没内容」的搜索。
-    // 原因写进错误里：URL 被安全闸门拦下与后端超时是两种完全不同的故障，用户要分得清。
+  it("sidecar 抓取回的不是对象、或 content 非字符串时整次搜索报错", async () => {
+    const notObject = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      onFetch: () => Promise.resolve("not-an-object"),
+    });
+    const badContent = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      onFetch: () => Promise.resolve({ content: 12_345, status: 200 }),
+    });
     await expect(
       createWebSearchProvider(deps({ sidecar: notObject, renderTopN: 1 })).search({ query: "q" }),
     ).rejects.toThrow(/no body/u);
@@ -394,98 +476,75 @@ describe("search provider 边界", () => {
   });
 
   it("URL 全被安全闸门拦下时报错，原因里点名 URL_BLOCKED", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A }] });
-    const blocked = {
-      alive: true,
-      capabilities: { scrapling: true, browser: false },
-      call: (): Promise<unknown> =>
-        Promise.reject(new SidecarError("URL_BLOCKED", "169.254.169.254: metadata")),
-    } as unknown as SidecarClient;
-    let caught: (Error & { code?: string }) | undefined;
-    try {
-      await createWebSearchProvider(deps({ sidecar: blocked, renderTopN: 1 })).search({
-        query: "q",
-      });
-    } catch (error) {
-      caught = error as Error & { code?: string };
-    }
-    expect(caught?.code).toBe("SCRAPLING_SEARCH_FAILED");
-    expect(caught?.message).toContain("URL_BLOCKED");
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      onFetch: () => Promise.reject(new SidecarError("URL_BLOCKED", "169.254.169.254: metadata")),
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({ query: "q" }),
+    );
+    expect(error.code).toBe(SEARCH_FAILED);
+    expect(error.message).toContain("URL_BLOCKED");
   });
 
-  it("取消不被当成「这条链接死了」，整次调用照常抛出", async () => {
-    stubSearchJson({ results: [{ url: PAGE_A }] });
+  it("发现阶段被取消时原样抛出", async () => {
     const controller = new AbortController();
-    const aborting = {
-      alive: true,
-      capabilities: { scrapling: true, browser: false },
-      call: (): Promise<unknown> => {
+    const sidecar = makeSidecar({
+      onDiscover: () => {
         controller.abort();
-        return Promise.reject(new Error("aborted"));
+        return Promise.reject(new Error("The operation was aborted"));
       },
-    } as unknown as SidecarClient;
-    await expect(
-      createWebSearchProvider(deps({ sidecar: aborting, renderTopN: 1 })).search(
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search(
         { query: "q" },
         controller.signal,
       ),
-    ).rejects.toThrow(/aborted/u);
+    );
+    expect(error.code).toBeUndefined();
+    expect(error.message).toContain("aborted");
   });
 
   it("抓取途中被取消时，取消原样抛出而不是被包成搜索失败", async () => {
-    // 取消的语义是「这次调用作废」。包成 provider 失败码的话，seam 那头看到的就是一次
-    // 搜索失败，日志与用户提示都会指错方向。
-    stubSearchJson({ results: [{ url: PAGE_A }] });
     const controller = new AbortController();
-    const aborting = {
-      alive: true,
-      capabilities: { scrapling: true, browser: false },
-      call: (): Promise<unknown> => {
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      onFetch: () => {
         controller.abort();
         return Promise.reject(new Error("this call was aborted"));
       },
-    } as unknown as SidecarClient;
-    const caught = await failureOf(() =>
-      createWebSearchProvider(deps({ sidecar: aborting, renderTopN: 1 })).search(
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search(
         { query: "q" },
         controller.signal,
       ),
     );
-    expect(caught.code).toBeUndefined();
-    expect(caught.message).toContain("aborted");
+    expect(error.code).toBeUndefined();
+    expect(error.message).toContain("aborted");
   });
 
-  it("搜索后端那次请求本身被取消时，取消原样抛出", async () => {
-    // 与抓取途中被取消同一处理：取消不是 provider 故障，包上失败码会让日志指错方向。
+  it("signal 同时透给发现层与 sidecar 抓取", async () => {
     const controller = new AbortController();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn<() => Promise<unknown>>(() => {
-        controller.abort();
-        return Promise.reject(new Error("The operation was aborted"));
-      }),
-    );
-    const caught = await failureOf(() =>
-      createWebSearchProvider(deps({ renderTopN: 0 })).search({ query: "q" }, controller.signal),
-    );
-    expect(caught.code).toBeUndefined();
-    expect(caught.message).toContain("aborted");
-  });
-
-  it("signal 同时透给搜索后端与 sidecar 抓取", async () => {
-    const fetchMock = stubSearchJson({ results: [{ url: PAGE_A }] });
     const calls: SidecarCall[] = [];
-    const controller = new AbortController();
-    await createWebSearchProvider(deps({ sidecar: fakeSidecar(calls), renderTopN: 1 })).search(
+    const sidecar = makeSidecar({ hits: [{ url: PAGE_A }], calls });
+    await createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search(
       { query: "q" },
       controller.signal,
     );
-    const options = fetchMock.mock.calls[0]?.[1] as { signal?: AbortSignal } | undefined;
-    // 搜索后端拿到的是「调用方取消 + 本次搜索超时」的组合信号，不是原对象本身：
-    // 只转原 signal 的话，调用方没给 signal 时这一枪就没有任何超时。
-    expect(options?.signal?.aborted).toBe(false);
-    controller.abort();
-    expect(options?.signal?.aborted).toBe(true);
     expect(calls[0]?.signal).toBe(controller.signal);
+    expect(calls[1]?.signal).toBe(controller.signal);
+  });
+
+  it("自动后端按 sidecar 回的 backend 选相对 URL 的基准", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({
+      discovery: { backend: "tavily", hits: [{ url: "/relative" }] },
+      calls,
+    });
+    await createWebSearchProvider(deps({ sidecar, backend: "auto", renderTopN: 1 })).search({
+      query: "q",
+    });
+    expect(calls[1]?.url).toBe(new URL("/relative", API_ENDPOINT).toString());
   });
 });

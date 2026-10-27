@@ -18,8 +18,16 @@
 // 写入用**第一笔改动落地时**读到的 revision 作围栏，而不是点击保存那一刻的最新值 ——
 // 后者会让宿主的冲突检测失效，把别处刚写下的值无声覆盖掉。
 
-import { createElement, useState, useSyncExternalStore } from "react";
+import { createElement, useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
+import { RUNTIME_PACKS, packLabelKey, packStateKey } from "../lib/runtime-shape.ts";
+import type {
+  PackState,
+  RuntimeJobView,
+  RuntimePack,
+  RuntimeStatusResult,
+} from "../lib/runtime-shape.ts";
+import type { RuntimeReader } from "./runtime-reader.ts";
 import { SETTINGS_FIELDS, SETTINGS_GROUPS } from "./settings-fields.ts";
 import type { FieldSpec, GroupSpec } from "./settings-fields.ts";
 
@@ -65,6 +73,11 @@ export interface CardProps {
   /** 由 slot 注册的 `locale` 席位注入；bundle 页自己不给，卡片也没有别的取字途径。 */
   readonly t: Translate;
   readonly form?: FormSource | undefined;
+  /**
+   * 宿主 runtime 读面；缺席（没有 remote 服务或客户端 ctx 没有 `get`）时卡片显示 CLI 命令。
+   * 与 form 分开：它是动作入口，不是配置字段，和 schema 的对账表没有关系。
+   */
+  readonly runtime?: RuntimeReader | undefined;
 }
 
 /** 没给值面时读到的那一版：既不在线也不可写，于是卡片画出一张锁住的空表。 */
@@ -186,6 +199,9 @@ export function buildOps(draft: Readonly<Record<string, unknown>>): PathOp[] {
     });
 }
 
+const BUTTON_CLASS = "dss-button";
+const STATUS_CLASS = "dss-status";
+
 /** 卡片样式。跟着宿主的语义色走，因此明暗两套主题都成立。 */
 const CARD_CSS = `
 .dss-card{display:flex;flex-direction:column;gap:16px;color:var(--dsw-alias-label-primary)}
@@ -214,6 +230,14 @@ const CARD_CSS = `
 .dss-button:disabled{opacity:.5;cursor:not-allowed}
 .dss-status{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px}
 .dss-status[data-error=true]{color:var(--dsw-alias-state-error-primary)}
+.dss-runtime{display:flex;flex-direction:column;gap:10px;border-top:.5px solid var(--dsw-alias-border-l2);padding-top:16px}
+.dss-runtimeInfo{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;word-break:break-all}
+.dss-packs{display:flex;flex-direction:column;gap:8px}
+.dss-pack{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center}
+.dss-packState{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px}
+.dss-packActions{display:flex;gap:6px;grid-column:2;justify-content:flex-end}
+.dss-command{display:block;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all}
+.dss-job{margin:0;max-height:180px;overflow:auto;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap}
 @media (max-width:560px){.dss-field{grid-template-columns:minmax(0,1fr)}.dss-hint,.dss-control{grid-column:1}}
 `;
 
@@ -515,7 +539,7 @@ function renderActions(props: {
       "button",
       {
         type: "button",
-        className: "dss-button",
+        className: BUTTON_CLASS,
         "data-primary": "true",
         disabled: idle || blocked || saving || !editable,
         onClick: onSave,
@@ -526,13 +550,330 @@ function renderActions(props: {
       "button",
       {
         type: "button",
-        className: "dss-button",
+        className: BUTTON_CLASS,
         disabled: idle || blocked || saving,
         onClick: onUndo,
       },
       t("undo"),
     ),
   );
+}
+
+/** 运行环境一节的交互状态与动作。 */
+interface RuntimeState {
+  snapshot: RuntimeStatusResult | null;
+  busy: string;
+  failure: string;
+  act: (pack: RuntimePack, mode: "install" | "repair") => void;
+  cancel: () => void;
+}
+
+/**
+ * 运行环境一节的状态机：读一次状态，作业在跑时每 2s 轮询。
+ *
+ * 轮询只在作业活着时开：空闲时不断敲 status 会让浏览器网络面板一直有请求，而作业结束后
+ * 结果已经落在 snapshot 里，不需要再看。
+ *
+ * @param reader - 宿主读面；undefined 时什么都不做（卡片显示 CLI 命令）
+ * @returns 状态与动作
+ */
+function useRuntime(reader: RuntimeReader | undefined): RuntimeState {
+  const [snapshot, setSnapshot] = useState<RuntimeStatusResult | null>(null);
+  const [busy, setBusy] = useState("");
+  const [failure, setFailure] = useState("");
+  const refresh = useCallback(async (): Promise<void> => {
+    if (reader === undefined) {
+      return;
+    }
+    try {
+      setSnapshot(await reader.status());
+      setFailure("");
+    } catch (error) {
+      setFailure(String(error));
+    }
+  }, [reader]);
+  const running = snapshot?.job?.status === "running" || snapshot?.job?.status === "stopping";
+  useEffect(() => {
+    if (reader === undefined) {
+      return;
+    }
+    void refresh();
+  }, [reader, refresh]);
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | undefined;
+    if (reader !== undefined && running) {
+      timer = setInterval(() => {
+        void refresh();
+      }, 2000);
+    }
+    return (): void => {
+      if (timer !== undefined) {
+        clearInterval(timer);
+      }
+    };
+  }, [reader, running, refresh]);
+  const act = useCallback(
+    (pack: RuntimePack, mode: "install" | "repair"): void => {
+      if (reader === undefined) {
+        return;
+      }
+      setBusy(pack);
+      setFailure("");
+      void (async (): Promise<void> => {
+        try {
+          const result = mode === "repair" ? await reader.repair(pack) : await reader.install(pack);
+          if (result.ok) {
+            await refresh();
+          } else {
+            setFailure(result.error);
+          }
+        } catch (error) {
+          setFailure(String(error));
+        } finally {
+          setBusy("");
+        }
+      })();
+    },
+    [reader, refresh],
+  );
+  const cancel = useCallback((): void => {
+    const job = snapshot?.job;
+    if (reader === undefined || job === null || job === undefined) {
+      return;
+    }
+    setBusy("cancel");
+    setFailure("");
+    void (async (): Promise<void> => {
+      try {
+        const result = await reader.cancel(job.id);
+        if (result.ok) {
+          await refresh();
+        } else {
+          setFailure(result.error);
+        }
+      } catch (error) {
+        setFailure(String(error));
+      } finally {
+        setBusy("");
+      }
+    })();
+  }, [reader, refresh, snapshot]);
+  return { snapshot, busy, failure, act, cancel };
+}
+
+/** 一条能力包：名称、状态与两个动作。 */
+function renderPackRow(props: {
+  readonly pack: RuntimePack;
+  readonly state: PackState | null;
+  readonly t: Translate;
+  readonly disabled: boolean;
+  readonly running: boolean;
+  readonly activePack: RuntimePack | null;
+  readonly onAct: (pack: RuntimePack, mode: "install" | "repair") => void;
+  readonly onCancel: () => void;
+}): ReactNode {
+  const { pack, state, t, disabled, running, activePack, onAct, onCancel } = props;
+  const stateText = state === null ? t("statusLoading") : t(packStateKey(state));
+  const packLabel = t(packLabelKey(pack));
+  const rowDisabled = disabled || state === null || state === "blocked" || state === "installing";
+  const actions: ReactNode[] = [
+    createElement(
+      "button",
+      {
+        type: "button",
+        className: BUTTON_CLASS,
+        key: "install",
+        disabled: rowDisabled || state === "ready",
+        onClick: (): void => {
+          onAct(pack, "install");
+        },
+      },
+      t("runtimeInstall"),
+    ),
+    createElement(
+      "button",
+      {
+        type: "button",
+        className: BUTTON_CLASS,
+        key: "repair",
+        disabled: rowDisabled || state === "missing",
+        onClick: (): void => {
+          onAct(pack, "repair");
+        },
+      },
+      t("runtimeRepair"),
+    ),
+  ];
+  if (running && activePack === pack) {
+    actions.push(
+      createElement(
+        "button",
+        {
+          type: "button",
+          className: BUTTON_CLASS,
+          key: "cancel",
+          disabled,
+          onClick: onCancel,
+        },
+        t("runtimeCancel"),
+      ),
+    );
+  }
+  return createElement(
+    "div",
+    { className: "dss-pack", key: pack },
+    createElement(
+      "div",
+      null,
+      createElement("div", { className: "dss-label" }, packLabel),
+      createElement("p", { className: "dss-packState" }, stateText),
+    ),
+    createElement("div", { className: "dss-packActions" }, ...actions),
+  );
+}
+
+/** 运行环境一节。没有远程面或没有作业后端时都退到可照抄的 CLI 命令。 */
+function renderRuntime(props: {
+  readonly reader: RuntimeReader | undefined;
+  readonly t: Translate;
+  readonly snapshot: RuntimeStatusResult | null;
+  readonly busy: string;
+  readonly failure: string;
+  readonly onAct: (pack: RuntimePack, mode: "install" | "repair") => void;
+  readonly onCancel: () => void;
+}): ReactNode {
+  const { reader, t, snapshot, busy, failure, onAct, onCancel } = props;
+  const header = createElement("h3", { className: "dss-groupTitle" }, t("runtimeTitle"));
+  const hint = createElement("p", { className: "dss-note" }, t("runtimeHint"));
+  const command = createElement(
+    "code",
+    { className: "dss-command" },
+    "dsh-scrapling setup --feature <pack> --apply",
+  );
+  const failureLine =
+    failure === ""
+      ? null
+      : createElement(
+          "p",
+          { className: STATUS_CLASS, "data-error": "true", role: "alert" },
+          t("runtimeError", { reason: failure }),
+        );
+  if (reader === undefined) {
+    return createElement(
+      "section",
+      { className: "dss-runtime" },
+      header,
+      hint,
+      createElement("p", { className: STATUS_CLASS }, t("runtimeUnavailable")),
+      command,
+    );
+  }
+  const jobsReady = snapshot?.jobsReady ?? false;
+  const job: RuntimeJobView | null = snapshot?.job ?? null;
+  const running = job !== null && (job.status === "running" || job.status === "stopping");
+  const info =
+    snapshot === null
+      ? null
+      : createElement(
+          "p",
+          { className: "dss-runtimeInfo" },
+          `${t("runtimePython")}: ${snapshot.python.path} (${snapshot.python.via})`,
+          createElement("br"),
+          `${t("runtimeDataDir")}: ${snapshot.dataDir}`,
+        );
+  const jobPack = job === null ? "" : t(packLabelKey(job.pack));
+  const jobLine =
+    job === null
+      ? null
+      : createElement(
+          "p",
+          { className: STATUS_CLASS },
+          running
+            ? t("runtimeJobRunning", { pack: jobPack })
+            : t("runtimeJobEnded", { status: job.status }),
+        );
+  const jobOutput =
+    job === null || job.output === ""
+      ? null
+      : createElement("pre", { className: "dss-job" }, job.output);
+  const disabled = busy !== "" || !jobsReady || snapshot === null;
+  const rows = RUNTIME_PACKS.map((pack) =>
+    renderPackRow({
+      pack,
+      state: snapshot?.packs[pack] ?? null,
+      t,
+      disabled,
+      running,
+      activePack: job?.pack ?? null,
+      onAct,
+      onCancel,
+    }),
+  );
+  const cliHint =
+    snapshot !== null && !jobsReady
+      ? createElement(
+          "div",
+          null,
+          createElement("p", { className: STATUS_CLASS }, t("runtimeJobsMissing")),
+          command,
+        )
+      : null;
+  return createElement(
+    "section",
+    { className: "dss-runtime" },
+    header,
+    hint,
+    info,
+    failureLine,
+    jobLine,
+    jobOutput,
+    createElement("div", { className: "dss-packs" }, ...rows),
+    cliHint,
+  );
+}
+
+/** 一次保存：把草稿按 revision 围栏写回宿主，并把结果落到卡片状态。 */
+async function commitDraft(args: {
+  readonly form: FormSource;
+  readonly draft: Draft;
+  readonly ops: readonly PathOp[];
+  readonly state: FormState;
+  readonly t: Translate;
+  readonly setDraft: (update: (previous: Draft) => Draft) => void;
+  readonly setFailure: (value: string) => void;
+  readonly setSaving: (value: boolean) => void;
+}): Promise<void> {
+  const { form, draft, ops, state, t, setDraft, setFailure, setSaving } = args;
+  setSaving(true);
+  setFailure("");
+  try {
+    // 围栏用「第一笔改动时」的 revision。传点击那一刻的最新值等于没传：宿主在这期间
+    // 被别处改过时，本卡的陈旧草稿会带着新 revision 提交，冲突检测形同不存在。
+    const accepted = await form.mutate(ops, draft.baseRevision);
+    if (accepted) {
+      // 只摘掉这次真正发出去的字段：控件在 await 期间是锁着的，但程序化改动仍可能落进来。
+      setDraft((previous) => {
+        const values = { ...previous.values };
+        for (const op of ops) {
+          const [key] = op.path;
+          Reflect.deleteProperty(values, key);
+        }
+        // 围栏与非法原文都只对「草稿里还剩东西」有意义：清空之后就该回到干净起点，
+        // 否则下一次改动会继承一个已经过期的 revision 与一条没人再看的非法原文。
+        return Object.keys(values).length === 0 ? EMPTY_DRAFT : { ...previous, values };
+      });
+    } else {
+      setFailure(
+        draft.baseRevision !== undefined && draft.baseRevision !== state.revision
+          ? t("stale")
+          : t("rejected"),
+      );
+    }
+  } catch (error) {
+    setFailure(t("failed", { reason: String(error) }));
+  } finally {
+    setSaving(false);
+  }
 }
 
 /** 设置卡本体。导出为常量而非函数声明：它是 React 组件，不是可 new 的类。 */
@@ -552,6 +893,8 @@ export function SettingsCard(props: CardProps): ReactNode {
     form === undefined ? loadingSubscribe : form.subscribe,
     form === undefined ? loadingSnapshot : form.getSnapshot,
   );
+  // 运行环境的 hook 同样留在早退之前：它会挂一次状态读取与一个按作业存活的轮询。
+  const runtime = useRuntime(props.runtime);
   // 摘要视图不画表单；宿主只在官方插件的卡片上才用这个视图，本包是 bundle 走不到，真走到
   // 时返回一个空 div 也好过抛错把整张卡顶掉。
   if (props.view !== "page" || form === undefined) {
@@ -560,36 +903,7 @@ export function SettingsCard(props: CardProps): ReactNode {
   const editable = state.writable && state.status === "ready";
   const ops = buildOps(draft.values);
   const save = async (): Promise<void> => {
-    setSaving(true);
-    setFailure("");
-    try {
-      // 围栏用「第一笔改动时」的 revision。传点击那一刻的最新值等于没传：宿主在这期间
-      // 被别处改过时，本卡的陈旧草稿会带着新 revision 提交，冲突检测形同不存在。
-      const accepted = await form.mutate(ops, draft.baseRevision);
-      if (accepted) {
-        // 只摘掉这次真正发出去的字段：控件在 await 期间是锁着的，但程序化改动仍可能落进来。
-        setDraft((previous) => {
-          const values = { ...previous.values };
-          for (const op of ops) {
-            const [key] = op.path;
-            Reflect.deleteProperty(values, key);
-          }
-          // 围栏与非法原文都只对「草稿里还剩东西」有意义：清空之后就该回到干净起点，
-          // 否则下一次改动会继承一个已经过期的 revision 与一条没人再看的非法原文。
-          return Object.keys(values).length === 0 ? EMPTY_DRAFT : { ...previous, values };
-        });
-      } else {
-        setFailure(
-          draft.baseRevision !== undefined && draft.baseRevision !== state.revision
-            ? t("stale")
-            : t("rejected"),
-        );
-      }
-    } catch (error) {
-      setFailure(t("failed", { reason: String(error) }));
-    } finally {
-      setSaving(false);
-    }
+    await commitDraft({ form, draft, ops, state, t, setDraft, setFailure, setSaving });
   };
   const onFieldChange = (field: FieldSpec, raw: string): void => {
     setFailure("");
@@ -648,7 +962,7 @@ export function SettingsCard(props: CardProps): ReactNode {
   });
   const status = createElement(
     "p",
-    { className: "dss-status", "data-error": "false", role: "status", "aria-live": "polite" },
+    { className: STATUS_CLASS, "data-error": "false", role: "status", "aria-live": "polite" },
     statusLine(t, state, ops.length, draft.invalid.length),
   );
   const reported =
@@ -657,12 +971,28 @@ export function SettingsCard(props: CardProps): ReactNode {
       : createElement(
           "p",
           {
-            className: "dss-status",
+            className: STATUS_CLASS,
             "data-error": "true",
             role: "alert",
             "aria-live": "assertive",
           },
           failure,
         );
-  return createElement("div", { className: "dss-card" }, status, reported, ...groups, actions);
+  return createElement(
+    "div",
+    { className: "dss-card" },
+    status,
+    reported,
+    ...groups,
+    renderRuntime({
+      reader: props.runtime,
+      t,
+      snapshot: runtime.snapshot,
+      busy: runtime.busy,
+      failure: runtime.failure,
+      onAct: runtime.act,
+      onCancel: runtime.cancel,
+    }),
+    actions,
+  );
 }

@@ -6,7 +6,9 @@
     "test/**/*.ts",
     "build-host.ts",
     "build-client.ts",
+    "build-cli.ts",
     "build-helpers.ts",
+    "cli-main.ts",
     "vitest.config.ts"
   ]
 }

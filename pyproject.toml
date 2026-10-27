@@ -10,7 +10,7 @@
 #   npm run lint:py        ruff check
 #   npm run fmt:py         ruff format --check
 #   npm run typecheck:py   mypy
-#   npm run bandit:py      bandit -q -ll（medium 及以上；Low 记入已知缺口，不加 # nosec）
+#   npm run bandit:py      bandit -q -r py/（全部 severity；误报用带理由的 # nosec）
 #   npm run test:py        py/tests/test_bridge.py 端到端
 #   npm run coverage:floor 覆盖率地板；cov:py 是"看缺口在哪"的报表面
 # 以上全在 check:py 里，随 pnpm run check 进 CI。
@@ -35,11 +35,18 @@ select = [
   "RET", # flake8-return：return 前的多余赋值
   "BLE001", # 裸 except Exception —— 本仓库刻意保留带理由的既有抑制，开这条等于把它们一起判死
   "PLW0603", # global 语句 —— 同理，抑制标记里写着「为什么可以」
-  "S603", # subprocess 调用 —— 守卫读系统代理的参数全是本文件常量
+  "S", # flake8-bandit：安全类（含 S603 子进程调用）
   "N802", # 函数命名 —— BaseHTTPRequestHandler 的 do_GET 约定
   "E402", # 模块级 import 不在文件头 —— bridge.py 为避开循环依赖而内联导入
+  "C90", # mccabe：函数复杂度
+  "ANN", # flake8-annotations：注解完整性；ANN401 单列 ignore
   "RUF100", # 失效的 noqa：抑制理由还留着、但那条违规已经不在了（或那条规则压根没开）
 ]
+ignore = ["ANN401"]
+
+# 以当前最高复杂度为棘轮；新增函数不得更复杂，收紧前先拆现有函数。
+[tool.ruff.lint.mccabe]
+max-complexity = 28
 
 # 上面 RUF100 是这段配置的兑现面：没有它，`# noqa` 会从「有人校验的断言」退化成「没人读的死文档」——
 # 该抑制的理由还在，但「这条已经不需要抑制了」与「新加了一处违规」都不会让任何门变红。
@@ -50,10 +57,13 @@ select = [
 
 [tool.mypy]
 ignore_missing_imports = true
-# 不设 warn_unused_ignores / disallow_untyped_defs 那一族：这一侧的 duck 类型是刻意
-# 的（Playwright 对象、跨语言回包），严格档会逼出一堆只为进一步沉默而存在的 ignore。
-# mypy 已进 check:py：它报的是「标注与实现不一致」，这一侧要在门禁里看见。
+# 严格档：未注解的函数体也要查，失效的 type: ignore 与未注解 def 都判红；
+# 第三方缺 stubs 时仍按 Any 处理（Playwright 对象是运行时形状）。
 python_version = "3.14"
+# 未注解的函数体也要查；失效的 type: ignore 与未注解 def 都判红。
+check_untyped_defs = true
+disallow_untyped_defs = true
+warn_unused_ignores = true
 
 [tool.coverage.run]
 # 只量随包发布的源文件 + 测试脚本本身；__pycache__ 与 _env 一概不进。

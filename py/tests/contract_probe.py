@@ -49,6 +49,7 @@ if str(PY_DIR) not in sys.path:
     sys.path.insert(0, str(PY_DIR))
 
 import adapters  # noqa: E402
+import redact  # noqa: E402
 from scrapling.engines._browsers import _types as engine_types  # noqa: E402
 from scrapling.engines._browsers._validators import _fetch_params  # noqa: E402
 
@@ -271,8 +272,8 @@ def _restore(originals: dict[str, Any]) -> None:
 
     :param originals: :func:`_install_recorders` 的返回
     """
-    adapters.Fetcher = originals["Fetcher"]  # type: ignore[misc,assignment]
-    adapters.StealthyFetcher = originals["StealthyFetcher"]  # type: ignore[misc,assignment]
+    adapters.Fetcher = originals["Fetcher"]  # type: ignore[misc]
+    adapters.StealthyFetcher = originals["StealthyFetcher"]  # type: ignore[misc]
     fetchers = originals["fetchers"]
     for name, obj in zip(originals["names"], originals["sessions"], strict=True):
         setattr(fetchers, name, obj)
@@ -389,7 +390,8 @@ def drive() -> None:
     ):
         extra = _browser_args() if kind != "static" else {}
         info = adapters.session_open(_full_args({**open_args, **extra, "sessionId": f"s-{kind}"}))
-        assert info["sessionId"] == f"s-{kind}"
+        if info["sessionId"] != f"s-{kind}":
+            raise AssertionError(info["sessionId"])
         fetch_extra = _browser_args() if kind != "static" else {"timeoutSeconds": 15.0, "retries": 1}
         adapters.session_fetch(_full_args({**fetch_extra, "sessionId": f"s-{kind}"}))
         if kind != "static":
@@ -411,8 +413,18 @@ def drive() -> None:
         adapters.session_close({"sessionId": f"s-{kind}"})
     adapters.close_all_sessions()
 
-    # 离线抽取与选择器：不发网络，但要确认传给 Selector / Response 的键名是上游真收的。
-    adapters.extract(_full_args({"html": HTML}))
+    # 已有 HTML 的正文归一：不发网络，但要确认传给 Response / Convertor 的键名是上游真收的。
+    # 协议面不再单开一个离线方法，这里直接摆到与 session.read 同一处的调用点上。
+    offline_args = _full_args({"html": HTML})
+    offline_type, offline_selector, offline_main, offline_limit = adapters._extraction(offline_args)
+    adapters.to_payload(
+        _response(str(offline_args["url"])),
+        extraction_type=offline_type,
+        css_selector=offline_selector,
+        main_content_only=offline_main,
+        max_content_chars=offline_limit,
+        strip_inline_images=adapters._strip_inline_images(offline_args),
+    )
     adapters.select(
         {
             "html": HTML,
@@ -428,7 +440,7 @@ def drive() -> None:
     adapters.select({"html": HTML, "selector": "//h1", "useXpath": True, "adaptive": True, "url": URL})
 
 
-class Recording(dict):  # type: ignore[type-arg]
+class Recording(dict):
     """记录每一次按键读取的字典。
 
     为什么不用静态解析：adapters 里有一批「按表驱动」的读法 ——
@@ -502,6 +514,8 @@ READ_PROBE_ARGS: dict[str, Any] = {
     "crawlId": "c-reads",
     "maxPages": 2,
     "maxDurationMs": 60_000,
+    "includePatterns": [r"/a"],
+    "excludePatterns": [r"/b"],
     "since": 0,
     "urlPattern": "/api/",
     "networkLimit": 5,
@@ -534,11 +548,94 @@ READ_PROBE_ARGS: dict[str, Any] = {
 # 只跑一遍会把「分支里真读了」误报成「没读」——那种误报一旦进门禁，就逼着人去加豁免，
 # 而豁免加多了，真正的「发了没人读」也跟着沉默。所以按方法列出要走的分支。
 READ_VARIANTS: dict[str, list[dict[str, Any]]] = {
-    "session.open": [{"sessionType": kind} for kind in ("static", "stealth")],
-    "session.fetch": [{"sessionType": kind} for kind in ("static", "stealth")],
+    # select 的查询参数分两条路：css/xpath 走自适应参数，text/regex/similar 走 query_nodes。
+    # 后一条要求关掉 adaptive，否则会在读这些键之前就以 BAD_ARGS 收场。
+    "select": [
+        {"queryType": "css"},
+        {"queryType": "xpath"},
+        {"queryType": "text", "adaptive": False},
+        {"queryType": "regex", "adaptive": False},
+        {"queryType": "similar", "adaptive": False},
+        # adaptive 的 Redis 分支：只有走到这一支，`deployment.redisUrl` 才会被真的读一次。
+        # 端口 1 必然拒绝，异常发生在记账之后，由外层 suppress 收下。
+        {
+            "queryType": "css",
+            "deployment": {"adaptiveStorage": "redis", "redisUrl": "redis://127.0.0.1:1/0"},
+        },
+    ],
+    # 浏览器会话的 cookies 是 Playwright 列表，而 fetch 探针里的 cookies 是键值对象；
+    # 这两种形状不能共用同一份入参，否则会话在读完键之前就以 BAD_ARGS 收场。
+    "session.open": [
+        {"sessionType": "static"},
+        {"sessionType": "stealth", "cookies": [{"name": "c", "value": "1"}]},
+    ],
+    # 浏览器参数读的是 Playwright cookie 列表，而 fetch 探针的 cookies 是键值对象。
+    # 不覆盖的话，_browser_params 会在读 cookies 时抛错，后面的键一个都记不到。
+    # 两条后端各走一遍：Bing 读 bingEndpoint，Tavily 读 apiKey/apiEndpoint；端点指向本机
+    # 关闭端口，调用会在记录完读取之后快速失败，不影响键表。
+    "search.discover": [
+        # auto 是一条独立分支，它先读 publicFallback，再按 apiKey / searxngEndpoint 分流；
+        # 只跑显式后端的话这几个键永远不进「读过的键」表，TS 侧发过去就成了没证据的悬空键。
+        # 四条各走一遍：无 key/端点（报 SEARCH_BACKEND_MISSING）、有 key、有 SearXNG 端点、
+        # 允许公共回退（只有这一条才会读 bingEndpoint）。
+        {"backend": "auto", "query": "q"},
+        {
+            "backend": "auto",
+            "query": "q",
+            "apiKey": "probe-key",
+            "apiEndpoint": "http://127.0.0.1:1/tavily",
+        },
+        {"backend": "auto", "query": "q", "searxngEndpoint": "http://127.0.0.1:1/searxng"},
+        {"backend": "auto", "query": "q", "publicFallback": True, "bingEndpoint": "http://127.0.0.1:1/bing"},
+        {"backend": "bing", "query": "q", "bingEndpoint": "http://127.0.0.1:1/bing"},
+        {
+            "backend": "tavily",
+            "query": "q",
+            "apiKey": "probe-key",
+            "apiEndpoint": "http://127.0.0.1:1/tavily",
+        },
+        # 四条新后端各走一趟：端点指到 127.0.0.1:1，连接必失败，但键已经被读过。
+        {
+            "backend": "brave",
+            "query": "q",
+            "apiKey": "probe-key",
+            "braveEndpoint": "http://127.0.0.1:1/brave",
+        },
+        {
+            "backend": "serper",
+            "query": "q",
+            "apiKey": "probe-key",
+            "serperEndpoint": "http://127.0.0.1:1/serper",
+        },
+        {
+            "backend": "duckduckgo",
+            "query": "q",
+            "duckduckgoEndpoint": "http://127.0.0.1:1/ddg",
+        },
+        {
+            "backend": "searxng",
+            "query": "q",
+            "searxngEndpoint": "http://127.0.0.1:1/searxng",
+        },
+    ],
+    "render": [{"cookies": [{"name": "c", "value": "1"}]}],
+    "capture": [{"cookies": [{"name": "c", "value": "1"}]}],
+    "session.fetch": [
+        {"sessionType": kind, "cookies": [{"name": "c", "value": "1"}]} for kind in ("static", "stealth")
+    ],
     "session.network": [{"sessionType": "stealth"}],
     "session.state_save": [{"sessionType": "stealth"}],
     "session.state_load": [{"sessionType": "stealth"}],
+    "session.read": [{"sessionType": "stealth", "cookies": [{"name": "c", "value": "1"}]}],
+    "session.act": [
+        {
+            "sessionType": "stealth",
+            "cookies": [{"name": "c", "value": "1"}],
+            "actions": [{"type": "wait_time", "ms": 0}],
+        }
+    ],
+    "screenshot": [{"sessionType": "stealth", "cookies": [{"name": "c", "value": "1"}]}],
+    "download": [{}],
     "fetch": [{"method": verb} for verb in ("GET", "POST")],
 }
 
@@ -549,7 +646,11 @@ def reads_by_method() -> dict[str, list[str]]:
     :returns: 方法名到读过的键列表
     """
     import crawl
+    import guard
 
+    saved_actions = guard.ALLOW_BROWSER_ACTIONS
+    saved_downloads = guard.ALLOW_FILE_DOWNLOADS
+    guard.configure(allow_browser_actions=True, allow_file_downloads=True)
     originals = _install_recorders()
     # 读取面这一趟会把引擎调用点也记进 CALLS，而 check()/facts() 读的是「按完整参数驱动
     # adapters 的那批记录」。两拨混在一起，站点级断言就取决于跑序 —— 临时收起来，跑完再还。
@@ -569,12 +670,19 @@ def reads_by_method() -> dict[str, list[str]]:
             for variant in READ_VARIANTS.get(method, [{}]):
                 kind = str(variant.get("sessionType", "static"))
                 adapters.close_all_sessions()
-                if method.startswith("session.") and method != "session.open":
+                if (method.startswith("session.") and method != "session.open") or method == "screenshot":
                     # 这几个方法要求会话**已经存在**，而且类型要和当前分支一致：拿 static 的
                     # 会话去跑浏览器分支，读到的是另一支的参数表，本表就会漏键。
                     # session.open 反过来要求那个 id **没被占用**，否则它读完两个键就以
                     # 「session already exists」收场，分支里的键一个都读不到。
-                    adapters.session_open(dict(READ_PROBE_ARGS, sessionType=kind, sessionId="s-reads"))
+                    adapters.session_open(
+                        dict(
+                            READ_PROBE_ARGS,
+                            sessionType=kind,
+                            sessionId="s-reads",
+                            cookies=[{"name": "c", "value": "1"}],
+                        )
+                    )
                 # 读完参数之后怎么失败都与本表无关：分支里抛的是抓取本身，不是键的读法。
                 with suppress(Exception):
                     handler(Recording(dict(READ_PROBE_ARGS, **variant), seen))
@@ -587,6 +695,7 @@ def reads_by_method() -> dict[str, list[str]]:
         adapters.close_all_sessions()
         _restore(originals)
         adapters.close_all_sessions()
+        guard.configure(allow_browser_actions=saved_actions, allow_file_downloads=saved_downloads)
         CALLS[:] = saved_calls
 
 
@@ -801,7 +910,7 @@ def facts() -> dict[str, Any]:
             if hasattr(SiteToMarkdownSpider, name)
         ),
         "responseInitParams": sorted(_init_keys(Response)),
-        "redactionTargets": sorted(adapters._SECRET_QUERY_KEYS),
+        "redactionTargets": sorted(redact._SECRET_QUERY_KEYS),
     }
 
 

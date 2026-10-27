@@ -1,6 +1,8 @@
 import { definePluginConfig } from "@jayyuen66/dsh-plugin-shared/config/oxlint";
 
 export default definePluginConfig({
+  // bin/ 是构建产物（压缩后的单文件 CLI），与 host.js/client.js 同类，不参与源码 lint。
+  extraIgnorePatterns: ["bin/**"],
   // 本包真实用到的同步写盘 API —— node/no-sync 的包内例外。
   // 构建脚本（build-helpers.ts 及其两个调用方）按需同步读写产物；renameSync 是原子写的
   // 最后一步（先写临时文件再改名），readdirSync/unlinkSync 只在清理上一次中断留下的
@@ -45,7 +47,7 @@ export default definePluginConfig({
       },
     },
     {
-      files: ["build-host.ts", "build-client.ts"],
+      files: ["build-host.ts", "build-client.ts", "build-cli.ts", "cli-main.ts"],
       rules: {
         "node/no-top-level-await": "off",
       },
@@ -69,6 +71,16 @@ export default definePluginConfig({
         // Promise 返回函数」上直接互斥，而契约本身就是这么定的。
         "typescript/require-await": "off",
         "typescript/promise-function-async": "off",
+      },
+    },
+    {
+      files: ["lib/mcp-server.ts"],
+      rules: {
+        // node 的 http server 只有回调：listen 的成功/失败是两个事件，close 是回调式收尾。
+        // 要把「EADDRINUSE 归成点名错误码」和「close 回来时端口真的空了」写成可 await 的
+        // 形式，就必须先拿到一个以后再兑现的 Promise —— 与 sidecar 同一类 deferred，
+        // 不是「把 async 函数包进 Promise」那种反模式。
+        "promise/avoid-new": "off",
       },
     },
     {
@@ -107,13 +119,13 @@ export default definePluginConfig({
     },
     "node/no-top-level-await": {
       kind: "对侧互斥",
-      measured: 2,
-      note: "构建脚本必须 await rolldown()。改用 promise 链就会撞上本文件本该满足的 unicorn/prefer-top-level-await 与 promise/prefer-await-to-then —— 两条规则在这两个文件上互斥，只能关一侧。脚本只由 node 按 ESM 直接执行，不进 bundler 的 require(esm) 路径，顶层 await 的真实代价不存在。",
+      measured: 4,
+      note: "构建脚本必须 await rolldown()，bin 入口必须 await 一次 CLI 运行。改用 promise 链就会撞上本文件本该满足的 unicorn/prefer-top-level-await 与 promise/prefer-await-to-then —— 两条规则在这些文件上互斥，只能关一侧。它们只由 node 按 ESM 直接执行，不进 bundler 的 require(esm) 路径，顶层 await 的真实代价不存在。",
     },
     "promise/avoid-new": {
       kind: "实测否证",
-      measured: 2,
-      note: "sidecar 是请求/响应协议：握手等待与单次调用都必须先拿到一个「以后再兑现」的 Promise，再按 id 把响应接回去。按该规则改写就只能轮询 pending 表，CPU 空转且把延迟从 O(响应时间) 变成 O(轮询间隔)。全仓 2 处，都是协议实现本身，不是 async 函数的包装。",
+      measured: 4,
+      note: "sidecar 是请求/响应协议：握手等待与单次调用都必须先拿到一个「以后再兑现」的 Promise，再按 id 把响应接回去；mcp-server 那两处包的是 node http server 的 listen 成功/失败事件与 close 回调。按该规则改写就只能轮询，CPU 空转且把延迟从 O(响应时间) 变成 O(轮询间隔)。命中都在协议实现本身，不在 async 函数的包装上。",
     },
     "promise/prefer-await-to-then": {
       kind: "实测否证",

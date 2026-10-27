@@ -32,15 +32,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 不跑 win32：本仓的 py 入口是 `sh -c '… _env/.venv/bin/python …'`，那是 POSIX 形态，
-        # win32 上没有 sh，也没有 bin/ 布局。给 win32 一格会红在环境上而不是红在代码上。
-        os: [ubuntu-latest, macos-latest]
+        # 三个平台各跑一格：Python 解释器的 venv 布局（bin/ 与 Scripts/）与可执行位语义
+        # 在那边不一样，而这一格是唯一会把 JS 测试、Python 门禁与 sidecar 端到端一起拉起来的
+        # 跨平台判据。运行时能力包仍然只在 macOS arm64 提供（安装器在别的平台拒绝），
+        # 所以 win32 这一格验的是「插件与门禁能跑」，不是「能力包装得上」。
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node: [22, 24]
         exclude:
-          # 平台行为与 node 版本是两个正交维度：macOS 那一格只跑 node 24，
-          # 不让矩阵从 2 格变 4 格。全 9 仓的门禁在本机（darwin）上实跑通过，
-          # 所以这一格验的是真实 darwin 行为，不是重复劳动。
+          # 平台行为与 node 版本是两个正交维度：macOS 与 Windows 各只跑 node 24，
+          # 不让矩阵从 3 格变 6 格。全 9 仓的门禁在本机（darwin）上实跑通过，
+          # 所以 macos 这一格验的是真实 darwin 行为，不是重复劳动。
           - os: macos-latest
+            node: 22
+          # Windows 验的是平台差异，不是 node 版本差异。
+          - os: windows-latest
             node: 22
     runs-on: ${{ matrix.os }}
     # 官方对单 job 的上限是 6 小时，那是「系统允许」不是「应该允许」。不设这一行，
@@ -73,39 +78,76 @@ jobs:
           # 那一大批轮子在这一层被复用，省掉最大的一段下载时间。
           cache: pip
           cache-dependency-path: py/requirements-dev.txt
-      # test/global-setup.ts 在模块加载期就要求 _env/.venv/bin/python3 存在，缺了整套件直接
+      # test/global-setup.ts 在模块加载期就要求仓内 venv 的解释器存在，缺了整套件直接
       # 抛错（刻意不跳过：跳过等于悄悄降低四项 100% 覆盖率）。那个目录被 gitignore，是机器
       # 本地状态，所以 CI 上必须自己备一份——与 publish.yml 的「备 sidecar 解释器」同源。
+      # venv 布局分平台（POSIX 的 bin/python、Windows 的 Scripts/python.exe），所以建好之后
+      # 一律经 py-launcher.mjs 调用：那是本仓解析解释器的唯一入口，与插件运行期同一条规则。
       #
       # 装 `scrapling[rag]` 而不是 `scrapling[fetchers]`：extractionType 默认 markdown，
       # markdownify 在 rag 这个 extra 里；装成 fetchers 的话第一次抓取就 ModuleNotFoundError。
-      # 浏览器刻意不装：没有浏览器二进制时那几节用例按档跳过，而 test:py 的检查条数下限分
-      # 两档（MIN_CHECKS_WITH_BROWSER / MIN_CHECKS_WITHOUT_BROWSER），由测试自己探测。
+      # 浏览器在下面的单独步骤里装完整 Chromium；不用 --only-shell —— Scrapling 的 stealth
+      # 路径在 headless shell 上起不来（实测），而 test:py 的浏览器档需要它。
       - name: 备 sidecar 解释器（Python 门禁与 global-setup 的前提）
+        shell: bash
         run: |
           python -m venv _env/.venv
-          _env/.venv/bin/python -m pip install --upgrade pip
-          _env/.venv/bin/python -m pip install "scrapling[rag]>=0.5,<0.6"
-          _env/.venv/bin/python -c "import scrapling; print('scrapling', scrapling.__version__)"
+          node py-launcher.mjs -m pip install --upgrade pip
+          node py-launcher.mjs -m pip install "scrapling[rag]>=0.5,<0.6"
+          node py-launcher.mjs -c "import scrapling; print('scrapling', scrapling.__version__)"
       # 版本在 py/requirements-dev.txt 里精确钉：规则集随版本漂移，不钉的话「升级 ruff」与
       # 「新写一处违规」在门禁上长得一模一样。缺这一步时 check:py 会以 "No module named ruff"
       # 硬失败——刻意不跳过。
-      # 把 venv 顶到 PATH 上。门禁本身**不依赖**这一行：check:py / test:py 走的是 package.json
-      # 的 `py` 脚本，那个脚本在 `_env/.venv/bin/python` 可执行时直接用它的绝对路径（与根
-      # `scripts/lib/py-env.mjs` 的规则同一条），所以选中哪支解释器与 PATH 无关。留它是为了
-      # 让后续步骤里任何一处按名字调用 `python3` 的写法解析到装了 ruff 与 scrapling 的这一支，
-      # 而不是 hostedtoolcache 的解释器——那种解析只影响按名字调用的地方，不改变门禁的判据。
+      # 把 venv 的脚本目录顶到 PATH 上。门禁本身**不依赖**这一行：check:py / test:py 走的是
+      # package.json 的 `py` 脚本，那个脚本在仓内 venv 可用时直接用它的绝对路径，所以选中哪支
+      # 解释器与 PATH 无关。留它是为了让后续步骤里任何一处按名字调用 python/python3 的写法
+      # 解析到装了 ruff 与 scrapling 的这一支——那种解析只影响按名字调用的地方，不改变门禁的判据。
       - name: 备 Python 检查工具
+        shell: bash
         run: |
-          _env/.venv/bin/python -m pip install -r py/requirements-dev.txt
-          echo "${GITHUB_WORKSPACE}/_env/.venv/bin" >> "$GITHUB_PATH"
+          node py-launcher.mjs -m pip install -r py/requirements-dev.txt
+          bin="$(node py-launcher.mjs --bin)"
+          if [ -n "$bin" ]; then
+            echo "$bin" >> "$GITHUB_PATH"
+          fi
+      # --with-deps 在 Linux 装系统库，在 macOS 是空操作；Windows 上它会去跑 Media Pack 的
+      # PowerShell 脚本（playwright 的 installDependenciesWindows），那是音视频编解码包，
+      # 与抓取用的浏览器二进制无关。所以 Windows 只装浏览器。
+      - name: 装 Chromium（Python 浏览器档）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: node py-launcher.mjs -m patchright install --with-deps chromium
+      - name: 装 Chromium（Windows）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: node py-launcher.mjs -m patchright install chromium
+      # Windows 的默认 shell 是 pwsh。实测在这条 runner 上，pwsh 里跑 `pnpm …` 会
+      # **零输出、秒退 0**：那一步看起来绿，实际什么都没跑（收尾时能读到被遗留在进程树里的
+      # pnpm 与 conhost）。判据不是退出码，而是那一步真的执行过，所以下面先把解析到的 pnpm
+      # 与它的版本打出来，再让两条 pnpm 步统一走 bash——Git Bash 解析的是 npm 生成的 sh
+      # 垫片，同一支 pnpm 在那里会真的执行并回显输出。
+      - name: 诊断 pnpm（Windows / pwsh）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Command pnpm -All | Format-List Name,CommandType,Source
+          where.exe pnpm
+      - name: pnpm 可用性（bash 口径）
+        shell: bash
+        run: |
+          command -v pnpm
+          pnpm --version
       # --frozen-lockfile：lockfile 与 package.json 不一致时直接失败，而不是在 CI 里静默改一份
       # lockfile 后继续跑——那样绿的是「CI 现场解出来的那棵树」，不是仓库里这一份。
-      - run: pnpm install --frozen-lockfile
-      # check 已含 check:py 的八步链（py:which → face:py → ruff → fmt → mypy → sidecar 端到端 →
-      # bandit → 覆盖率地板）。强度只写在那一条链里：在 CI 里另起一步就会出现两套说法互相打脸
-      # 的形状（一步拦、一步只记录），所以这里不重复跑 Python 面。
-      - run: pnpm run check
+      - name: 安装依赖
+        shell: bash
+        run: pnpm install --frozen-lockfile
+      # check 已含 check:py 的链条（py:which → face:py → deps:py → ruff → fmt → mypy → sidecar
+      # 端到端 → bandit → 覆盖率地板）。强度只写在那一条链里：在 CI 里另起一步就会出现两套说法
+      # 互相打脸的形状（一步拦、一步只记录），所以这里不重复跑 Python 面。
+      - name: 跑门禁
+        shell: bash
+        run: pnpm run check
       # 覆盖率只在一次运行的日志里滚一遍就没了，翻起来费劲。落成产物之后，
       # 「这次为什么掉了」可以直接把报告下下来看，而不必重跑一次。
       # 只收 ubuntu 的 node 24 那一格：其余格各传一份只会得到同样的报告。
@@ -128,6 +170,9 @@ jobs:
       # 所以这一步在现状下极少失败；它留着的理由是覆盖「产物被误提交成跟踪文件」那一档。
       - name: 校验门禁没有改写被跟踪文件
         if: always()
+        # Windows 的默认 shell 是 pwsh，`test` 与 `$(...)` 都不存在；显式声明 bash 让这条
+        # 判据在三个平台上是同一句话。
+        shell: bash
         run: test -z "$(git status --porcelain --untracked-files=no)"
 
       # 运行页顶部的摘要：把结果留在这一页，不必点进每一步的日志里找。
@@ -244,6 +289,32 @@ jobs:
           if (!existsSync(bridge)) throw new Error("py/bridge.py 没随包发出：sidecar 起不来");
           console.log("装载通过：apply / Config / bundle patch / py sidecar 均就位");
           '
+
+  # pack-probe：出货面的复验，钉在**本仓承诺的那一个平台**上（macos arm64）。
+  # 它跑 test/install-probe.mjs：npm pack → 干净目录 npm install → host/client 载入 →
+  # CLI `setup --status` 离线退 0。与 install-probe 的分工：那一步在 ubuntu 上判 JS
+  # 产物面（tarball 清单、入口、bundle patch），这一步判「在承诺平台上装出去能不能用」。
+  # 分钟级、且打真包，所以挂在 gate 之后而不是压进每一格矩阵。
+  pack-probe:
+    needs: gate
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 12
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: 出货探针（pack → 干净目录安装 → 载入 → CLI 离线 status）
+        run: node test/install-probe.mjs
 
   # 来源证明是给「这次运行打出来的这份产物」出的第三方可验凭据，不是多一步验证：
   # 签在 PR 上，那张证明看起来属于本仓，指向的却是 PR 里 prepack 脚本产出的字节。

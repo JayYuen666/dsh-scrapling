@@ -68,13 +68,17 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
     }
     // 键数按「不低于某个下限」钉，而不是写死等号：驱动退化（漏了一个调用点、少填了一批参数）
     // 会掉破下限，而某天上游多认一个键不该让这里变红。
+    // capture.fetch 与 session.fetch.stealth 从 11 掉到 9：那两个默认键（blocked_domains /
+    // disable_resources）不再被无条件预置——调用方没显式给就整条不发，否则等于替调用方
+    // 覆盖上游默认（两键都在 FETCH_LEVEL_KEYS 里，所以两条会话路径各掉两格）。下限跟着
+    // 实测值走；若真有驱动退化，掉破的仍是这一条。
     const FLOORS: Record<string, number> = {
       "browser.render": 20,
       "capture.open": 10,
-      "capture.fetch": 10,
+      "capture.fetch": 9,
       "session.open.stealth": 10,
       "session.open.static": 2,
-      "session.fetch.stealth": 10,
+      "session.fetch.stealth": 9,
       "session.fetch.static": 4,
       "static.get": 4,
       "static.post": 4,

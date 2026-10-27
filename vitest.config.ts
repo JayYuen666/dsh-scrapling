@@ -9,6 +9,11 @@ export default definePackageConfig({
   // 的 src 文件时应把它加进这份名单，渲染面入分母前先补渲染层测试。
   coverageInclude: ["host.ts", "lib/**/*.ts", "src/settings-fields.ts"],
   test: {
+    // 基线那 20s 是给「假边跑边等」用的，本包有真 Chromium 的用例：CI 的 macOS runner 上
+    // `scrapling_render 与真实 sidecar` 那条实测 20080ms 撞线（同一条在 ubuntu 格过），
+    // 而首次拉起 Chromium 的成本本来就在秒级到十几秒。放宽的是**测量预算**，不是判据：
+    // 真卡住的用例会以 60s 的停顿暴露，而不是悄悄过掉。
+    testTimeout: 60_000,
     // 串行跑测试文件：本包是族系里唯一会**真的拉起 Python 进程**的（sidecar.test.ts 与
     // host.test.ts 里的爬虫链路）。文件并行时多个解释器同时冷启动、互相抢 CPU，握手预算
     // 就成了随缘的假失败。串行换来的是「只有一个 Python 在跑」这个确定前提。

@@ -11,6 +11,8 @@ daemon 线程**跑 spider，主线程立刻返回 crawl id；进度通过「没�
 from __future__ import annotations
 
 import json
+import re
+import sys
 import threading
 import time
 import uuid
@@ -36,6 +38,10 @@ MAX_CONCURRENT_CRAWLS = 2
 # 结束就删；但全留着就是内存泄漏，所以留一个上限，按最旧的淘汰。
 MAX_REMEMBERED_CRAWLS = 16
 
+# sidecar 收尾时给每只蜘蛛的等待预算（秒）。宿主那边的优雅关闭只有 sidecarGraceMs（默认
+# 5s）那么久，超了就把进程杀掉；这里必须比它小，否则「等蜘蛛停」自己会变成关机卡住的原因。
+SHUTDOWN_JOIN_SECONDS = 2.0
+
 # 一次 crawl.status 回包的字节上界。Host 侧按 8 MiB 切帧，而一个快站点能在一个轮询间隔里
 # 落下几十页；留一半余量，越过切帧线的那一帧会把整个 sidecar 拆掉。回不完的由 `more` 交接。
 MAX_STATUS_BYTES = 4 * 1024 * 1024
@@ -48,6 +54,26 @@ DEFAULT_MAX_RUNTIME_MS = 1_800_000
 # ``concurrent_requests = 4``），写在这里是为了让「部署没表态」与「部署表态成 4」在
 # 日志里不是同一件事。
 DEFAULT_CONCURRENT_REQUESTS = 4
+
+# 只投影这些统计字段：上游 to_dict() 还带 autothrottle / log_count / proxies 等
+# 部署内部读数，模型用不上，也不该成为协议面的一部分。
+_STATS_KEYS = (
+    "requests_count",
+    "failed_requests_count",
+    "blocked_requests_count",
+    "offsite_requests_count",
+    "robots_disallowed_count",
+    "items_scraped",
+    "elapsed_seconds",
+    "response_bytes",
+    "response_status_count",
+)
+
+
+def _stats_projection(stats: Any) -> dict[str, Any]:
+    """把 ``CrawlStats`` 压成协议声明的子集。"""
+    data = stats.to_dict()
+    return {key: data[key] for key in _STATS_KEYS if key in data}
 
 
 def _crawl_policy(args: dict[str, Any]) -> dict[str, Any]:
@@ -146,6 +172,127 @@ def _within_allowed_domains(url: str, allowed: set[str]) -> bool:
     return any(domain == entry or domain.endswith(f".{entry}") for entry in allowed)
 
 
+def _crawl_patterns(value: Any, field: str) -> list[str]:
+    """校验并编译 crawl 的 include/exclude 正则。"""
+    from adapters import AdapterError
+
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise AdapterError("BAD_ARGS", f"{field} must be an array of non-empty strings")
+    for pattern in value:
+        try:
+            re.compile(pattern)
+        except re.error as error:
+            raise AdapterError("BAD_ARGS", f"invalid crawl pattern: {error}") from error
+    return value
+
+
+def _collect_page(
+    item: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    limit: int,
+    crawl_id: str,
+    domains: set[str],
+    pause: Any,
+) -> None:
+    """收一页：域内/截止/清洗/封顶，与 content 模式同一条判据。"""
+    pages: list[dict[str, Any]] = state["pages"]
+    if len(pages) >= limit:
+        return
+    page_url = str(item.get("url", ""))
+    allowed, reason = url_allowed(page_url)
+    if allowed and not _within_allowed_domains(page_url, domains):
+        allowed, reason = False, "left the start domain (redirect)"
+    if not allowed:
+        _emit_event("crawlSkipped", crawlId=crawl_id, url=page_url, text=f"skipped {page_url}: {reason}")
+        return
+    if time.monotonic() >= state["deadline"]:
+        state["expired"] = True
+        _emit_event(
+            "crawlSkipped",
+            crawlId=crawl_id,
+            url=page_url,
+            text=f"crawl stopped: runtime budget of {state['budget_ms']}ms reached",
+        )
+        with suppress(RuntimeError):
+            pause()
+        return
+    markdown = str(item.get("markdown", ""))
+    if state["strip_inline_images"]:
+        from adapters import drop_data_uris
+
+        markdown = drop_data_uris(markdown)
+    pages.append(
+        {
+            "url": page_url,
+            "title": str(item.get("title", "")),
+            "markdown": _clip_markdown(markdown, state["max_content_chars"]),
+        }
+    )
+    _emit_event(
+        "progress",
+        crawlId=crawl_id,
+        done=len(pages),
+        limit=limit,
+        text=f"{len(pages)}/{limit} {page_url}",
+    )
+
+
+def _collect_row(
+    item: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    limit: int,
+    crawl_id: str,
+    pause: Any,
+) -> None:
+    """收一行结构化 feed 数据；行本身不再发请求，因此只受页数/时长约束。
+
+    到点时必须像 :func:`_collect_page` 一样把 Spider 叫停：只置 ``expired`` 的话 spider
+    会继续翻页，``maxDurationMs`` 对 feed / shopify 这两种模式等于没生效。
+    """
+    rows: list[dict[str, Any]] = state["rows"]
+    if len(rows) >= limit:
+        return
+    if time.monotonic() >= state["deadline"]:
+        state["expired"] = True
+        with suppress(RuntimeError):
+            pause()
+        return
+    rows.append(dict(item))
+    _emit_event(
+        "progress",
+        crawlId=crawl_id,
+        done=len(rows),
+        limit=limit,
+        text=f"{len(rows)}/{limit} row",
+    )
+
+
+def _session_config(manager: Any, url: str) -> None:
+    """给爬虫换一份安全重定向 + 部署代理的静态会话。"""
+    from scrapling.fetchers import FetcherSession
+
+    session_kwargs: dict[str, Any] = {"follow_redirects": "safe"}
+    proxies = proxies_for(url)
+    if proxies is not None:
+        session_kwargs["proxies"] = proxies
+    manager.add("default", FetcherSession(**session_kwargs))
+
+
+def _policy_attrs(policy: dict[str, Any]) -> dict[str, Any]:
+    """Spider 类属性上的待站策略（三种模板共用同一份）。"""
+    return {
+        "robots_txt_obey": policy["obey_robots"],
+        "download_delay": policy["delay_seconds"],
+        "concurrent_requests": policy["concurrency"],
+        "crawl_strategy": policy["strategy"],
+        "autothrottle_enabled": policy["autothrottle"],
+    }
+
+
 def _make_spider(
     url: str,
     limit: int,
@@ -153,6 +300,7 @@ def _make_spider(
     state: dict[str, Any],
     domains: set[str],
     policy: dict[str, Any],
+    options: dict[str, Any] | None = None,
 ) -> Any:
     """动态造一个 spider 类。
 
@@ -169,9 +317,15 @@ def _make_spider(
     :param policy: ``_crawl_policy`` 读出的待站策略
     :returns: spider 实例
     """
-    from scrapling.spiders import SiteToMarkdownSpider
+    from scrapling.spiders import ContentSpider, CrawlRule, LinkExtractor
 
-    class Collector(SiteToMarkdownSpider):  # type: ignore[misc, valid-type]
+    settings = options or {}
+    content_selector = settings.get("css_selector")
+    content_body_only = settings.get("main_content_only", True)
+    include_patterns = settings.get("include_patterns") or []
+    exclude_patterns = settings.get("exclude_patterns") or []
+
+    class Collector(ContentSpider):
         """把页面攒进 state 并向上报进度，不落盘。"""
 
         name = f"scrapling-{crawl_id}"
@@ -179,13 +333,27 @@ def _make_spider(
         allowed_domains = domains
         max_pages = limit
         output_dir = None
-        # 待站策略。robots_txt_obey 打开后 0.5 会把「取不到 robots.txt」当成禁止爬该域
-        # （0.4.15 是放行），所以这一档要么别开，要么确保那台站点的 robots.txt 取得回来。
+        css_selector = content_selector
+        main_content_only = content_body_only
+        # 待站策略。robots_txt_obey 打开后 0.5 的取数口径是：抓取异常或 5xx → 该域按
+        # 全面禁止处理；站点没有 robots.txt（404）→ 视作允许全部。所以这一档要么别开，
+        # 要么确认目标站点 robots.txt 取得回来。
         robots_txt_obey = policy["obey_robots"]
         download_delay = policy["delay_seconds"]
         concurrent_requests = policy["concurrency"]
         crawl_strategy = policy["strategy"]
         autothrottle_enabled = policy["autothrottle"]
+
+        def rules(self) -> list[Any]:
+            """按模型给的 allow/deny 收窄链接发现；没给就沿用默认。"""
+            return [
+                CrawlRule(
+                    LinkExtractor(
+                        allow=include_patterns or (),
+                        deny=exclude_patterns or (),
+                    )
+                )
+            ]
 
         def configure_sessions(self, manager: Any) -> None:
             """把爬虫的会话换成「只跟安全重定向、走配置里那份代理」的那一份。
@@ -221,66 +389,210 @@ def _make_spider(
             :param item: spider 交来的页面
             :returns: 恒为 None
             """
-            pages: list[dict[str, Any]] = state["pages"]
-            if len(pages) >= limit:
-                return None
-            page_url = str(item.get("url", ""))
-            # 收页前的最后两道：
-            # 一是即使 safe 重定向放行了，这一页的最终 URL 仍可能落在私网上；
-            # 二是它可能被重定向去了**站外另一台公网主机** —— allowed_domains 只参与链接
-            # 发现，拦不住 curl_cffi 自己跟的那一跳。判否就不收：内容已经在对端取过了，
-            # 但至少不把它写进 state 流回模型上下文。
-            allowed, reason = url_allowed(page_url)
-            if allowed and not _within_allowed_domains(page_url, domains):
-                allowed, reason = False, "left the start domain (redirect)"
-            if not allowed:
-                _emit_event(
-                    "crawlSkipped",
-                    crawlId=crawl_id,
-                    url=page_url,
-                    text=f"skipped {page_url}: {reason}",
-                )
-                return None
-            # 整体截止：页数上限管不了慢站点，而爬虫跑在没人看的后台线程里。到了点就按
-            # 引擎自己的停机通道退场 —— pause() 让引擎在在途请求收尾后停，不是撕进程。
-            if time.monotonic() >= state["deadline"]:
-                state["expired"] = True
-                _emit_event(
-                    "crawlSkipped",
-                    crawlId=crawl_id,
-                    url=page_url,
-                    text=f"crawl stopped: runtime budget of {state['budget_ms']}ms reached",
-                )
-                with suppress(RuntimeError):
-                    self.pause()
-                return None
-            markdown = str(item.get("markdown", ""))
-            # 与其余抓取路径同一口径：内嵌 base64 图片是纯 token 噪音，先剥再封顶 ——
-            # 顺序反了等于白剥，那几十 KB 早就把 max_content_chars 的额度吃掉了。
-            if state["strip_inline_images"]:
-                # 函数内导入：本模块顶层已经被 adapters 导入过，再顶层反向导入会成环
-                # （adapters 末尾就是 `from crawl import METHODS`）。谁先被 import 决定
-                # 这个环会不会炸，所以不赌。
-                from adapters import drop_data_uris
-
-                markdown = drop_data_uris(markdown)
-            pages.append(
-                {
-                    "url": page_url,
-                    "title": str(item.get("title", "")),
-                    "markdown": _clip_markdown(markdown, state["max_content_chars"]),
-                }
-            )
-            _emit_event(
-                "progress",
-                crawlId=crawl_id,
-                done=len(pages),
+            _collect_page(
+                item,
+                state=state,
                 limit=limit,
-                text=f"{len(pages)}/{limit} {page_url}",
+                crawl_id=crawl_id,
+                domains=domains,
+                pause=self.pause,
             )
             return None
 
     return Collector(crawldir=policy["checkpoint_dir"] or None)
+
+
+def _make_sitemap_spider(
+    url: str,
+    limit: int,
+    crawl_id: str,
+    state: dict[str, Any],
+    domains: set[str],
+    policy: dict[str, Any],
+    options: dict[str, Any],
+) -> Any:
+    """SitemapSpider：只抓 sitemap 里的 loc，不跟随页面内链接。
+
+    ``max_pages`` / ``css_selector`` / ``main_content_only`` 不是上游 SitemapSpider 声明的类
+    属性（content 模式那一支才认这三个），引擎读不到它们；页数上限与正文范围由下面那个
+    ``parse`` 自己取，别把它们当成引擎会执行的旋钮。
+    """
+    from scrapling.spiders import CrawlRule, LinkExtractor, SitemapSpider
+
+    include = options["include_patterns"]
+    exclude = options["exclude_patterns"]
+    follow = options["sitemap_follow"]
+    content_selector = options["css_selector"]
+    body_only = options["main_content_only"]
+
+    class Collector(SitemapSpider):
+        name = f"scrapling-{crawl_id}"
+        sitemap_urls = [options["sitemap_url"]]
+        sitemap_follow = LinkExtractor(allow=follow) if follow else None
+        allowed_domains = domains
+        max_pages = limit
+        css_selector = content_selector
+        main_content_only = body_only
+        robots_txt_obey = policy["obey_robots"]
+        download_delay = policy["delay_seconds"]
+        concurrent_requests = policy["concurrency"]
+        crawl_strategy = policy["strategy"]
+        autothrottle_enabled = policy["autothrottle"]
+
+        def rules(self) -> list[Any]:
+            if not include and not exclude:
+                return []
+            return [
+                CrawlRule(
+                    LinkExtractor(allow=include or (), deny=exclude or ()),
+                    callback=self.parse,
+                )
+            ]
+
+        def configure_sessions(self, manager: Any) -> None:
+            _session_config(manager, url)
+
+        async def parse(self, response: Any) -> Any:
+            if self.max_pages and len(state["pages"]) >= self.max_pages:
+                return
+            yield {
+                "url": response.url,
+                "title": str(response.css("title::text").get() or "").strip(),
+                "markdown": response.markdown(self.css_selector, self.main_content_only),
+            }
+
+        async def on_scraped_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
+            _collect_page(
+                item,
+                state=state,
+                limit=limit,
+                crawl_id=crawl_id,
+                domains=domains,
+                pause=self.pause,
+            )
+            return None
+
+    return Collector(crawldir=policy["checkpoint_dir"] or None)
+
+
+def _make_shopify_spider(
+    url: str,
+    limit: int,
+    crawl_id: str,
+    state: dict[str, Any],
+    domains: set[str],
+    policy: dict[str, Any],
+    options: dict[str, Any],
+) -> Any:
+    """ShopifySpider：走 `/collections.json` 与每个集合的 `/products.json`，按变体出行。
+
+    上游模板把三个 URL 写死成 `https://`，而本地夹具与内网镜像常常是 http；这里按起始
+    URL（或 `sitemapUrl`）的 scheme 重写同一组模板，好让「同一个实现」既能打真店也能打夹具。
+    """
+    from urllib.parse import urlsplit
+
+    from scrapling.spiders import ShopifySpider
+
+    override = options.get("sitemap_url")
+    if override is not None and (not isinstance(override, str) or not override):
+        from adapters import AdapterError
+
+        raise AdapterError("BAD_ARGS", "sitemapUrl must be a non-empty string or null")
+    source = override or url
+    parts = urlsplit(source)
+    scheme = parts.scheme or "https"
+    website = parts.netloc
+    if not website:
+        raise ValueError("shopify mode needs a host in url or sitemapUrl")
+
+    class Collector(ShopifySpider):
+        name = f"scrapling-{crawl_id}"
+        target_website = website
+        collections_url = f"{scheme}://{{website}}/collections.json?page={{page}}&limit=250"
+        products_url = f"{scheme}://{{website}}/collections/{{handle}}/products.json?page={{page}}&limit=250"
+        product_url = f"{scheme}://{{website}}/collections/{{handle}}/products/{{product_handle}}"
+        allowed_domains = domains
+        robots_txt_obey = policy["obey_robots"]
+        download_delay = policy["delay_seconds"]
+        concurrent_requests = policy["concurrency"]
+        autothrottle_enabled = policy["autothrottle"]
+
+        def configure_sessions(self, manager: Any) -> None:
+            # 代理判定跟着**真正要打的主机**走：shopify 的 collections/products 是用
+            # sitemapUrl（或 url）的 netloc 拼出来的，与 url 可能不是同一台。
+            _session_config(manager, source)
+
+        async def on_scraped_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
+            _collect_row(item, state=state, limit=limit, crawl_id=crawl_id, pause=self.pause)
+            if len(state["rows"]) >= limit:
+                # 集合分页对真店是有限的，但没有上限的目录会让作业一直跑下去；到量就叫停。
+                with suppress(RuntimeError):
+                    self.pause()
+            return None
+
+    return Collector(crawldir=policy["checkpoint_dir"] or None)
+
+
+def _make_feed_spider(
+    url: str,
+    limit: int,
+    crawl_id: str,
+    state: dict[str, Any],
+    domains: set[str],
+    policy: dict[str, Any],
+    options: dict[str, Any],
+) -> Any:
+    """XMLFeedSpider / CSVFeedSpider：按 fields 映射出行，不抓页面。"""
+    from scrapling.spiders import CSVFeedSpider, XMLFeedSpider
+
+    feed_type = options["feed_type"]
+    fields = options["fields"]
+    iter_tag = options["itertag"]
+    base = CSVFeedSpider if feed_type == "csv" else XMLFeedSpider
+
+    class Collector(base):  # type: ignore[misc, valid-type]
+        name = f"scrapling-{crawl_id}"
+        start_urls = [options["feed_url"]]
+        allowed_domains = domains
+        max_pages = limit
+        itertag = iter_tag
+        robots_txt_obey = policy["obey_robots"]
+        download_delay = policy["delay_seconds"]
+        concurrent_requests = policy["concurrency"]
+        crawl_strategy = policy["strategy"]
+        autothrottle_enabled = policy["autothrottle"]
+
+        def configure_sessions(self, manager: Any) -> None:
+            _session_config(manager, url)
+
+        async def parse_node(self, response: Any, node: Any) -> Any:
+            yield {name: node.findtext(path) for name, path in fields.items()}
+
+        async def parse_row(self, response: Any, row: dict[str, Any]) -> Any:
+            yield {name: row.get(path) for name, path in fields.items()}
+
+        async def on_scraped_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
+            _collect_row(item, state=state, limit=limit, crawl_id=crawl_id, pause=self.pause)
+            return None
+
+    return Collector(crawldir=policy["checkpoint_dir"] or None)
+
+
+def _shopify_sitemap_arg(mode: str, value: Any) -> Any:
+    """shopify 的 sitemapUrl 只收非空字符串或 null（与 _make_shopify_spider 同一条判据）。
+
+    提前到这里判，是因为后面的 url_allowed 复核要拿它当字符串处理：先判干净，才不会把
+    类型错误翻成 CRAWL_SETUP_FAILED。拆成函数也顺手把 crawl_run 的分支数压回去。
+
+    :param mode: 爬取模式
+    :param value: 协议参数 sitemapUrl
+    :returns: 原值
+    """
+    if mode == "shopify" and value is not None and (not isinstance(value, str) or not value):
+        from adapters import AdapterError
+
+        raise AdapterError("BAD_ARGS", "sitemapUrl must be a non-empty string or null")
+    return value
 
 
 def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
@@ -303,23 +615,82 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
     max_content_chars = _positive_int(args.get("maxContentChars"), "maxContentChars", DEFAULT_MAX_CONTENT_CHARS)
     budget_ms = _positive_int(args.get("maxDurationMs"), "maxDurationMs", DEFAULT_MAX_RUNTIME_MS)
     strip_inline_images = _strip_inline_images(args)
+    css_selector = args.get("cssSelector")
+    if css_selector is not None and not isinstance(css_selector, str):
+        raise AdapterError("BAD_ARGS", "cssSelector must be a string or null")
+    main_content_only = args.get("mainContentOnly", True)
+    if not isinstance(main_content_only, bool):
+        raise AdapterError("BAD_ARGS", "mainContentOnly must be a boolean")
+    include_patterns = _crawl_patterns(args.get("includePatterns"), "includePatterns")
+    exclude_patterns = _crawl_patterns(args.get("excludePatterns"), "excludePatterns")
+    mode = args.get("mode", "content")
+    if mode not in ("content", "sitemap", "feed", "shopify"):
+        raise AdapterError("BAD_ARGS", f"mode must be content, sitemap, feed or shopify, got {mode!r}")
+    sitemap_url = args.get("sitemapUrl")
+    sitemap_follow = args.get("sitemapFollow")
+    feed_url = args.get("feedUrl")
+    feed_type = args.get("feedType")
+    itertag = args.get("itertag", "item")
+    fields = args.get("fields")
+    if mode == "sitemap":
+        if not isinstance(sitemap_url, str) or not sitemap_url:
+            raise AdapterError("BAD_ARGS", "sitemap mode requires sitemapUrl")
+        if sitemap_follow is not None:
+            if not isinstance(sitemap_follow, str):
+                raise AdapterError("BAD_ARGS", "sitemapFollow must be a string or null")
+            try:
+                re.compile(sitemap_follow)
+            except re.error as error:
+                raise AdapterError("BAD_ARGS", f"invalid sitemapFollow: {error}") from error
+    if mode == "feed":
+        if not isinstance(feed_url, str) or not feed_url:
+            raise AdapterError("BAD_ARGS", "feed mode requires feedUrl")
+        if feed_type not in ("xml", "csv"):
+            raise AdapterError("BAD_ARGS", "feedType must be 'xml' or 'csv'")
+        if not isinstance(itertag, str) or not itertag:
+            raise AdapterError("BAD_ARGS", "itertag must be a non-empty string")
+        if (
+            not isinstance(fields, dict)
+            or not fields
+            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in fields.items())
+        ):
+            raise AdapterError("BAD_ARGS", "fields must be a non-empty {output: path} mapping of strings")
+    sitemap_url = _shopify_sitemap_arg(mode, sitemap_url)
     policy = _crawl_policy(args)
     crawl_id = uuid.uuid4().hex[:12]
     state: dict[str, Any] = {
         "error": None,
+        "mode": mode,
         "pages": [],
+        "rows": [],
+        "stats": None,
         "max_content_chars": max_content_chars,
         "strip_inline_images": strip_inline_images,
         "budget_ms": budget_ms,
         "deadline": time.monotonic() + budget_ms / 1000,
     }
-    domains = _allowed_domains(url)
+    # shopify 模式真正抓的主机可以来自 sitemapUrl：_make_shopify_spider 用它的 netloc 拼
+    # collections/products 两个 URL。而站内判定用的是 allowed_domains —— 两处取不同来源时
+    # spider 发出的每个请求都会被判成站外，一页都收不到。所以主机以真正要打的那一个为准。
+    domain_source = sitemap_url if mode == "shopify" and sitemap_url else url
+    domains = _allowed_domains(domain_source)
 
     # Host 闸门判的是这条 URL，但协议层不该假设调用方一定判过：这道复核与浏览器路径上
     # 的 guard.url_allowed 是同一个实现，因此两侧同解。
     allowed, reason = url_allowed(url)
     if not allowed:
         raise AdapterError("URL_BLOCKED", f"{url}: {reason}")
+    # sitemap / shopify 的 sitemapUrl、feed 的 feedUrl 都是 spider 会真去请求的地址，
+    # 每一个都要在这里复判：只判起点的 url 等于给 sitemapUrl 留了一条不过闸的门。
+    for target in (
+        sitemap_url if mode in ("sitemap", "shopify") else None,
+        feed_url if mode == "feed" else None,
+    ):
+        if target is None:
+            continue
+        allowed, reason = url_allowed(target)
+        if not allowed:
+            raise AdapterError("URL_BLOCKED", f"{target}: {reason}")
 
     with _CRAWL_LOCK:
         _evict_finished_crawls()
@@ -340,7 +711,63 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
         }
 
     try:
-        spider = _make_spider(url, max_pages, crawl_id, state, domains, policy)
+        if mode == "sitemap":
+            spider = _make_sitemap_spider(
+                url,
+                max_pages,
+                crawl_id,
+                state,
+                domains,
+                policy,
+                {
+                    "sitemap_url": sitemap_url,
+                    "sitemap_follow": sitemap_follow,
+                    "css_selector": css_selector,
+                    "main_content_only": main_content_only,
+                    "include_patterns": include_patterns,
+                    "exclude_patterns": exclude_patterns,
+                },
+            )
+        elif mode == "shopify":
+            spider = _make_shopify_spider(
+                url,
+                max_pages,
+                crawl_id,
+                state,
+                domains,
+                policy,
+                {"sitemap_url": sitemap_url},
+            )
+        elif mode == "feed":
+            spider = _make_feed_spider(
+                url,
+                max_pages,
+                crawl_id,
+                state,
+                domains,
+                policy,
+                {
+                    "feed_url": feed_url,
+                    "feed_type": feed_type,
+                    "itertag": itertag,
+                    "fields": fields,
+                },
+            )
+        else:
+            spider = _make_spider(
+                url,
+                max_pages,
+                crawl_id,
+                state,
+                domains,
+                policy,
+                {
+                    "css_selector": css_selector,
+                    "main_content_only": main_content_only,
+                    "include_patterns": include_patterns,
+                    "exclude_patterns": exclude_patterns,
+                },
+            )
     except BaseException as error:
         with _CRAWL_LOCK:
             _CRAWLS.pop(crawl_id, None)
@@ -355,7 +782,8 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
                 # 线程还没跑就被叫停了（crawl_stop 在 spider 登记之前到）：一页都不抓。
                 return
         try:
-            spider.start()
+            result = spider.start()
+            state["stats"] = _stats_projection(result.stats)
         except Exception as error:  # noqa: BLE001
             state["error"] = f"{type(error).__name__}: {error}"
             _emit_event("crawlError", crawlId=crawl_id, text=str(error))
@@ -369,7 +797,11 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
     # 之前就先推了 progress，宿主侧「第一条是 crawlStarted」的读法于是变成随缘；二是万一这一帧
     # 发不出去（stdout 断了、序列化炸了），异常抛给调用方时蜘蛛已经在跑 —— 调用方拿不到
     # crawlId，就叫不停它，那个名额要一直占到进程退出。
-    _emit_event("crawlStarted", crawlId=crawl_id, text=f"crawling {url} (max {max_pages} pages)")
+    _emit_event(
+        "crawlStarted",
+        crawlId=crawl_id,
+        text=f"crawling {url} in {mode} mode (max {max_pages} items)",
+    )
     try:
         thread.start()
     except RuntimeError:
@@ -451,19 +883,27 @@ def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
     # pages 是 spider 线程边跑边 append 的活列表，而回包要经 json.dumps 序列化。
     # 进锁里取一段：一边序列化一边追加，结果要么漏一页要么撞上 RuntimeError。
     with _CRAWL_LOCK:
-        total = len(state["pages"])
-        pages, more = _take_pages(state["pages"], since)
+        feed_rows = state.get("mode") in ("feed", "shopify")
+        source = state["rows"] if feed_rows else state["pages"]
+        total = len(source)
+        taken, more = _take_pages(source, since)
         running = _is_running(entry)
+    pages = [] if feed_rows else taken
+    rows = taken if feed_rows else []
     return {
         "crawlId": entry["crawl_id"],
+        "mode": state.get("mode", "content"),
         # thread 为 None 表示 spider 还在构造中：没跑起来，但也没结束。
         "running": running,
         "pages": pages,
+        "rows": rows,
         "total": total,
         "more": more,
         "error": state["error"],
         # 截止到点而停的爬虫带这个标记：模型能看出「为什么比 maxPages 少」。
         "expired": state.get("expired") is True,
+        # 只有 spider.start() 返回之后才完整；运行中为 null，不把「还没量到」报成 0。
+        "stats": state.get("stats"),
     }
 
 
@@ -483,6 +923,8 @@ def _shrink_page(page: dict[str, Any], budget: int) -> dict[str, Any]:
     :param budget: 这一页的字节预算
     :returns: 压过的新页（不就地改原对象，state 里留全量）
     """
+    if "markdown" not in page:
+        return page
     overhead = len(json.dumps({**page, "markdown": ""}, ensure_ascii=False).encode("utf-8"))
     room = max(0, budget - overhead)
     markdown = str(page.get("markdown", ""))
@@ -495,8 +937,14 @@ def _shrink_page(page: dict[str, Any], budget: int) -> dict[str, Any]:
 def _take_pages(all_pages: list[dict[str, Any]], since: int) -> tuple[list[dict[str, Any]], bool]:
     """从 ``since`` 起取一段页，按 :data:`MAX_STATUS_BYTES` 封顶。
 
-    至少回一页：单页就超预算时也回它，否则调用方永远取不到下一页，轮询变成死循环。但这一
-    页必须**压到预算之内**再回 —— 原样交出去的那一帧会顶过 Host 的 8 MiB 切帧线。
+    回包条数与 ``since`` 的推进是同一件事：调用方按 ``len(pages)`` 推进 ``since``，所以
+    这一轮回了哪几页，下一轮就必须从紧接着的下一页开始 —— 回包里的页得是**连续**的一段。
+    早先碰到单页超预算就直接 ``return [_shrink_page(...)]``，把已经收下的前几页一起丢掉，
+    而调用方只按回包条数推进一页，于是那些页下一轮被**重复**发出、更后面的页永远轮不到。
+
+    现在：已经收下的页一起回，当前这页压到预算内再回；当前页若挤不进本轮余量就留给下一轮
+    （下一轮的 ``since`` 正好落在它身上，且那一轮 ``taken`` 为空、只走截断分支），既不重复
+    也不永久跳过。
 
     :param all_pages: 活页表
     :param since: 已经读走多少页
@@ -509,7 +957,10 @@ def _take_pages(all_pages: list[dict[str, Any]], since: int) -> tuple[list[dict[
     for index in range(since, len(all_pages)):
         size = len(json.dumps(all_pages[index], ensure_ascii=False).encode("utf-8"))
         if size > MAX_STATUS_BYTES:
-            # 单页就超预算：压到预算内回它，并置 more 让调用方知道后面还有（或还有别的页）。
+            # 当前页压到预算内，但已经收下的页必须一起回：这一轮回了 k 页，since 就前进
+            # k 页，缺一页就会在下一轮重发它、更后面的页则被跳过。
+            if taken:
+                return taken, True
             return [_shrink_page(all_pages[index], MAX_STATUS_BYTES)], index + 1 < len(all_pages)
         if taken and spent + size > MAX_STATUS_BYTES:
             return taken, True
@@ -518,22 +969,12 @@ def _take_pages(all_pages: list[dict[str, Any]], since: int) -> tuple[list[dict[
     return taken, False
 
 
-def crawl_stop(args: dict[str, Any]) -> dict[str, Any]:
-    """叫停一个爬虫。
+def _request_stop(entry: dict[str, Any]) -> bool:
+    """叫停一个登记条目：在跑的让引擎收尾，还没开跑的置标志。
 
-    为什么必须有这条：宿主的作业取消只活在 Node 侧，Python 里的 Spider 跑在自己的
-    线程上，看不见它。少了这一条，「作业显示已杀」之后爬虫还在后台跑，Python 进程也
-    一直被一个没人管的蜘蛛占着。三条路各管一段：已经在跑的由 ``Spider.pause()`` 立刻
-    收尾（引擎留给外部叫停的通道，等在途请求收尾后自己退出）；还没开始跑的把截止提前到
-    现在，并在抓到第一页之前退出。
-
-    已经跑完的爬虫叫不停（引擎已拆），那不是错误：调用的意图是「别跑了」，已经停了。
-
-    :param args: 协议参数
-    :returns: {crawlId, stopping}
-    :raises adapters.AdapterError: id 缺失或不存在
+    :param entry: 登记条目
+    :returns: 是否真有一只蜘蛛在跑（因而被叫停）
     """
-    entry = _get_crawl(args.get("crawlId"))
     state: dict[str, Any] = entry["state"]
     # 截止提前到「现在」：构造中的蜘蛛、刚起线程还没抓到页的蜘蛛，都在收到第一页时停。
     state["deadline"] = time.monotonic()
@@ -543,24 +984,51 @@ def crawl_stop(args: dict[str, Any]) -> dict[str, Any]:
         if spider is None:
             # 线程还没起：置个标志，worker 起手看见它就直接退出，一页都不抓。
             entry["stop_requested"] = True
-    stopping = False
     if spider is not None and running:
         with suppress(RuntimeError):
             spider.pause()
-        stopping = True
-    return {"crawlId": entry["crawl_id"], "stopping": stopping}
+        return True
+    return False
+
+
+def crawl_stop(args: dict[str, Any]) -> dict[str, Any]:
+    """叫停一个爬虫。
+
+    为什么必须有这条：宿主的作业取消只活在 Node 侧，Python 里的 Spider 跑在自己的线程上，
+    看不见它。少了这一条，「作业显示已杀」之后爬虫还在后台跑，Python 进程也被一只没人管的
+    蜘蛛占着。已经跑完的叫不停（引擎已拆），那不是错误：调用的意图是「别跑了」，已经停了。
+
+    :param args: 协议参数
+    :returns: {crawlId, stopping}
+    :raises adapters.AdapterError: id 缺失或不存在
+    """
+    entry = _get_crawl(args.get("crawlId"))
+    return {"crawlId": entry["crawl_id"], "stopping": _request_stop(entry)}
 
 
 def close_all_crawls() -> None:
-    """清掉爬虫登记表。
+    """叫停全部爬虫，有界地等线程退出，再清登记表。
 
-    爬虫跑在 daemon 线程里：sidecar 退出时它们跟着退出，所以这里只清登记，
-    不需要（也没法）去优雅中断一个正在跑的 spider。
-
-    **它不停线程**：调用之后仍在跑的蜘蛛会继续往 stdout 推事件帧（进度、跳过、报错）。
-    进程退出时这无所谓，但任何「清完登记表就以为场上没蜘蛛了」的调用方都会被这件事咬到
-    —— 要停就按 id 逐只 :func:`crawl_stop`，再等 ``thread`` 退出。
+    sidecar 的两条收尾路径都走这里。等是**有界**的：宿主的优雅关闭只有 ``sidecarGraceMs``
+    那么久（默认 5s），拖过它只会换来一次强杀，反而更看不清是谁停的。等不到的那几只记一行
+    stderr —— stdout 是与 Host 的协议通道，那里不能写。
     """
+    with _CRAWL_LOCK:
+        entries = list(_CRAWLS.values())
+    threads: list[Any] = []
+    for entry in entries:
+        _request_stop(entry)
+        worker = entry.get("thread")
+        if worker is not None:
+            threads.append(worker)
+    deadline = time.monotonic() + SHUTDOWN_JOIN_SECONDS
+    for worker in threads:
+        # 还没 start() 的线程 join 会抛 RuntimeError；那一段窗口里本来就没有可等的东西。
+        with suppress(RuntimeError):
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+    stuck = sum(1 for worker in threads if worker.is_alive())
+    if stuck:
+        print(f"[crawl] {stuck} spider thread(s) still running at shutdown", file=sys.stderr)
     _CRAWLS.clear()
 
 

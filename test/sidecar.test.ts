@@ -67,6 +67,13 @@ interface FakeBehaviour {
   crashOnExit?: boolean;
   /** 在 spawn 之前卡住一段时间，用来把 dispose 挤进启动途中那个窗口。 */
   spawnDelayMs?: number;
+  /**
+   * 进程结束后 done 晚多久兑现。用来把「旧代退出」排到新一代已经拉起来之后 ——
+   * 那正是旧代事件误拆新进程的时序。
+   */
+  exitDelayMs?: number;
+  /** waitForExit 卡住一段时间，把新一代的 spawn 挤进旧代拆除的窗口里。 */
+  reapDelayMs?: number;
 }
 
 const fakeCtx = (
@@ -134,6 +141,9 @@ const fakeCtx = (
         // 存进句柄而不是当场 await，.then 链会被 prefer-await-to-then 判掉。
         done: (async (): Promise<{ exitCode: number; signal: null }> => {
           await once(stdout, "end");
+          if (behaviour.exitDelayMs !== undefined) {
+            await delay(behaviour.exitDelayMs);
+          }
           if (behaviour.crashOnExit === true) {
             throw new Error("sidecar died");
           }
@@ -146,6 +156,9 @@ const fakeCtx = (
           }
         },
         waitForExit: async (): Promise<boolean> => {
+          if (behaviour.reapDelayMs !== undefined) {
+            await delay(behaviour.reapDelayMs);
+          }
           if (behaviour.failExit === true) {
             throw new Error("cannot reap");
           }
@@ -163,6 +176,9 @@ const okReply = (id: string): Record<string, unknown> => ({ id, ok: true, result
 /** 闸门用例里反复出现的两个 URL，提出来免得 sonarjs 当重复字面量报。 */
 const PUBLIC_URL = "http://93.184.216.34";
 const NORMALIZED_URL = "http://93.184.216.34/normalized";
+const PRIVATE_SITEMAP = "http://127.0.0.1/sitemap.xml";
+const RAW_SITEMAP = "http://93.184.216.34/sitemap.xml?raw=1";
+const NORMALIZED_SITEMAP = "http://93.184.216.34/sitemap.xml";
 
 function options(overrides: Partial<SidecarOptions> = {}): SidecarOptions {
   // 这两个默认值只服务于下面「真实 python 进程」那组用例（其余用例都显式传 80 / 5000
@@ -216,6 +232,13 @@ describe("parseCapabilities", () => {
   it("版本号只在是字符串时带上", () => {
     expect(parseCapabilities({ version: "0.5" }).version).toBe("0.5");
     expect(parseCapabilities({ version: 15 }).version).toBeUndefined();
+  });
+
+  it("能力报告的 websocketGuard 只在真布尔时带上，缺字段与非布尔都不带这一位", () => {
+    expect(parseCapabilities({ websocketGuard: true }).websocketGuard).toBe(true);
+    expect(parseCapabilities({ websocketGuard: false }).websocketGuard).toBe(false);
+    expect(parseCapabilities({ websocketGuard: "yes" }).websocketGuard).toBeUndefined();
+    expect(parseCapabilities({}).websocketGuard).toBeUndefined();
   });
 
   it("写方法与出口代理如实上报（代理形状不对就不带这一项）", () => {
@@ -304,6 +327,70 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
+  it("crawl 的 sitemapUrl 与 feedUrl 同样过闸门，判否就不写管道", async () => {
+    const seen: string[] = [];
+    const sent: (Record<string, unknown> | undefined)[] = [];
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      fakeCtx(
+        {
+          reply: okReply,
+          onFrame: (frame) => {
+            sent.push(frame.params);
+          },
+        },
+        spawned,
+      ) as never,
+      options({
+        urlGate: async (url: string): Promise<string> => {
+          seen.push(url);
+          if (url === PRIVATE_SITEMAP) {
+            throw new SidecarError("URL_BLOCKED", `${url}: refused by the host URL gate`);
+          }
+          return url;
+        },
+      }),
+    );
+    await client.ensureStarted();
+    await expect(
+      client.call("crawl.run", {
+        url: PUBLIC_URL,
+        sitemapUrl: PRIVATE_SITEMAP,
+        feedUrl: NORMALIZED_SITEMAP,
+      }),
+    ).rejects.toMatchObject({ code: "URL_BLOCKED" });
+    expect(seen).toStrictEqual([PUBLIC_URL, PRIVATE_SITEMAP]);
+    expect(sent).toStrictEqual([]);
+    await client.dispose();
+  });
+
+  it("闸门归一化嵌套 URL 后，发往子进程的是归一串而不是入参", async () => {
+    const sent: (Record<string, unknown> | undefined)[] = [];
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      fakeCtx(
+        {
+          reply: okReply,
+          onFrame: (frame) => {
+            sent.push(frame.params);
+          },
+        },
+        spawned,
+      ) as never,
+      // 归一化按 URL 给：起始页原样，sitemap 换成归一串。判的和连的必须是同一串。
+      options({
+        urlGate: async (url: string): Promise<string> =>
+          url === RAW_SITEMAP ? NORMALIZED_SITEMAP : url,
+      }),
+    );
+    await client.ensureStarted();
+    const params = { url: PUBLIC_URL, sitemapUrl: RAW_SITEMAP };
+    await client.call("crawl.run", params);
+    expect(sent).toStrictEqual([{ url: PUBLIC_URL, sitemapUrl: NORMALIZED_SITEMAP }]);
+    expect(params).toStrictEqual({ url: PUBLIC_URL, sitemapUrl: RAW_SITEMAP });
+    await client.dispose();
+  });
+
   it("进程惰性拉起：只构造不发请求不会 spawn", async () => {
     const spawned: { count: number; last?: FakeHandle } = { count: 0 };
     const client = new SidecarClient(fakeCtx({}, spawned) as never, options());
@@ -321,7 +408,7 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
-  it("对端回 ok:false 时把错误码与消息带出来", async () => {
+  it("对端回 ok:false 时把错误码、消息与 details 带出来", async () => {
     const spawned: { count: number; last?: FakeHandle } = { count: 0 };
     const client = new SidecarClient(
       fakeCtx(
@@ -329,14 +416,26 @@ describe("sidecar client 与假 runtime", () => {
           reply: (id) => ({
             id,
             ok: false,
-            error: { code: "BAD_ARGS", message: "url is required" },
+            error: {
+              code: "ACTION_FAILED",
+              message: "action 1 failed",
+              details: { actionIndex: 1 },
+            },
           }),
         },
         spawned,
       ) as never,
       options(),
     );
-    await expect(client.call("fetch", {})).rejects.toThrow("url is required");
+    const error = await client.call("fetch", {}).then(
+      () => null,
+      (error_: unknown) => error_,
+    );
+    expect(error).toMatchObject({
+      code: "ACTION_FAILED",
+      message: "action 1 failed",
+      details: { actionIndex: 1 },
+    });
     await client.dispose();
   });
 
@@ -712,6 +811,70 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
+  it("旧代退出事件晚到时不拆掉新一代进程，也不作废新一代的在途请求", async () => {
+    // 时序：请求超时把第 1 代拆掉，而它的 done 被故意推迟兑现；拆除还卡在
+    // waitForExit 上时，下一个请求已经把第 2 代拉起来了。旧实现里那枚 done 回调
+    // 无条件 #teardown，于是晚到的「旧代已退出」会把第 2 代连同在途请求一起带走。
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const lines: string[] = [];
+    const client = new SidecarClient(
+      fakeCtx(
+        {
+          reply: (id, method) => (method === "slow" ? null : okReply(id)),
+          exitDelayMs: 100,
+          reapDelayMs: 60,
+        },
+        spawned,
+      ) as never,
+      {
+        ...options({ requestTimeoutMs: 30 }),
+        log: (line) => {
+          lines.push(line);
+        },
+      },
+    );
+    await client.ensureStarted();
+    const first = spawned.last!;
+    await expect(client.call("slow")).rejects.toThrow(/timed out/u);
+    // 拆除正在 waitForExit 上等（reapDelayMs 还没到）—— 新一代就出生在这个窗口里。
+    await delay(10);
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    expect(spawned.count).toBe(2);
+    const second = spawned.last!;
+    expect(second).not.toBe(first);
+    // 等第 1 代的 done 兑现（terminate 之后 exitDelayMs 才落地）。
+    await delay(150);
+    expect(client.alive).toBe(true);
+    expect(lines.some((line) => line.includes("ignoring stale teardown"))).toBe(true);
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    await client.dispose();
+  });
+
+  it("旧代管道错误晚到时不拆掉新一代进程", async () => {
+    // 管道 error 回调同样来自某一个具体进程：旧代已经退出之后，它的 stderr 错误
+    // 才落地，不该据此拆掉后来才拉起来的新一代。
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      fakeCtx(
+        { reply: (id, method) => (method === "slow" ? null : okReply(id)) },
+        spawned,
+      ) as never,
+      options({ requestTimeoutMs: 20 }),
+    );
+    await client.ensureStarted();
+    const first = spawned.last!;
+    await expect(client.call("slow")).rejects.toThrow(/timed out/u);
+    // 等第 1 代拆完，再拉第 2 代 —— 然后才让第 1 代的管道错误落地。
+    await delay(20);
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    expect(spawned.count).toBe(2);
+    first.stderr.emit("error", new Error("old stderr broke"));
+    await delay(20);
+    expect(client.alive).toBe(true);
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    await client.dispose();
+  });
+
   it("写管道已销毁时主动拆进程，并结清在途请求", async () => {
     // 已销毁的 Writable 上 write 会同步抛 ERR_STREAM_DESTROYED。这里测的是那之前的一道
     // 判据：先看 destroyed，就地拆进程 —— 在途条目都等不到回帧，只能自己回收。
@@ -858,18 +1021,33 @@ describe("sidecar client 与真实 python 进程", () => {
     await client.dispose();
   });
 
+  it.runIf(available)("握手如实上报 WebSocket 握手是否被守卫覆盖", async () => {
+    const client = new SidecarClient(
+      realCtx as never,
+      options({ pythonBin: LOCAL_PYTHON, requestTimeoutMs: 30_000 }),
+    );
+    const caps = await client.ensureStarted();
+    // 这里钉的是「有上报」而不是「报 true」：拦不拦得住由对端那套库有没有 route_web_socket
+    // 决定，Python 侧的 run_inprocess_capabilities 拿 Page 类的真实面比它；缺这一位才说明
+    // README 承诺的覆盖面报告又丢了。
+    expect(
+      caps.websocketGuard,
+      `能力报告没带 WebSocket 覆盖面：${JSON.stringify(caps)}`,
+    ).toBeTypeOf("boolean");
+    await client.dispose();
+  });
+
   it.runIf(available)("ping 往返", async () => {
     const client = new SidecarClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
     await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
     await client.dispose();
   });
 
-  it.runIf(available)("离线抽取往返（不需要网络）", async () => {
+  it.runIf(available)("离线正文方法已从协议面下线（清洗只剩 to_payload 那一条口）", async () => {
     const client = new SidecarClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
-    const result = (await client.call("extract", { html: "<body><h1>你好</h1></body>" })) as {
-      content: string;
-    };
-    expect(result.content).toContain("你好");
+    await expect(client.call("extract", { html: "<body><h1>你好</h1></body>" })).rejects.toThrow(
+      /unknown method/u,
+    );
     await client.dispose();
   });
 

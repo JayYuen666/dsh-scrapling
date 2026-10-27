@@ -22,6 +22,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { SidecarClient } from "../lib/sidecar.ts";
 import { TOOL_SPECS } from "../host.ts";
+import { createWebSearchProvider } from "../lib/search-provider.ts";
 import { runProbe } from "./probe.ts";
 import type { CrawlJobRunner, ToolSettings } from "../lib/tools.ts";
 
@@ -65,6 +66,8 @@ const SETTINGS: ToolSettings = {
   recordRequests: true,
   maxRecordedRequests: 100,
   sessionStateDir: "/tmp/scrapling-state",
+  adaptiveStorage: "sqlite",
+  redisUrl: "redis://127.0.0.1:6379/0",
   crawlRespectRobots: false,
   crawlDownloadDelayMs: 0,
   crawlConcurrentRequests: 4,
@@ -75,6 +78,8 @@ const SETTINGS: ToolSettings = {
   // 关掉那一档的形状由 test/tools.test.ts 单独钉（那里判的是「参数面里根本没有这两个键」）。
   allowWriteMethods: true,
   stripInlineImages: true,
+  downloadDir: "/tmp/scrapling-downloads",
+  downloadMaxBytes: 10_000_000,
 };
 
 const SAMPLE_URL = "https://example.com/page";
@@ -96,17 +101,31 @@ const BY_NAME: Record<string, unknown> = {
   extractionType: "markdown",
   method: "GET",
   sessionType: "static",
+  imageType: "png",
   selector: "h1",
   html: "<html><body><h1>hi</h1></body></html>",
   body: { a: 1 },
+  params: { page: "1" },
+  form: { field: "1" },
+  json: { field: 1 },
+  blockedDomains: ["ads.test"],
+  cookies: [{ name: "c", value: "1" }],
   question: "这个页面讲什么",
   crawlId: "c-1",
   sessionId: "s-1",
+  mode: "content",
+  sitemapUrl: SAMPLE_URL,
+  sitemapFollow: "sitemap",
+  feedUrl: SAMPLE_URL,
+  feedType: "xml",
+  itertag: "item",
+  fields: { title: "title" },
 };
 
-/** 一个参数的声明形状（只取本用例关心的两点）。 */
+/** 一个参数的声明形状（只取本用例关心的几点）。 */
 interface ParamSpec {
   type?: string;
+  enum?: unknown[];
 }
 
 /**
@@ -135,6 +154,11 @@ function sampleValue(name: string, spec: ParamSpec): unknown {
   if (name in BY_NAME) {
     return BY_NAME[name];
   }
+  // 枚举参数取第一个合法值：塞 "probe" 会被 defineTool 的入参校验拦在 sidecar.call 之前，
+  // 整个工具一个帧都发不出去 —— 该工具的每一个声明参数都会被误报成「线上没有它」。
+  if (Array.isArray(spec.enum) && spec.enum.length > 0) {
+    return spec.enum[0];
+  }
   const type = spec.type ?? "";
   return type in BY_TYPE ? BY_TYPE[type] : "probe";
 }
@@ -154,7 +178,17 @@ function flattenKeys(value: unknown, prefix = ""): string[] {
    * 这几个键的值是**调用方自定的映射**（请求体、请求头、Cookie），不是协议字段表：
    * 摊平它们会把 `body.a` 当成一个协议键去问对端读不读，那是夹具造出来的假违规。
    */
-  const OPAQUE = new Set(["body", "headers", "cookies", "extraHeaders", "attributes"]);
+  const OPAQUE = new Set([
+    "body",
+    "headers",
+    "cookies",
+    "extraHeaders",
+    "attributes",
+    "params",
+    "form",
+    "json",
+    "fields",
+  ]);
   const out: string[] = [];
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
     const name = prefix === "" ? key : `${prefix}.${key}`;
@@ -250,6 +284,13 @@ const REPLIES: Record<string, unknown> = {
     expired: false,
   },
   "crawl.stop": { crawlId: "c-1", stopping: true },
+  screenshot: {
+    url: SAMPLE_URL,
+    mediaType: "image/png",
+    base64: "aGVsbG8=",
+    width: 1,
+    height: 1,
+  },
 };
 
 /**
@@ -276,6 +317,15 @@ async function driveTools(): Promise<Record<string, ToolObservation>> {
           return "job-1";
         },
         answer: async () => ({ answer: "a", provider: "p", model: "m" }),
+        attachments: {
+          saveImage: async (input) => ({
+            attachmentId: "a-1",
+            mediaType: input.mediaType,
+            bytes: input.data.byteLength,
+            width: 1,
+            height: 1,
+          }),
+        },
       });
       // `defineTool` 把声明的那份 DSL 编译成 JSON Schema（type/properties/required），
       // 模型看到的正是这一份 —— 所以「声明了什么」必须从编译结果读，而不是从源码字面量抄。
@@ -296,6 +346,29 @@ async function driveTools(): Promise<Record<string, ToolObservation>> {
       out[spec.name] = { calls, declared: Object.keys(parameters) };
     }),
   );
+  // 检索不是工具：它由 ctx.web 的 search provider 驱动，同样要进这张对表，否则
+  // search.discover 的读取会被当成「本侧从不发」。
+  const search = recordingSidecar({
+    "search.discover": { backend: "bing", hits: [] },
+  });
+  await createWebSearchProvider({
+    sidecar: search.client,
+    backend: "bing",
+    apiKey: "",
+    braveApiKey: "",
+    serperApiKey: "",
+    apiEndpoint: "https://api.tavily.com/search",
+    bingEndpoint: "https://www.bing.com/search",
+    braveEndpoint: "https://api.search.brave.com/res/v1/web/search",
+    serperEndpoint: "https://google.serper.dev/search",
+    duckduckgoEndpoint: "https://html.duckduckgo.com/html/",
+    searxngEndpoint: "",
+    publicFallback: false,
+    renderTopN: 0,
+    maxOutputBytes: 4000,
+    timeoutMs: 30_000,
+  }).search({ query: "probe" });
+  out["web_search provider"] = { calls: search.calls, declared: [] };
   return out;
 }
 
@@ -314,9 +387,15 @@ interface PythonSide {
  * 会把「真读了」误判成「没读」。误报一旦进门禁，下一次有人为了变绿而加豁免，真正的
  * 「发了没人读」就也跟着沉默了。探针用记录型字典驱动每个方法，读哪个记哪个。
  *
+ * 一个进程只起一次探针：它要拉起真解释器、按上游真形状造会话与 Spider，一次十几秒，
+ * 而下面四条用例问的是同一份表。每条各起一次会把单条时长顶到 `testTimeout` 那条线上
+ * （macOS runner 上就是这么越线的），而判据一条也不会因此多覆盖。
+ *
  * @returns 方法全集与读取表
  */
-async function pythonSide(): Promise<PythonSide> {
+let side: Promise<PythonSide> | undefined;
+
+async function buildPythonSide(): Promise<PythonSide> {
   const report = await runProbe();
   const reads = new Map<string, Set<string>>();
   for (const [method, keys] of Object.entries(report.reads)) {
@@ -324,6 +403,14 @@ async function pythonSide(): Promise<PythonSide> {
   }
   return { reads, methods: new Set(report.methods) };
 }
+
+async function pythonSide(): Promise<PythonSide> {
+  side ??= buildPythonSide();
+  return side;
+}
+
+/** 起探针那一条用例的时间预算：默认那 20s 恰好压在探针的实际耗时上，runner 慢一点就越线。 */
+const PROBE_TIMEOUT_MS = 180_000;
 
 /**
  * 已知「Python 读了但 Host 从不发」的键。
@@ -333,12 +420,7 @@ async function pythonSide(): Promise<PythonSide> {
  * 但清单必须逐条写在这里 —— 于是新增一段走不到的读取会立刻被点名，而不是跟着「反正有历史
  * 包袱」一起沉默。
  */
-const KNOWN_UNREACHABLE: Record<string, string[]> = {
-  // sidecar 的 `extract`（离线 HTML -> 正文）至今没有任何工具在调：scrapling_extract 走的是
-  // `select`。它读的 status 因此不是「忘接线」，而是整个方法没有入口 —— 那是一条产品决定，
-  // 不该由测试替它做。其余键已全部接成模型可见入参。
-  extract: ["status"],
-};
+const KNOWN_UNREACHABLE: Record<string, string[]> = {};
 
 /**
  * 允许「声明给模型但不上网线」的入参：值在本侧就消化掉了。
@@ -349,6 +431,9 @@ const MODEL_ONLY: Record<string, string[]> = {
   // question 交给 ctx.llm（deps.answer），本来就不是 sidecar 的入参。
   // render 不发给 Python，它选的是发哪一个方法：true -> render，false -> fetch。
   scrapling_answer: ["question", "render"],
+  // locate 的 by/query 是模型面的新名：by -> 线上 queryType、query -> 线上 selector
+  // （Python 只读旧名）。两个新名都在本侧映射掉，协议帧上不会出现它们。
+  scrapling_locate: ["by", "query"],
 };
 
 /**
@@ -406,18 +491,35 @@ function unreadKeys(
  * @param reads - 对端读取表
  * @returns 两个列表：新增的死分支与过期的豁免
  */
+function sentKeysByMethod(observations: Record<string, ToolObservation>): Map<string, Set<string>> {
+  const sentByMethod = new Map<string, Set<string>>();
+  for (const observation of Object.values(observations)) {
+    for (const call of observation.calls) {
+      const sent = sentByMethod.get(call.method) ?? new Set<string>();
+      for (const key of call.keys) {
+        sent.add(key);
+      }
+      sentByMethod.set(call.method, sent);
+    }
+  }
+  return sentByMethod;
+}
+
 function deadReads(
   observations: Record<string, ToolObservation>,
   reads: Map<string, Set<string>>,
 ): { unreachable: string[]; stale: string[] } {
   const wire = keysOf(Object.values(observations).flatMap((item) => item.calls));
+  const sentByMethod = sentKeysByMethod(observations);
   const unreachable: string[] = [];
   const stale: string[] = [];
   for (const [method, read] of reads) {
     const excused = excusedFor(KNOWN_UNREACHABLE, method);
     for (const key of read) {
       if (wire.has(key)) {
-        if (excused.has(key)) {
+        // 豁免是针对**这个方法**的：别的工具把同名键发给别的方法，不能让这条豁免
+        // 看起来已经接线。
+        if (excused.has(key) && (sentByMethod.get(method)?.has(key) ?? false)) {
           stale.push(`${method} 的 ${key} 已上网线，仍留在豁免表里`);
         }
       } else if (!excused.has(key)) {
@@ -455,41 +557,60 @@ function unforwardedArgs(
 }
 
 describe("两侧对表：线路上的键必须一一对得上", () => {
-  it("每个被调用的 sidecar 方法都在对端的 METHODS 表里", async () => {
-    const { methods } = await pythonSide();
-    const observations = await driveTools();
-    const sent = new Set(
-      Object.values(observations).flatMap((item) => item.calls.map((call) => call.method)),
-    );
-    const unknown = [...sent].filter((method) => !methods.has(method));
-    expect(unknown, "对端不认这些方法，运行时会回 UNKNOWN_METHOD").toStrictEqual([]);
-    // 驱动退化（工具没跑起来、一帧没发）会让下面几组断言一起变成真空通过。
-    expect(sent.size).toBeGreaterThanOrEqual(10);
-  });
+  it(
+    "每个被调用的 sidecar 方法都在对端的 METHODS 表里",
+    async () => {
+      const { methods } = await pythonSide();
+      const observations = await driveTools();
+      const sent = new Set(
+        Object.values(observations).flatMap((item) => item.calls.map((call) => call.method)),
+      );
+      const unknown = [...sent].filter((method) => !methods.has(method));
+      expect(unknown, "对端不认这些方法，运行时会回 UNKNOWN_METHOD").toStrictEqual([]);
+      // 驱动退化（工具没跑起来、一帧没发）会让下面几组断言一起变成真空通过。
+      expect(sent.size).toBeGreaterThanOrEqual(10);
+    },
+    PROBE_TIMEOUT_MS,
+  );
 
-  it("本侧发出的每个键，对端那侧真读（否则就是「拧了没反应」）", async () => {
-    const { reads } = await pythonSide();
-    expect(unreadKeys(await driveTools(), reads)).toStrictEqual([]);
-  });
+  it(
+    "本侧发出的每个键，对端那侧真读（否则就是「拧了没反应」）",
+    async () => {
+      const { reads } = await pythonSide();
+      expect(unreadKeys(await driveTools(), reads)).toStrictEqual([]);
+    },
+    PROBE_TIMEOUT_MS,
+  );
 
-  it("对端读的每个键，本侧真发（否则是走不到的死分支）", async () => {
-    const { reads } = await pythonSide();
-    const { unreachable, stale } = deadReads(await driveTools(), reads);
-    // 新增的走不到的读取要被抓到……
-    expect(unreachable).toStrictEqual([]);
-    // ……而已接线的键也不能继续躺在豁免表里：那会让这张表慢慢变成「谁也不读」的废纸。
-    expect(stale).toStrictEqual([]);
-  });
+  it(
+    "对端读的每个键，本侧真发（否则是走不到的死分支）",
+    async () => {
+      const { reads } = await pythonSide();
+      const { unreachable, stale } = deadReads(await driveTools(), reads);
+      // 新增的走不到的读取要被抓到……
+      expect(unreachable).toStrictEqual([]);
+      // ……而已接线的键也不能继续躺在豁免表里：那会让这张表慢慢变成「谁也不读」的废纸。
+      expect(stale).toStrictEqual([]);
+    },
+    PROBE_TIMEOUT_MS,
+  );
 
-  it("声明给模型的参数要么上网线，要么被本侧消化（写了却没有=静默失效）", async () => {
-    const { reads } = await pythonSide();
-    const observations = await driveTools();
-    expect(unforwardedArgs(observations, reads)).toStrictEqual([]);
-    // 驱动退化保护：schema 一个都解析不出来会让上面那条断言变成真空通过。
-    // `scrapling_session_list` 本来就无入参，所以按总量判而不是按每个工具判。
-    const total = Object.values(observations).reduce((sum, item) => sum + item.declared.length, 0);
-    expect(total).toBeGreaterThanOrEqual(40);
-  });
+  it(
+    "声明给模型的参数要么上网线，要么被本侧消化（写了却没有=静默失效）",
+    async () => {
+      const { reads } = await pythonSide();
+      const observations = await driveTools();
+      expect(unforwardedArgs(observations, reads)).toStrictEqual([]);
+      // 驱动退化保护：schema 一个都解析不出来会让上面那条断言变成真空通过。
+      // `scrapling_session_list` 本来就无入参，所以按总量判而不是按每个工具判。
+      const total = Object.values(observations).reduce(
+        (sum, item) => sum + item.declared.length,
+        0,
+      );
+      expect(total).toBeGreaterThanOrEqual(40);
+    },
+    PROBE_TIMEOUT_MS,
+  );
 
   it("会话开场把部署级浏览器设置发过去（那些键只在构造期生效）", async () => {
     // block_ads / executable_path / init_script / record_requests / max_recorded_requests 只在

@@ -13,16 +13,30 @@
 
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolDefinition, ToolRunContext } from "@deepseek-ai/dsh-tools";
-import { setTimeout as sleep } from "node:timers/promises";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import type { AttachmentSaver } from "./browser-tools.ts";
+import { anySignal, drainCrawl } from "./crawl-support.ts";
+import type { CrawlJobStarter } from "./crawl-support.ts";
 import { capText } from "./output.ts";
 import type { CappedText } from "./output.ts";
 import type { AnswerRequest, AnswerResult } from "./answer.ts";
 import { SidecarError } from "./sidecar.ts";
 import type { SidecarClient } from "./sidecar.ts";
+import {
+  BROWSER_REQUEST_PARAMS,
+  CRAWL_MODE_PARAMS,
+  MAIN_CONTENT_ONLY_DESC,
+  NETWORK_ITEM,
+  NETWORK_READ_PARAMS,
+  networkReadParams,
+  sessionOpenExtras,
+  STATIC_REQUEST_PARAMS,
+} from "./tool-params.ts";
 
 /** 抽取形态；与 Scrapling 的 extraction_types 一致。 */
-export type ExtractionType = "markdown" | "html" | "text";
+export type ExtractionType = "markdown" | "html" | "text" | "json";
+
+export type { AttachmentSaver } from "./browser-tools.ts";
 
 /** 工具共用的一份「已解析的设置」。 */
 export interface ToolSettings {
@@ -44,6 +58,10 @@ export interface ToolSettings {
   readonly waitSelectorState: WaitSelectorState;
   /** 是否把 open shadow root 的内容并进正文。 */
   readonly pierceShadow: boolean;
+  /** 下载落点（dataDir/downloads）。 */
+  readonly downloadDir: string;
+  /** 单次下载的字节上限。 */
+  readonly downloadMaxBytes: number;
   /** Python 侧单次请求的硬上限（秒）。与 timeoutMs 是两层：后者管宿主等多久，前者管子进程
    *  自己何时放弃——只设前者，一个卡死的子进程会一直占着宿主的协同超时。 */
   readonly requestTimeoutSeconds: number;
@@ -74,6 +92,9 @@ export interface ToolSettings {
   readonly maxRecordedRequests: number;
   /** 会话登录态文件的存放目录；空表示禁用这对工具。部署级，模型改不了。 */
   readonly sessionStateDir: string;
+  /** adaptive 指纹库后端；与 `redisUrl` 一起经 deployment 命名空间下传给 sidecar。 */
+  readonly adaptiveStorage: "sqlite" | "redis";
+  readonly redisUrl: string;
   /** 爬虫是否遵守 robots.txt。部署级。 */
   readonly crawlRespectRobots: boolean;
   /** 爬虫两次请求之间的间隔（毫秒）。部署级。 */
@@ -121,6 +142,8 @@ export interface ToolDeps {
    *  但跟 startCrawlJob 一样对每个 builder 都传：类型逼着所有工具看见完整依赖，
    *  漏传是编译错误而不是运行时才发现。 */
   readonly answer: AnswerStarter;
+  /** 截图落库用的宿主 attachment 服务；没有时截图工具不注册。 */
+  readonly attachments?: AttachmentSaver | undefined;
 }
 
 /** 抓取类工具的 canonical 结果。 */
@@ -131,6 +154,7 @@ interface FetchResult {
   content: string;
   truncated: boolean;
   notice: string;
+  metadata?: Record<string, Jsonish>;
 }
 
 /**
@@ -149,15 +173,62 @@ interface Match {
   text?: string;
   /** `attribute` 指定的那个属性值。 */
   value?: string;
+  /** 元素的 outerHTML；仅 includeHtml 为真时出现。 */
+  html?: string;
   /** 元素全部属性；仅 `includeAttributes` 为真时给出。值由 Python 侧统一转成字符串。 */
   attributes?: Record<string, Jsonish>;
 }
+
+/** 一条多字段记录。字段值由 Python 侧决定，缺失为 null。 */
+type Row = Record<string, Jsonish>;
 
 /** 结构化选择的结果。 */
 interface SelectResult {
   count: number;
   truncated: boolean;
   matches: Match[];
+  rows?: Row[];
+  notice?: string;
+}
+
+/** locate 返回的一条命中。 */
+interface LocateMatch {
+  tag: string;
+  text: string;
+  attributes: Record<string, Jsonish>;
+  cssSelector: string;
+  xpathSelector: string;
+  fullCssSelector: string;
+  fullXpathSelector: string;
+  ancestors: { tag: string; attributes: Record<string, Jsonish> }[];
+}
+
+/** locate 的结果。 */
+interface LocateResult {
+  count: number;
+  truncated: boolean;
+  matches: LocateMatch[];
+  notice?: string;
+}
+
+/** links 返回的一条 URL。 */
+interface LinkEntry {
+  url: string;
+}
+
+/** links 返回的分页候选。 */
+interface NextCandidate {
+  url: string;
+  text: string;
+  reason: string;
+}
+
+/** links 的结果。 */
+interface LinksResult {
+  count: number;
+  truncated: boolean;
+  links: LinkEntry[];
+  nextCandidates: NextCandidate[];
 }
 
 /**
@@ -219,6 +290,53 @@ function boolOf(value: unknown, field: string): boolean {
 }
 
 /**
+ * 把任意值收成可 JSON 序列化的形状。
+ *
+ * rows 的字段是 Python 侧拼出来的自由结构；这里逐层收窄，避免 unknown 漏进模型上下文。
+ *
+ * @param value - 任意值
+ * @returns JSON 值
+ */
+function toJsonish(value: unknown): Jsonish {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => toJsonish(item));
+  }
+  if (isRecord(value)) {
+    const out: Record<string, Jsonish> = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = toJsonish(item);
+    }
+    return out;
+  }
+  return JSON.stringify(value) || "";
+}
+
+/** 把一个对象值收成属性表。 */
+function attributesOf(value: unknown): Record<string, Jsonish> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  const out: Record<string, Jsonish> = {};
+  for (const [key, item] of Object.entries(value)) {
+    out[key] = toJsonish(item);
+  }
+  return out;
+}
+
+/** 本次调用的数值参数：调用值优先，缺省用部署值；给了 cap 就只压上限。 */
+function callNumber(value: unknown, fallback: number, cap = Number.POSITIVE_INFINITY): number {
+  return typeof value === "number" ? Math.min(value, cap) : fallback;
+}
+
+/**
  * 把 sidecar 的 result 归一成抓取类工具的载荷。
  *
  * `status` 与 `truncated` 一律必填：见 {@link intOf} / {@link boolOf}。
@@ -228,6 +346,8 @@ function boolOf(value: unknown, field: string): boolean {
  * @returns 抓取载荷
  */
 function toFetchResult(raw: unknown, extractionType: string): FetchResult {
+  const metadata =
+    isRecord(raw) && isRecord(raw["metadata"]) ? attributesOf(raw["metadata"]) : undefined;
   return {
     url: textOf(raw, "url"),
     statusCode: intOf(raw, "status"),
@@ -235,6 +355,7 @@ function toFetchResult(raw: unknown, extractionType: string): FetchResult {
     content: textOf(raw, "content"),
     truncated: boolOf(raw, "truncated"),
     notice: "",
+    ...(metadata === undefined ? {} : { metadata }),
   };
 }
 
@@ -276,6 +397,26 @@ function toSessionOpen(raw: unknown): SessionOpenResult {
 }
 
 /**
+ * 归一一条会话记录。
+ *
+ * 三枚可选面原样透传：给就带、不给就不注入 —— 会话存活状态与页池统计是 Python 侧才
+ * 知道的事实，Host 不替它编默认值（编出来的 alive:false 会被模型读成「这个会话死了」）。
+ *
+ * @param item - 回包里的一条会话记录
+ * @returns 会话行
+ */
+function sessionRowOf(item: Record<string, unknown>): SessionRow {
+  return {
+    sessionId: typeof item["sessionId"] === "string" ? item["sessionId"] : "",
+    sessionType: typeof item["sessionType"] === "string" ? item["sessionType"] : "unknown",
+    createdAt: typeof item["createdAt"] === "string" ? item["createdAt"] : "",
+    ...(typeof item["alive"] === "boolean" ? { alive: item["alive"] } : {}),
+    ...(isRecord(item["settings"]) ? { settings: attributesOf(item["settings"]) } : {}),
+    ...(isRecord(item["poolStats"]) ? { poolStats: attributesOf(item["poolStats"]) } : {}),
+  };
+}
+
+/**
  * 把 sidecar 的会话列表回包归一成结构。
  *
  * @param raw - 回包里的 result
@@ -285,17 +426,7 @@ function toSessionRows(raw: unknown): SessionRow[] {
   if (!isRecord(raw) || !Array.isArray(raw["sessions"])) {
     return [];
   }
-  const rows: SessionRow[] = [];
-  for (const item of raw["sessions"]) {
-    if (isRecord(item)) {
-      rows.push({
-        sessionId: typeof item["sessionId"] === "string" ? item["sessionId"] : "",
-        sessionType: typeof item["sessionType"] === "string" ? item["sessionType"] : "unknown",
-        createdAt: typeof item["createdAt"] === "string" ? item["createdAt"] : "",
-      });
-    }
-  }
-  return rows;
+  return raw["sessions"].filter(isRecord).map((item) => sessionRowOf(item));
 }
 
 /**
@@ -304,6 +435,9 @@ function toSessionRows(raw: unknown): SessionRow[] {
  * 正文与属性值只会出其中一个：Python 按有没有给 `attribute` 选字段名，所以这里也只原样搬
  * 出现的那个，不另补一个空串字段。两个都没有（对端回了非字符串的脏值）时才补一个空正文 ——
  * `text` 在 schema 里是可选的，让 undefined 流过去等于让模型看到一条什么都不说的匹配。
+ *
+ * `html` 原样透传（只在 Python 真写了的时候）：它是 `includeHtml` 且没给 `attribute` 时的
+ * 那份 outerHTML，与本函数的补空正文逻辑无关 —— 有 html 而没正文的匹配是合法的。
  *
  * @param item - 回包里的单条匹配
  * @returns 归一后的匹配
@@ -315,6 +449,12 @@ function oneMatch(item: Record<string, unknown>): Match {
   }
   if (typeof item["value"] === "string") {
     match.value = item["value"];
+  }
+  // includeHtml 且没给 attribute 时，Python 侧会单独写一份 outerHTML（py/extraction.py 的
+  // item["html"]）。接口注释与 EXTRACT_OUTPUT_SCHEMA 都声明了这个字段 —— 这里不搬，声明
+  // 就等于一句空话，模型永远收不到 html。
+  if (typeof item["html"] === "string") {
+    match.html = item["html"];
   }
   if (isRecord(item["attributes"])) {
     // 逐值转字符串而不是整体断言类型：Python 侧本来就 str() 过一遍，这里再按声明的形状
@@ -344,6 +484,359 @@ function toMatches(raw: unknown): Match[] {
 }
 
 /**
+ * 把 sidecar 回包里的 rows 归一成对象数组。
+ *
+ * @param source - 回包里的 rows 数组
+ * @returns 归一后的行
+ */
+function toRows(source: readonly unknown[]): Row[] {
+  const rows: Row[] = [];
+  for (const item of source) {
+    if (isRecord(item)) {
+      const row: Row = {};
+      for (const [key, value] of Object.entries(item)) {
+        row[key] = toJsonish(value);
+      }
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
+/**
+ * 读回包里的 notice；缺失给空串。
+ *
+ * @param raw - 回包里的 result
+ * @returns notice 文本
+ */
+function noticeOf(raw: unknown): string {
+  return isRecord(raw) && typeof raw["notice"] === "string" ? raw["notice"] : "";
+}
+
+/** 读字符串字段；缺失或类型不对时给空串。 */
+function stringOrEmpty(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  return typeof value === "string" ? value : "";
+}
+
+interface AncestorEntry {
+  tag: string;
+  attributes: Record<string, Jsonish>;
+}
+
+/** 读一个必需的数组字段；缺失或类型不对时报可读错误，不补空列表。 */
+function arrayOf(raw: unknown, field: string): unknown[] {
+  if (!isRecord(raw) || !Array.isArray(raw[field])) {
+    throw new Error(`sidecar result is missing an array field: ${field}`);
+  }
+  return raw[field];
+}
+
+/** 归一 locate 的祖先链；非对象项丢弃。 */
+function toAncestors(value: unknown): AncestorEntry[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const out: AncestorEntry[] = [];
+  for (const item of value) {
+    if (isRecord(item)) {
+      out.push({ tag: stringOrEmpty(item, "tag"), attributes: attributesOf(item["attributes"]) });
+    }
+  }
+  return out;
+}
+
+/** 归一一条 locate 命中。 */
+function toLocateMatch(item: Record<string, unknown>): LocateMatch {
+  return {
+    tag: stringOrEmpty(item, "tag"),
+    text: stringOrEmpty(item, "text"),
+    attributes: attributesOf(item["attributes"]),
+    cssSelector: stringOrEmpty(item, "cssSelector"),
+    xpathSelector: stringOrEmpty(item, "xpathSelector"),
+    fullCssSelector: stringOrEmpty(item, "fullCssSelector"),
+    fullXpathSelector: stringOrEmpty(item, "fullXpathSelector"),
+    ancestors: toAncestors(item["ancestors"]),
+  };
+}
+
+/**
+ * 归一 locate 的 matches；非对象项丢弃。
+ *
+ * @param raw - 回包里的 result
+ * @returns 命中列表
+ */
+function toLocateMatches(raw: unknown): LocateMatch[] {
+  const out: LocateMatch[] = [];
+  for (const item of arrayOf(raw, "matches")) {
+    if (!isRecord(item)) {
+      throw new Error("sidecar locate match is not an object");
+    }
+    out.push(toLocateMatch(item));
+  }
+  return out;
+}
+
+/**
+ * 归一 links；非对象项丢弃。
+ *
+ * @param raw - 回包里的 result
+ * @returns URL 列表
+ */
+function toLinkEntries(raw: unknown): LinkEntry[] {
+  const out: LinkEntry[] = [];
+  for (const item of arrayOf(raw, "links")) {
+    if (!isRecord(item) || typeof item["url"] !== "string") {
+      throw new Error("sidecar link entry is not an object with a string url");
+    }
+    out.push({ url: item["url"] });
+  }
+  return out;
+}
+
+/**
+ * 归一 nextCandidates；非对象项丢弃。
+ *
+ * @param raw - 回包里的 result
+ * @returns 候选列表
+ */
+function toNextCandidates(raw: unknown): NextCandidate[] {
+  const out: NextCandidate[] = [];
+  for (const item of arrayOf(raw, "nextCandidates")) {
+    if (!isRecord(item) || typeof item["url"] !== "string") {
+      throw new Error("sidecar next candidate is not an object with a string url");
+    }
+    out.push({
+      url: item["url"],
+      text: typeof item["text"] === "string" ? item["text"] : "",
+      reason: typeof item["reason"] === "string" ? item["reason"] : "",
+    });
+  }
+  return out;
+}
+
+/**
+ * 渲染 locate 结果。
+ *
+ * @param value - locate 结果
+ * @returns 模型侧文本
+ */
+function renderLocate(value: LocateResult): string {
+  const body =
+    value.matches.length === 0
+      ? "no matches"
+      : value.matches
+          .map(
+            (item) =>
+              `<${item.tag}> ${item.text}\n  css: ${item.cssSelector}\n  xpath: ${item.xpathSelector}`,
+          )
+          .join("\n");
+  return value.notice !== undefined && value.notice.length > 0
+    ? `${body}\n\n${value.notice}`
+    : body;
+}
+
+/**
+ * 渲染 links 结果。
+ *
+ * @param value - links 结果
+ * @returns 模型侧文本
+ */
+function renderLinks(value: LinksResult): string {
+  const lines = value.links.map((item) => item.url);
+  for (const candidate of value.nextCandidates) {
+    lines.push(`next: ${candidate.text} -> ${candidate.url} (${candidate.reason})`);
+  }
+  return lines.length === 0 ? "no links" : lines.join("\n");
+}
+
+/**
+ * select 的查询参数；缺省键不发，保持旧载荷不变。
+ *
+ * @param args - 工具入参
+ * @returns 查询相关键
+ */
+function selectQueryPayload(args: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...(typeof args["queryType"] === "string" && args["queryType"].length > 0
+      ? { queryType: args["queryType"] }
+      : {}),
+    ...(args["fields"] === undefined ? {} : { fields: args["fields"] }),
+    ...(args["partial"] === true ? { partial: true } : {}),
+    ...(args["caseSensitive"] === true ? { caseSensitive: true } : {}),
+    ...(args["cleanMatch"] === undefined ? {} : { cleanMatch: args["cleanMatch"] }),
+    ...(typeof args["similarityThreshold"] === "number"
+      ? { similarityThreshold: args["similarityThreshold"] }
+      : {}),
+    ...(args["ignoreAttributes"] === undefined
+      ? {}
+      : { ignoreAttributes: args["ignoreAttributes"] }),
+    ...(args["matchText"] === true ? { matchText: true } : {}),
+  };
+}
+
+/**
+ * select 的 adaptive 与 URL 参数；缺省键不发。
+ *
+ * @param args - 工具入参
+ * @returns adaptive 相关键
+ */
+function selectAdaptivePayload(args: Record<string, unknown>): Record<string, unknown> {
+  const adaptive = args["adaptive"] === true;
+  const adaptiveSave = args["adaptiveSave"] === true || adaptive;
+  const adaptiveRelocate = args["adaptiveRelocate"] === true || adaptive;
+  return {
+    ...(typeof args["identifier"] === "string" && args["identifier"].length > 0
+      ? { identifier: args["identifier"] }
+      : {}),
+    ...(adaptiveSave ? { adaptiveSave: true } : {}),
+    ...(adaptiveRelocate ? { adaptiveRelocate: true } : {}),
+    ...(typeof args["percentage"] === "number" ? { percentage: args["percentage"] } : {}),
+    ...(adaptive ? { adaptive: true } : {}),
+    ...(typeof args["url"] === "string" && args["url"].length > 0 ? { url: args["url"] } : {}),
+    ...(args["resolveUrls"] === true ? { resolveUrls: true } : {}),
+    ...(args["includeHtml"] === true ? { includeHtml: true } : {}),
+  };
+}
+
+/**
+ * select 的输出参数；limit/attribute/includeAttributes 始终发送，保持旧载荷字段面。
+ *
+ * @param args - 工具入参
+ * @param settings - 已解析设置
+ * @returns 输出相关键
+ */
+function selectOutputPayload(
+  args: Record<string, unknown>,
+  settings: ToolSettings,
+): Record<string, unknown> {
+  return {
+    limit: args["limit"] ?? 200,
+    attribute: args["attribute"] ?? null,
+    includeAttributes: args["includeAttributes"] === true,
+    // 调用值优先，缺省仍用部署的抽取结果上限：给模型一个「这一段我只要多少字」的旋钮，
+    // 但不给时行为与旧载荷逐字一致。
+    maxContentChars: callNumber(args["maxContentChars"], settings.maxOutputBytes),
+  };
+}
+
+/**
+ * 组装 select 的完整 sidecar 载荷。
+ *
+ * @param args - 工具入参
+ * @param settings - 已解析设置
+ * @returns sidecar 载荷
+ */
+function buildSelectPayload(
+  args: Record<string, unknown>,
+  settings: ToolSettings,
+): Record<string, unknown> {
+  return {
+    html: args["html"],
+    selector: args["selector"],
+    useXpath: args["useXpath"] === true,
+    ...selectQueryPayload(args),
+    ...selectAdaptivePayload(args),
+    ...selectOutputPayload(args, settings),
+    // 指纹库放哪儿是部署表态：模型只给「存/取」，后端由这一层定。
+    deployment: { adaptiveStorage: settings.adaptiveStorage, redisUrl: settings.redisUrl },
+  };
+}
+
+/** `scrapling_extract` 的参数面；拆出来避免单函数超过行数上限。 */
+const EXTRACT_PARAMETERS = {
+  html: { type: "string", required: true, description: "要抽取的 HTML 源码。" },
+  selector: {
+    type: "string",
+    required: true,
+    description: "CSS 选择器，例如 'table tr td.price'。",
+  },
+  useXpath: { type: "boolean", description: "把 selector 当作 XPath 解析，默认 false。" },
+  queryType: {
+    type: "string",
+    description:
+      "查询方式：css（默认）/ xpath / text / regex / similar；给了它时 useXpath 只对 css/xpath 生效。",
+  },
+  fields: {
+    type: "json",
+    description:
+      "字段表：字段名 → 子选择器或 {selector, mode: text|html|attribute, attribute, all}。" +
+      "给了 fields 时返回 rows（每条记录一行），缺失字段为 null。",
+  },
+  partial: { type: "boolean", description: "text 查询是否部分匹配，默认 false。" },
+  caseSensitive: { type: "boolean", description: "text/regex 查询是否区分大小写，默认 false。" },
+  cleanMatch: { type: "boolean", description: "text/regex 查询前是否压缩空白，默认 true。" },
+  similarityThreshold: { type: "number", description: "similar 查询的相似度阈值，默认 0.2。" },
+  ignoreAttributes: {
+    type: "json",
+    description: 'similar 查询忽略的属性名数组，默认 ["href", "src"]。',
+  },
+  matchText: { type: "boolean", description: "similar 查询是否比较文本，默认 false。" },
+  identifier: { type: "string", description: "adaptive 指纹标识；默认用 selector。" },
+  adaptiveSave: { type: "boolean", description: "命中成功时保存指纹；与 adaptiveRelocate 分开。" },
+  adaptiveRelocate: { type: "boolean", description: "命中失败时按指纹重定位；默认 false。" },
+  percentage: { type: "integer", description: "adaptive 相似度阈值，1–100，默认 40。" },
+  resolveUrls: { type: "boolean", description: "把 href/src/action 拼成绝对 URL，默认 false。" },
+  includeHtml: { type: "boolean", description: "每条匹配额外返回 outerHTML，默认 false。" },
+  adaptive: {
+    type: "boolean",
+    description: "自愈选择器的旧开关：等价于同时打开 adaptiveSave 与 adaptiveRelocate。",
+  },
+  url: {
+    type: "string",
+    description: "HTML 来源页的地址；adaptive 用它给指纹分桶，resolveUrls 用它拼绝对地址。",
+  },
+  limit: {
+    type: "integer",
+    description: "最多返回多少条匹配，默认 200；总长度受「抽取结果上限」约束。",
+  },
+  maxContentChars: { type: "integer", description: "本次抽取的字符预算，缺省用部署值。" },
+  attribute: {
+    type: "string",
+    description:
+      "取这个**属性**的值而不是元素正文，例如 href、src、data-id。" +
+      "给了它就不再返回正文，每条匹配改回 value。",
+  },
+  includeAttributes: {
+    type: "boolean",
+    description: "连同元素的全部属性一起返回，默认 false。开它之后每条多一个 attributes。",
+  },
+} as const;
+
+/** `scrapling_extract` 的输出 schema；拆出来避免单函数超过行数上限。 */
+const EXTRACT_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    count: { type: "integer", required: true },
+    truncated: { type: "boolean", required: true },
+    matches: {
+      type: "array",
+      required: true,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          tag: { type: "string", required: true },
+          // text 与 value 只会出现其一（取决于有没有给 attribute），所以都不是必填；
+          // attributes 仅在 includeAttributes 为真时出现。上游的 schema 子集只允许
+          // additionalProperties 取布尔，属性表因此不声明值类型。
+          text: { type: "string" },
+          value: { type: "string" },
+          html: { type: "string" },
+          attributes: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    rows: {
+      type: "array",
+      items: { type: "object", additionalProperties: true },
+    },
+    notice: { type: "string" },
+  },
+} as const;
+
+/**
  * 把抓取结果渲染成模型看的文本。
  *
  * 收强类型而不是 `unknown`：output.schema 用的是 value-schema DSL，必填字段由 schema
@@ -355,7 +848,14 @@ function toMatches(raw: unknown): Match[] {
  */
 function renderFetch(value: FetchResult): string {
   const body = `Fetched ${value.url} (HTTP ${value.statusCode})\n\n${value.content}`;
-  return value.notice.length > 0 ? `${body}\n\n${value.notice}` : body;
+  const metadata =
+    value.metadata === undefined || Object.keys(value.metadata).length === 0
+      ? ""
+      : `\n\nMetadata:\n${Object.entries(value.metadata)
+          .map(([key, item]) => `${key}: ${typeof item === "string" ? item : JSON.stringify(item)}`)
+          .join("\n")}`;
+  const withMetadata = `${body}${metadata}`;
+  return value.notice.length > 0 ? `${withMetadata}\n\n${value.notice}` : withMetadata;
 }
 
 /**
@@ -368,15 +868,24 @@ function renderFetch(value: FetchResult): string {
  * @returns 模型侧文本
  */
 function renderMatches(value: SelectResult): string {
-  return value.matches.length === 0
-    ? "no matches"
-    : value.matches
-        .map((item) => {
-          const picked = item.value ?? item.text ?? "";
-          const attrs = item.attributes ? ` ${JSON.stringify(item.attributes)}` : "";
-          return `<${item.tag}> ${picked}${attrs}`;
-        })
-        .join("\n");
+  let body: string;
+  if (value.rows) {
+    body =
+      value.rows.length === 0 ? "no rows" : value.rows.map((row) => JSON.stringify(row)).join("\n");
+  } else if (value.matches.length === 0) {
+    body = "no matches";
+  } else {
+    body = value.matches
+      .map((item) => {
+        const picked = item.value ?? item.text ?? "";
+        const attrs = item.attributes ? ` ${JSON.stringify(item.attributes)}` : "";
+        return `<${item.tag}> ${picked}${attrs}`;
+      })
+      .join("\n");
+  }
+  return value.notice !== undefined && value.notice.length > 0
+    ? `${body}\n\n${value.notice}`
+    : body;
 }
 
 /**
@@ -427,6 +936,53 @@ const WRITE_PARAMS = {
 
 /** 会话抓取那一条帧的方法名。三处共用，写散了一次就查不出来。 */
 const METHOD_SESSION_FETCH = "session.fetch";
+const METHOD_SESSION_NETWORK = "session.network";
+
+/**
+ * 组装静态抓取的协议载荷。
+ *
+ * @param args - 工具入参
+ * @param settings - 工具设置
+ * @param extractionType - 本次请求的抽取形态
+ * @returns 发给 sidecar 的键值表
+ */
+function fetchPayload(
+  args: Record<string, unknown>,
+  settings: ToolSettings,
+  extractionType: string,
+): Record<string, unknown> {
+  return {
+    url: args["url"],
+    cssSelector: args["cssSelector"] ?? null,
+    extractionType,
+    mainContentOnly: args["mainContentOnly"] ?? settings.mainContentOnly,
+    maxContentChars: settings.maxOutputBytes,
+    // 调用值优先，缺省仍用部署的 requestTimeoutSeconds；Python 侧 _static_params 用
+    // _positive_number 校验，非法值会被它报成 BAD_ARGS，不在这一层静默改值。
+    timeoutSeconds: callNumber(args["timeoutSeconds"], settings.requestTimeoutSeconds),
+    // 关着的时候连帧上都不发这两个键：Python 缺 method 时按 GET 走，而「参数面里看不见、
+    // 帧上却带着 method」会让两侧的对表门禁各说各话。
+    ...(settings.allowWriteMethods
+      ? { method: args["method"] ?? "GET", body: args["body"] ?? null }
+      : {}),
+    headers: args["headers"] ?? null,
+    cookies: args["cookies"] ?? null,
+    impersonate: args["impersonate"] ?? "",
+    retries: args["retries"] ?? 3,
+    ...(args["params"] === undefined ? {} : { params: args["params"] }),
+    ...(args["form"] === undefined ? {} : { form: args["form"] }),
+    ...(args["json"] === undefined ? {} : { json: args["json"] }),
+    ...(typeof args["defaultEncoding"] === "string" && args["defaultEncoding"].length > 0
+      ? { defaultEncoding: args["defaultEncoding"] }
+      : {}),
+    ...(typeof args["retryDelay"] === "number" ? { retryDelay: args["retryDelay"] } : {}),
+    ...(typeof args["stealthyHeaders"] === "boolean"
+      ? { stealthyHeaders: args["stealthyHeaders"] }
+      : {}),
+    ...(args["includeMetadata"] === true ? { includeMetadata: true } : {}),
+    deployment: { stripInlineImages: settings.stripInlineImages },
+  };
+}
 
 /**
  * 建 `scrapling_fetch`：抓一个 URL 并转成 Markdown/文本/HTML。
@@ -461,9 +1017,11 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
       },
       mainContentOnly: {
         type: "boolean",
-        description: "只保留 body 内容，默认 true。",
+        description: MAIN_CONTENT_ONLY_DESC,
       },
+      timeoutSeconds: { type: "integer", description: "本次抓取超时（秒），缺省用部署值。" },
       ...REQUEST_PARAMS,
+      ...STATIC_REQUEST_PARAMS,
       // 部署没开放写方法时，这两个入参**根本不出现在参数面里**：模型看不见一个用了也没用的
       // 旋钮，比给了之后再用 WRITE_DISABLED 拦它更诚实，也少一轮往返。
       ...(settings.allowWriteMethods ? WRITE_PARAMS : {}),
@@ -481,6 +1039,7 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
           content: { type: "string", required: true },
           truncated: { type: "boolean", required: true },
           notice: { type: "string", required: true },
+          metadata: { type: "object", additionalProperties: true },
         },
       },
       render: (_args, value) => [{ type: "text", text: renderFetch(value) }],
@@ -525,28 +1084,10 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
           );
         }
       }
-      const raw = await sidecar.call(
-        "fetch",
-        {
-          url: args["url"],
-          cssSelector: args["cssSelector"] ?? null,
-          extractionType,
-          mainContentOnly: args["mainContentOnly"] ?? settings.mainContentOnly,
-          maxContentChars: settings.maxOutputBytes,
-          timeoutSeconds: settings.requestTimeoutSeconds,
-          // 关着的时候连帧上都不发这两个键：Python 缺 method 时按 GET 走，而「参数面里看不见、
-          // 帧上却带着 method」会让两侧的对表门禁各说各话。
-          ...(settings.allowWriteMethods
-            ? { method: args["method"] ?? "GET", body: args["body"] ?? null }
-            : {}),
-          headers: args["headers"] ?? null,
-          cookies: args["cookies"] ?? null,
-          impersonate: args["impersonate"] ?? "",
-          retries: args["retries"] ?? 3,
-          deployment: { stripInlineImages: settings.stripInlineImages },
-        },
-        { signal: exec.signal, timeoutMs: settings.timeoutMs },
-      );
+      const raw = await sidecar.call("fetch", fetchPayload(args, settings, extractionType), {
+        signal: exec.signal,
+        timeoutMs: settings.timeoutMs,
+      });
       const result = toFetchResult(raw, extractionType);
       const capped = capText(result.content, settings.maxOutputBytes, RECOVERY_HINT);
       return {
@@ -592,45 +1133,97 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
       "不发网络请求 —— HTML 通常来自 scrapling_fetch 的结果。要从 URL 开始，就先抓再抽取。" +
       "站点改版导致选择器失配时，用 adaptive 按上一次命中留下的指纹重新定位元素" +
       "（指纹按注册域分桶，跨调用复用请带上同一站点的 url）。",
-    parameters: {
-      html: { type: "string", required: true, description: "要抽取的 HTML 源码。" },
-      selector: {
-        type: "string",
-        required: true,
-        description: "CSS 选择器，例如 'table tr td.price'。",
-      },
-      useXpath: { type: "boolean", description: "把 selector 当作 XPath 解析，默认 false。" },
-      adaptive: {
-        type: "boolean",
-        description: "自愈选择器：命中成功时记下元素指纹，命中失败时按指纹重定位。默认 false。",
-      },
-      url: {
-        type: "string",
-        description: "HTML 来源页的地址；仅 adaptive 用它给指纹分桶，缺省时所有指纹共用一个桶。",
-      },
-      limit: {
-        type: "integer",
-        description: "最多返回多少条匹配，默认 200；总长度受「抽取结果上限」约束。",
-      },
-      attribute: {
-        type: "string",
-        description:
-          "取这个**属性**的值而不是元素正文，例如 href、src、data-id。" +
-          "给了它就不再返回正文，每条匹配改回 value。",
-      },
-      includeAttributes: {
-        type: "boolean",
-        description: "连同元素的全部属性一起返回，默认 false。开它之后每条多一个 attributes。",
-      },
-    },
+    parameters: EXTRACT_PARAMETERS,
     output: {
-      schema: {
+      schema: EXTRACT_OUTPUT_SCHEMA,
+      render: (_args, value) => [{ type: "text", text: renderMatches(value) }],
+      presentationMeta: (_args, value) => ({ count: value.count }),
+    },
+    timeoutMs: settings.timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec: ToolRunContext): Promise<SelectResult> {
+      const raw = await sidecar.call("select", buildSelectPayload(args, settings), {
+        signal: exec.signal,
+        timeoutMs: settings.timeoutMs,
+      });
+      const matches: Match[] = toMatches(raw);
+      const rows = isRecord(raw) && Array.isArray(raw["rows"]) ? toRows(raw["rows"]) : undefined;
+      const notice = noticeOf(raw);
+      return {
+        count: intOf(raw, "count"),
+        truncated: boolOf(raw, "truncated"),
+        matches,
+        ...(rows === undefined ? {} : { rows }),
+        ...(notice.length === 0 ? {} : { notice }),
+      };
+    },
+    presentCall: (args) => ({ card: "generic", title: args["selector"], kind: "search" }),
+  });
+}
+
+/** `scrapling_locate` 的参数面。 */
+const LOCATE_PARAMETERS = {
+  html: { type: "string", required: true, description: "要定位的 HTML 源码。" },
+  by: {
+    type: "string",
+    enum: ["css", "xpath", "text", "regex", "similar"],
+    description: "查询方式：css（默认）/ xpath / text / regex / similar。与 query 配对。",
+  },
+  query: {
+    type: "string",
+    description:
+      "选择器或查询词：css/xpath 传选择器，text/regex 传查询词，similar 传种子选择器。" +
+      "不给 by 时按 css 解释。",
+  },
+  // 兼容别名：老调用只写 selector/queryType（协议帧上本来就是这两个键），新参数与它们
+  // 同时出现时以 by/query 为准。
+  selector: {
+    type: "string",
+    description: "query 的旧名（兼容别名），也是 similar 的种子选择器；by/query 未给时必填。",
+  },
+  queryType: {
+    type: "string",
+    enum: ["css", "xpath", "text", "regex", "similar"],
+    description: "by 的旧名（兼容别名）。",
+  },
+  url: { type: "string", description: "HTML 来源页地址；只作为相对 URL 的基准。" },
+  partial: { type: "boolean", description: "text 查询是否部分匹配。" },
+  caseSensitive: { type: "boolean", description: "text/regex 查询是否区分大小写。" },
+  cleanMatch: { type: "boolean", description: "text/regex 查询前是否压缩空白，默认 true。" },
+  similarityThreshold: { type: "number", description: "similar 查询的相似度阈值，默认 0.2。" },
+  ignoreAttributes: {
+    type: "json",
+    description: 'similar 查询忽略的属性名数组，默认 ["href", "src"]。',
+  },
+  matchText: { type: "boolean", description: "similar 查询是否比较文本。" },
+  limit: { type: "integer", description: "最多返回多少条，默认 200。" },
+  maxContentChars: { type: "integer", description: "本次定位的字符预算，缺省用部署值。" },
+  includeAncestors: { type: "boolean", description: "返回祖先链，默认 true。" },
+  generateSelectors: { type: "boolean", description: "生成 CSS/XPath 选择器，默认 true。" },
+} as const;
+
+/** `scrapling_locate` 的输出 schema。 */
+const LOCATE_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    count: { type: "integer", required: true },
+    truncated: { type: "boolean", required: true },
+    matches: {
+      type: "array",
+      required: true,
+      items: {
         type: "object",
         additionalProperties: false,
         properties: {
-          count: { type: "integer", required: true },
-          truncated: { type: "boolean", required: true },
-          matches: {
+          tag: { type: "string", required: true },
+          text: { type: "string", required: true },
+          attributes: { type: "object", required: true, additionalProperties: true },
+          cssSelector: { type: "string", required: true },
+          xpathSelector: { type: "string", required: true },
+          fullCssSelector: { type: "string", required: true },
+          fullXpathSelector: { type: "string", required: true },
+          ancestors: {
             type: "array",
             required: true,
             items: {
@@ -638,51 +1231,210 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
               additionalProperties: false,
               properties: {
                 tag: { type: "string", required: true },
-                // text 与 value 只会出现其一（取决于有没有给 attribute），所以都不是必填；
-                // attributes 仅在 includeAttributes 为真时出现。上游的 schema 子集只允许
-                // additionalProperties 取布尔，属性表因此不声明值类型。
-                text: { type: "string" },
-                value: { type: "string" },
-                attributes: { type: "object", additionalProperties: true },
+                attributes: { type: "object", required: true, additionalProperties: true },
               },
             },
           },
         },
       },
-      render: (_args, value) => [{ type: "text", text: renderMatches(value) }],
+    },
+    notice: { type: "string" },
+  },
+} as const;
+
+/** `scrapling_links` 的参数面。 */
+const LINKS_PARAMETERS = {
+  html: { type: "string", required: true, description: "要抽出链接的 HTML 源码。" },
+  baseUrl: {
+    type: "string",
+    description: "相对链接的基准地址；为空时 LinkExtractor 不产出绝对 URL。",
+  },
+  allow: { type: "json", description: "保留 URL 的正则/正则数组；空表示全部。" },
+  deny: { type: "json", description: "丢弃 URL 的正则/正则数组；优先于 allow。" },
+  allowDomains: { type: "json", description: "保留的主机名/数组。" },
+  denyDomains: { type: "json", description: "丢弃的主机名/数组。" },
+  restrictCss: { type: "json", description: "只在匹配的 CSS 区域内抽链接。" },
+  restrictXpath: { type: "json", description: "只在匹配的 XPath 区域内抽链接。" },
+  tags: { type: "json", description: '查找链接的标签名数组，默认 ["a", "area"]。' },
+  attrs: { type: "json", description: '读取 URL 的属性名数组，默认 ["href"]。' },
+  canonicalize: { type: "boolean", description: "规范化 URL，默认 true。" },
+  strip: { type: "boolean", description: "去掉首尾空白，默认 true。" },
+  keepFragment: { type: "boolean", description: "保留 #fragment，默认 false。" },
+  denyExtensions: { type: "json", description: "丢弃这些后缀的 URL。" },
+  limit: { type: "integer", description: "最多返回多少条链接，默认 200。" },
+  findNext: { type: "boolean", description: "返回下一页/load more 候选，默认 true。" },
+} as const;
+
+/** `scrapling_links` 的输出 schema。 */
+const LINKS_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    count: { type: "integer", required: true },
+    truncated: { type: "boolean", required: true },
+    links: {
+      type: "array",
+      required: true,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          url: { type: "string", required: true },
+        },
+      },
+    },
+    nextCandidates: {
+      type: "array",
+      required: true,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          url: { type: "string", required: true },
+          text: { type: "string", required: true },
+          reason: { type: "string", required: true },
+        },
+      },
+    },
+  },
+} as const;
+
+/**
+ * 建 `scrapling_locate`：按文本/正则/相似元素定位并返回生成选择器。
+ *
+ * @param deps - 依赖
+ * @returns 工具定义
+ */
+export function createLocateTool(deps: ToolDeps): ToolDefinition {
+  const { sidecar, settings } = deps;
+  return defineTool({
+    name: "scrapling_locate",
+    description:
+      "不知道稳定选择器时，用文本、正则或相似元素定位，并返回可复用的 CSS/XPath 选择器。" +
+      "它不发网络请求，也不保存 adaptive 指纹；输入 HTML 通常来自 scrapling_fetch。",
+    parameters: LOCATE_PARAMETERS,
+    output: {
+      schema: LOCATE_OUTPUT_SCHEMA,
+      render: (_args, value) => [{ type: "text", text: renderLocate(value) }],
       presentationMeta: (_args, value) => ({ count: value.count }),
     },
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => true,
-    async execute(args, exec: ToolRunContext): Promise<SelectResult> {
+    async execute(args, exec: ToolRunContext): Promise<LocateResult> {
+      // by/query 是模型面的名字，selector/queryType 是协议帧上 Python 真正读的键：
+      // 两套同时给时以新名为准，老调用只给旧名时行为逐字不变。query 与 selector 都没有
+      // 就等于没给查询目标 —— Python 侧也会报 BAD_ARGS，这里先拦一次是为了让文案点名
+      // 模型看得见的两个参数，而不是只在报错里说「selector is required」。
+      const by = typeof args["by"] === "string" ? args["by"] : (args["queryType"] ?? "css");
+      const query = typeof args["query"] === "string" ? args["query"] : args["selector"];
+      if (typeof query !== "string" || query.length === 0) {
+        throw new SidecarError("BAD_ARGS", "query (or its alias selector) is required");
+      }
       const raw = await sidecar.call(
-        "select",
+        "locate",
         {
           html: args["html"],
-          selector: args["selector"],
-          useXpath: args["useXpath"] === true,
-          // adaptive 与 url 原样透传：undefined 与「没给」同义，Python 侧按缺省处理。
-          ...(args["adaptive"] === true ? { adaptive: true } : {}),
+          selector: query,
+          queryType: by,
           ...(typeof args["url"] === "string" && args["url"].length > 0
             ? { url: args["url"] }
             : {}),
+          ...(args["partial"] === true ? { partial: true } : {}),
+          ...(args["caseSensitive"] === true ? { caseSensitive: true } : {}),
+          ...(args["cleanMatch"] === undefined ? {} : { cleanMatch: args["cleanMatch"] }),
+          ...(typeof args["similarityThreshold"] === "number"
+            ? { similarityThreshold: args["similarityThreshold"] }
+            : {}),
+          ...(args["ignoreAttributes"] === undefined
+            ? {}
+            : { ignoreAttributes: args["ignoreAttributes"] }),
+          ...(args["matchText"] === true ? { matchText: true } : {}),
           limit: args["limit"] ?? 200,
-          attribute: args["attribute"] ?? null,
-          includeAttributes: args["includeAttributes"] === true,
-          // 抽取结果也有预算：limit 数的是条数，而十条十万字的正文照样能把上下文撑爆。
-          // 与抓取类工具同一份预算（extractMaxOutputChars），在 Python 侧逐条累计封顶。
-          maxContentChars: settings.maxOutputBytes,
+          includeAncestors: args["includeAncestors"] !== false,
+          generateSelectors: args["generateSelectors"] !== false,
+          maxContentChars: callNumber(args["maxContentChars"], settings.maxOutputBytes),
         },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
       );
-      const matches: Match[] = toMatches(raw);
+      const matches = toLocateMatches(raw);
+      const notice = noticeOf(raw);
       return {
         count: intOf(raw, "count"),
         truncated: boolOf(raw, "truncated"),
         matches,
+        ...(notice.length === 0 ? {} : { notice }),
       };
     },
-    presentCall: (args) => ({ card: "generic", title: args["selector"], kind: "search" }),
+    presentCall: (args) => ({
+      card: "generic",
+      title: typeof args["query"] === "string" ? args["query"] : (args["selector"] ?? ""),
+      kind: "search",
+    }),
+  });
+}
+
+/**
+ * 建 `scrapling_links`：列出链接与分页候选。
+ *
+ * @param deps - 依赖
+ * @returns 工具定义
+ */
+export function createLinksTool(deps: ToolDeps): ToolDefinition {
+  const { sidecar, settings } = deps;
+  return defineTool({
+    name: "scrapling_links",
+    description:
+      "从一段 HTML 中列出链接，并给出下一页/load more 候选。只做离线解析，不发网络请求；" +
+      "baseUrl 为空时保留相对链接为空结果，不猜绝对地址。",
+    parameters: LINKS_PARAMETERS,
+    output: {
+      schema: LINKS_OUTPUT_SCHEMA,
+      render: (_args, value) => [{ type: "text", text: renderLinks(value) }],
+      presentationMeta: (_args, value) => ({ count: value.count }),
+    },
+    timeoutMs: settings.timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args, exec: ToolRunContext): Promise<LinksResult> {
+      const raw = await sidecar.call(
+        "links",
+        {
+          html: args["html"],
+          baseUrl: typeof args["baseUrl"] === "string" ? args["baseUrl"] : "",
+          ...(args["allow"] === undefined ? {} : { allow: args["allow"] }),
+          ...(args["deny"] === undefined ? {} : { deny: args["deny"] }),
+          ...(args["allowDomains"] === undefined ? {} : { allowDomains: args["allowDomains"] }),
+          ...(args["denyDomains"] === undefined ? {} : { denyDomains: args["denyDomains"] }),
+          ...(args["restrictCss"] === undefined ? {} : { restrictCss: args["restrictCss"] }),
+          ...(args["restrictXpath"] === undefined ? {} : { restrictXpath: args["restrictXpath"] }),
+          ...(args["tags"] === undefined ? {} : { tags: args["tags"] }),
+          ...(args["attrs"] === undefined ? {} : { attrs: args["attrs"] }),
+          ...(typeof args["canonicalize"] === "boolean"
+            ? { canonicalize: args["canonicalize"] }
+            : {}),
+          ...(typeof args["strip"] === "boolean" ? { strip: args["strip"] } : {}),
+          ...(typeof args["keepFragment"] === "boolean"
+            ? { keepFragment: args["keepFragment"] }
+            : {}),
+          ...(args["denyExtensions"] === undefined
+            ? {}
+            : { denyExtensions: args["denyExtensions"] }),
+          limit: args["limit"] ?? 200,
+          findNext: args["findNext"] !== false,
+        },
+        { signal: exec.signal, timeoutMs: settings.timeoutMs },
+      );
+      return {
+        count: intOf(raw, "count"),
+        truncated: boolOf(raw, "truncated"),
+        links: toLinkEntries(raw),
+        nextCandidates: toNextCandidates(raw),
+      };
+    },
+    presentCall: (args) => ({
+      card: "generic",
+      title: typeof args["baseUrl"] === "string" ? args["baseUrl"] : "links",
+      kind: "search",
+    }),
   });
 }
 
@@ -693,11 +1445,13 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
  * 正文时给出的原因 —— 「这个接口没有正文」与「上游没把它存下来」是两件要采取不同行动的事。
  */
 export interface NetworkEntry {
+  id?: number;
   url: string;
   status: number;
   bytes: number;
   method: string;
   resourceType: string;
+  headers?: Jsonish;
   bodyNote?: string;
   body?: string;
   bodyTruncated?: boolean;
@@ -722,7 +1476,7 @@ const BROWSER_PARAMS_TEXT = {
     description: "可选的 CSS 选择器，只转换匹配到的元素 —— 抓整页时留空。",
   },
   extractionType: { type: "string", description: "输出形态：markdown（默认）/ html / text。" },
-  mainContentOnly: { type: "boolean", description: "只保留 body 内容，默认 true。" },
+  mainContentOnly: { type: "boolean", description: MAIN_CONTENT_ONLY_DESC },
   pierceShadow: {
     type: "boolean",
     description:
@@ -800,11 +1554,13 @@ const BROWSER_IDENTITY_PARAMS = {
  */
 function normalizeNetworkEntry(item: Record<string, unknown>): NetworkEntry {
   return {
+    ...(typeof item["id"] === "number" ? { id: item["id"] } : {}),
     url: typeof item["url"] === "string" ? item["url"] : "",
     status: typeof item["status"] === "number" ? item["status"] : 0,
     bytes: typeof item["bytes"] === "number" ? item["bytes"] : 0,
     method: typeof item["method"] === "string" ? item["method"] : "GET",
     resourceType: typeof item["resourceType"] === "string" ? item["resourceType"] : "",
+    ...(isRecord(item["headers"]) ? { headers: attributesOf(item["headers"]) } : {}),
     ...(typeof item["bodyNote"] === "string" ? { bodyNote: item["bodyNote"] } : {}),
     ...(typeof item["body"] === "string" ? { body: item["body"] } : {}),
     ...(item["bodyTruncated"] === true ? { bodyTruncated: true } : {}),
@@ -830,24 +1586,52 @@ function toNetworkEntries(raw: unknown, key: "xhr" | "matches"): NetworkEntry[] 
 }
 
 /**
- * 读网络历史的那几个参数，按方法分档。
+ * 组装浏览器请求参数。
  *
- * 只有 `capture` 读它们。把 `urlPattern` 之类发给 `render` 或会话抓取等于递过去一个对面
- * 根本不读的键 —— 那正是本包一直在消灭的「拧了没反应」。
+ * fetch 层与构造期的键在这里分家：cookies / retries / retryDelay 在 session.fetch 上发过去
+ * 会被上游静默丢掉，只有 render / capture 这种一次性会话才收。
  *
- * @param method - sidecar 方法名
  * @param args - 工具入参
+ * @param sessionScoped - 这一帧是不是会话内的逐次 fetch
  * @returns 要并进载荷的键
  */
-function networkReadParams(method: string, args: Record<string, unknown>): Record<string, unknown> {
-  if (method !== "capture") {
+function waitSelectorParams(
+  args: Record<string, unknown>,
+  settings: ToolSettings,
+): Record<string, unknown> {
+  const { waitSelector, waitSelectorState: state } = args;
+  if (typeof waitSelector !== "string" || waitSelector.length === 0) {
     return {};
   }
   return {
-    urlPattern: args["urlPattern"] ?? null,
-    includeBody: args["includeBody"] === true,
-    networkLimit: args["networkLimit"] ?? null,
-    maxBodyChars: args["maxBodyChars"] ?? null,
+    waitSelector,
+    waitSelectorState:
+      typeof state === "string" && state.length > 0 ? state : settings.waitSelectorState,
+  };
+}
+
+function browserRequestParams(
+  args: Record<string, unknown>,
+  sessionScoped: boolean,
+): Record<string, unknown> {
+  return {
+    ...(typeof args["disableResources"] === "boolean"
+      ? { disableResources: args["disableResources"] }
+      : {}),
+    ...(typeof args["loadDom"] === "boolean" ? { loadDom: args["loadDom"] } : {}),
+    ...(typeof args["googleSearch"] === "boolean" ? { googleSearch: args["googleSearch"] } : {}),
+    ...(Array.isArray(args["blockedDomains"]) ? { blockedDomains: args["blockedDomains"] } : {}),
+    ...(typeof args["waitSelectorState"] === "string" && args["waitSelectorState"].length > 0
+      ? { waitSelectorState: args["waitSelectorState"] }
+      : {}),
+    ...(args["includeMetadata"] === true ? { includeMetadata: true } : {}),
+    ...(sessionScoped
+      ? {}
+      : {
+          ...(Array.isArray(args["cookies"]) ? { cookies: args["cookies"] } : {}),
+          ...(typeof args["retries"] === "number" ? { retries: args["retries"] } : {}),
+          ...(typeof args["retryDelay"] === "number" ? { retryDelay: args["retryDelay"] } : {}),
+        }),
   };
 }
 
@@ -859,12 +1643,28 @@ function networkReadParams(method: string, args: Record<string, unknown>): Recor
  * @param method - sidecar 方法名
  * @returns 调用载荷
  */
+function sessionFetchExtras(
+  args: Record<string, unknown>,
+  settings: ToolSettings,
+): Record<string, unknown> {
+  return {
+    headers: args["headers"] ?? null,
+    retries: args["retries"] ?? null,
+    ...(args["params"] === undefined ? {} : { params: args["params"] }),
+    ...(args["form"] === undefined ? {} : { form: args["form"] }),
+    ...(args["json"] === undefined ? {} : { json: args["json"] }),
+    ...(Array.isArray(args["cookies"]) ? { cookies: args["cookies"] } : {}),
+    // 静态会话不接受 timeoutMs，只认 timeoutSeconds；不给的话部署级那枚
+    // requestTimeoutSeconds 对会话路径完全无效，每次都落回 Python 写死的 120 秒。
+    timeoutSeconds: args["timeoutSeconds"] ?? settings.requestTimeoutSeconds,
+  };
+}
+
 function browserPayload(
   args: Record<string, unknown>,
   settings: ToolSettings,
   method: string,
 ): { method: string; params: Record<string, unknown> } {
-  const { waitSelector } = args;
   // 会话抓取这一帧被 static 与浏览器两种会话共用：static 那一支读 headers/retries，
   // 浏览器那一支读 extraHeaders/timeoutMs。只给会话帧补前者，免得给 render 发一个
   // Python 根本不读的键（那是「拧了没反应」的老毛病）。
@@ -879,7 +1679,11 @@ function browserPayload(
       pierceShadow: args["pierceShadow"] ?? settings.pierceShadow,
       headless: args["headless"] ?? settings.headless,
       networkIdle: args["networkIdle"] ?? settings.networkIdle,
-      timeoutMs: settings.pageTimeoutMs,
+      // 调用值优先，且**只压上限**：部署的 pageTimeoutMs 是这台机器愿意等多久的天花板，
+      // 模型要更长也不越过它；非法值（0 / 负数 / 非数字）不在这一层改写成合法值 ——
+      // Python 侧 _positive_int 会把它报成 BAD_ARGS，静默夹成 1 等于把明确参数错误换成
+      // 静默跑起来。args 里没这个键时逐字沿用部署值。
+      timeoutMs: callNumber(args["timeoutMs"], settings.pageTimeoutMs, settings.pageTimeoutMs),
       maxContentChars: settings.maxOutputBytes,
       blockAds: settings.blockAds,
       // 反检测那几条只在被显式拧过时才发：没给就交给 Python 的默认值（hide_canvas=False、
@@ -905,44 +1709,20 @@ function browserPayload(
       },
       waitMs: args["waitMs"] ?? null,
       extraHeaders: args["extraHeaders"] ?? null,
+      ...browserRequestParams(args, sessionScoped),
       // 会话抓取这一帧被 static 与浏览器两种会话共用：static 那一支读 headers / retries /
       // timeoutSeconds，浏览器那一支读 extraHeaders 与 timeoutMs。只给会话帧补 static 的
       // 那三个键，免得给 render 发一个 Python 根本不读的键（那是「拧了没反应」的老毛病）。
-      ...(sessionScoped
-        ? {
-            headers: args["headers"] ?? null,
-            retries: args["retries"] ?? null,
-            // 静态会话不接受 timeoutMs，只认 timeoutSeconds；不给的话部署级那枚
-            // requestTimeoutSeconds 对会话路径完全无效，每次都落回 Python 写死的 120 秒。
-            timeoutSeconds: settings.requestTimeoutSeconds,
-          }
-        : {}),
+      ...(sessionScoped ? sessionFetchExtras(args, settings) : {}),
       // scrapling_answer 的静态支路（render 不开）同样落进 Python 的 _static_params：
       // 不补 timeoutSeconds 的话，部署级那枚 requestTimeoutSeconds 对它完全无效。
       // 浏览器路径（render / capture）的 Python 侧不读这个键，不发。
       ...(method === "fetch" ? { timeoutSeconds: settings.requestTimeoutSeconds } : {}),
-      ...(typeof waitSelector === "string" && waitSelector.length > 0
-        ? { waitSelector, waitSelectorState: settings.waitSelectorState }
-        : {}),
+      // waitSelector 只对浏览器支路生效；发给静态 fetch 就是「拧了没反应」。
+      ...(method === "fetch" ? {} : waitSelectorParams(args, settings)),
     },
   };
 }
-
-/** 网络历史条目的条目 schema。 */
-const NETWORK_ITEM = {
-  type: "object" as const,
-  additionalProperties: false as const,
-  properties: {
-    url: { type: "string" as const, required: true as const },
-    status: { type: "integer" as const, required: true as const },
-    bytes: { type: "integer" as const, required: true as const },
-    method: { type: "string" as const, required: true as const },
-    resourceType: { type: "string" as const, required: true as const },
-    bodyNote: { type: "string" as const },
-    body: { type: "string" as const },
-    bodyTruncated: { type: "boolean" as const },
-  },
-};
 
 /**
  * 网络历史条目 → 模型可读的若干行。
@@ -985,6 +1765,11 @@ function renderBrowser(value: BrowserResult | FetchResult): string {
   return `${body}\n\nCaptured XHR/fetch:\n${networkLines(captured).join("\n")}`;
 }
 
+/** 一次性浏览器抓取的「本次超时」参数；只摆给 render，capture 那一支用不上。 */
+const BROWSER_TIMEOUT_PARAMS = {
+  timeoutMs: { type: "integer", description: "本次浏览器超时（毫秒），不超过部署上限。" },
+} as const;
+
 /** 建浏览器抓取工具时的可变部分。 */
 interface BrowserToolOptions {
   readonly name: string;
@@ -992,7 +1777,7 @@ interface BrowserToolOptions {
   readonly method: string;
   /** 结果里是否带网络历史。 */
   readonly withXhr: boolean;
-  /** 额外的参数声明；只有 capture 用它装「怎么读网络历史」那几枚。 */
+  /** 额外的参数声明：render 用它装本次超时，capture 用它装「怎么读网络历史」那几枚。 */
   readonly extraParameters?: Record<string, unknown>;
 }
 
@@ -1011,7 +1796,12 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
   return defineTool({
     name: options.name,
     description: options.description,
-    parameters: { ...BROWSER_PARAMS_TEXT, ...BROWSER_IDENTITY_PARAMS, ...options.extraParameters },
+    parameters: {
+      ...BROWSER_PARAMS_TEXT,
+      ...BROWSER_IDENTITY_PARAMS,
+      ...BROWSER_REQUEST_PARAMS,
+      ...options.extraParameters,
+    },
     output: {
       schema: {
         type: "object",
@@ -1023,6 +1813,7 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
           content: { type: "string", required: true },
           truncated: { type: "boolean", required: true },
           notice: { type: "string", required: true },
+          metadata: { type: "object", additionalProperties: true },
           ...(options.withXhr
             ? { xhr: { type: "array", required: true, items: NETWORK_ITEM } }
             : {}),
@@ -1072,23 +1863,6 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
   });
 }
 
-/** capture 独有的「怎么读这次抓到的网络历史」参数。 */
-const NETWORK_READ_PARAMS = {
-  urlPattern: {
-    type: "string",
-    description:
-      '只回 URL 匹配这个正则的条目，例如 "/api/"。留空表示全部（只含 XHR/fetch 与 HTTP 错误）。',
-  },
-  includeBody: {
-    type: "boolean",
-    description:
-      "连响应体一起回，默认 false。上游只为文本类型存正文，存不下时条目上会给出原因；" +
-      "单条上限由 maxBodyChars 决定。",
-  },
-  networkLimit: { type: "integer", description: "最多回多少条，默认 50。" },
-  maxBodyChars: { type: "integer", description: "单条正文的字符上限，默认 20000。" },
-} as const;
-
 /**
  * 建 `scrapling_render`：用真实浏览器（patchright）渲染后抓取。
  *
@@ -1117,6 +1891,7 @@ export function createRenderTool(deps: ToolDeps): ToolDefinition {
       "所以匹配成功不代表那部分内容还在结果里。",
     method: "render",
     withXhr: false,
+    extraParameters: BROWSER_TIMEOUT_PARAMS,
   });
 }
 
@@ -1209,6 +1984,18 @@ export function createAnswerTool(deps: ToolDeps): ToolDefinition {
         type: "boolean",
         description: "是否只取 body 内容，默认取插件设置。",
       },
+      cssSelector: {
+        type: "string",
+        description: "只把匹配这个 CSS 选择器的部分交给模型；留空交整页。",
+      },
+      waitSelector: {
+        type: "string",
+        description: "render:true 时等这个选择器出现再取正文。",
+      },
+      waitSelectorState: {
+        type: "string",
+        description: "waitSelector 要到达的状态：attached / detached / hidden / visible。",
+      },
     },
     output: {
       schema: {
@@ -1284,6 +2071,12 @@ interface SessionRow {
   sessionId: string;
   sessionType: string;
   createdAt: string;
+  /** 会话是否还活着；Python 侧给不出时不发这个键（不是补 false）。 */
+  alive?: boolean;
+  /** 非敏感摘要（类型、headless、记录开关、locale、timezone 一类），原样透传。 */
+  settings?: Record<string, Jsonish>;
+  /** 浏览器会话的页池统计；非浏览器会话或 Python 侧不给时不发这个键。 */
+  poolStats?: Record<string, Jsonish>;
 }
 
 /** 开一个会话的结果。 */
@@ -1353,6 +2146,15 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
         description:
           "让这个会话记下它的 XHR/fetch 历史，之后用 scrapling_session_network 读。默认跟随部署设置。",
       },
+      cookies: BROWSER_REQUEST_PARAMS.cookies,
+      disableResources: BROWSER_REQUEST_PARAMS.disableResources,
+      loadDom: BROWSER_REQUEST_PARAMS.loadDom,
+      blockedDomains: BROWSER_REQUEST_PARAMS.blockedDomains,
+      googleSearch: BROWSER_REQUEST_PARAMS.googleSearch,
+      retries: BROWSER_REQUEST_PARAMS.retries,
+      retryDelay: BROWSER_REQUEST_PARAMS.retryDelay,
+      maxPages: { type: "integer", description: "浏览器会话最多打开多少页面。" },
+      sessionId: { type: "string", description: "可选的会话 id；不给由 sidecar 生成。" },
     },
     output: {
       schema: {
@@ -1392,6 +2194,7 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
           blockWebrtc: args["blockWebrtc"] === true,
           allowWebgl: args["allowWebgl"] ?? true,
           recordNetwork: args["recordNetwork"] === true,
+          ...sessionOpenExtras(args),
           // 这几枚旋钮**只在开场生效**：会话内每次 fetch 传过去会被上游 validate_fetch
           // 静默丢掉（见 py/adapters.py 的 FETCH_LEVEL_KEYS）。之前只发 sessionType /
           // headless / solveCloudflare，于是设置卡上的页面超时、广告拦截、浏览器二进制路径
@@ -1445,6 +2248,20 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
         type: "integer",
         description: "仅 static 会话：本次请求的重试次数。给浏览器会话传它会直接报错。",
       },
+      waitSelectorState: BROWSER_REQUEST_PARAMS.waitSelectorState,
+      disableResources: BROWSER_REQUEST_PARAMS.disableResources,
+      loadDom: BROWSER_REQUEST_PARAMS.loadDom,
+      blockedDomains: BROWSER_REQUEST_PARAMS.blockedDomains,
+      googleSearch: BROWSER_REQUEST_PARAMS.googleSearch,
+      includeMetadata: BROWSER_REQUEST_PARAMS.includeMetadata,
+      params: STATIC_REQUEST_PARAMS.params,
+      form: STATIC_REQUEST_PARAMS.form,
+      json: STATIC_REQUEST_PARAMS.json,
+      cookies: BROWSER_REQUEST_PARAMS.cookies,
+      timeoutSeconds: {
+        type: "integer",
+        description: "仅 static 会话：本次请求在 Python 侧的超时（秒）。",
+      },
     },
     output: {
       schema: {
@@ -1458,6 +2275,7 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
           truncated: { type: "boolean", required: true },
           notice: { type: "string", required: true },
           sessionId: { type: "string", required: true },
+          metadata: { type: "object", additionalProperties: true },
         },
       },
       render: (_args, value) => [{ type: "text", text: renderFetch(value) }],
@@ -1544,13 +2362,10 @@ export function createSessionNetworkTool(deps: ToolDeps): ToolDefinition {
       exec: ToolRunContext,
     ): Promise<{ sessionId: string; count: number; matches: NetworkEntry[] }> {
       const raw = await sidecar.call(
-        "session.network",
+        METHOD_SESSION_NETWORK,
         {
           sessionId: args["sessionId"],
-          urlPattern: args["urlPattern"] ?? null,
-          includeBody: args["includeBody"] === true,
-          networkLimit: args["networkLimit"] ?? null,
-          maxBodyChars: args["maxBodyChars"] ?? null,
+          ...networkReadParams(METHOD_SESSION_NETWORK, args),
         },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
       );
@@ -1689,7 +2504,7 @@ export function createSessionListTool(deps: ToolDeps): ToolDefinition {
   const { sidecar, settings } = deps;
   return defineTool({
     name: "scrapling_session_list",
-    description: "列出当前打开的抓取会话（id、类型、创建时间）。不返回任何凭据。",
+    description: "列出当前打开的抓取会话（id、类型、创建时间、存活状态）。不返回任何凭据。",
     parameters: {},
     output: {
       schema: {
@@ -1706,6 +2521,9 @@ export function createSessionListTool(deps: ToolDeps): ToolDefinition {
                 sessionId: { type: "string", required: true },
                 sessionType: { type: "string", required: true },
                 createdAt: { type: "string", required: true },
+                alive: { type: "boolean" },
+                settings: { type: "object", additionalProperties: true },
+                poolStats: { type: "object", additionalProperties: true },
               },
             },
           },
@@ -1780,219 +2598,7 @@ export function createSessionCloseTool(deps: ToolDeps): ToolDefinition {
   });
 }
 
-/** 爬虫作业往后台作业输出环上写东西的出口。 */
-export interface CrawlSink {
-  /** 追加一行输出。 */
-  append: (text: string) => void;
-  /** 更新「当前进度」那一行。 */
-  progress: (line: string) => void;
-  /**
-   * 作业的取消信号。
-   *
-   * 爬虫必须用**这个**信号，而不是工具执行上下文那个：job_kill 中止的是作业自己的
-   * controller，两者毫无关系。用了 exec.signal 的话，作业显示被杀了，爬虫却还在跑，
-   * Python 进程也不会被拆。
-   */
-  signal: AbortSignal;
-  /**
-   * 把这次爬虫的 crawlId 交给宿主，让 sidecar 推来的进度事件能找到这个作业的输出环。
-   *
-   * 事件帧与 `crawl.run` 的响应走同一条 stdout，只能靠 crawlId 归属；而 crawlId 在响应
-   * 里才第一次出现，宿主在那之前没有任何键可挂。缺省实现什么都不做（单测直接跑工具时
-   * 没有事件通道）。
-   */
-  track?: (crawlId: string) => void;
-}
-
-/** 爬虫作业的干活部分：宿主保证它只被调用一次，返回后作业就算结束。 */
-export type CrawlJobRunner = (sink: CrawlSink) => Promise<void>;
-
-/**
- * 起一个后台作业并返回它的 id。
- *
- * 抽成回调是为了让 `lib/tools.ts` 不必依赖 `@deepseek-ai/dsh-jobs`：工具定义只管
- * 「把这次调用交给后台跑」，真正怎么挂到 `ctx.jobs` 上由 host.ts 决定。
- */
-export type CrawlJobStarter = (label: string, run: CrawlJobRunner) => Promise<string>;
-
-/** 轮询爬虫状态的间隔（毫秒）。 */
-const CRAWL_POLL_MS = 500;
-
-/**
- * 把多个取消信号合成一个：任一中止则整体中止。
- *
- * 爬虫有两个独立的取消来源 —— 作业被 job_kill 杀掉，以及本轮工具调用超时/被打断。
- * 之前只接了后者，于是「作业显示已杀、爬虫还在跑」。
- *
- * @param sources - 参与合成的信号
- * @returns 合并后的信号
- */
-function anySignal(sources: readonly AbortSignal[]): AbortSignal {
-  // 先看原始列表：已经中止的源必须立刻生效。
-  // （先 filter 再查会恒为假 —— 过滤后的信号按定义都不是已中止状态。）
-  if (sources.some((signal) => signal.aborted)) {
-    return AbortSignal.abort();
-  }
-  const alive = sources.filter((signal) => !signal.aborted);
-  /* v8 ignore start —— 空列表与单信号都是防御性分支：调用方恒定传两个
-     （作业信号 + 工具执行信号），且任一已中止都会在上一行提前返回。 */
-  if (alive.length === 0) {
-    return AbortSignal.abort();
-  }
-  // 只有一个信号时不必再包一层：它本身就是想要的那个语义。
-  const [only] = alive;
-  if (alive.length === 1 && only !== undefined) {
-    return only;
-  }
-  /* v8 ignore stop */
-  const merged = new AbortController();
-  for (const signal of alive) {
-    signal.addEventListener(
-      "abort",
-      (): void => {
-        merged.abort();
-      },
-      { once: true },
-    );
-  }
-  return merged.signal;
-}
-
-/* v8 ignore start —— 下面这两个函数是对**对端形状**的防御：crawl.status 的 pages
-   由另一个语言的进程拼出来，字段类型不该被直接相信。正常路径（三个字段都是字符串）
-   由端到端爬虫用例覆盖，非字符串那一侧属于兜底。 */
-/** 把一个可能不是字符串的字段取成字符串，缺失时给空串。 */
-function strField(page: Record<string, unknown>, field: string): string {
-  const value = page[field];
-  return typeof value === "string" ? value : "";
-}
-
-/**
- * 把一页爬取结果写成输出环上的一段文本。
- *
- * 逐字段判类型而不是直接 String(...)：回包是跨语言进程给的，String({}) 会变成
- * "[object Object]" 混进模型上下文。
- *
- * @param page - 一页
- * @returns 可追加的文本
- */
-function pageToText(page: Record<string, unknown>): string {
-  const url = strField(page, "url");
-  const title = strField(page, "title") || url;
-  return `## ${title}\n${url}\n\n${strField(page, "markdown")}\n`;
-}
-/* v8 ignore stop */
-
-/**
- * 叫停 Python 侧那个爬虫。
- *
- * 尽力而为：进程可能已经退了（那一次 job_kill 把 sidecar 一起拆了），这一帧只会换回
- * 一个错误。错误绝不能往外抛 —— 它要盖掉的是调用方真正关心的那个失败原因。
- *
- * @param sidecar - sidecar 客户端
- * @param crawlId - 爬虫 id
- */
-async function stopCrawl(sidecar: SidecarClient, crawlId: string): Promise<void> {
-  try {
-    await sidecar.call("crawl.stop", { crawlId });
-  } catch {
-    // 已经没人可停了：sidecar 拆掉时爬虫线程跟着退出，这里无事可做。
-  }
-}
-
-/**
- * 轮询一次爬虫状态并吐出新增页面；还在跑就等一拍再来。
- *
- * @param sidecar - sidecar 客户端
- * @param crawlId - 爬虫 id
- * @param sink - 输出出口
- * @param signal - 取消信号
- * @param seen - 已经输出过多少页，跨轮次累积
- * @returns 结束时一共输出过多少页
- */
-async function drainOnce(
-  sidecar: SidecarClient,
-  crawlId: string,
-  sink: CrawlSink,
-  signal: AbortSignal,
-  seen: number,
-): Promise<number> {
-  // 只取 seen 之后新增的那一段：整份 pages 每轮重发是 O(n²)。
-  const raw = await sidecar.call(
-    "crawl.status",
-    { crawlId, since: seen },
-    { signal, timeoutMs: null },
-  );
-  /* v8 ignore next 1 —— sidecar 回了非对象时的兜底：协议层已保证回包是对象。 */
-  const status = isRecord(raw) ? raw : {};
-  const failure = typeof status["error"] === "string" ? status["error"] : "";
-  if (failure !== "") {
-    throw new Error(`crawl failed: ${failure}`);
-  }
-  /* v8 ignore start —— 下面这段只在「sidecar 回了非数组 pages」时走到，
-     属于对端形状异常的防御：过滤掉非对象项。
-     正常路径（crawl.status 每轮返回新增的 pages 数组）由集成测试覆盖。 */
-  const allPages = Array.isArray(status["pages"]) ? status["pages"] : [];
-  const pages = allPages.filter((page): page is Record<string, unknown> => isRecord(page));
-  for (const page of pages) {
-    sink.append(pageToText(page));
-  }
-  /* v8 ignore stop */
-  const total = seen + pages.length;
-  if (status["more"] === true) {
-    // 对端按字节预算只回了一段（见 py/crawl.py 的 MAX_STATUS_BYTES）：紧接着取下一段，
-    // 一页都不丢。这里不睡那一拍 —— 睡眠的意思是「还没跑完，等它攒点新页」，而现在是有
-    // 现成的页等着读。
-    return drainOnce(sidecar, crawlId, sink, signal, total);
-  }
-  if (status["running"] !== true && status["expired"] === true) {
-    // 只在收尾那一拍说：页数比 maxPages 少的原因是整体截止到了点，不是站点就这么大。
-    /* v8 ignore next 1 —— 本行由 test/tools.test.ts 的「到点收场」用例断言输出；
-       Node 24 的 v8 在 macOS CI 上偶发把这条语句记成未覆盖，行为判据仍由该用例兜住。 */
-    sink.progress("crawl stopped at its runtime budget; the page cap was not reached");
-  }
-  sink.progress(`${total} page(s) crawled`);
-  if (status["running"] !== true) {
-    return total;
-  }
-  await sleep(CRAWL_POLL_MS, undefined, { signal });
-  // 自己递归而不是回调 drainCrawl：叫停只在最外层那一个 try 里做一次，
-  // 每层各停一遍会让一次 job_kill 打出 N 帧 crawl.stop。
-  return drainOnce(sidecar, crawlId, sink, signal, total);
-}
-
-/**
- * 把一个跑着的爬虫的页面增量写进作业输出环，直到它结束。
- *
- * 轮询而不是等一个大回包：一次爬取可能几分钟，作业的输出环是给模型增量看的，
- * 等全部跑完再一次性吐出来等于没有进度可言。
- *
- * 写成递归而不是循环：每一步都要等上一次 sidecar 往返，顺序不能并行；
- * 递归也让「顺序等待」这件事在代码结构上显形，不用靠注释说明为什么不能并发。
- *
- * @param sidecar - sidecar 客户端
- * @param crawlId - 爬虫 id
- * @param sink - 输出出口
- * @param signal - 取消信号
- * @param seen - 已经输出过多少页，跨轮次累积
- */
-async function drainCrawl(
-  sidecar: SidecarClient,
-  crawlId: string,
-  sink: CrawlSink,
-  signal: AbortSignal,
-  seen: number,
-): Promise<number> {
-  try {
-    return await drainOnce(sidecar, crawlId, sink, signal, seen);
-  } catch (error: unknown) {
-    // 轮询断了（job_kill、本轮超时、sidecar 崩了）不等于爬虫停了：Python 侧的 Spider 跑在
-    // 自己的线程里，Node 侧的取消它根本看不见。先叫停再抛，否则作业显示已杀、爬虫还在
-    // 后台跑，Python 进程也一直被一个没人管的蜘蛛占着。
-    await stopCrawl(sidecar, crawlId);
-    throw error;
-  }
-}
+export type { CrawlJobRunner, CrawlJobStarter, CrawlSink } from "./crawl-support.ts";
 
 /** 爬虫工具的输出。 */
 export interface CrawlResult {
@@ -2016,14 +2622,33 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
   return defineTool({
     name: "scrapling_crawl",
     description:
-      "后台爬一个网站，把每页转成 Markdown。**立刻返回 job id，不会阻塞。**" +
-      "用 job_list 看进度、job_output 读已抓到的页面、job_kill 中断。" +
-      "爬取只在起始 URL 所属的域名内进行，默认最多 20 页。" +
+      "后台爬一个网站或 feed。**立刻返回 job id，不会阻塞。**" +
+      "用 job_list 看进度、job_output 读已抓到的结果、job_kill 中断。" +
+      "mode=content 把每页转成 Markdown；mode=sitemap 只抓 sitemap 里的 loc；" +
+      "mode=feed 读 XML/CSV feed 并按 fields 出行。" +
+      "爬取只在起始 URL 所属的域名内进行，默认最多 20 页（feed 为 20 行）。" +
       "是否遵守 robots.txt、请求间隔与并发数由部署侧配置（默认不遵守、无间隔、并发 4）。" +
       "只想抓一个已知 URL 时用 scrapling_fetch，不必起爬虫。",
     parameters: {
       url: { type: "string", required: true, description: URL_PARAM_DESC },
-      maxPages: { type: "integer", description: "最多爬多少页，默认 20。" },
+      maxPages: { type: "integer", description: "最多爬多少页（feed 为多少行），默认 20。" },
+      ...CRAWL_MODE_PARAMS,
+      cssSelector: {
+        type: "string",
+        description: "只把每页匹配这个 CSS 选择器的部分转成 Markdown；留空转整页。",
+      },
+      mainContentOnly: {
+        type: "boolean",
+        description: MAIN_CONTENT_ONLY_DESC,
+      },
+      includePatterns: {
+        type: "json",
+        description: "只跟 URL 匹配这些正则的链接（数组）。",
+      },
+      excludePatterns: {
+        type: "json",
+        description: "不跟 URL 匹配这些正则的链接（数组）；优先于 includePatterns。",
+      },
     },
     output: {
       schema: {
@@ -2054,8 +2679,10 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
     async execute(args, exec: ToolRunContext): Promise<CrawlResult> {
       const { url } = args;
       // crawlMaxItems 是部署侧的天花板，maxPages 是模型可提的参数：后者只能在前者之内。
-      // 只压上限，不动非法值（0 / 负数 / NaN 原样透下去）——把它们静默夹成 1 等于把一个
-      // 明确的参数错误换成一个静默跑起来的爬虫，模型再也学不到「这个参数是非法的」。
+      // 只压上限，不动非法值（0 / 负数原样透下去，由 Python 侧报 BAD_ARGS）——把它们静默
+      // 夹成 1 等于把一个明确的参数错误换成一个静默跑起来的爬虫，模型再也学不到「这个参数
+      // 是非法的」。NaN / Infinity 到不了这里：defineTool 的 integer 参数校验在 execute
+      // 之前就拒收（JSON 也没有这两个值）。
       const requested = typeof args["maxPages"] === "number" ? args["maxPages"] : 20;
       const maxPages = Math.min(requested, settings.crawlMaxItems);
       // crawlId 只在作业体内部拿得到（作业是异步调度的，execute 返回时它还不存在），
@@ -2073,6 +2700,25 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
             // 单页正文预算。不给的话 Python 落回它写死的默认值，设置卡上「渲染输出上限」
             // 这一档对爬虫就完全无效 —— 而 job_output 里读到的正是每页正文。
             maxContentChars: settings.maxOutputBytes,
+            ...(args["cssSelector"] === undefined ? {} : { cssSelector: args["cssSelector"] }),
+            ...(args["mainContentOnly"] === undefined
+              ? {}
+              : { mainContentOnly: args["mainContentOnly"] }),
+            ...(args["includePatterns"] === undefined
+              ? {}
+              : { includePatterns: args["includePatterns"] }),
+            ...(args["excludePatterns"] === undefined
+              ? {}
+              : { excludePatterns: args["excludePatterns"] }),
+            ...(args["mode"] === undefined ? {} : { mode: args["mode"] }),
+            ...(args["sitemapUrl"] === undefined ? {} : { sitemapUrl: args["sitemapUrl"] }),
+            ...(args["sitemapFollow"] === undefined
+              ? {}
+              : { sitemapFollow: args["sitemapFollow"] }),
+            ...(args["feedUrl"] === undefined ? {} : { feedUrl: args["feedUrl"] }),
+            ...(args["feedType"] === undefined ? {} : { feedType: args["feedType"] }),
+            ...(args["itertag"] === undefined ? {} : { itertag: args["itertag"] }),
+            ...(args["fields"] === undefined ? {} : { fields: args["fields"] }),
             // 待站策略全是部署级：它们决定「这台机器怎么对待别人的站点」，模型入参到不了
             // 这里（Python 侧只从 deployment 读）。
             deployment: {
@@ -2099,6 +2745,6 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
       });
       return { jobId, url, maxPages };
     },
-    presentCall: (args) => ({ card: "generic", title: args["url"], kind: "search" }),
+    presentCall: (args) => ({ card: "generic", title: textOf(args, "url"), kind: "search" }),
   });
 }

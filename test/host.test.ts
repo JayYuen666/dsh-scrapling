@@ -9,7 +9,7 @@ import { createServer } from "node:http";
 import type { Socket } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -19,6 +19,9 @@ import { createCrawlTool } from "../lib/tools.ts";
 import type { CrawlSink, ToolDeps, ToolSettings } from "../lib/tools.ts";
 import type { AnswerResult } from "../lib/answer.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
+import { MCP_TOKEN_ENV } from "../lib/mcp-contract.ts";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   Config as configSchema,
   apply,
@@ -32,9 +35,10 @@ import {
   resolveDataDir,
   resolvePythonBin,
   snapshotFlags,
+  startMcpSurface,
   TOOL_SPECS,
 } from "../host.ts";
-import type { Config as ConfigType, ToolFlags } from "../host.ts";
+import type { Config as ConfigType, ToolFlags, ToolPlan } from "../host.ts";
 import type { Volatile } from "@deepseek-ai/cordis";
 import { Context } from "@deepseek-ai/cordis";
 import type { SidecarCapabilities } from "../lib/sidecar.ts";
@@ -57,9 +61,13 @@ function mkRef(value: string | number | boolean): Volatile<string | number | boo
 }
 
 /** 全开开关。 */
+const BROWSER_MISSING = "browser-missing";
+
 const ALL_ON: ToolFlags = {
   fetch: true,
   extract: true,
+  locate: true,
+  links: true,
   render: true,
   captureXhr: true,
   network: true,
@@ -67,12 +75,18 @@ const ALL_ON: ToolFlags = {
   sessionState: true,
   crawl: true,
   answer: true,
+  sessionRead: true,
+  sessionActions: true,
+  download: true,
+  screenshot: true,
 };
 
 /** 全关开关。 */
 const ALL_OFF: ToolFlags = {
   fetch: false,
   extract: false,
+  locate: false,
+  links: false,
   render: false,
   captureXhr: false,
   network: false,
@@ -80,6 +94,10 @@ const ALL_OFF: ToolFlags = {
   sessionState: false,
   crawl: false,
   answer: false,
+  sessionRead: false,
+  sessionActions: false,
+  download: false,
+  screenshot: false,
 };
 
 /** 指引判据的另一半：所有工具都看得见（只看开关那一档时用这份）。 */
@@ -203,6 +221,8 @@ function toolsStub(): { names: string[]; face: unknown } {
   };
 }
 
+type Mode = "native" | "mcp" | "official-mcp";
+
 /**
  * 造一份与宿主同形的配置：volatile 字段是引用，部署级字段是真值。
  *
@@ -227,11 +247,15 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
   // 部署级二选一枚举（crawlStrategy）同样是裸值，且类型是 `"bfs" | "dfs"` 而非泛 string。
   const plainChoice = (key: string, fallback: "bfs" | "dfs"): "bfs" | "dfs" =>
     (overrides[key] as "bfs" | "dfs" | undefined) ?? fallback;
+  const plainChoice3 = (key: string, fallback: Mode): Mode =>
+    (overrides[key] as Mode | undefined) ?? fallback;
   return {
     pythonBin: pick("pythonBin", ""),
     failFastOnMissingPython: pick("failFastOnMissingPython", true),
     fetchEnabled: pick("fetchEnabled", true),
     extractEnabled: pick("extractEnabled", true),
+    locateEnabled: pick("locateEnabled", true),
+    linksEnabled: pick("linksEnabled", true),
     renderEnabled: pick("renderEnabled", true),
     captureXhrEnabled: pick("captureXhrEnabled", true),
     networkEnabled: pick("networkEnabled", true),
@@ -239,6 +263,13 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     sessionStateEnabled: pick("sessionStateEnabled", true),
     crawlEnabled: pick("crawlEnabled", true),
     answerEnabled: pick("answerEnabled", true),
+    sessionReadEnabled: pick("sessionReadEnabled", true),
+    sessionActionsEnabled: pick("sessionActionsEnabled", true),
+    downloadEnabled: pick("downloadEnabled", true),
+    screenshotEnabled: pick("screenshotEnabled", true),
+    allowBrowserActions: plainFlag("allowBrowserActions", false),
+    allowFileDownloads: plainFlag("allowFileDownloads", false),
+    downloadMaxBytes: plain("downloadMaxBytes", 10 * 1024 * 1024),
     extractionType: pick("extractionType", "markdown"),
     mainContentOnly: pick("mainContentOnly", true),
     fetchMaxOutputChars: pick("fetchMaxOutputChars", 200_000),
@@ -266,6 +297,8 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     recordRequests: plainFlag("recordRequests", false),
     maxRecordedRequests: plain("maxRecordedRequests", 100),
     sessionStateDir: plainText("sessionStateDir", ""),
+    adaptiveStorage: pick("adaptiveStorage", "sqlite"),
+    redisUrl: plainText("redisUrl", "redis://127.0.0.1:6379/0"),
     crawlRespectRobots: plainFlag("crawlRespectRobots", false),
     crawlDownloadDelayMs: plain("crawlDownloadDelayMs", 0),
     crawlConcurrentRequests: plain("crawlConcurrentRequests", 4),
@@ -273,11 +306,22 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     crawlStrategy: plainChoice("crawlStrategy", "bfs"),
     crawlCheckpointDir: plainText("crawlCheckpointDir", ""),
     allowWriteMethods: plainFlag("allowWriteMethods", false),
+    integrationMode: plainChoice3("integrationMode", "native"),
+    mcpPort: plain("mcpPort", 39_217),
+    officialMcpEnabled: plainFlag("officialMcpEnabled", false),
     nat64Prefixes: pick("nat64Prefixes", ""),
     dataDir: pick("dataDir", ""),
     provideWebFetch: pick("provideWebFetch", true),
     provideWebSearch: pick("provideWebSearch", true),
-    searchEndpoint: plainText("searchEndpoint", ""),
+    searchBackend: pick("searchBackend", "auto"),
+    searchPublicFallback: pick("searchPublicFallback", false),
+    tavilyApiKey: pick("tavilyApiKey", ""),
+    braveApiKey: pick("braveApiKey", ""),
+    serperApiKey: pick("serperApiKey", ""),
+    searxngEndpoint: pick("searxngEndpoint", ""),
+    duckduckgoEndpoint: plainText("duckduckgoEndpoint", "https://html.duckduckgo.com/html/"),
+    tavilyApiEndpoint: plainText("tavilyApiEndpoint", "https://api.tavily.com/search"),
+    bingEndpoint: plainText("bingEndpoint", "https://www.bing.com/search"),
     searchRenderTopN: plain("searchRenderTopN", 3),
     answerProvider: pick("answerProvider", ""),
     answerModel: pick("answerModel", ""),
@@ -376,29 +420,31 @@ describe("volatile 快照", () => {
 });
 
 describe("工具注册计划", () => {
-  it("全开且能力齐备时十三个工具全注册", () => {
-    expect(planTools(ALL_ON, FULL_CAPS, true).ready).toStrictEqual(
-      TOOL_SPECS.map((spec) => spec.name),
-    );
+  it("全开且能力齐备时十九个工具全注册", () => {
+    const { ready } = planTools(ALL_ON, FULL_CAPS, true);
+    expect(ready).toHaveLength(19);
+    expect(ready).toStrictEqual(TOOL_SPECS.map((spec) => spec.name));
   });
 
   it("用户关掉的工具不注册，原因记为 disabled", () => {
     const plan = planTools({ ...ALL_ON, crawl: false, answer: false }, FULL_CAPS, true);
-    expect(plan.ready).toHaveLength(11);
+    expect(plan.ready).toHaveLength(17);
     expect(plan.skipped).toStrictEqual([
       { name: "scrapling_crawl", reason: "disabled" },
       { name: "scrapling_answer", reason: "disabled" },
     ]);
   });
 
-  it("缺浏览器时不注册两个浏览器类工具，会话与爬虫照常", () => {
-    // 0.5 起浏览器抓取只剩 patchright 一套，所以依赖 browser 的只有 render 与 capture_xhr；
-    // 会话、登录态存取、爬虫、问答都不需要浏览器，能力缺了也照常注册。
+  it("缺浏览器时不注册四个浏览器类工具，会话与爬虫照常", () => {
+    // 依赖 browser 的现在是 render / capture_xhr / session_read / session_act / screenshot；
+    // 下载只依赖 scrapling，所以浏览器缺失时照常注册。
     const caps: SidecarCapabilities = { ...FULL_CAPS, browser: false };
     const plan = planTools(ALL_ON, caps, true);
     expect(plan.ready).toStrictEqual([
       "scrapling_fetch",
       "scrapling_extract",
+      "scrapling_locate",
+      "scrapling_links",
       "scrapling_session_open",
       "scrapling_session_fetch",
       "scrapling_session_network",
@@ -408,11 +454,34 @@ describe("工具注册计划", () => {
       "scrapling_session_close",
       "scrapling_crawl",
       "scrapling_answer",
+      "scrapling_download",
     ]);
     expect(plan.skipped).toStrictEqual([
-      { name: "scrapling_render", reason: "browser-missing" },
-      { name: "scrapling_capture_xhr", reason: "browser-missing" },
+      { name: "scrapling_render", reason: BROWSER_MISSING },
+      { name: "scrapling_capture_xhr", reason: BROWSER_MISSING },
+      { name: "scrapling_session_read", reason: BROWSER_MISSING },
+      { name: "scrapling_session_act", reason: BROWSER_MISSING },
+      { name: "scrapling_screenshot", reason: BROWSER_MISSING },
     ]);
+  });
+
+  it("没有 attachment 服务时截图不注册，其余照常", () => {
+    const plan = planTools(ALL_ON, FULL_CAPS, true, false);
+    expect(plan.ready).not.toContain("scrapling_screenshot");
+    expect(plan.skipped).toContainEqual({
+      name: "scrapling_screenshot",
+      reason: "attachments-missing",
+    });
+  });
+
+  it("部署门禁压过卡片开关：动作与下载在门禁关时不注册", () => {
+    const config = makeConfig({ allowBrowserActions: false, allowFileDownloads: false });
+    const flags = snapshotFlags(config);
+    expect(flags.sessionActions).toBe(false);
+    expect(flags.download).toBe(false);
+    const open = snapshotFlags(makeConfig({ allowBrowserActions: true, allowFileDownloads: true }));
+    expect(open.sessionActions).toBe(true);
+    expect(open.download).toBe(true);
   });
 
   it("scrapling 缺失时一个工具都不注册", () => {
@@ -452,7 +521,10 @@ describe("resolveDataDir", () => {
   });
 
   it("显式配置时解析成绝对路径（相对路径按 cwd 展开）", () => {
-    expect(resolveDataDir("/tmp/scrapling-data")).toBe("/tmp/scrapling-data");
+    // 用 path.resolve 现造一条本平台上的绝对路径：写死 `/tmp/...` 在 Windows 上会被
+    // 解析成 `<当前盘符>:\\tmp\\...`，测的就不是「绝对路径原样返回」了。
+    const absolute = path.resolve("scrapling-data");
+    expect(resolveDataDir(absolute)).toBe(absolute);
     expect(path.isAbsolute(resolveDataDir("relative-dir"))).toBe(true);
   });
 });
@@ -471,6 +543,10 @@ describe("每个工具的输出预算各走各的旋钮", () => {
     });
     expect(outputBudgetOf(config, "scrapling_fetch")).toBe(111);
     expect(outputBudgetOf(config, "scrapling_extract")).toBe(222);
+    expect(outputBudgetOf(config, "scrapling_session_read")).toBe(222);
+    // locate / links 只解析调用方给的 HTML，产出与 extract 同档，共用它的预算。
+    expect(outputBudgetOf(config, "scrapling_locate")).toBe(222);
+    expect(outputBudgetOf(config, "scrapling_links")).toBe(222);
     expect(outputBudgetOf(config, "scrapling_render")).toBe(333);
     expect(outputBudgetOf(config, "scrapling_capture_xhr")).toBe(444);
     // 会话类产出的是句柄与列表而非页面正文，跟渲染同档；爬虫、网络历史与登录态存取同理。
@@ -601,13 +677,23 @@ describe("apply", () => {
       systemPrompt: promptStub(),
       effect: (): void => undefined,
     } as unknown as never;
-    // 指向一个不可能建出来的路径：父级是文件而不是目录。
+    // 指向一个不可能建出来的路径：父级是文件而不是目录。`/dev/null/impossible` 只在
+    // POSIX 上成立——Windows 会把它解析成 `<盘符>:\dev\null\impossible` 并真的建出来，
+    // 于是这条测的成了「建得出来」。父级是文件这一条在两边都必失败。
     // 目录建不出来 = sidecar 的 cwd 必然 ENOENT，跟「解释器起不来」同一档：failFast
     // 默认开着，所以拒绝加载而不是静默降级成「设置卡能开、工具一个没有」的空壳。
-    await expect(apply(ctx, makeConfig({ dataDir: "/dev/null/impossible" }))).rejects.toMatchObject(
-      { code: "CONFIG_INVALID" },
-    );
-    expect(spawned).toBe(0);
+    const holder = mkdtempSync(path.join(os.tmpdir(), "dsh-blocked-"));
+    const blocker = path.join(holder, "blocker");
+    writeFileSync(blocker, "");
+    const dataDir = path.join(blocker, "impossible");
+    try {
+      await expect(apply(ctx, makeConfig({ dataDir }))).rejects.toMatchObject({
+        code: "CONFIG_INVALID",
+      });
+      expect(spawned).toBe(0);
+    } finally {
+      rmSync(path.dirname(blocker), { recursive: true, force: true });
+    }
   });
 
   it("数据目录建不出来且 failFast 关着时，warn 里点名 dataDir 并提前返回", async () => {
@@ -633,19 +719,24 @@ describe("apply", () => {
       systemPrompt: promptStub(),
       effect: (): void => undefined,
     } as unknown as never;
-    await apply(
-      ctx,
-      makeConfig({ dataDir: "/dev/null/impossible", failFastOnMissingPython: false }),
-    );
-    expect(spawned).toBe(0);
-    // 死因是目录，不是 sidecar：文案必须点名 dataDir 与具体路径，把排查引向正确的设置项。
-    expect(warnings.some((line) => line.includes("dataDir") && line.includes("/dev/null"))).toBe(
-      true,
-    );
-    expect(warnings.some((line) => line.includes("未能启动"))).toBe(false);
+    const holder = mkdtempSync(path.join(os.tmpdir(), "dsh-blocked-"));
+    const blocker = path.join(holder, "blocker");
+    writeFileSync(blocker, "");
+    const dataDir = path.join(blocker, "impossible");
+    try {
+      await apply(ctx, makeConfig({ dataDir, failFastOnMissingPython: false }));
+      expect(spawned).toBe(0);
+      // 死因是目录，不是 sidecar：文案必须点名 dataDir 与具体路径，把排查引向正确的设置项。
+      expect(warnings.some((line) => line.includes("dataDir") && line.includes(dataDir))).toBe(
+        true,
+      );
+      expect(warnings.some((line) => line.includes("未能启动"))).toBe(false);
+    } finally {
+      rmSync(path.dirname(blocker), { recursive: true, force: true });
+    }
   });
 
-  it("pythonBin 留空时回落到 python3", async () => {
+  it("pythonBin 留空时先用仓内 venv 的绝对路径", async () => {
     const resolved: string[] = [];
     const ctx = {
       get: (): undefined => undefined,
@@ -670,11 +761,9 @@ describe("apply", () => {
     // failFastOnMissingPython 默认 true：Python 起不来就拒绝加载，不静默降级成
     // 「所有工具不可用」——后者会让模型几轮之后才发现工具全没了。
     await expect(apply(ctx, makeConfig({ pythonBin: "" }))).rejects.toThrow(INTERPRETER_UNUSABLE);
-    // 留空不再等于 python3：仓内 `_env/.venv/bin/python` 可执行时就用它。用同一份解析器
+    // 留空不再等于 PATH 上的名字：仓内 venv 的解释器可用时就用它。用同一份解析器
     // 算出期望值之外的**独立**判据：这条路必须指向包根下的 venv，而不是 PATH 上的名字。
-    expect(resolved).toStrictEqual([
-      path.join(path.resolve(import.meta.dirname, ".."), "_env", ".venv", "bin", "python"),
-    ]);
+    expect(resolved).toStrictEqual([LOCAL_PYTHON]);
   });
 
   it("failFastOnMissingPython=false 时探测失败只 warn，降级为工具全不可用", async () => {
@@ -711,13 +800,13 @@ describe("apply", () => {
     // 选中哪支解释器必须每次都播报：这是「工具全没了」时唯一能对照的线索。
     expect(infos.some((line) => line.includes("[dsh-scrapling] Python 解释器："))).toBe(true);
     // 缺 Scrapling 时那条 warn 要点名解释器路径。这里写的是一条**独立的**事实：本仓
-    // `_env/.venv/bin/python` 就在包根下，所以这条文案必须带它，而不是带一个泛称。
-    expect(
-      warnings.some((line) => line.includes("_env/.venv/bin/python") && line.includes("Scrapling")),
-    ).toBe(true);
+    // venv 的解释器就在包根下，所以这条文案必须带它，而不是带一个泛称。
+    expect(warnings.some((line) => line.includes(LOCAL_PYTHON) && line.includes("Scrapling"))).toBe(
+      true,
+    );
   });
 
-  it("venv 存在但不可执行时落回 PATH；显式配置压过两者", () => {
+  it.runIf(process.platform !== "win32")("venv 存在但不可执行时落回 PATH；显式配置压过两者", () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "dsh-python-choice-"));
     const venvBin = path.join(root, "_env", ".venv", "bin");
     mkdirSync(venvBin, { recursive: true });
@@ -738,6 +827,28 @@ describe("apply", () => {
     });
     expect(resolvePythonBin("  /opt/py/bin/python3  ", root)).toStrictEqual({
       path: "/opt/py/bin/python3",
+      via: "configured",
+    });
+  });
+
+  it.runIf(process.platform === "win32")("win32 没有可执行位，venv 文件在就被选中", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "dsh-python-choice-"));
+    const venvBin = path.join(root, "_env", ".venv", "Scripts");
+    const exe = "python.exe";
+    mkdirSync(venvBin, { recursive: true });
+    writeFileSync(path.join(venvBin, exe), "");
+
+    expect(resolvePythonBin("", root)).toStrictEqual({
+      path: path.join(venvBin, exe),
+      via: "_env/.venv",
+    });
+    expect(resolvePythonBin("", path.join(root, "absent"))).toStrictEqual({
+      path: exe,
+      via: "PATH",
+    });
+    const configured = String.raw`C:\py\python.exe`;
+    expect(resolvePythonBin(`  ${configured}  `, root)).toStrictEqual({
+      path: configured,
       via: "configured",
     });
   });
@@ -896,11 +1007,14 @@ describe("apply", () => {
     await probe.dispose();
 
     // 这一格不验 provider 注册（那条由「接管 ctx.web 的两个接缝」那组负责），而夹具里
-    // 也没有 ctx.web 面，所以把默认开着的 fetch provider 显式关掉，免得 apply 在半路抛。
-    await apply(ctx, makeConfig({ pythonBin: python, provideWebFetch: false }));
+    // 也没有 ctx.web 面，所以把默认开着的两个 provider 显式关掉，免得 apply 在半路抛。
+    await apply(
+      ctx,
+      makeConfig({ pythonBin: python, provideWebFetch: false, provideWebSearch: false }),
+    );
     // 握手成功后必然打出注册计划这一行。
     expect(infos.some((line) => line.includes("注册"))).toBe(true);
-    // 真正注册上去的 =「静态两条」+「会话七条」+「爬虫一条」+「问答一条」+（浏览器可用时的两条）。
+    // 真正注册上去的 =「静态四条」+「会话七条」+「爬虫一条」+「问答一条」+（浏览器可用时的两条）。
     // 会话七条都是独立工具名，少一条就说明 TOOL_SPECS 与构造器又对不上了。
     const sessionTools = [
       "scrapling_session_open",
@@ -915,15 +1029,20 @@ describe("apply", () => {
       ? [
           "scrapling_fetch",
           "scrapling_extract",
+          "scrapling_locate",
+          "scrapling_links",
           "scrapling_render",
           "scrapling_capture_xhr",
           ...sessionTools,
           "scrapling_crawl",
           "scrapling_answer",
+          "scrapling_session_read",
         ]
       : [
           "scrapling_fetch",
           "scrapling_extract",
+          "scrapling_locate",
+          "scrapling_links",
           ...sessionTools,
           "scrapling_crawl",
           "scrapling_answer",
@@ -938,8 +1057,11 @@ describe("apply", () => {
       makeConfig({
         pythonBin: python,
         provideWebFetch: false,
+        provideWebSearch: false,
         fetchEnabled: false,
         extractEnabled: false,
+        locateEnabled: false,
+        linksEnabled: false,
         renderEnabled: false,
         captureXhrEnabled: false,
         networkEnabled: false,
@@ -947,6 +1069,10 @@ describe("apply", () => {
         sessionStateEnabled: false,
         crawlEnabled: false,
         answerEnabled: false,
+        sessionReadEnabled: false,
+        sessionActionsEnabled: false,
+        downloadEnabled: false,
+        screenshotEnabled: false,
       }),
     );
     expect(infos.some((line) => line.includes("(none)"))).toBe(true);
@@ -1026,6 +1152,8 @@ const CRAWL_SETTINGS = {
   recordRequests: false,
   maxRecordedRequests: 100,
   sessionStateDir: "",
+  adaptiveStorage: "sqlite",
+  redisUrl: "redis://127.0.0.1:6379/0",
   crawlRespectRobots: false,
   crawlDownloadDelayMs: 0,
   crawlConcurrentRequests: 4,
@@ -1036,6 +1164,8 @@ const CRAWL_SETTINGS = {
   // 这件事悄悄当成前提。
   allowWriteMethods: false,
   stripInlineImages: true,
+  downloadDir: "/tmp/scrapling-downloads",
+  downloadMaxBytes: 10_000_000,
 } satisfies ToolSettings;
 
 /**
@@ -1320,8 +1450,9 @@ describe("apply 到爬虫作业的完整链路", () => {
           pythonBin: python,
           crawlEnabled: true,
           failFastOnMissingPython: false,
-          // 夹具没有 ctx.web 面：把默认开着的 fetch provider 关掉，免得 apply 在半路抛。
+          // 夹具没有 ctx.web 面：把默认开着的两个 provider 关掉，免得 apply 在半路抛。
           provideWebFetch: false,
+          provideWebSearch: false,
           // 本地测试站点在回环地址上：与 Python 侧同一份放行设置，Host 侧闸门才放得过。
           allowedHosts: LOOPBACK_ALLOWLIST,
         }),
@@ -1803,6 +1934,7 @@ describe("接管 ctx.web 的两个接缝", () => {
         makeConfig({
           pythonBin: LOCAL_PYTHON,
           provideWebFetch: true,
+          provideWebSearch: false,
           allowedHosts: LOOPBACK_ALLOWLIST,
         }),
       );
@@ -1830,7 +1962,7 @@ describe("接管 ctx.web 的两个接缝", () => {
     }
   });
 
-  it.runIf(HAS_LOCAL_PYTHON)("search 接缝：配了端点时注册 provider", async () => {
+  it.runIf(HAS_LOCAL_PYTHON)("search 接缝：backend=bing 时注册 provider", async () => {
     const harness = makeJobHarness();
     try {
       await apply(
@@ -1839,7 +1971,7 @@ describe("接管 ctx.web 的两个接缝", () => {
           pythonBin: LOCAL_PYTHON,
           provideWebFetch: false,
           provideWebSearch: true,
-          searchEndpoint: "http://search.example/api",
+          searchBackend: "bing",
           allowedHosts: LOOPBACK_ALLOWLIST,
         }),
       );
@@ -1895,8 +2027,29 @@ describe("接管 ctx.web 的两个接缝", () => {
     expect(warnings.some((line) => line.includes("跳过注册 fetch provider"))).toBe(true);
   });
 
+  it.runIf(HAS_LOCAL_PYTHON)("动作与下载门禁打开时两个工具注册", async () => {
+    const harness = makeJobHarness();
+    try {
+      await apply(
+        harness.ctx,
+        makeConfig({
+          pythonBin: LOCAL_PYTHON,
+          provideWebFetch: false,
+          provideWebSearch: false,
+          allowBrowserActions: true,
+          allowFileDownloads: true,
+          allowedHosts: LOOPBACK_ALLOWLIST,
+        }),
+      );
+      expect(harness.tools.has("scrapling_session_act")).toBe(true);
+      expect(harness.tools.has("scrapling_download")).toBe(true);
+    } finally {
+      harness.dispose();
+    }
+  });
+
   it.runIf(HAS_LOCAL_PYTHON)(
-    "search 接缝：没配端点时即使开关打开也不注册（否则会触发 AMBIGUOUS）",
+    "search 接缝：Tavily 没配 key 仍然注册，错误留到 search 时报",
     async () => {
       const harness = makeJobHarness();
       try {
@@ -1905,11 +2058,12 @@ describe("接管 ctx.web 的两个接缝", () => {
           makeConfig({
             pythonBin: LOCAL_PYTHON,
             provideWebSearch: true,
-            searchEndpoint: "",
+            searchBackend: "tavily",
+            tavilyApiKey: "",
             allowedHosts: LOOPBACK_ALLOWLIST,
           }),
         );
-        expect(harness.webProviders.search).toStrictEqual([]);
+        expect(harness.webProviders.search).toStrictEqual(["scrapling"]);
       } finally {
         harness.dispose();
       }
@@ -2004,5 +2158,329 @@ describe("作业闸门：夹具与真实现同解", () => {
     const stubbed =
       "background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)";
     expect(message).toBe(stubbed);
+  });
+});
+
+/** MCP server 的卸载函数；宿主按「调用它即回收」这一约定登记。 */
+type Disposer = () => unknown;
+
+const STUB_DEPS = (): never =>
+  ({
+    sidecar: { call: async () => ({}) } as never,
+    settings: {} as never,
+    startCrawlJob: async () => "crawl-0000000000000000",
+    answer: async () => ({}) as never,
+    attachments: undefined,
+  }) as never;
+
+const LIVE_SEARCH = {
+  available: () => true,
+  search: async () => ({
+    sources: [{ url: "http://93.184.216.34/a", title: "A 页", snippet: "摘要" }],
+    truncated: false,
+  }),
+};
+
+const MCP_PLAN = {
+  ready: ["scrapling_fetch", "scrapling_answer", "scrapling_screenshot"],
+  skipped: [],
+} as unknown as ToolPlan;
+
+function surfaceHarness(): {
+  ctx: unknown;
+  logs: string[];
+  disposers: Disposer[];
+  port: () => number;
+} {
+  const logs: string[] = [];
+  const disposers: Disposer[] = [];
+  const ctx = {
+    effect: (factory: () => Disposer): void => {
+      disposers.push(factory());
+    },
+    logger: {
+      info: (line: string): void => {
+        logs.push(line);
+      },
+      warn: (line: string): void => {
+        logs.push(line);
+      },
+      debug: (): void => undefined,
+    },
+  };
+  return {
+    ctx,
+    logs,
+    disposers,
+    port: () => Number(/127\.0\.0\.1:(?<port>\d+)/u.exec(logs.join("\n"))?.groups?.["port"] ?? 0),
+  };
+}
+
+async function connectProbe(port: number, token?: string): Promise<Client> {
+  const client = new Client({ name: "host-probe", version: "0.0.0" });
+  const headers = token === undefined ? {} : { Authorization: `Bearer ${token}` };
+  const transport = new StreamableHTTPClientTransport(
+    new URL(`http://127.0.0.1:${String(port)}/mcp`),
+    {
+      requestInit: { headers },
+    },
+  );
+  await client.connect(transport);
+  return client;
+}
+
+async function startSurface(
+  env: NodeJS.ProcessEnv,
+  search: unknown,
+): Promise<ReturnType<typeof surfaceHarness>> {
+  const harness = surfaceHarness();
+  const handle = await startMcpSurface({
+    ctx: harness.ctx as never,
+    config: makeConfig({ mcpPort: 0 }),
+    plan: MCP_PLAN,
+    depsFor: STUB_DEPS,
+    search: search as never,
+    env,
+  });
+  const { port } = harness;
+  expect(handle.url).toContain(String(port()));
+  return harness;
+}
+
+function degradedHarness(): {
+  infos: string[];
+  names: string[];
+  disposers: Disposer[];
+  ctx: never;
+} {
+  const infos: string[] = [];
+  const names: string[] = [];
+  const disposers: Disposer[] = [];
+  const ctx = {
+    get: (): undefined => undefined,
+    subprocess: {
+      resolveExecutable: async (): Promise<string> => {
+        throw new Error(INTERPRETER_UNUSABLE);
+      },
+      spawn: (): never => {
+        throw new Error(SHOULD_NOT_REACHED);
+      },
+    },
+    logger: {
+      info: (line: string): void => {
+        infos.push(line);
+      },
+      warn: (): void => undefined,
+      debug: (): void => undefined,
+    },
+    settings: settingsStub(),
+    systemPrompt: promptStub(),
+    tools: {
+      register: (definition: { name: string }): (() => void) => {
+        names.push(definition.name);
+        return (): void => undefined;
+      },
+      get: (): undefined => undefined,
+    },
+    effect: (factory: () => Disposer): void => {
+      disposers.push(factory());
+    },
+  };
+  return { infos, names, disposers, ctx: ctx as never };
+}
+
+async function tearDown(harness: ReturnType<typeof surfaceHarness>): Promise<void> {
+  await Promise.all(harness.disposers.map((dispose) => dispose()));
+}
+
+describe("mcp 模式的装配", () => {
+  it("apply 在 mcp 模式下不注册原生工具，只起 server", async () => {
+    const harness = degradedHarness();
+    await apply(
+      harness.ctx,
+      makeConfig({
+        pythonBin: "",
+        failFastOnMissingPython: false,
+        integrationMode: "mcp",
+        mcpPort: 0,
+      }),
+    );
+    expect(harness.names).toStrictEqual([]);
+    expect(harness.infos.join("\n")).toContain("MCP server：http://127.0.0.1:");
+    await Promise.all(harness.disposers.map((dispose) => dispose()));
+  });
+
+  it("apply 在 official-mcp 模式下既不起 server 也不注册工具", async () => {
+    const harness = degradedHarness();
+    await apply(
+      harness.ctx,
+      makeConfig({
+        pythonBin: "",
+        failFastOnMissingPython: false,
+        integrationMode: "official-mcp",
+      }),
+    );
+    expect(harness.names).toStrictEqual([]);
+    const joined = harness.infos.join("\n");
+    expect(joined).toContain("integrationMode=official-mcp");
+    // 指路要指到能动手的那一句：没开开关时要点名 officialMcpEnabled 与 --accept-risk。
+    expect(joined).toContain("officialMcpEnabled");
+    expect(joined).toContain("--accept-risk");
+    await Promise.all(harness.disposers.map((dispose) => dispose()));
+  });
+
+  it.runIf(HAS_LOCAL_PYTHON)(
+    "mcp 模式下真宿主、真 sidecar 与真 MCP 客户端能走通一次 fetch",
+    async () => {
+      const site = await startCrawlSite();
+      const infos: string[] = [];
+      const registered: string[] = [];
+      const disposers: Disposer[] = [];
+      const ctx = {
+        get: (): undefined => undefined,
+        subprocess: {
+          resolveExecutable: async (command: string): Promise<string> => {
+            if (!existsSync(command)) {
+              throw new Error(`executable not found: ${command}`);
+            }
+            return command;
+          },
+          spawn: (spec: { argv: string[]; cwd: string; env?: Record<string, string> }): never => {
+            const child = spawn(spec.argv[0] ?? "", spec.argv.slice(1), {
+              cwd: spec.cwd,
+              env: { ...process.env, ...spec.env },
+              stdio: ["pipe", "pipe", "pipe"],
+            });
+            return {
+              stdin: child.stdin,
+              stdout: child.stdout,
+              stderr: child.stderr,
+              done: (async (): Promise<{ exitCode: number | null; signal: null }> => {
+                const args = await once(child, "close");
+                return { exitCode: args[0] as number | null, signal: null };
+              })(),
+              terminate: (): void => {
+                child.kill("SIGTERM");
+              },
+              waitForExit: async (): Promise<boolean> => true,
+            } as never;
+          },
+        },
+        logger: {
+          info: (line: string): void => {
+            infos.push(line);
+          },
+          warn: (): void => undefined,
+          debug: (): void => undefined,
+        },
+        tools: {
+          register: (definition: { name: string }): (() => void) => {
+            registered.push(definition.name);
+            return (): void => undefined;
+          },
+          get: (): undefined => undefined,
+        },
+        settings: settingsStub(),
+        systemPrompt: promptStub(),
+        effect: (factory: () => Disposer): void => {
+          disposers.push(factory());
+        },
+      } as unknown as never;
+
+      await apply(
+        ctx,
+        makeConfig({
+          pythonBin: LOCAL_PYTHON,
+          provideWebFetch: false,
+          provideWebSearch: false,
+          // D10：公共引擎不是默认发现路径，MCP 的 search 工具要显式打开回退才存在。
+          searchPublicFallback: true,
+          integrationMode: "mcp",
+          mcpPort: 0,
+          allowedHosts: LOOPBACK_ALLOWLIST,
+        }),
+      );
+      try {
+        // 模式互斥的第一条判据：mcp 模式下一个原生工具都不注册。
+        expect(registered).toStrictEqual([]);
+        const port = Number(
+          /127\.0\.0\.1:(?<port>\d+)/u.exec(infos.join("\n"))?.groups?.["port"] ?? 0,
+        );
+        expect(port).toBeGreaterThan(0);
+        const client = await connectProbe(port);
+        const listed = await client.listTools();
+        const names = listed.tools.map((tool) => tool.name);
+        expect(names).toContain("fetch");
+        expect(names).toContain("search");
+        expect(names).not.toContain("answer");
+        const fetched = await client.callTool({
+          name: "fetch",
+          arguments: { url: `${site.base}b.html` },
+        });
+        expect(fetched.isError).not.toBe(true);
+        expect(JSON.stringify(fetched.content)).toContain("Leaf Page");
+        await client.close();
+      } finally {
+        await Promise.all(disposers.map((dispose) => dispose()));
+        await site.close();
+      }
+    },
+  );
+
+  it("端出去的是同一份工具表，但不含 answer", async () => {
+    const harness = await startSurface({}, LIVE_SEARCH);
+    const client = await connectProbe(harness.port());
+    const listed = await client.listTools();
+    expect(listed.tools.map((tool) => tool.name)).toStrictEqual(["fetch", "screenshot", "search"]);
+    await client.close();
+    await tearDown(harness);
+  });
+
+  it("mcp 调用真的走工具执行面与渲染面", async () => {
+    const harness = await startSurface({}, LIVE_SEARCH);
+    const client = await connectProbe(harness.port());
+    const result = await client.callTool({ name: "search", arguments: { query: "dsh" } });
+    expect(result.isError).not.toBe(true);
+    expect(JSON.stringify(result.content)).toContain("A 页");
+    await client.close();
+    await tearDown(harness);
+  });
+
+  it("卸载后端口不再应答", async () => {
+    const harness = await startSurface({}, LIVE_SEARCH);
+    const port = harness.port();
+    const client = await connectProbe(port);
+    await client.close();
+    await tearDown(harness);
+    const refused = await fetch(`http://127.0.0.1:${String(port)}/mcp`).catch(
+      (error_: unknown) => error_,
+    );
+    expect(refused).toBeInstanceOf(TypeError);
+  });
+
+  it("环境里有 token 时，不带 Authorization 的连接被拒", async () => {
+    const harness = await startSurface({ [MCP_TOKEN_ENV]: "issued-token" }, LIVE_SEARCH);
+    const port = harness.port();
+    const anonymous = await fetch(`http://127.0.0.1:${String(port)}/mcp`, {
+      method: "POST",
+      headers: { accept: "application/json, text/event-stream" },
+    });
+    expect(anonymous.status).toBe(401);
+    void anonymous.body?.cancel();
+    expect(harness.logs.join("\n")).toContain("需要 bearer token");
+    const client = await connectProbe(port, "issued-token");
+    const listed = await client.listTools();
+    expect(listed.tools).toHaveLength(3);
+    await client.close();
+    await tearDown(harness);
+  });
+
+  it("搜索层不可用时 MCP 侧也没有 search", async () => {
+    const harness = await startSurface({}, { available: () => false, search: async () => ({}) });
+    const client = await connectProbe(harness.port());
+    const listed = await client.listTools();
+    expect(listed.tools.map((tool) => tool.name)).toStrictEqual(["fetch", "screenshot"]);
+    await client.close();
+    await tearDown(harness);
   });
 });

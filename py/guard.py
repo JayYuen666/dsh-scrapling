@@ -20,9 +20,13 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import threading
+import time
 from collections.abc import Iterable
 from typing import Any
 from urllib.parse import unquote, urlparse
+
+from redact import redact_url_secrets
 
 # 放行的额外主机名。默认空 —— 只有字面量公网 IP 与解析到公网的域名能过。
 ALLOWED_HOSTS: frozenset[str] = frozenset()
@@ -65,6 +69,13 @@ ALLOW_WRITE_METHODS_ENV = "DSH_SCRAPLING_ALLOW_WRITE_METHODS"
 
 # 当前是否允许写方法；由 :func:`configure_from_env` 按上面那枚变量填。
 ALLOW_WRITE_METHODS: bool = False
+
+# 结构化浏览器动作与文件下载是两组独立的高风险能力：动作会改页面对端状态，下载会把
+# 远端字节写进本机目录。两者都默认关，由部署方分别表态。
+ALLOW_BROWSER_ACTIONS_ENV = "DSH_SCRAPLING_ALLOW_BROWSER_ACTIONS"
+ALLOW_BROWSER_ACTIONS: bool = False
+ALLOW_FILE_DOWNLOADS_ENV = "DSH_SCRAPLING_ALLOW_FILE_DOWNLOADS"
+ALLOW_FILE_DOWNLOADS: bool = False
 
 # 手动追加的合成段（CIDR）。默认空 —— 自动检测是主路径。
 SYNTHETIC_NETWORKS: tuple[ipaddress.IPv4Network, ...] = ()
@@ -118,7 +129,13 @@ EXTRA_NAT64_PREFIXES: tuple[str, ...] = ()
 _NAT64_EMBEDDED_OFFSET: dict[int, int] = {96: 12, 64: 9, 56: 7, 48: 6, 40: 5, 32: 4}
 
 
-def configure(allowed_hosts=None, nat64_prefixes=None, allow_write_methods=None) -> None:
+def configure(
+    allowed_hosts: frozenset[str] | None = None,
+    nat64_prefixes: tuple[str, ...] | None = None,
+    allow_write_methods: bool | None = None,
+    allow_browser_actions: bool | None = None,
+    allow_file_downloads: bool | None = None,
+) -> None:
     """按部署配置收紧或放宽放行集合。
 
     只应由宿主侧在启动时调用一次，参数来自用户显式设置，而不是模型入参。
@@ -128,12 +145,17 @@ def configure(allowed_hosts=None, nat64_prefixes=None, allow_write_methods=None)
     :param allow_write_methods: 是否开放写方法；None 表示沿用当前值
     """
     global ALLOWED_HOSTS, EXTRA_NAT64_PREFIXES, ALLOW_WRITE_METHODS  # noqa: PLW0603 —— 模块级策略常量，需整体替换
+    global ALLOW_BROWSER_ACTIONS, ALLOW_FILE_DOWNLOADS  # noqa: PLW0603
     if allowed_hosts is not None:
         ALLOWED_HOSTS = allowed_hosts
     if nat64_prefixes is not None:
         EXTRA_NAT64_PREFIXES = nat64_prefixes
     if allow_write_methods is not None:
         ALLOW_WRITE_METHODS = allow_write_methods
+    if allow_browser_actions is not None:
+        ALLOW_BROWSER_ACTIONS = allow_browser_actions
+    if allow_file_downloads is not None:
+        ALLOW_FILE_DOWNLOADS = allow_file_downloads
 
 
 def configure_from_env() -> None:
@@ -155,6 +177,7 @@ def configure_from_env() -> None:
         configure(nat64_prefixes=prefixes)
 
     global SYNTHETIC_NETWORKS, PROXY_URL, PROXY_BYPASS, ALLOW_WRITE_METHODS, _BYPASS_ENTRIES  # noqa: PLW0603 —— 启动时定一次
+    global ALLOW_BROWSER_ACTIONS, ALLOW_FILE_DOWNLOADS  # noqa: PLW0603
     global _ENV_PROXIES, _ENV_BYPASS, _SYSTEM_PROXIES, _PAC_NOTICE  # 同上
     networks: list[ipaddress.IPv4Network] = []
     for item in os.environ.get(SYNTHETIC_RANGES_ENV, "").split(","):
@@ -176,6 +199,18 @@ def configure_from_env() -> None:
     # 写方法开关只认那几种明确写法：拼错的值（"ture"）必须落在「关」那一侧，而不是被
     # `bool("非空")` 读成开 —— 一个安全开关的默认失败方向是收紧。
     ALLOW_WRITE_METHODS = os.environ.get(ALLOW_WRITE_METHODS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    ALLOW_BROWSER_ACTIONS = os.environ.get(ALLOW_BROWSER_ACTIONS_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    ALLOW_FILE_DOWNLOADS = os.environ.get(ALLOW_FILE_DOWNLOADS_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     _ENV_PROXIES, _ENV_BYPASS = _snapshot_env_proxies()
     _SYSTEM_PROXIES, _PAC_NOTICE = _read_system_proxies()
     _BYPASS_ENTRIES = (
@@ -185,7 +220,11 @@ def configure_from_env() -> None:
     if PROXY_URL and split_proxy(PROXY_URL) is None:
         # 不抛：抛出去 sidecar 直接起不来，用户看到的只是「插件加载失败」，看不出是自己
         # 填错了一个地址。记一行指向明确的日志，让侧栏里的能力摘要照实报成未配置。
-        _log(f"ignoring an unusable {PROXY_ENV}: {PROXY_URL!r} (scheme must be one of {_PROXY_SCHEMES})")
+        # 日志面过 redact：代理地址常带 user:pass@，不能原样进宿主日志。
+        _log(
+            f"ignoring an unusable {PROXY_ENV}: {redact_url_secrets(PROXY_URL)!r}"
+            f" (scheme must be one of {_PROXY_SCHEMES})"
+        )
         PROXY_URL = ""
     if _PAC_NOTICE:
         _log(
@@ -311,10 +350,12 @@ def _run_readonly(argv: list[str]) -> str:
     :param argv: 命令与参数
     :returns: 标准输出；任何失败都返回空串
     """
-    import subprocess
+    # 只读系统命令，参数全是本文件常量。
+    import subprocess  # nosec B404
 
     try:
-        done = subprocess.run(  # noqa: S603 —— 参数是本文件里的常量，没有外部输入
+        # 参数是本文件里的常量，没有外部输入。
+        done = subprocess.run(  # noqa: S603  # nosec B603
             argv,
             capture_output=True,
             text=True,
@@ -760,6 +801,51 @@ def _acceptable_resolved(item: ipaddress.IPv4Address | ipaddress.IPv6Address) ->
     return bool(SYNTHETIC_NETWORKS) and any(item in network for network in SYNTHETIC_NETWORKS)
 
 
+# 逐主机解析结果的小缓存。浏览器路径的每个子资源都要过一次守卫，而解析是同步的：
+# 解析器变慢或故障时，每个子资源都要等满一次解析超时，整页加载被逐个资源放大。
+# 正向答案按常见 DNS TTL 的量级缓存；负向（解析失败）只缓存一小拍，让恢复先于缓存过期。
+# 缓存放大的是「校验通过到真正建连」之间的 TOCTOU 窗口，量级与 DNS 自身的记录缓存同阶。
+_DNS_CACHE: dict[str, tuple[float, list[str] | None]] = {}
+_DNS_CACHE_LOCK = threading.Lock()
+_DNS_CACHE_LIMIT = 1024
+_DNS_TTL_OK_SECONDS = 60.0
+_DNS_TTL_FAIL_SECONDS = 10.0
+
+
+def _resolve_cached(host: str) -> list[str] | None:
+    """解析一个主机名，命中未过期的缓存就不出网。解析失败记 ``None``。
+
+    :param host: 主机名
+    :returns: 地址串列表；解析失败时为 None
+    """
+    now = time.monotonic()
+    with _DNS_CACHE_LOCK:
+        hit = _DNS_CACHE.get(host)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        answer = None
+        ttl = _DNS_TTL_FAIL_SECONDS
+    else:
+        answer = [str(info[4][0]) for info in infos]
+        ttl = _DNS_TTL_OK_SECONDS
+    with _DNS_CACHE_LOCK:
+        # 简单封顶：超限就先淘汰最早写入的条目。键数受「近期抓取的站点数」约束，
+        # 到得了上限说明键在净增长，FIFO 足够。
+        while len(_DNS_CACHE) >= _DNS_CACHE_LIMIT:
+            _DNS_CACHE.pop(next(iter(_DNS_CACHE)), None)
+        _DNS_CACHE[host] = (now + ttl, answer)
+    return answer
+
+
+def _dns_cache_clear() -> None:
+    """清空解析缓存；测试换假解析器时用，生产路径不需要。"""
+    with _DNS_CACHE_LOCK:
+        _DNS_CACHE.clear()
+
+
 def is_public_address(host: str, *, proxied: bool = False) -> bool:
     """判定一个主机名/字面量是否指向公网地址。
 
@@ -796,32 +882,37 @@ def is_public_address(host: str, *, proxied: bool = False) -> bool:
     if "." not in host:
         return False
 
-    try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    except OSError:
+    answer = _resolve_cached(host)
+    if answer is None:
         if proxied:
             _log(f"local DNS has no answer for {host}; allowing it through the proxy")
             return True
         return False
     # 整张答案表都要是公网：混入一条私网即整体拒绝，避免 DNS 轮询绕过。
-    addresses: Iterable[ipaddress.IPv4Address | ipaddress.IPv6Address] = (
-        ipaddress.ip_address(info[4][0]) for info in infos
-    )
+    addresses: Iterable[ipaddress.IPv4Address | ipaddress.IPv6Address] = (ipaddress.ip_address(item) for item in answer)
     resolved = [effective_ip(item) for item in addresses]
     return bool(resolved) and all(_acceptable_resolved(item) for item in resolved)
 
 
-def url_allowed(url: str) -> tuple[bool, str]:
+def url_allowed(url: str, *, websocket: bool = False) -> tuple[bool, str]:
     """判定一个 URL 是否允许发出。
 
     :param url: 待判定的完整 URL
+    :param websocket: 按 WebSocket 握手的口径判（认 ws/wss）；发出请求的那几条路径都不传
     :returns: (是否允许, 原因)；允许时原因为空串
     """
     parsed = urlparse(url)
     # ws/wss 与 http/https 走同一套地址判定。WebSocket 握手是独立路由，page.route 拦不到，
     # 这里不认它就等于把公网 WebSocket 一起杀了 —— 不少站点的实时数据就靠它。
-    if parsed.scheme not in ("http", "https", "ws", "wss"):
+    # 而真正**发出请求**的那几条路径（fetch/crawl/download/session）不认 ws：它们不会用
+    # ws 取字节，认了就是给「scheme 判拒」留一条按调用方变化的缝。
+    schemes = ("http", "https", "ws", "wss") if websocket else ("http", "https")
+    if parsed.scheme not in schemes:
         return False, f"unsupported URL scheme: {parsed.scheme!r}"
+    # 内嵌凭据一律判拒，Host 侧 url-policy 的同一条规则在这里也要成立：两道闸门一边严一边
+    # 松时，弱的那道就是那条能走的路。放行名单只豁免「地址必须公网」，不豁免这一条。
+    if parsed.username or parsed.password:
+        return False, "URL embeds credentials"
     host = parsed.hostname or ""
     if not host:
         return False, "URL has no host"
@@ -839,10 +930,10 @@ def install(page: Any) -> None:
     """把守卫注册到 Playwright 的 page 上。
 
     用法是交给 Scrapling 的 ``page_setup=install``。选择器用 ``**/*`` 以覆盖主导航、
-    子资源与 XHR；Scrapling 自己在 ``_get_page`` 里会先 ``page.unroute_all()`` 再注册它
-    自带的 handler，而 ``page_setup`` 在那之后才跑（见
-    ``engines/_browsers/_controllers.py``：``_page_generator`` 在前，``page_setup`` 在后，
-    ``goto`` 最后），所以我们的 handler 不会被冲掉，且每次重试都会重新注册。
+    子资源与 XHR；Scrapling 自己在 ``engines/_browsers/_base.py`` 的 ``_get_page`` 里会先
+    ``page.unroute_all()`` 再注册它自带的 handler，而 ``page_setup`` 在那之后才跑（同仓
+    ``_stealth.py`` 在 ``_page_generator`` 给出的页上调用它，仍在 ``goto`` 之前），所以我们的
+    handler 不会被冲掉，且每次重试都会重新注册。
 
     放行时走 ``fallback()`` 而不是 ``continue_()``：Playwright 里多个匹配的 handler 逆序
     执行，而 ``continue_()`` 会**立刻**把请求放到网络上，跳过后面所有 handler。守卫排第一
@@ -873,36 +964,38 @@ def install(page: Any) -> None:
             else:
                 route.continue_()
         else:
-            _log(f"blocked {request.url}: {reason}")
+            _log(f"blocked {redact_url_secrets(request.url)}: {reason}")
             route.abort()
 
     def ws_handler(websocket: Any) -> None:
         url = getattr(websocket, "url", "")
-        allowed, reason = url_allowed(url if isinstance(url, str) else "")
+        allowed, reason = url_allowed(url if isinstance(url, str) else "", websocket=True)
         if allowed:
             # 显式连一次而不是什么都不做：不连时 Playwright 自己放行，那条默认路径
             # 不经任何判定，显式连接才与 HTTP 侧摆在同一套逻辑里。
             websocket.connect_to_server()
         else:
-            _log(f"blocked websocket {url}: {reason}")
+            _log(f"blocked websocket {redact_url_secrets(url)}: {reason}")
             websocket.close()
 
     page.route("**/*", handler)
 
-    route_ws = getattr(page, "route_web_socket", None)
-    if callable(route_ws):
-        route_ws("**/*", ws_handler)
+    if websocket_guard_supported(page):
+        page.route_web_socket("**/*", ws_handler)
     else:
         _log("this Playwright build has no route_web_socket; WebSocket connections are not covered by the URL guard")
 
 
-def websocket_guard_supported(page: Any) -> bool:
-    """page 上挂得上 WebSocket 守卫与否；供能力报告如实说明覆盖面。
+def websocket_guard_supported(candidate: Any) -> bool:
+    """这一版 Playwright 拦不拦得住 WebSocket 握手；Page 类与 page 实例都收。
 
-    :param page: Playwright 的 Page 对象
-    :returns 是否支持拦截 WebSocket 握手
+    能力报告在握手那一刻就要回答这一问题（那时还没有 page），而 :func:`install` 手上是
+    真页面对象，所以两侧共用这一条判据，而不是各写一份 ``getattr``。
+
+    :param candidate: Playwright / patchright 的 Page 类或其实例
+    :returns: 是否支持拦截 WebSocket 握手
     """
-    return callable(getattr(page, "route_web_socket", None))
+    return callable(getattr(candidate, "route_web_socket", None))
 
 
 def _log(message: str) -> None:

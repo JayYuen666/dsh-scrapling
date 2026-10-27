@@ -133,6 +133,33 @@ describe("中英文文档对等", () => {
     ).toStrictEqual([]);
   });
 
+  it("新工具的边界在两份里都写清楚", async () => {
+    const { en, zh } = await readPair();
+    for (const [label, text] of [
+      [EN, en],
+      [ZH, zh],
+    ] as const) {
+      expect(text, `${label} 没写清 baseUrl 为空时的行为`).toContain("baseUrl");
+    }
+    expect(en).toContain("best-effort");
+    expect(zh).toContain("尽力而为");
+  });
+
+  it("发布范围写明 macOS arm64、安装器与 blocked 项", async () => {
+    const { en, zh } = await readPair();
+    for (const [label, text] of [
+      [EN, en],
+      [ZH, zh],
+    ] as const) {
+      expect(text, `${label} 没写 macOS arm64`).toContain("macOS arm64");
+      expect(text, `${label} 没写 blocked 项`).toContain("blocked");
+      expect(text, `${label} 没写 integrationMode`).toContain("integrationMode");
+      expect(text, `${label} 没写 CLI 安装器`).toContain("dsh-scrapling setup");
+      expect(text, `${label} 不该声称四平台可用`).not.toMatch(/four platforms|四平台可用/u);
+      expect(text, `${label} 不该声称三家 API 全通`).not.toMatch(/three APIs|三家 API 全通/u);
+    }
+  });
+
   it("二级章节数一致", async () => {
     const { en, zh } = await readPair();
     expect(sectionCount(zh), `${ZH} 的章节数与 ${EN} 不一致`).toBe(sectionCount(en));

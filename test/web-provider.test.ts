@@ -4,7 +4,6 @@
 // markdown 必须降级成 text —— dsh-web 的 WebFetchBody 是封闭联合，只有 html/text。
 
 import { describe, expect, it } from "vitest";
-import { WebError } from "@deepseek-ai/dsh-web";
 import { createWebFetchProvider, PROVIDER_ID, toBodyKind } from "../lib/web-provider.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
@@ -143,6 +142,41 @@ describe("fetch", () => {
     expect(caught?.message).toContain("malformed");
   });
 
+  it("回包是 undefined 时同样抛可路由的抓取失败，而不是在拼错误文案时崩掉", async () => {
+    // `JSON.stringify(undefined)` 返回 undefined，紧跟的 `.slice` 会抛 TypeError ——
+    // 调用方拿到的是没有 code 的崩溃，而不是能按码路由的 SCRAPLING_FETCH_FAILED。
+    const client = stubSidecar();
+    Object.assign(client, { call: async (): Promise<unknown> => undefined });
+    let caught: (Error & { code?: string }) | undefined;
+    try {
+      await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+    } catch (error) {
+      caught = error as Error & { code?: string };
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught?.constructor.name).toBe("WebError");
+    expect(caught?.code).toBe("SCRAPLING_FETCH_FAILED");
+    expect(caught?.message).toContain("malformed");
+  });
+
+  it("回包是循环引用对象时也不崩在拼错误文案上", async () => {
+    // 循环引用会让 JSON.stringify 抛；拼文案这一层不许把「回包坏了」换成一条
+    // 没有 code 的 TypeError。
+    const client = stubSidecar();
+    const cyclic: Record<string, unknown> = { url: "u" };
+    cyclic["self"] = cyclic;
+    Object.assign(client, { call: async (): Promise<unknown> => cyclic });
+    let caught: (Error & { code?: string }) | undefined;
+    try {
+      await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+    } catch (error) {
+      caught = error as Error & { code?: string };
+    }
+    expect(caught?.constructor.name).toBe("WebError");
+    expect(caught?.code).toBe("SCRAPLING_FETCH_FAILED");
+    expect(caught?.message).toContain("malformed");
+  });
+
   it("回包缺 status / content 时同样抛错", async () => {
     const client = stubSidecar();
     Object.assign(client, {
@@ -184,7 +218,13 @@ describe("fetch", () => {
     } catch (error) {
       caught = error as Error & { code?: string };
     }
-    expect(caught).toBeInstanceOf(WebError);
+    // ctx.web.fetch 对 provider 抛出的错是原样透传（宿主 web 侧不 catch、不按 instanceof
+    // 分流），跨模块副本真正流动的只有 message 与 code；而 vitest 5 的模块图会把
+    // @deepseek-ai/dsh-web 在测试侧与 lib 侧各装一份（纯 node 下同一说明符解析为同一
+    // 实例，instanceof 通过），instanceof 在这里量到的是装载器不是行为——类身份改用
+    // constructor.name 钉，message 与 code 仍逐字断言。
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught?.constructor.name).toBe("WebError");
     expect(caught?.code).toBe("SCRAPLING_FETCH_FAILED");
     // 外层码统一是 SCRAPLING_FETCH_FAILED（WebError 的 code 是开放的 provider 码），
     // 但内层 sidecar 码必须留在消息里：「被安全闸门拦下」与「sidecar 超时」要采取的行动不同。
@@ -207,7 +247,8 @@ describe("fetch", () => {
     } catch (error) {
       caught = error as Error & { code?: string };
     }
-    expect(caught).toBeInstanceOf(WebError);
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught?.constructor.name).toBe("WebError");
     expect(caught?.message).toBe("Error: socket hang up");
   });
 

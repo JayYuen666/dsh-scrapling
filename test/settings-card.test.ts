@@ -10,6 +10,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Config as configSchema } from "../host.ts";
+import { RUNTIME_PACKS, packLabelKey, packStateKey } from "../lib/runtime-shape.ts";
 import {
   BUNDLE_PACKAGE_NAME,
   LOCALE_NS,
@@ -92,6 +93,13 @@ describe("字段表与 schema 同解", () => {
     expect(SETTINGS_FIELD_KEYS.toSorted()).toStrictEqual(VOLATILE_KEYS.toSorted());
   });
 
+  it("locate / links 两枚离线解析开关在字段表里，默认开", () => {
+    for (const key of ["locateEnabled", "linksEnabled"]) {
+      expect(SETTINGS_FIELD_KEYS).toContain(key);
+      expect(fieldOf(key).fallback).toBe(true);
+    }
+  });
+
   it("每个字段的默认值都等于 schema 里的默认值", () => {
     const wrong = SETTINGS_FIELDS.filter(
       (field) => PROPERTIES[field.key]?.meta?.default !== field.fallback,
@@ -130,6 +138,17 @@ describe("locale 字典", () => {
 
   it("中英两份键集完全一致，缺一条就有一半标签露成键名", () => {
     expect(Object.keys(dicts.zh).toSorted()).toStrictEqual(Object.keys(dicts.en).toSorted());
+  });
+
+  it("六个能力包的名称与五种状态都配了中英文案", () => {
+    for (const pack of RUNTIME_PACKS) {
+      expect(dicts.zh[packLabelKey(pack)]).not.toBe("");
+      expect(dicts.en[packLabelKey(pack)]).not.toBe("");
+    }
+    for (const state of ["ready", "missing", "corrupt", "installing", "blocked"] as const) {
+      expect(dicts.zh[packStateKey(state)]).not.toBe("");
+      expect(dicts.en[packStateKey(state)]).not.toBe("");
+    }
   });
 
   it("每个字段与每个分组都有 label / hint / title / note 四个键", () => {

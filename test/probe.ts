@@ -130,12 +130,21 @@ export interface ProbeReport {
   facts: ProbeFacts;
 }
 
+/** runProbe 的可替换路径：只给测试在不碰真实 venv 的情况下验启动失败那条分支用。 */
+export interface ProbeOptions {
+  /** 覆盖探针解释器路径（缺省为 py-launcher 解析出的那一支）。 */
+  pythonPath?: string;
+  /** 覆盖探针脚本路径（缺省为 py/tests/contract_probe.py）。 */
+  probePath?: string;
+}
+
 /**
  * 跑一次探针。
  *
  * 解释器与脚本都先判存在：CI 上没有 `_env/.venv` 时 `spawn` 会给一个裸 ENOENT，那句
  * 「spawn ... ENOENT」分不清缺的是解释器还是探针脚本，而两者的修法完全不同。
- * 判过之后再挂 `error` 监听兜住其余启动失败（例如解释器在但不可执行）。
+ * 判过存在性之后，剩下的启动失败（解释器在但不可执行）走的是 `error` 事件：Node 在这里
+ * 不再发 `close`，`events.once` 会把它转成拒绝，所以下面接住那条拒绝并点名解释器路径。
  *
  * 等的是 `close` 而不是 `exit`：Node 文档明写 `exit` 触发时 stdio 流可能尚未读完，探针
  * 输出稍大一点 `Buffer.concat` 就会拿到截断的 JSON —— 表现为随机失败，最难查。`close`
@@ -145,17 +154,19 @@ export interface ProbeReport {
  * @returns 探针报告
  * @throws 探针不存在、起不来、非零退出（或被信号终止）、输出不是 JSON
  */
-export async function runProbe(): Promise<ProbeReport> {
-  if (!existsSync(LOCAL_PYTHON)) {
+export async function runProbe(options: ProbeOptions = {}): Promise<ProbeReport> {
+  const python = options.pythonPath ?? LOCAL_PYTHON;
+  const probe = options.probePath ?? PROBE;
+  if (!existsSync(python)) {
     throw new Error(
-      `缺少探针解释器：${LOCAL_PYTHON} 不存在。\n` +
+      `缺少探针解释器：${python} 不存在。\n` +
         '先建好环境：pip install "scrapling[rag]>=0.5,<0.6"（CI 上由 publish.yml 那一步代劳）。',
     );
   }
-  if (!existsSync(PROBE)) {
-    throw new Error(`缺少探针脚本：${PROBE} 不存在。它随仓库发布，不该缺席。`);
+  if (!existsSync(probe)) {
+    throw new Error(`缺少探针脚本：${probe} 不存在。它随仓库发布，不该缺席。`);
   }
-  const child = spawn(LOCAL_PYTHON, [PROBE], { cwd: REPO, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(python, [probe], { cwd: REPO, stdio: ["ignore", "pipe", "pipe"] });
   const out: Buffer[] = [];
   const err: Buffer[] = [];
   child.stdout.on("data", (chunk: Buffer) => {
@@ -165,7 +176,19 @@ export async function runProbe(): Promise<ProbeReport> {
     err.push(chunk);
   });
   // 探针不是 sidecar：它只写一行结论到 stdout，所以这里等它自己退，不超时也不杀。
-  const [code, signal] = (await once(child, "close")) as [number | null, NodeJS.Signals | null];
+  let code: number | null;
+  let signal: NodeJS.Signals | null;
+  try {
+    [code, signal] = (await once(child, "close")) as [number | null, NodeJS.Signals | null];
+  } catch (spawnError) {
+    // 启动失败只来 `error` 事件、永远不来 `close`（实测 EACCES：error 先到，close 的 once
+    // 直接以同一个错误拒绝）。把它包成一句点名解释器的话，否则用户读到的是一句裸 EACCES。
+    throw new Error(
+      `探针起不来：${python}（${spawnError instanceof Error ? spawnError.message : String(spawnError)}）。\n` +
+        "存在性已经判过，这类失败通常是可执行位或权限问题，不是缺少 Scrapling。",
+      { cause: spawnError },
+    );
+  }
   const stdout = Buffer.concat(out).toString("utf8");
   if (code !== 0) {
     // 非零退出时栈全在 stderr 那一侧，不接出来就只剩「命令失败」一句废话。
