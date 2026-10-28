@@ -425,6 +425,20 @@ def _make_sitemap_spider(
     content_selector = options["css_selector"]
     body_only = options["main_content_only"]
 
+    # 发现期的账：上游的 ``max_pages`` 只拦 ``parse()``（收页），发现期的 sitemap 请求是
+    # 另一条路 —— 一个 sitemapindex 指向几百个子 sitemap 时，``maxPages=2`` 照样能打出
+    # 几百次请求。这里给两个发现维度各设同一道上限。
+    # 放在类外是必须的：类体里的名字不构成方法的闭包（方法里读不到）。
+    discovery = {"sitemaps": 0, "urls": 0}
+
+    def _cap_discovery() -> None:
+        """记下「发现期被截断」这件事，让作业结果能说出为什么少。"""
+        if not state.get("notice"):
+            state["notice"] = (
+                f"sitemap discovery stopped at maxPages={limit}: at most {limit} child sitemaps "
+                f"and {limit} sitemap URLs are followed"
+            )
+
     class Collector(SitemapSpider):
         name = f"scrapling-{crawl_id}"
         sitemap_urls = [options["sitemap_url"]]
@@ -451,6 +465,21 @@ def _make_sitemap_spider(
 
         def configure_sessions(self, manager: Any) -> None:
             _session_config(manager, url)
+
+        async def _parse_sitemap(self, response: Any) -> Any:
+            """把 SitemapSpider 的发现期请求也收进 maxPages 上限。
+
+            判两类请求：回调仍是 ``_parse_sitemap`` 的是子 sitemap 文档，其余是要抓的页面
+            URL；两类各自按 ``limit`` 封顶，超出的不再发出，并给作业结果留一条 notice。
+            """
+            async for request in super()._parse_sitemap(response):
+                is_child_sitemap = getattr(request, "callback", None) == self._parse_sitemap
+                key = "sitemaps" if is_child_sitemap else "urls"
+                if discovery[key] >= limit:
+                    _cap_discovery()
+                    continue
+                discovery[key] += 1
+                yield request
 
         async def parse(self, response: Any) -> Any:
             if self.max_pages and len(state["pages"]) >= self.max_pages:
@@ -521,6 +550,55 @@ def _make_shopify_spider(
             # 代理判定跟着**真正要打的主机**走：shopify 的 collections/products 是用
             # sitemapUrl（或 url）的 netloc 拼出来的，与 url 可能不是同一台。
             _session_config(manager, source)
+
+        def _not_a_store(self, response: Any, expected: str) -> str | None:
+            """判断这次响应是不是「不是 Shopify 店铺」；是则回一条人读的原因。
+
+            上游模板对 ``response.json()["collections"]`` 直接下标：站点回 404 页或一张
+            HTML 首页时，异常被引擎吞进日志，作业就这么「completed、0 行」，模型看不出
+            是打错了站还是抓早了。这里把三种常见形态折成一句可断言的话。
+            """
+            status = getattr(response, "status", 200)
+            where = str(getattr(response, "url", "") or source)
+            if status != 200:
+                return (
+                    f"shopify source answered HTTP {status} for {where}; "
+                    f"the response is not Shopify store JSON (expected {expected}.json)"
+                )
+            try:
+                payload = response.json()
+            except Exception:  # noqa: BLE001 —— 上游 json() 的异常类型随响应体变
+                return (
+                    f"shopify source returned a non-JSON body for {where}; "
+                    f"the response is not Shopify store JSON (expected {expected}.json)"
+                )
+            if not isinstance(payload, dict) or not isinstance(payload.get(expected), list):
+                return (
+                    f"shopify source returned JSON without a {expected!r} list for {where}; "
+                    f"the response is not Shopify store JSON (expected {expected}.json)"
+                )
+            return None
+
+        def _note(self, notice: str) -> None:
+            """只在第一条 notice 上落笔：同一份结果里留最先出现的那个原因。"""
+            if not state.get("notice"):
+                state["notice"] = notice
+
+        async def parse(self, response: Any) -> Any:
+            notice = self._not_a_store(response, "collections")
+            if notice is not None:
+                self._note(notice)
+                return
+            async for item in super().parse(response):
+                yield item
+
+        async def parse_collection(self, response: Any) -> Any:
+            notice = self._not_a_store(response, "products")
+            if notice is not None:
+                self._note(notice)
+                return
+            async for item in super().parse_collection(response):
+                yield item
 
         async def on_scraped_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
             _collect_row(item, state=state, limit=limit, crawl_id=crawl_id, pause=self.pause)
@@ -668,6 +746,7 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
         "strip_inline_images": strip_inline_images,
         "budget_ms": budget_ms,
         "deadline": time.monotonic() + budget_ms / 1000,
+        "notice": "",
     }
     # shopify 模式真正抓的主机可以来自 sitemapUrl：_make_shopify_spider 用它的 netloc 拼
     # collections/products 两个 URL。而站内判定用的是 allowed_domains —— 两处取不同来源时
@@ -900,6 +979,9 @@ def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
         "total": total,
         "more": more,
         "error": state["error"],
+        # 作业自己知道的可读原因（sitemap 发现期被截断、shopify 源不是店铺 JSON 等）：
+        # 缺了它，「0 条结果」与「站点不是那个形态」在模型眼里长得一样。
+        "notice": state.get("notice", ""),
         # 截止到点而停的爬虫带这个标记：模型能看出「为什么比 maxPages 少」。
         "expired": state.get("expired") is True,
         # 只有 spider.start() 返回之后才完整；运行中为 null，不把「还没量到」报成 0。

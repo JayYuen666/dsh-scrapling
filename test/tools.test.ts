@@ -51,6 +51,12 @@ const SAMPLE_API = "https://api.test/items";
 
 /** 测试里反复用到的示例 URL。 */
 const SAMPLE_URL = "http://example.test/";
+
+/** 只做相对链接解析用的基址（同一字面量在多处出现，按 lint 要求收成常量）。 */
+const LINKS_URL = "https://a.test/";
+
+/** 内层已经带过 `CODE: ` 的报错文本。 */
+const ALREADY_PREFIXED = "BAD_ARGS: too many pages";
 /** 跟随重定向之后的最终地址：结果卡片用它，而不是调用参数里那个。 */
 const FINAL_URL = "http://final.test/";
 
@@ -647,19 +653,21 @@ describe("scrapling_fetch 的写方法闸门", () => {
   /** 一次工具调用用的执行上下文。 */
   const exec = { signal: new AbortController().signal } as never;
 
-  it("闸门关着时，method/body 根本不在参数面里（而不是给了再拦）", () => {
+  it("闸门关着时，写意图四枚入参（method/body/form/json）都不在参数面里", () => {
     const names = parameterNames(gated(false).tool);
-    expect(names).not.toContain("method");
-    expect(names).not.toContain("body");
+    for (const key of ["method", "body", "form", "json"]) {
+      expect(names).not.toContain(key);
+    }
     // 只读那一半不受影响：带凭据的 GET 是正常用法，闸门管的是「到了之后干什么」。
     expect(names).toContain("headers");
     expect(names).toContain("cookies");
   });
 
-  it("闸门开着时两个键都摆出来", () => {
+  it("闸门开着时四枚写意图入参都摆出来", () => {
     const names = parameterNames(gated(true).tool);
-    expect(names).toContain("method");
-    expect(names).toContain("body");
+    for (const key of ["method", "body", "form", "json"]) {
+      expect(names).toContain(key);
+    }
   });
 
   it("关着时帧上不带 method/body，普通 GET 照常上网线", async () => {
@@ -714,6 +722,47 @@ describe("scrapling_fetch 的写方法闸门", () => {
     expect(calls[0]?.params).toMatchObject({ method: "put", body: { field: "value" } });
   });
 
+  it("关着时手搓的 form/json 与写方法同档：隐含 POST，就地拒绝", async () => {
+    const { tool, calls } = gated(false);
+    await expect(tool.execute({ url: SAMPLE_URL, form: { a: "1" } }, exec)).rejects.toMatchObject({
+      code: "WRITE_DISABLED",
+    });
+    await expect(tool.execute({ url: SAMPLE_URL, json: { a: 1 } }, exec)).rejects.toMatchObject({
+      code: "WRITE_DISABLED",
+    });
+    expect(calls).toStrictEqual([]);
+  });
+
+  it("显式 GET 带请求体先报组合矛盾（BAD_ARGS），不把因果推给部署开关", async () => {
+    // F7：早先这一档落 WRITE_DISABLED，模型会照着去改部署，而它该做的是去掉 body。
+    const off = gated(false);
+    await expect(
+      off.tool.execute({ url: SAMPLE_URL, method: "get", body: "x" }, exec),
+    ).rejects.toMatchObject({ code: "BAD_ARGS" });
+    await expect(
+      off.tool.execute({ url: SAMPLE_URL, method: "GET", form: { a: "1" } }, exec),
+    ).rejects.toThrow(/GET cannot carry a request body/u);
+    expect(off.calls).toStrictEqual([]);
+  });
+
+  it("开着时 form/json 不给 method 隐含 POST，原样转发", async () => {
+    const { tool, calls } = gated(true);
+    await tool.execute({ url: SAMPLE_URL, form: { a: "1" } }, exec);
+    expect(calls[0]?.params).toMatchObject({ method: "POST", form: { a: "1" } });
+    await tool.execute({ url: SAMPLE_URL, json: { beta: 2 } }, exec);
+    expect(calls[1]?.params).toMatchObject({ method: "POST", json: { beta: 2 } });
+    // 两枚都给也照原样发：互斥是 Python 侧 BAD_ARGS 的判据，Host 不替它改写语义。
+    await tool.execute(
+      { url: SAMPLE_URL, method: "post", form: { a: "1" }, json: { beta: 2 } },
+      exec,
+    );
+    expect(calls[2]?.params).toMatchObject({
+      method: "post",
+      form: { a: "1" },
+      json: { beta: 2 },
+    });
+  });
+
   it("并发判定按这一次调用的动词走：写请求串行，读请求照旧可并发", () => {
     // 上游把这一档做成按参数问的，所以开了写方法的部署不必让所有静态抓取都排队 —— 而并行
     // 的写请求就是重复提交（重试再叠上去，对端会收到两次），那一档必须串起来。
@@ -723,6 +772,48 @@ describe("scrapling_fetch 的写方法闸门", () => {
     expect(concurrencySafe(true, { url: SAMPLE_URL, method: "get" })).toBe(true);
     expect(concurrencySafe(true, { url: SAMPLE_URL, method: "POST" })).toBe(false);
     expect(concurrencySafe(true, { url: SAMPLE_URL, method: "delete" })).toBe(false);
+    // 隐含 POST 的 form/json 同样算写：并行发两个表单提交就是对端收到两次。
+    expect(concurrencySafe(true, { url: SAMPLE_URL, form: { a: "1" } })).toBe(false);
+    expect(concurrencySafe(true, { url: SAMPLE_URL, json: { a: 1 } })).toBe(false);
+    // 动词大小写不改变语义：小写的 get 仍是读。
+    expect(concurrencySafe(true, { url: SAMPLE_URL, method: "Get" })).toBe(true);
+  });
+
+  it("sidecar 的错误码带进模型可见文本（J5）", async () => {
+    const fake = fakeSidecar({});
+    Object.assign(fake.client, {
+      call: async (): Promise<unknown> => {
+        throw new SidecarError(
+          "URL_BLOCKED",
+          "http://127.0.0.1:3080/: host resolves to a non-public address (127.0.0.1)",
+        );
+      },
+    });
+    const tool = createFetchTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    // 模型只看到一行 "Error: <message>"，码不进 message 它就永远看不见（F6/J5）。
+    await expect(tool.execute({ url: "http://127.0.0.1:3080" }, exec)).rejects.toThrow(
+      /^URL_BLOCKED: /u,
+    );
+    // code 仍然在错误对象上：宿主按结构化字段分支，不解析文本。
+    await expect(tool.execute({ url: "http://127.0.0.1:3080" }, exec)).rejects.toMatchObject({
+      code: "URL_BLOCKED",
+    });
+  });
+
+  it("本地抛出的写闸门错误同样带 CODE 前缀（F6：模型按码分支，不靠解析文案）", async () => {
+    const off = gated(false);
+    await expect(off.tool.execute({ url: SAMPLE_URL, form: { a: "1" } }, exec)).rejects.toThrow(
+      /^WRITE_DISABLED: POST changes state/u,
+    );
+    await expect(
+      off.tool.execute({ url: SAMPLE_URL, method: "GET", body: "x" }, exec),
+    ).rejects.toThrow(/^BAD_ARGS: GET cannot carry a request body/u);
+    expect(off.calls).toStrictEqual([]);
   });
 });
 
@@ -828,13 +919,10 @@ describe("scrapling_extract", () => {
       answer: fakeAnswer,
     });
     const exec = { signal: new AbortController().signal } as never;
-    await tool.execute(
-      { html: "<p>x</p>", selector: "p", adaptive: true, url: "https://a.test/" },
-      exec,
-    );
+    await tool.execute({ html: "<p>x</p>", selector: "p", adaptive: true, url: LINKS_URL }, exec);
     expect(fake.calls[0]?.params).toMatchObject({
       adaptive: true,
-      url: "https://a.test/",
+      url: LINKS_URL,
     });
     await tool.execute({ html: "<p>x</p>", selector: "p" }, exec);
     expect(fake.calls[1]?.params).not.toHaveProperty("adaptive");
@@ -1897,7 +1985,7 @@ describe("scrapling_render", () => {
     expect(fake.calls[0]?.params).not.toHaveProperty("waitSelector");
   });
 
-  it("render 的 timeoutMs 调用值优先、超过部署上限时封顶，非法值不静默改写", async () => {
+  it("render 的 timeoutMs 只在模型显式给了才发，超过部署上限时封顶，非法值不静默改写", async () => {
     const exec = { signal: new AbortController().signal } as never;
     const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "x", truncated: false });
     const tool = createRenderTool({
@@ -1908,9 +1996,10 @@ describe("scrapling_render", () => {
     });
     await tool.execute({ url: SAMPLE_URL, timeoutMs: 5000 }, exec);
     expect(fake.calls[0]?.params).toMatchObject({ timeoutMs: 5000 });
-    // 缺省仍是部署值。
+    // 模型没给超时值就**不发**这一位：一对同值的「内层等待 / 外层预算」会让部署调大的
+    // 上限永远等不到，Python 侧的 30 秒默认才是它该用的那个（F12/J8）。
     await tool.execute({ url: SAMPLE_URL }, exec);
-    expect(fake.calls[1]?.params).toMatchObject({ timeoutMs: SETTINGS.pageTimeoutMs });
+    expect(fake.calls[1]?.params).not.toHaveProperty("timeoutMs");
     // 部署的 pageTimeoutMs 是天花板：给十倍也只能等到上限。
     await tool.execute({ url: SAMPLE_URL, timeoutMs: SETTINGS.pageTimeoutMs * 10 }, exec);
     expect(fake.calls[2]?.params).toMatchObject({ timeoutMs: SETTINGS.pageTimeoutMs });
@@ -3286,7 +3375,10 @@ describe("会话工具", () => {
     await tool.execute({ sessionId: "s1", url: SAMPLE_URL }, sessionExec());
     const params = fake.calls[0]?.params as Record<string, unknown>;
     expect(params["timeoutSeconds"]).toBe(SETTINGS.requestTimeoutSeconds);
-    expect(params["timeoutMs"]).toBe(SETTINGS.pageTimeoutMs);
+    // 与 render 同一条规则：模型没给 timeoutMs 就不发，让 Python 用自己的默认（J8）。
+    expect(params).not.toHaveProperty("timeoutMs");
+    await tool.execute({ sessionId: "s1", url: SAMPLE_URL, timeoutMs: 2000 }, sessionExec());
+    expect(fake.calls[1]?.params).toMatchObject({ timeoutMs: 2000 });
   });
 
   it("list 回包不是对象时给空列表", async () => {
@@ -3581,6 +3673,24 @@ describe("浏览器会话读/动作/媒体工具", () => {
     await expect(notObject.execute({ sessionId: "s1" }, exec)).rejects.toMatchObject({
       code: "SIDECAR_REQUEST_FAILED",
     });
+  });
+
+  it("session_read 的 sidecar 错误带码（F17：直连调用同样归一到 CODE: message）", async () => {
+    const fake = fakeSidecar({});
+    Object.assign(fake.client, {
+      call: async (): Promise<never> => {
+        throw new SidecarError("NO_SUCH_SESSION", "no such session: s1");
+      },
+    });
+    const tool = createSessionReadTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(tool.execute({ sessionId: "s1" }, exec)).rejects.toThrow(
+      /^NO_SUCH_SESSION: no such session: s1$/u,
+    );
   });
 
   it("session_act 的视图与坏回包", async () => {
@@ -4373,6 +4483,81 @@ describe("爬虫报错的传播", () => {
     expect(text).toContain("1 page(s) crawled");
   });
 
+  it("收尾拍透传 sidecar 的 notice：shopify/sitemap 的人读原因不再被吞掉（J9）", async () => {
+    // Python 侧把「为什么不完整」写进 status.notice；JS 若丢掉它，模型只看到页数变少。
+    const lines: string[] = [];
+    const fake = fakeSidecar({ crawlId: "c1" });
+    Object.assign(fake.client, {
+      call: async (method: string): Promise<unknown> => {
+        if (method === "crawl.run") {
+          return { crawlId: "c1" };
+        }
+        return {
+          running: false,
+          pages: [{ url: "https://x.test/1", title: "one", markdown: "m" }],
+          rows: [],
+          error: null,
+          expired: false,
+          notice: "shopify mode: response is not a store JSON; recorded the page as text",
+        };
+      },
+    });
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: async (_label, run) => {
+        await run({
+          append: (text: string): void => {
+            lines.push(text);
+          },
+          progress: (): void => undefined,
+          signal: new AbortController().signal,
+        });
+        return "job-1";
+      },
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL, maxPages: 2 }, {
+      signal: new AbortController().signal,
+    } as never);
+    const notices = lines.filter((line) => line.startsWith("crawl notice:"));
+    expect(notices).toStrictEqual([
+      "crawl notice: shopify mode: response is not a store JSON; recorded the page as text",
+    ]);
+  });
+
+  it("notice 为空串时不多发一行", async () => {
+    const lines: string[] = [];
+    const fake = fakeSidecar({ crawlId: "c1" });
+    Object.assign(fake.client, {
+      call: async (method: string): Promise<unknown> => {
+        if (method === "crawl.run") {
+          return { crawlId: "c1" };
+        }
+        return { running: false, pages: [], rows: [], error: null, expired: false, notice: "" };
+      },
+    });
+    const tool = createCrawlTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: async (_label, run) => {
+        await run({
+          append: (text: string): void => {
+            lines.push(text);
+          },
+          progress: (): void => undefined,
+          signal: new AbortController().signal,
+        });
+        return "job-1";
+      },
+      answer: fakeAnswer,
+    });
+    await tool.execute({ url: SAMPLE_URL, maxPages: 2 }, {
+      signal: new AbortController().signal,
+    } as never);
+    expect(lines.some((line) => line.startsWith("crawl notice:"))).toBe(false);
+  });
+
   it("轮询断了先去叫停 Python 侧那个爬虫，再把原因抛出去", async () => {
     // 作业取消只活在 Node 侧，Python 里的 Spider 在自己的线程上跑，看不见它。
     // 少这一帧的话，作业显示已杀、爬虫还在后台跑。
@@ -4452,5 +4637,234 @@ describe("爬虫报错的传播", () => {
       signal: new AbortController().signal,
     } as never);
     expect(String(caught)).toContain("status poll failed");
+  });
+});
+
+/**
+ * 造一个只需依赖 sidecar 的工具依赖包。
+ *
+ * @param result - 假 sidecar 的回包
+ * @returns 假 sidecar 与它收到的帧
+ */
+function fakeDeps(result: unknown): ReturnType<typeof fakeSidecar> {
+  return fakeSidecar(result);
+}
+
+/**
+ * 造一个 call 必然抛错的 fetch 工具。
+ *
+ * @param error - 假 sidecar 要抛出的错误
+ * @returns fetch 工具
+ */
+function throwingFetchTool(error: unknown): ReturnType<typeof createFetchTool> {
+  const fake = fakeSidecar(undefined);
+  Object.assign(fake.client, {
+    call: async (): Promise<unknown> => {
+      throw error;
+    },
+  });
+  return createFetchTool({
+    sidecar: fake.client,
+    settings: SETTINGS,
+    startCrawlJob: fakeJobStarter,
+    answer: fakeAnswer,
+  });
+}
+
+describe("结果投影补全（J4：schema 里声明的面必须在文本里看得见）", () => {
+  it("select 命中里带 html 时渲染出来，includeHtml 不再是个空操作", () => {
+    const fake = fakeDeps({});
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const rendered = tool.output.render(
+      { html: "<div></div>", selector: "a", includeHtml: true },
+      {
+        count: 1,
+        truncated: false,
+        matches: [{ tag: "a", text: "x", html: '<a href="/x">x</a>' }],
+      },
+    ) as { text: string }[];
+    expect(rendered[0]?.text).toContain('html: <a href="/x">x</a>');
+  });
+
+  it("select 的 rows 面：空表说 no rows，有表逐行 JSON", () => {
+    const fake = fakeDeps({});
+    const tool = createExtractTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const empty = tool.output.render(
+      { html: "x", fields: {} },
+      {
+        count: 0,
+        truncated: false,
+        matches: [],
+        rows: [],
+      },
+    ) as { text: string }[];
+    expect(empty[0]?.text).toBe("no rows");
+    const filled = tool.output.render(
+      { html: "x", fields: {} },
+      {
+        count: 1,
+        truncated: false,
+        matches: [],
+        rows: [{ name: "Ada" }],
+      },
+    ) as { text: string }[];
+    expect(filled[0]?.text).toContain('{"name":"Ada"}');
+  });
+
+  it("locate 渲染 attributes / 完整选择器 / 祖先链，截断时给提示", () => {
+    const fake = fakeDeps({});
+    const tool = createLocateTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const rendered = tool.output.render(
+      { html: "x", query: "a" },
+      {
+        count: 1,
+        truncated: true,
+        matches: [
+          {
+            tag: "a",
+            text: "x",
+            attributes: { href: "/x" },
+            cssSelector: "a",
+            xpathSelector: "//a",
+            fullCssSelector: "html > body > a",
+            fullXpathSelector: "/html/body/a",
+            ancestors: [
+              { tag: "body", attributes: { class: "page" } },
+              { tag: "html", attributes: {} },
+            ],
+          },
+        ],
+      },
+    ) as { text: string }[];
+    const text = rendered[0]?.text ?? "";
+    expect(text).toContain('attributes: {"href":"/x"}');
+    expect(text).toContain("full css: html > body > a");
+    expect(text).toContain('ancestors: <body> {"class":"page"} < <html>');
+    expect(text).toContain("结果被截断");
+  });
+
+  it("links 截断时给提示，不再静默少一半", () => {
+    const fake = fakeDeps({});
+    const tool = createLinksTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const rendered = tool.output.render(
+      { html: "x" },
+      {
+        count: 1,
+        truncated: true,
+        links: [{ url: LINKS_URL }],
+        nextCandidates: [],
+      },
+    ) as { text: string }[];
+    expect(rendered[0]?.text).toContain("结果被截断");
+  });
+
+  it("capture_xhr 抓到 0 条时给一行可操作提示，而不是只给正文", () => {
+    const fake = fakeDeps({});
+    const tool = createCaptureXhrTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const rendered = tool.output.render(
+      { url: SAMPLE_URL },
+      {
+        url: SAMPLE_URL,
+        statusCode: 200,
+        extractionType: "markdown",
+        content: "# ok",
+        truncated: false,
+        notice: "",
+        xhr: [],
+      },
+    ) as { text: string }[];
+    expect(rendered[0]?.text).toContain("Captured no XHR/fetch requests");
+  });
+
+  it("session_network 渲染 id 与 includeHeaders 时的 headers", () => {
+    const fake = fakeDeps({});
+    const tool = createSessionNetworkTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const rendered = tool.output.render(
+      { sessionId: "s1", includeHeaders: true },
+      {
+        sessionId: "s1",
+        count: 1,
+        matches: [
+          {
+            id: 7,
+            method: "GET",
+            url: "https://api.test/x",
+            status: 200,
+            bytes: 12,
+            resourceType: "xhr",
+            headers: { "content-type": "application/json" },
+          },
+        ],
+      },
+    ) as { text: string }[];
+    const text = rendered[0]?.text ?? "";
+    expect(text).toContain("[id 7] GET https://api.test/x (HTTP 200, 12B, xhr)");
+    expect(text).toContain('headers: {"content-type":"application/json"}');
+  });
+});
+
+describe("sidecar 失败的归一（J5：模型可见文案带码、且不重复加码）", () => {
+  it("非 SidecarError 原样上抛：别把宿主/进程错译成 sidecar 码", async () => {
+    const tool = throwingFetchTool(new Error("boom"));
+    await expect(
+      tool.execute({ url: SAMPLE_URL }, { signal: new AbortController().signal } as never),
+    ).rejects.toThrow("boom");
+  });
+
+  it("已经带码的 SidecarError 不重复加前缀", async () => {
+    // 内层（或测试替身）已经拼过 `CODE: ` 时再拼一次，模型会看到 `BAD_ARGS: BAD_ARGS:`。
+    const tool = throwingFetchTool(new SidecarError("BAD_ARGS", ALREADY_PREFIXED));
+    const error = await tool
+      .execute({ url: SAMPLE_URL }, { signal: new AbortController().signal } as never)
+      .then(
+        () => {
+          throw new Error("应当抛错");
+        },
+        (error_: unknown) => error_ as Error,
+      );
+    expect(error.message).toBe(ALREADY_PREFIXED);
+  });
+
+  it("未带码的 SidecarError 补上码", async () => {
+    const tool = throwingFetchTool(new SidecarError("BAD_ARGS", "too many pages"));
+    const error = await tool
+      .execute({ url: SAMPLE_URL }, { signal: new AbortController().signal } as never)
+      .then(
+        () => {
+          throw new Error("应当抛错");
+        },
+        (error_: unknown) => error_ as Error,
+      );
+    expect(error.message).toBe("BAD_ARGS: too many pages");
   });
 });

@@ -17,10 +17,19 @@ import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import type { AttachmentSaver } from "./browser-tools.ts";
 import { anySignal, drainCrawl } from "./crawl-support.ts";
 import type { CrawlJobStarter } from "./crawl-support.ts";
-import { capText } from "./output.ts";
+import {
+  capText,
+  networkLines,
+  renderAnswer,
+  renderBrowser,
+  renderFetch,
+  renderLinks,
+  renderLocate,
+  renderMatches,
+} from "./output.ts";
 import type { CappedText } from "./output.ts";
 import type { AnswerRequest, AnswerResult } from "./answer.ts";
-import { SidecarError } from "./sidecar.ts";
+import { callSidecar, sidecarErrorWithCode } from "./sidecar.ts";
 import type { SidecarClient } from "./sidecar.ts";
 import {
   BROWSER_REQUEST_PARAMS,
@@ -31,6 +40,7 @@ import {
   networkReadParams,
   sessionOpenExtras,
   STATIC_REQUEST_PARAMS,
+  WRITE_BODY_PARAMS,
 } from "./tool-params.ts";
 
 /** 抽取形态；与 Scrapling 的 extraction_types 一致。 */
@@ -147,7 +157,7 @@ export interface ToolDeps {
 }
 
 /** 抓取类工具的 canonical 结果。 */
-interface FetchResult {
+export interface FetchResult {
   url: string;
   statusCode: number;
   extractionType: string;
@@ -183,7 +193,7 @@ interface Match {
 type Row = Record<string, Jsonish>;
 
 /** 结构化选择的结果。 */
-interface SelectResult {
+export interface SelectResult {
   count: number;
   truncated: boolean;
   matches: Match[];
@@ -204,7 +214,7 @@ interface LocateMatch {
 }
 
 /** locate 的结果。 */
-interface LocateResult {
+export interface LocateResult {
   count: number;
   truncated: boolean;
   matches: LocateMatch[];
@@ -224,7 +234,7 @@ interface NextCandidate {
 }
 
 /** links 的结果。 */
-interface LinksResult {
+export interface LinksResult {
   count: number;
   truncated: boolean;
   links: LinkEntry[];
@@ -375,10 +385,10 @@ function truncationOf(upstream: boolean, capped: CappedText): boolean {
   return upstream || capped.truncated;
 }
 
-/** 被截断时告诉模型怎么把内容再拿回来。 */
 /** url 参数的说明，被多处参数表共用。 */
 const URL_PARAM_DESC = "要抓取的 HTTP(S) URL。";
 
+/** 被截断时告诉模型怎么把内容再拿回来。 */
 const RECOVERY_HINT = "要拿被省略的部分，请用 cssSelector 收窄范围，或分多次抓取。";
 
 /**
@@ -616,41 +626,6 @@ function toNextCandidates(raw: unknown): NextCandidate[] {
 }
 
 /**
- * 渲染 locate 结果。
- *
- * @param value - locate 结果
- * @returns 模型侧文本
- */
-function renderLocate(value: LocateResult): string {
-  const body =
-    value.matches.length === 0
-      ? "no matches"
-      : value.matches
-          .map(
-            (item) =>
-              `<${item.tag}> ${item.text}\n  css: ${item.cssSelector}\n  xpath: ${item.xpathSelector}`,
-          )
-          .join("\n");
-  return value.notice !== undefined && value.notice.length > 0
-    ? `${body}\n\n${value.notice}`
-    : body;
-}
-
-/**
- * 渲染 links 结果。
- *
- * @param value - links 结果
- * @returns 模型侧文本
- */
-function renderLinks(value: LinksResult): string {
-  const lines = value.links.map((item) => item.url);
-  for (const candidate of value.nextCandidates) {
-    lines.push(`next: ${candidate.text} -> ${candidate.url} (${candidate.reason})`);
-  }
-  return lines.length === 0 ? "no links" : lines.join("\n");
-}
-
-/**
  * select 的查询参数；缺省键不发，保持旧载荷不变。
  *
  * @param args - 工具入参
@@ -837,58 +812,6 @@ const EXTRACT_OUTPUT_SCHEMA = {
 } as const;
 
 /**
- * 把抓取结果渲染成模型看的文本。
- *
- * 收强类型而不是 `unknown`：output.schema 用的是 value-schema DSL，必填字段由 schema
- * 声明，defineTool 推出来的 value 每个字段都保证存在。写「万一字段缺失」那层兜底只会
- * 造出永远走不到的死分支。
- *
- * @param value - 投影出的结果值
- * @returns 模型侧文本
- */
-function renderFetch(value: FetchResult): string {
-  const body = `Fetched ${value.url} (HTTP ${value.statusCode})\n\n${value.content}`;
-  const metadata =
-    value.metadata === undefined || Object.keys(value.metadata).length === 0
-      ? ""
-      : `\n\nMetadata:\n${Object.entries(value.metadata)
-          .map(([key, item]) => `${key}: ${typeof item === "string" ? item : JSON.stringify(item)}`)
-          .join("\n")}`;
-  const withMetadata = `${body}${metadata}`;
-  return value.notice.length > 0 ? `${withMetadata}\n\n${value.notice}` : withMetadata;
-}
-
-/**
- * 把选择结果渲染成模型看的文本。
- *
- * 收强类型：`output.schema` 用 value-schema DSL 声明了必填字段，defineTool 推出来的
- * `value` 保证每项都在；写「万一不是数组」的兜底只会造出永远走不到的死分支。
- *
- * @param value - 投影出的结果值
- * @returns 模型侧文本
- */
-function renderMatches(value: SelectResult): string {
-  let body: string;
-  if (value.rows) {
-    body =
-      value.rows.length === 0 ? "no rows" : value.rows.map((row) => JSON.stringify(row)).join("\n");
-  } else if (value.matches.length === 0) {
-    body = "no matches";
-  } else {
-    body = value.matches
-      .map((item) => {
-        const picked = item.value ?? item.text ?? "";
-        const attrs = item.attributes ? ` ${JSON.stringify(item.attributes)}` : "";
-        return `<${item.tag}> ${picked}${attrs}`;
-      })
-      .join("\n");
-  }
-  return value.notice !== undefined && value.notice.length > 0
-    ? `${body}\n\n${value.notice}`
-    : body;
-}
-
-/**
  * 静态抓取的「请求件」入参（只读那一档）。
  *
  * 单独成块是因为 createFetchTool 本体已经接近仓库允许的行数上限，也因为这一组说明在
@@ -939,6 +862,28 @@ const METHOD_SESSION_FETCH = "session.fetch";
 const METHOD_SESSION_NETWORK = "session.network";
 
 /**
+ * 这次静态抓取隐含的方法：显式 method 优先；给了 form/json/body 而没给 method 时按 POST。
+ *
+ * 与 static 会话的 `session.fetch` 同一语义（Python 侧 `_static_params` 做同样的事），
+ * 两侧不靠对方兜底：任何一侧单独看帧时结论都成立。
+ *
+ * @param args - 工具入参
+ * @returns 大写的请求方法
+ */
+/** 这次调用有没有带请求体（body / form / json 任一）。 */
+function hasFetchBody(args: Record<string, unknown>): boolean {
+  return args["body"] !== undefined || args["form"] !== undefined || args["json"] !== undefined;
+}
+
+function impliedFetchMethod(args: Record<string, unknown>): string {
+  const asked = args["method"];
+  if (typeof asked === "string" && asked.length > 0) {
+    return asked;
+  }
+  return hasFetchBody(args) ? "POST" : "GET";
+}
+
+/**
  * 组装静态抓取的协议载荷。
  *
  * @param args - 工具入参
@@ -963,15 +908,17 @@ function fetchPayload(
     // 关着的时候连帧上都不发这两个键：Python 缺 method 时按 GET 走，而「参数面里看不见、
     // 帧上却带着 method」会让两侧的对表门禁各说各话。
     ...(settings.allowWriteMethods
-      ? { method: args["method"] ?? "GET", body: args["body"] ?? null }
+      ? { method: impliedFetchMethod(args), body: args["body"] ?? null }
       : {}),
     headers: args["headers"] ?? null,
     cookies: args["cookies"] ?? null,
     impersonate: args["impersonate"] ?? "",
     retries: args["retries"] ?? 3,
     ...(args["params"] === undefined ? {} : { params: args["params"] }),
-    ...(args["form"] === undefined ? {} : { form: args["form"] }),
-    ...(args["json"] === undefined ? {} : { json: args["json"] }),
+    // form/json 是写意图：部署没开放写方法时参数面里没有它们，帧上也不发 ——
+    // 「参数面看不见、帧上却带着」正是上一处注释在防的那种两边对不上。
+    ...(settings.allowWriteMethods && args["form"] !== undefined ? { form: args["form"] } : {}),
+    ...(settings.allowWriteMethods && args["json"] !== undefined ? { json: args["json"] } : {}),
     ...(typeof args["defaultEncoding"] === "string" && args["defaultEncoding"].length > 0
       ? { defaultEncoding: args["defaultEncoding"] }
       : {}),
@@ -1022,9 +969,10 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
       timeoutSeconds: { type: "integer", description: "本次抓取超时（秒），缺省用部署值。" },
       ...REQUEST_PARAMS,
       ...STATIC_REQUEST_PARAMS,
-      // 部署没开放写方法时，这两个入参**根本不出现在参数面里**：模型看不见一个用了也没用的
-      // 旋钮，比给了之后再用 WRITE_DISABLED 拦它更诚实，也少一轮往返。
-      ...(settings.allowWriteMethods ? WRITE_PARAMS : {}),
+      // 部署没开放写方法时，这四枚入参**根本不出现在参数面里**：模型看不见一个用了也没用
+      // 的旋钮，比给了之后再用 WRITE_DISABLED 拦它更诚实，也少一轮往返。form/json 与
+      // method/body 同档 —— 它们的缺省语义是 POST，本身就是写意图。
+      ...(settings.allowWriteMethods ? { ...WRITE_PARAMS, ...WRITE_BODY_PARAMS } : {}),
     },
     output: {
       schema: {
@@ -1060,8 +1008,8 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
       if (!settings.allowWriteMethods) {
         return true;
       }
-      const asked = args["method"];
-      return typeof asked !== "string" || asked.toUpperCase() === "GET";
+      // form/json 没给 method 时隐含 POST：按隐含动词判，否则「并行发两个表单提交」会漏过去。
+      return impliedFetchMethod(args).toUpperCase() === "GET";
     },
     async execute(args, exec: ToolRunContext): Promise<FetchResult> {
       const requested = args["extractionType"];
@@ -1073,21 +1021,38 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
       // 「参数面里没有 method」拦得住模型，却拦不住截断后重放的旧调用、别的插件代发的调用，
       // 或任何手搓的一帧。把它们改成 GET 是最坏的结果：调用方以为写成功了，而对端什么都没
       // 发生 —— 那正是本包在消灭的「看起来生效了」的故障。Python 侧那道硬拒仍然留着。
+      //
+      // 两条拒绝先拆开（F7）：GET + 请求体是**组合本身**矛盾，与部署开没开写方法无关；
+      // 早先它跟写闸门共用一条 WRITE_DISABLED，模型会照着去改部署，而它该做的是去掉 body
+      // 或换个方法。先判因果，再判开关。
+      const explicitMethod =
+        typeof args["method"] === "string" && args["method"].length > 0
+          ? args["method"].toUpperCase()
+          : undefined;
+      if (explicitMethod === "GET" && hasFetchBody(args)) {
+        throw sidecarErrorWithCode(
+          "BAD_ARGS",
+          "GET cannot carry a request body (body/form/json); use POST/PUT/DELETE or drop the body",
+        );
+      }
       if (!settings.allowWriteMethods) {
-        const asked = args["method"];
-        const verb = typeof asked === "string" && asked.length > 0 ? asked.toUpperCase() : "GET";
-        const wantedBody = args["body"] !== undefined && args["body"] !== null;
-        if (verb !== "GET" || wantedBody) {
-          throw new SidecarError(
+        const verb = impliedFetchMethod(args).toUpperCase();
+        if (verb !== "GET") {
+          throw sidecarErrorWithCode(
             "WRITE_DISABLED",
             `${verb} changes state on the remote side; the deployment must set allowWriteMethods (off by default)`,
           );
         }
       }
-      const raw = await sidecar.call("fetch", fetchPayload(args, settings, extractionType), {
-        signal: exec.signal,
-        timeoutMs: settings.timeoutMs,
-      });
+      const raw = await callSidecar(
+        sidecar,
+        "fetch",
+        fetchPayload(args, settings, extractionType),
+        {
+          signal: exec.signal,
+          timeoutMs: settings.timeoutMs,
+        },
+      );
       const result = toFetchResult(raw, extractionType);
       const capped = capText(result.content, settings.maxOutputBytes, RECOVERY_HINT);
       return {
@@ -1142,7 +1107,7 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => true,
     async execute(args, exec: ToolRunContext): Promise<SelectResult> {
-      const raw = await sidecar.call("select", buildSelectPayload(args, settings), {
+      const raw = await callSidecar(sidecar, "select", buildSelectPayload(args, settings), {
         signal: exec.signal,
         timeoutMs: settings.timeoutMs,
       });
@@ -1328,9 +1293,10 @@ export function createLocateTool(deps: ToolDeps): ToolDefinition {
       const by = typeof args["by"] === "string" ? args["by"] : (args["queryType"] ?? "css");
       const query = typeof args["query"] === "string" ? args["query"] : args["selector"];
       if (typeof query !== "string" || query.length === 0) {
-        throw new SidecarError("BAD_ARGS", "query (or its alias selector) is required");
+        throw sidecarErrorWithCode("BAD_ARGS", "query (or its alias selector) is required");
       }
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         "locate",
         {
           html: args["html"],
@@ -1395,7 +1361,8 @@ export function createLinksTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => true,
     async execute(args, exec: ToolRunContext): Promise<LinksResult> {
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         "links",
         {
           html: args["html"],
@@ -1679,11 +1646,20 @@ function browserPayload(
       pierceShadow: args["pierceShadow"] ?? settings.pierceShadow,
       headless: args["headless"] ?? settings.headless,
       networkIdle: args["networkIdle"] ?? settings.networkIdle,
-      // 调用值优先，且**只压上限**：部署的 pageTimeoutMs 是这台机器愿意等多久的天花板，
-      // 模型要更长也不越过它；非法值（0 / 负数 / 非数字）不在这一层改写成合法值 ——
-      // Python 侧 _positive_int 会把它报成 BAD_ARGS，静默夹成 1 等于把明确参数错误换成
-      // 静默跑起来。args 里没这个键时逐字沿用部署值。
-      timeoutMs: callNumber(args["timeoutMs"], settings.pageTimeoutMs, settings.pageTimeoutMs),
+      // 模型没给 timeoutMs 时**不发这个键**：Python 自己的 30 秒是浏览器动作的默认预算，
+      // 而发部署的 pageTimeoutMs（取自 fetchTimeoutMs）等于把「浏览器这一帧的等待预算」
+      // 和「sidecar 这一帧的超时」压成同一个值 —— 两层同时在那一刻到，谁先报错就成了竞态，
+      // 现象是同一个调用时好时坏。显式给了才发，且只压上限；非法值（0 / 负数 / 非数字）
+      // 不在这一层夹成合法值，留给 Python 的 _positive_int 报 BAD_ARGS。
+      ...(args["timeoutMs"] === undefined
+        ? {}
+        : {
+            timeoutMs: callNumber(
+              args["timeoutMs"],
+              settings.pageTimeoutMs,
+              settings.pageTimeoutMs,
+            ),
+          }),
       maxContentChars: settings.maxOutputBytes,
       blockAds: settings.blockAds,
       // 反检测那几条只在被显式拧过时才发：没给就交给 Python 的默认值（hide_canvas=False、
@@ -1722,47 +1698,6 @@ function browserPayload(
       ...(method === "fetch" ? {} : waitSelectorParams(args, settings)),
     },
   };
-}
-
-/**
- * 网络历史条目 → 模型可读的若干行。
- *
- * 正文只在条目真的带了 body 时展开；`bodyNote` 说明上游为什么没存下正文。
- *
- * @param matches - 归一后的条目
- * @returns 行文本
- */
-function networkLines(matches: readonly NetworkEntry[]): string[] {
-  return matches.map((item) => {
-    const kind = item.resourceType.length > 0 ? `, ${item.resourceType}` : "";
-    const head = `- ${item.method} ${item.url} (HTTP ${item.status}, ${item.bytes}B${kind})`;
-    if (typeof item.bodyNote === "string") {
-      return `${head} — no body: ${item.bodyNote}`;
-    }
-    if (typeof item.body !== "string") {
-      return head;
-    }
-    const label = item.bodyTruncated === true ? "body (truncated)" : "body";
-    return `${head} — ${label}:\n${item.body}`;
-  });
-}
-
-/**
- * 把浏览器抓取结果渲染成模型看的文本，末尾附上网络历史。
- *
- * @param value - 浏览器抓取载荷
- * @returns 模型侧文本
- */
-function renderBrowser(value: BrowserResult | FetchResult): string {
-  const body = renderFetch(value);
-  // 不带网络历史的工具（render）其 schema 里没有这个字段，execute 也就不会产出它；
-  // capture 那一路上它一定是数组。这里只能断言一次：联合类型里 FetchResult 没有
-  // 这个键，但两个调用点传进来的对象都出自 createBrowserTool 的 execute。
-  const captured: NetworkEntry[] = (value as Partial<BrowserResult>).xhr ?? [];
-  if (captured.length === 0) {
-    return body;
-  }
-  return `${body}\n\nCaptured XHR/fetch:\n${networkLines(captured).join("\n")}`;
 }
 
 /** 一次性浏览器抓取的「本次超时」参数；只摆给 render，capture 那一支用不上。 */
@@ -1831,7 +1766,7 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext): Promise<BrowserResult> {
       const payload = browserPayload(args, settings, options.method);
-      const raw = await sidecar.call(payload.method, payload.params, {
+      const raw = await callSidecar(sidecar, payload.method, payload.params, {
         signal: exec.signal,
         timeoutMs: settings.timeoutMs,
       });
@@ -1933,18 +1868,6 @@ export interface AnswerToolResult {
 }
 
 /**
- * 把问答结果渲染成模型看的文本。
- *
- * @param value - 问答结果
- * @returns 模型侧文本
- */
-function renderAnswer(value: AnswerToolResult): string {
-  const head = `Answer to "${value.url}" (HTTP ${value.statusCode}, via ${value.provider}/${value.model}):`;
-  const tail = value.notice.length > 0 ? `\n\n${value.notice}` : "";
-  return `${head}\n\n${value.answer}${tail}`;
-}
-
-/**
  * 建 `scrapling_answer`：抓一个页面，把正文连同问题一起交给模型作答。
  *
  * 与 `scrapling_fetch` / `render` 的区别是最后多一步模型综合 —— 它们把正文原样交给
@@ -2026,7 +1949,7 @@ export function createAnswerTool(deps: ToolDeps): ToolDefinition {
     async execute(args, exec: ToolRunContext): Promise<AnswerToolResult> {
       const rendered = args["render"] === true;
       const payload = browserPayload(args, settings, rendered ? "render" : "fetch");
-      const raw = await sidecar.call(payload.method, payload.params, {
+      const raw = await callSidecar(sidecar, payload.method, payload.params, {
         signal: exec.signal,
         timeoutMs: settings.timeoutMs,
       });
@@ -2180,7 +2103,8 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext): Promise<SessionOpenResult> {
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         "session.open",
         {
           sessionType: args["sessionType"],
@@ -2255,8 +2179,11 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
       googleSearch: BROWSER_REQUEST_PARAMS.googleSearch,
       includeMetadata: BROWSER_REQUEST_PARAMS.includeMetadata,
       params: STATIC_REQUEST_PARAMS.params,
-      form: STATIC_REQUEST_PARAMS.form,
-      json: STATIC_REQUEST_PARAMS.json,
+      // form/json 与 method/body 同档的写意图，但会话侧参数面不随 allowWriteMethods 收窄
+      // （那是静态抓取那一面的事）：这里逐键取用同一份描述，帧上仍由 Python 侧的
+      // session.fetch 判写意图，别让两边对一份文案各改各的。
+      form: WRITE_BODY_PARAMS.form,
+      json: WRITE_BODY_PARAMS.json,
       cookies: BROWSER_REQUEST_PARAMS.cookies,
       timeoutSeconds: {
         type: "integer",
@@ -2288,7 +2215,8 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext): Promise<FetchResult & { sessionId: string }> {
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         METHOD_SESSION_FETCH,
         {
           ...browserPayload(args, settings, METHOD_SESSION_FETCH).params,
@@ -2361,7 +2289,8 @@ export function createSessionNetworkTool(deps: ToolDeps): ToolDefinition {
       args,
       exec: ToolRunContext,
     ): Promise<{ sessionId: string; count: number; matches: NetworkEntry[] }> {
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         METHOD_SESSION_NETWORK,
         {
           sessionId: args["sessionId"],
@@ -2456,7 +2385,8 @@ function createSessionStateTool(deps: ToolDeps, saving: boolean): ToolDefinition
       args,
       exec: ToolRunContext,
     ): Promise<{ sessionId: string; path: string; saved: boolean }> {
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         saving ? "session.state_save" : "session.state_load",
         {
           sessionId: args["sessionId"],
@@ -2545,7 +2475,7 @@ export function createSessionListTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => true,
     async execute(_args, exec: ToolRunContext): Promise<{ sessions: SessionRow[] }> {
-      const raw = await sidecar.call("session.list", {}, { signal: exec.signal });
+      const raw = await callSidecar(sidecar, "session.list", {}, { signal: exec.signal });
       return { sessions: toSessionRows(raw) };
     },
   });
@@ -2582,7 +2512,8 @@ export function createSessionCloseTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext): Promise<{ sessionId: string; closed: boolean }> {
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         "session.close",
         { sessionId: args["sessionId"] },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
@@ -2691,7 +2622,8 @@ export function createCrawlTool(deps: ToolDeps): ToolDefinition {
       const jobId = await startCrawlJob(`crawl ${url} (max ${maxPages})`, async (sink) => {
         // 工具执行上下文与作业取消都要生效：前者是本轮超时，后者是 job_kill。
         const signal = anySignal([sink.signal, exec.signal]);
-        const started = await sidecar.call(
+        const started = await callSidecar(
+          sidecar,
           "crawl.run",
           {
             url,

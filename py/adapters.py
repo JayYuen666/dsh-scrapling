@@ -596,6 +596,36 @@ def _static_request_payload(args: dict[str, Any], method: str) -> dict[str, Any]
     return payload
 
 
+# 请求体本身就是写意图：给了这些键却把方法留空时按 POST 发，而不是把它们丢进一次
+# GET（那会「发出去但语义错了」，而回包上没有任何一行能看出这件事）。
+_WRITE_BODY_KEYS = ("form", "json", "body")
+
+
+def _static_method(args: dict[str, Any]) -> str:
+    """定静态抓取的方法：显式 ``method`` 优先，没给时由请求体推。
+
+    缺省一律 GET 的写法会让 ``form`` / ``json`` / ``body`` **静默落地**：请求照发、
+    对端收到空体。所以这三个键在场时默认按 POST 发；而显式 GET 配它们是无解的组
+    合 —— 那是参数错误，不是可以静默降级的默认值。
+
+    :param args: 协议参数
+    :returns: ``GET`` / ``POST`` / ``PUT`` / ``DELETE``
+    :raises AdapterError: 方法不支持，或显式 GET 带了请求体
+    """
+    raw = args.get("method")
+    method = str(raw).upper() if raw is not None and raw != "" else ""
+    if not method:
+        return "POST" if any(args.get(key) is not None for key in _WRITE_BODY_KEYS) else "GET"
+    if method not in ("GET", "POST", "PUT", "DELETE"):
+        raise AdapterError("BAD_ARGS", f"unsupported method: {method}")
+    if method == "GET" and any(args.get(key) is not None for key in _WRITE_BODY_KEYS):
+        raise AdapterError(
+            "BAD_ARGS",
+            "GET cannot carry a request body; drop body/form/json or use a write method such as POST",
+        )
+    return method
+
+
 def fetch(args: dict[str, Any]) -> dict[str, Any]:
     """静态抓取（curl_cffi）。不需要浏览器。
 
@@ -606,9 +636,7 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
     _require(Fetcher)
     url = _url(args)
     extraction_type, css_selector, main_content_only, limit = _extraction(args)
-    method = str(args.get("method", "GET")).upper()
-    if method not in ("GET", "POST", "PUT", "DELETE"):
-        raise AdapterError("BAD_ARGS", f"unsupported method: {method}")
+    method = _static_method(args)
     request_payload = _static_request_payload(args, method)
     if method != "GET" and not guard.ALLOW_WRITE_METHODS:
         # 这一侧是硬拒，不依赖 Host 有没有把入参摆出来：手搓一帧 stdin 也写不出去。
@@ -630,7 +658,18 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
     allowed, reason = guard.url_allowed(url)
     if not allowed:
         raise AdapterError("URL_BLOCKED", f"{url}: {reason}")
-    response = getattr(Fetcher, method.lower())(url, **params)
+    try:
+        response = getattr(Fetcher, method.lower())(url, **params)
+    except Exception as error:
+        # 非法的 impersonate 不是「抓取失败」而是参数错误：curl_cffi 在**请求时**才
+        # 校验它，抛的是 ``ImpersonateError``（构造 Session 那一层不校验，所以只能在
+        # 这里接）。原文与堆栈对模型没有信息量，换成一句能自己纠正的 BAD_ARGS。
+        if type(error).__name__ == "ImpersonateError":
+            raise AdapterError(
+                "BAD_ARGS",
+                f"impersonate {impersonate!r} is not supported by curl_cffi; use one of its supported browser presets",
+            ) from error
+        raise
     return to_payload(
         response,
         extraction_type=extraction_type,
@@ -1730,6 +1769,14 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
                         f"allowWriteMethods (env {guard.ALLOW_WRITE_METHODS_ENV}) to allow it",
                     )
                 static_params = _static_params(args, url)
+                # extraHeaders 在浏览器那条路是请求头（上游的 extra_headers），static 这条路
+                # 没有同名旋钮 —— 不合并的话它会被静默丢掉：调用成功、对端却没收到那个头。
+                # 同名键以 extraHeaders 为准（它比 headers 更具体，也是浏览器侧的语义）。
+                extra_headers = _string_map(args.get("extraHeaders"), "extraHeaders")
+                if extra_headers is not None:
+                    merged = dict(static_params.get("headers") or {})
+                    merged.update(extra_headers)
+                    static_params["headers"] = merged
                 static_params.update(_static_request_payload(args, static_method))
                 response = getattr(session, static_method.lower())(url, **static_params)
         else:
@@ -2119,7 +2166,14 @@ def _session_state(args: dict[str, Any], *, saving: bool) -> dict[str, Any]:
                 Path(target).chmod(0o600)
         else:
             worker.run(lambda: session.load_state(target))
-    except Exception as error:  # 上游的文件/JSON 错误一律翻成可路由的码
+    except FileNotFoundError as error:
+        # 上游的原文里带着**宿主绝对路径**（「[Errno 2] No such file or directory:
+        # '/Users/…/login.json'」）：那是部署面的信息，对模型既没用又是泄露。点名
+        # 那个模型自己给的文件名就够了。
+        raise AdapterError("STATE_FAILED", f"state file does not exist: {Path(target).name}") from error
+    except json.JSONDecodeError as error:
+        raise AdapterError("STATE_FAILED", f"state file is not valid JSON: {Path(target).name}") from error
+    except Exception as error:  # 上游的其余文件/JSON 错误一律翻成可路由的码
         raise AdapterError("STATE_FAILED", f"{type(error).__name__}: {error}") from error
     return {"sessionId": session_id, "path": target, "saved": saving}
 

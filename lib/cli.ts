@@ -115,18 +115,6 @@ function withDefaults(overrides: Partial<CliDeps>): CliDeps {
   };
 }
 
-async function showStatus(deps: CliDeps): Promise<number> {
-  const runtime = resolveRuntime({
-    pythonBin: "",
-    dataDir: deps.dataDir,
-    repoRoot: deps.repoRoot,
-  });
-  const state = await readRuntimeState(deps.dataDir);
-  const packs = await packStates(deps.dataDir);
-  deps.log(JSON.stringify({ dataDir: deps.dataDir, runtime, packs, state }, null, 2));
-  return 0;
-}
-
 function stringFlag(flags: FlagMap, name: string): string | undefined {
   const value = flags.get(name);
   return typeof value === "string" ? value : undefined;
@@ -290,6 +278,62 @@ function hasPatchValue(text: string, key: string): boolean {
 function patchFlag(text: string, key: string): boolean {
   const value = patchScalar(text, key);
   return value === "true" || value === "True" || value === "TRUE";
+}
+
+/** `--status` 里 profile 那一段：没给 `--profile` 时是 `null` 路径加一句为什么没读。 */
+interface StatusProfile {
+  readonly path: string | null;
+  readonly pythonBin: string | null;
+  readonly note?: string;
+}
+
+const NO_PROFILE_NOTE =
+  "未读 profile：runtime 只按 CLI 自身的解析链（pythonBin 配置 → 托管 runtime → 仓内 _env/.venv → PATH python3）；" +
+  "要看部署配置解析出的解释器就加 --profile <目录>";
+
+const NO_PYTHON_BIN_NOTE =
+  "profile 里没有 scrapling 的 pythonBin：runtime 回落到 CLI 自身的解析链（托管 runtime → 仓内 _env/.venv → PATH python3）";
+
+/**
+ * `--status` 的解释器来源。
+ *
+ * 宿主按 profile 里的 `pythonBin` 起 sidecar，CLI 不读 profile 时只能走自己的解析链——那会让
+ * `--status` 报 `python3/path/unknown`，而部署实际用的是别的解释器。给了 `--profile` 就读
+ * 那份 `cordis.patch.yml` 里的 `pythonBin`（与 doctor 读同一份文本、同一个 `patchScalar`），
+ * 没给则在输出里明说没读，而不是假装那已经是宿主会用的解释器。
+ *
+ * @param flags - 本次命令行旗标
+ * @returns 写进 JSON 的 profile 段，以及交给 `resolveRuntime` 的 `pythonBin`
+ */
+async function statusProfile(
+  flags: FlagMap,
+): Promise<{ profile: StatusProfile; pythonBin: string }> {
+  const dir = stringFlag(flags, "profile");
+  if (dir === undefined) {
+    return { profile: { path: null, pythonBin: null, note: NO_PROFILE_NOTE }, pythonBin: "" };
+  }
+  const snapshot = await readProfileSnapshot(dir);
+  const pythonBin = patchScalar(snapshot.patchText, "pythonBin") ?? "";
+  return {
+    profile:
+      pythonBin === ""
+        ? { path: dir, pythonBin: null, note: NO_PYTHON_BIN_NOTE }
+        : { path: dir, pythonBin },
+    pythonBin,
+  };
+}
+
+async function showStatus(flags: FlagMap, deps: CliDeps): Promise<number> {
+  const { profile, pythonBin } = await statusProfile(flags);
+  const runtime = resolveRuntime({
+    pythonBin,
+    dataDir: deps.dataDir,
+    repoRoot: deps.repoRoot,
+  });
+  const state = await readRuntimeState(deps.dataDir);
+  const packs = await packStates(deps.dataDir);
+  deps.log(JSON.stringify({ dataDir: deps.dataDir, profile, runtime, packs, state }, null, 2));
+  return 0;
 }
 
 // lib/search-provider.ts 里的 SEARCH_PROVIDER_ID。这里写本地常量，免得 CLI 把 sidecar 依赖一起拖进来。
@@ -524,7 +568,7 @@ export async function runCli(
       return await runDoctor(flags, deps);
     }
     if (flags.has("status")) {
-      return await showStatus(deps);
+      return await showStatus(flags, deps);
     }
     if (flags.has("mode")) {
       return await setupMode(flags, deps);

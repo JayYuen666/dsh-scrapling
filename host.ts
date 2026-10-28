@@ -20,13 +20,13 @@ import type { JobOutcome } from "@deepseek-ai/dsh-jobs";
 import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
 import type { WebFetchBody, WebSearchProvider } from "@deepseek-ai/dsh-web";
 import Schema from "@deepseek-ai/schemastery";
-import { createSidecar } from "./lib/sidecar.ts";
+import { createSidecar, sidecarErrorWithCode } from "./lib/sidecar.ts";
 import { SidecarError } from "./lib/sidecar-error.ts";
 import { resolveRuntime } from "./lib/runtime.ts";
 import { installRuntimeRemote } from "./lib/runtime-remote.ts";
 import type { RuntimeJobs } from "./lib/runtime-remote.ts";
 import { defaultInstallerIO, installCapabilityPack } from "./lib/installer.ts";
-import { createUrlPolicy } from "./lib/url-policy.ts";
+import { createUrlPolicy, redactUrlSecrets } from "./lib/url-policy.ts";
 import { createWebFetchProvider, PROVIDER_ID } from "./lib/web-provider.ts";
 import { createWebSearchProvider, SEARCH_PROVIDER_ID } from "./lib/search-provider.ts";
 import {
@@ -651,7 +651,10 @@ const GUIDANCE: Record<keyof ToolFlags, string> = {
 };
 
 /** 一个工具对运行环境的最低要求。 */
-export type ToolRequirement = "scrapling" | "browser" | "jobs";
+export type ToolRequirement = "scrapling" | "browser" | "jobs" | "session-state";
+
+/** 会话状态工具的能力门：`sessionStateDir` 配了才有地方落盘。 */
+const SESSION_STATE_REQUIREMENT = "session-state";
 /** 工具构造器：名字到「给定依赖造一个工具定义」的映射。 */
 type ToolBuilder = (deps: ToolDeps) => ToolDefinition;
 
@@ -717,13 +720,13 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
   {
     name: "scrapling_session_state_save",
     flag: "sessionState",
-    requires: "scrapling",
+    requires: SESSION_STATE_REQUIREMENT,
     build: createSessionStateSaveTool,
   },
   {
     name: "scrapling_session_state_load",
     flag: "sessionState",
-    requires: "scrapling",
+    requires: SESSION_STATE_REQUIREMENT,
     build: createSessionStateLoadTool,
   },
   {
@@ -847,7 +850,8 @@ export type SkipReason =
   | "scrapling-missing"
   | "browser-missing"
   | "jobs-unavailable"
-  | "attachments-missing";
+  | "attachments-missing"
+  | "session-state-unavailable";
 
 /** 注册计划的结果。 */
 export interface ToolPlan {
@@ -866,6 +870,9 @@ export interface ToolPlan {
  *
  * @param flags - 每工具开关快照
  * @param capabilities - sidecar 握手报上来的能力；undefined 表示尚未探测成功
+ * @param jobsReady - 作业后端是否可用（false 时爬虫不注册）
+ * @param attachmentsReady - 附件落库面是否可用（false 时截图不注册）
+ * @param sessionStateReady - sessionStateDir 是否已配置（false 时登录态存取不注册）
  * @returns 注册计划
  */
 export function planTools(
@@ -873,6 +880,7 @@ export function planTools(
   capabilities: SidecarCapabilities | undefined,
   jobsReady = false,
   attachmentsReady = true,
+  sessionStateReady = false,
 ): ToolPlan {
   const ready: string[] = [];
   const skipped: { name: string; reason: SkipReason }[] = [];
@@ -889,6 +897,11 @@ export function planTools(
     // 注定失败的工具 —— 与 browser-missing 同一套取舍。
     if (requires === "jobs" && !jobsReady) {
       return "jobs-unavailable";
+    }
+    // 登录态存取要有落盘目录：sessionStateDir 为空时 sidecar 一律回
+    // `SESSION_STATE_DISABLED`，注册出去就是两只注定失败的工具（lead-findings F4/F11）。
+    if (requires === SESSION_STATE_REQUIREMENT && !sessionStateReady) {
+      return "session-state-unavailable";
     }
     return NONE;
   };
@@ -1131,6 +1144,23 @@ function startUnderCrawlController<Spec, Id>(jobs: CrawlJobsFace<Spec, Id>, spec
 }
 
 /**
+ * 把作业主体抛出的错误折成结算行的 detail。
+ *
+ * 带码的错误（sidecar 的 `BAD_ARGS` / `URL_BLOCKED`）必须把码留在文案最前面，模型
+ * 才能据此改参数；其它错误（宿主服务、意外异常）保留原文，不编一个假码出来（J9）。
+ *
+ * @param error - 作业主体捕获到的错误
+ * @returns 写进 JobOutcome.detail 的文案
+ */
+export function crawlFailureDetail(error: unknown): string {
+  if (error instanceof SidecarError) {
+    // 幂等：Python 侧有时已把码拼进 message，再拼一次就是 `X: X: …`。
+    return sidecarErrorWithCode(error.code, error.message, { cause: error }, error.details).message;
+  }
+  return String(error);
+}
+
+/**
  * 起一个爬虫后台作业。
  *
  * 作业产出者返回的 `done` **不能 reject**：运行时会把 rejection 翻成 `failed`，而那
@@ -1204,10 +1234,15 @@ function startCrawlJob(
               await run(sink);
               return { status: "completed" };
             } catch (error: unknown) {
-              return {
-                status: "killed",
-                detail: String(error),
-              };
+              // 取消不是失败：signal 已被 abort 时给 killed 一个可读原因，让作业面板与模型
+              // 分得清「我让它停的」与「它自己断了」。JobOutcome 的状态词表只有
+              // completed / killed / failed，所以取消也落 killed，靠 detail 区分（F1/J9）。
+              if (controller.signal.aborted) {
+                return { status: "killed", detail: "cancelled" };
+              }
+              // sidecar 错误把码带进 detail：作业结算行是模型看结果的唯一一帧，丢了码
+              // 就只剩一句光秃秃的话，而 URL_BLOCKED / BAD_ARGS 该带它去修正参数。
+              return { status: "failed", detail: crawlFailureDetail(error) };
             } finally {
               router.forget(sink);
             }
@@ -1311,7 +1346,9 @@ export function createUrlGate(config: Config): (url: string) => Promise<string> 
   return async (url: string): Promise<string> => {
     const verdict = await policy.verify(url);
     if (!verdict.ok) {
-      throw new SidecarError("URL_BLOCKED", `${url}: ${verdict.message}`);
+      // 这条文案会进会话日志与模型上下文：模型交进来的地址原样回显，`user:pass@host`
+      // 里的口令就跟着泄露。展示层脱敏，判定与连接仍用原串（F3）。
+      throw new SidecarError("URL_BLOCKED", `${redactUrlSecrets(url)}: ${verdict.message}`);
     }
     // 交回归一串，让 sidecar 发出去的与这里判过的是同一个地址。
     return verdict.url.toString();
@@ -1620,6 +1657,27 @@ function warnJobsUnavailable(ctx: Context, plan: ToolPlan): void {
 }
 
 /**
+ * sessionStateDir 未配置时，把两只注定失败的登录态工具拦在注册之外，并点名修法。
+ *
+ * 这一条与 jobs-unavailable 同缘：目录为空时 sidecar 的 state.save / state.load 一律回
+ * `SESSION_STATE_DISABLED`，注册出去只会让模型点开一个必然失败的按钮。跳过它不影响
+ * 其余会话工具（open / fetch / list / close 照常）。
+ *
+ * @param ctx - 宿主上下文（只用于 logger）
+ * @param plan - 本次注册计划
+ */
+function warnSessionStateUnavailable(ctx: Context, plan: ToolPlan): void {
+  if (!plan.skipped.some((item) => item.reason === "session-state-unavailable")) {
+    return;
+  }
+  ctx.logger.warn(
+    "[dsh-scrapling] scrapling_session_state_save/_load 不注册：sessionStateDir 未配置。" +
+      "在设置卡里填一个可写目录（例如 ~/.dsh-scrapling/sessions），或留空就维持这一档 ——" +
+      "它会同时保存 cookie / localStorage / IndexedDB。其余会话工具不受影响。",
+  );
+}
+
+/**
  * 缺 scrapling 时把选中解释器一起点名。
  *
  * 这条路径上工具全都不注册，而「解释器里没装」与「装了但 PATH 指错」在日志里长得一样，
@@ -1723,7 +1781,13 @@ export async function apply(
   // 签名由截图工具的实际调用验证。
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion
   const attachments = ctx.get("attachments") as AttachmentSaver | undefined;
-  const plan = planTools(flags, capabilities, jobsReady, attachments !== undefined);
+  const plan = planTools(
+    flags,
+    capabilities,
+    jobsReady,
+    attachments !== undefined,
+    config.sessionStateDir.trim().length > 0,
+  );
   for (const item of plan.skipped) {
     if (item.reason !== "disabled") {
       ctx.logger.warn(`[dsh-scrapling] ${item.name} 不注册：${item.reason}`);
@@ -1734,6 +1798,8 @@ export async function apply(
   warnScraplingMissing(ctx, plan, python);
 
   warnJobsUnavailable(ctx, plan);
+
+  warnSessionStateUnavailable(ctx, plan);
 
   // 按计划真正注册。登记表里每一项自己带着构造器，所以不存在「加了一个工具却忘了接线」
   // 这一类漏注册。

@@ -337,6 +337,16 @@ async function driveTools(): Promise<Record<string, ToolObservation>> {
       for (const [name, item] of Object.entries(parameters)) {
         args[name] = sampleValue(name, item);
       }
+      // 满参数面要给每枚参数各塞一个值，但 `scrapling_fetch` 的 GET + body/form/json 是
+      // **非法组合**（J6 守卫在发帧前就回 BAD_ARGS），那样一帧都观测不到，这个工具的全部
+      // 参数都会被误报成「线上没有它」。写体在场时把方法换成 POST —— 合法形态下发帧，
+      // 该有的键一个不少。
+      if (
+        spec.name === "scrapling_fetch" &&
+        (args["body"] !== undefined || args["form"] !== undefined || args["json"] !== undefined)
+      ) {
+        args["method"] = "POST";
+      }
       try {
         await definition.execute(args, { signal: new AbortController().signal } as never);
       } catch {

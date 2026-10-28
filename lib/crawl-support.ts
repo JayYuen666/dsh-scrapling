@@ -82,6 +82,30 @@ async function stopCrawl(sidecar: SidecarClient, crawlId: string): Promise<void>
 }
 
 /**
+ * 把收尾那一拍的摘要写进输出环：统计与 notice 各一行。
+ *
+ * @param status - crawl.status 的回包
+ * @param sink - 输出出口
+ */
+function appendFinalNotes(status: Record<string, unknown>, sink: CrawlSink): void {
+  if (status["running"] === true) {
+    return;
+  }
+  const { stats } = status;
+  if (isRecord(stats) && Object.keys(stats).length > 0) {
+    // 只在收尾那一拍写一行：统计不能把每页正文再抄一遍，页面仍走上面的增量 pages。
+    sink.append(`crawl stats: ${JSON.stringify(stats)}`);
+  }
+  // Python 侧把「为什么不完整」写进 notice（shopify 模式撞到非店铺响应、sitemap 发现期
+  // 被上限截断）。作业若把它吞掉，模型只看到少了几页、却永远不知道原因 —— 收尾那一拍
+  // 透传一次；空串表示没有话要说，不占一行。
+  const notice = typeof status["notice"] === "string" ? status["notice"] : "";
+  if (notice !== "") {
+    sink.append(`crawl notice: ${notice}`);
+  }
+}
+
+/**
  * 轮询一次爬虫状态并吐出新增页面；还在跑就等一拍再来。
  *
  * @param sidecar - sidecar 客户端
@@ -131,11 +155,7 @@ async function drainOnce(
     // 现成的页等着读。
     return drainOnce(sidecar, crawlId, sink, signal, total);
   }
-  const { stats } = status;
-  if (status["running"] !== true && isRecord(stats) && Object.keys(stats).length > 0) {
-    // 只在收尾那一拍写一行：统计不能把每页正文再抄一遍，页面仍走上面的增量 pages。
-    sink.append(`crawl stats: ${JSON.stringify(stats)}`);
-  }
+  appendFinalNotes(status, sink);
   // 页数比 maxPages 少时，模型该能看出是「整体截止到了点」而不是站点就这么大；挂在收尾
   // 那一行里说，不再单独发一条进度 —— 同一件事两句进度只会让输出环里多一行噪音。
   const budgetNote =

@@ -4,7 +4,7 @@
 // 钉死的用例。DNS 全部走注入的假解析器，不碰真实网络。
 
 import { describe, expect, it } from "vitest";
-import { createUrlPolicy } from "../lib/url-policy.ts";
+import { createUrlPolicy, redactUrlSecrets } from "../lib/url-policy.ts";
 import type { BlockReason, ResolveAddresses, UrlPolicy, UrlVerdict } from "../lib/url-policy.ts";
 
 /** 用例里反复用到的主机名与目标 URL。 */
@@ -617,5 +617,35 @@ describe("合成段白名单的解析容错", () => {
     });
     const verdict = await policy.verify(HOME_URL);
     expect(reasonOf(verdict)).toBe(PRIVATE);
+  });
+});
+
+describe("redactUrlSecrets：展示层脱敏", () => {
+  it("带 scheme 的 userinfo 整段抹掉，保留 host/path", () => {
+    expect(redactUrlSecrets("https://user:pw@example.com/a?b=1")).toBe(
+      "https://***@example.com/a?b=1",
+    );
+  });
+
+  it("只有用户名没有口令也要抹：用户名本身就是身份信息", () => {
+    expect(redactUrlSecrets("http://alice@example.com/")).toBe("http://***@example.com/");
+  });
+
+  it("无 scheme 的 user:pass@host 形态（urlsplit 会读成 scheme 的那一类）", () => {
+    expect(redactUrlSecrets("user:pass@93.184.216.34/:8080/x")).toBe("***@93.184.216.34/:8080/x");
+  });
+
+  it("没有 userinfo 时原样返回", () => {
+    expect(redactUrlSecrets("https://example.com/path")).toBe("https://example.com/path");
+  });
+
+  it("路径里的 @ 不当 userinfo：抹掉反而让文案失真", () => {
+    expect(redactUrlSecrets("https://example.com/users/@me/profile")).toBe(
+      "https://example.com/users/@me/profile",
+    );
+  });
+
+  it("scheme 大小写不影响识别", () => {
+    expect(redactUrlSecrets("HTTPS://u:p@example.com/")).toBe("HTTPS://***@example.com/");
   });
 });

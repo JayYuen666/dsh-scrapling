@@ -3,6 +3,26 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。最新版本在最上。
 
+## 0.1.4
+
+### Fixed
+
+- **`scrapling_fetch` 的 `form` / `json` 不再静默落地**：`allowWriteMethods=false` 时这两个参数与 `method` / `body` 走同一道闸，模型参数面里根本不出现；写方法开启时，给了 `form` / `json` 而没给 `method` 会隐含 `POST`（与静态会话抓取一致），显式 `GET` 配请求体判 `BAD_ARGS`。此前请求照发、对端收到空体，而回包上没有任何一行能看出这件事。
+- **离线解析器的 `url` 不再被出站闸门误拦**：`scrapling_extract` / `scrapling_locate` / `scrapling_links` 的 `url` 只作相对地址基准，不做 DNS 解析也不连网；此前它被当成取回目标，给一个内网基准地址就会报 `URL_BLOCKED`。
+- **URL 守卫错误文案不再回显凭据**：`https://user:pass@host` 在 `URL_BLOCKED` 里脱敏成 `***@`，判定与连接仍用原串。
+- **`sessionStateDir` 未配置时不再注册登录态存取工具**：`scrapling_session_state_save` / `scrapling_session_state_load` 现在与 jobs / attachments 同一种门，目录为空时那两只注定回 `SESSION_STATE_DISABLED` 的工具不会出现在工具目录里，并给一条点名修法的告警。
+- **模型可见渲染补齐**：`includeHtml` 真正输出每条匹配的 `html`；`scrapling_locate` 的 `attributes`、`ancestors`、`full css` / `full xpath` 与 `truncated` / 截断提示进入模型文本；`session_network` 印出 `id` 与（`includeHeaders` 时）`headers`，`requestId` / `afterId` / `includeHeaders` 不再是无可见效果的旋钮；`capture_xhr` 零捕获时给一条「页面可能没有 XHR，也可能抓早了」的提示。
+- **原生工具错误带回错误码**：sidecar 的错误不再只剩 `Error: <message>`，模型能看到 `BAD_ARGS: …` / `URL_BLOCKED: …` 前缀。
+- **非法 `impersonate` 报 `BAD_ARGS`**：curl_cffi 在请求时才校验浏览器预设，过去把 `ImpersonateError` 泄漏成一次抓取失败；现在点名可用预设。
+- **爬虫作业结算行保留错误码并区分取消与失败**：`BAD_ARGS` / `URL_BLOCKED` 以 `CODE: message` 进入作业最终 detail；`job_kill` 落 `killed` + `cancelled`，异常落 `failed`，不再一律 `killed`。
+- **爬虫结果里的 `notice` 能到模型眼前**：`mode=shopify` 遇到 404 / 非 JSON / 非店铺 JSON、`mode=sitemap` 发现期被 `maxPages` 截断时，作业输出多一行 `crawl notice:`（此前 Python 侧有这份原因、JS 侧从不读）。
+- **`sitemapFollow` 不再放大抓取**：发现期抓子 sitemap 与 sitemap URL 各自按 `maxPages` 封顶，`maxPages=2` 不会再打出几百次请求。
+- **浏览器页面超时与工具调用预算解耦**：`scrapling_render` / `scrapling_capture_xhr` / 会话抓取 / `session_act` 在模型未给 `timeoutMs` 时不再下发页面超时（交给 Python 的 30s），显式值只按 `min(调用值, pageTimeoutMs)` 下发；坏选择器与永不 idle 的页面因此能返回 `ACTION_FAILED` / 结构化超时，而不是把整次调用拖到宿主外层 120s。
+- **静态会话的 `extraHeaders` 生效**：此前只有浏览器会话合并它、静态路径静默丢掉；现在与 `headers` 合并，同名以 `extraHeaders` 为准。
+- **浏览器下载走附件回退**：`useBrowser=true` 抓二进制响应时 Chromium 会报 `Page.goto: Download is starting`，现在改为先开会话取 URL、再经附件链路落盘；`DOWNLOAD_FAILED` 也补回原始原因。
+- **登录态文件错误不再泄漏宿主绝对路径**：`state_load` 的 `FileNotFoundError` / JSON 解析错误只点名模型自己给的文件名。
+- **文档与 CLI 同步**：随包 `cordis.patch.yml` 的工具数从 13 改到 19；`setup --status --profile <目录>` 读该 profile 的 `pythonBin`（不再永远回 `python3/path/unknown`）；README 设置卡表把 `duckduckgoEndpoint` 从 volatile 栏移出，并新增 README 与 config schema 的一致性测试。
+
 ## 0.1.3
 
 ### Added

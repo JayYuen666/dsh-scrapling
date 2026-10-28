@@ -108,6 +108,7 @@ dsh-scrapling setup --status
 - `search`、`media`、`mcp` 与 `adaptive-redis` 都以 `core` 的 venv 为载体：`mcp` 带来 `official-mcp` 模式要的官方 `scrapling-mcp` server（`mcp` 包，16 个工具），`adaptive-redis` 带来 `adaptiveStorage: redis` 背后的 `redis` 客户端。六个包都可安装；设置卡把每个包报成 `ready`、`missing`、`corrupt` 或 `installing`。
 - `--feature` 默认 dry-run；`--apply` 才落盘。`--repair` 重装且不碰用户数据；`--uninstall <包> [--purge]` 删运行时文件，只有 `--purge` 才连 `elements_storage.db` 与 `downloads/` 一起删。
 - `--offline <目录>` 全程不联网：`<目录>` 里要有 Python 归档（文件名与清单 URL 的最后一段一致，浏览器与 `curl -O` 落盘的 `cpython-3.14.9+…-install_only.tar.gz` 可用，百分号转义那种写法也认），以及一个 `wheels/` 目录（每条钉版一枚 wheel，可用 `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <目录>/wheels` 生成）。Python 归档的哈希校验与联网路径一致，pip 带 `--no-index`；缺归档或缺 wheelhouse 时报 `INSTALL_OFFLINE_ASSETS`，不会悄悄退回联网。
+- `setup --status` 打印一份 JSON：`dataDir`、`profile`、`runtime`、`packs` 与 `state`。带 `--profile <目录>` 时读该 profile 的 `cordis.patch.yml`，按本包条目里的 `pythonBin`（宿主真正在用的那个设置）解析解释器；不带时 `profile.path` 为 `null`，输出里有一句说明没读 profile，`runtime` 回落到 CLI 自己的链（托管 runtime → 仓内 `_env/.venv` → PATH `python3`）。要拿 `--status` 和设置卡上的解释器对照，就带上 `--profile`。
 - profile 同时有远程读面与作业后端时，设置卡能经 `scraplingRuntime` 发起同一套安装/修复/取消；否则显示可照抄的 CLI 命令。
 - `integrationMode` 只在部署配置里；`setup --mode` 负责打印或写出两种 MCP 接法的客户端条目，`doctor` 用来核对一份 profile —— 见 [MCP 模式](#mcp-模式)。`official-mcp` 起的是托管 venv 里的 `scrapling-mcp`，由 `mcp` 能力包装进去（`setup --feature mcp --apply`）。
 - 只验证了 **macOS arm64**。Windows、Linux 与 macOS x64 是 blocked（B1/B2）：所有包都报 `blocked`，安装器直接拒绝，不猜资产路径。
@@ -291,7 +292,6 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 | `searchPublicFallback` | boolean | `false` | 允许 `auto` 在既没有 key、也没有 SearXNG 时回落到公共引擎（DuckDuckGo / Bing）。**默认关是刻意的**：打开就等于把查询词发给第三方公共引擎 |
 | `braveApiKey` / `serperApiKey` | secret | `""` | Brave Search 与 Serper.dev 的 key |
 | `searxngEndpoint` | string | `""` | SearXNG 实例的基址（会拼上 `…/search?format=json`）；为空表示这条后端不可用，报 `SEARCH_AUTH` |
-| `duckduckgoEndpoint` | string | `https://html.duckduckgo.com/html/` | DuckDuckGo HTML 端点；镜像或测试 stub 可覆盖 |
 | `answerProvider` / `answerModel` / `answerMaxTokens` | string / natural | `""` / `""` / `2000` | `scrapling_answer` 走哪条模型路由与单次回答的 token 上限。provider 与 model 都留空表示「跟随当前会话的模型」 |
 | `allowedHosts` | string | `""` | 额外放行的主机名（逗号分隔）。指向内网等于主动放弃那些目标的 SSRF 防护 |
 | `syntheticDnsRanges` | string | `""` | 合成 DNS 的手动兜底：填代理 fake-IP 池的 CIDR（逗号分隔），留给把合成地址与真地址混着返回的解析器。写错的段直接丢掉 —— 兜底坏了退化成「维持最严」，不该崩 |
@@ -316,6 +316,7 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 | `crawlDownloadDelayMs` / `crawlConcurrentRequests` / `crawlAutothrottle` / `crawlStrategy` | `0` / `4` / `false` / `bfs` | 请求间隔、并发数、自适应限速、广度或深度优先 |
 | `crawlCheckpointDir` | `""` | 把爬取队列落盘，重启后从断点接着走而不是回到起始 URL |
 | `tavilyApiEndpoint` / `bingEndpoint` / `searchRenderTopN` | `https://api.tavily.com/search` / `https://www.bing.com/search` / `3` | 发现端点（测试或代理可覆盖），以及前几条要真的抓下来渲染（`0` = 只给链接列表） |
+| `duckduckgoEndpoint` | `https://html.duckduckgo.com/html/` | DuckDuckGo HTML 端点；镜像或测试 stub 可覆盖 |
 | `allowBrowserActions` / `allowFileDownloads` / `downloadMaxBytes` | `false` / `false` / `10485760` | 部署级动作与下载门禁，以及单次下载的字节上限。两枚门禁默认关，关时对应工具也不注册给模型 |
 
 ## <img src="https://api.iconify.design/lucide/network.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 代理

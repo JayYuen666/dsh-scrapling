@@ -364,6 +364,69 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
+  it("select/locate/links 的 url 只当基准：不过 DNS/私网判定（J2）", async () => {
+    // extract 的 html 是调用方自己给的，url 只是解析相对链接的基准；为它做一次主机
+    // 解析会把一个纯本地操作变成需要联网、还会被私网拦截的操作（F2）。
+    const seen: string[] = [];
+    const sent: (Record<string, unknown> | undefined)[] = [];
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      fakeCtx(
+        {
+          reply: okReply,
+          onFrame: (frame) => {
+            sent.push(frame.params);
+          },
+        },
+        spawned,
+      ) as never,
+      options({
+        urlGate: async (url: string): Promise<string> => {
+          seen.push(url);
+          if (url.startsWith("http://127.0.0.1")) {
+            throw new SidecarError("URL_BLOCKED", `${url}: refused`);
+          }
+          return url;
+        },
+      }),
+    );
+    await client.ensureStarted();
+    const params = { html: "<p>x</p>", url: "http://127.0.0.1:3080/local-only" };
+    await client.call("select", params);
+    await client.call("locate", params);
+    await client.call("links", params);
+    expect(seen).toStrictEqual([]);
+    expect(sent[0]).toStrictEqual(params);
+    expect(sent[1]).toStrictEqual(params);
+    expect(sent[2]).toStrictEqual(params);
+    // 非基准类的调用照旧过闸门：静态抓取真的要去打那个地址。
+    await expect(client.call("fetch", { url: PRIVATE_SITEMAP })).rejects.toMatchObject({
+      code: "URL_BLOCKED",
+    });
+    await client.dispose();
+  });
+
+  it("select 帧上若另带 sitemapUrl/feedUrl，这两个仍要过闸门（J2）", async () => {
+    // 只有顶层 url 是「基准」；其它 URL 字段一律是 sidecar 会真去请求的目标。
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      fakeCtx({ reply: okReply }, spawned) as never,
+      options({
+        urlGate: async (url: string): Promise<string> => {
+          if (url === PRIVATE_SITEMAP) {
+            throw new SidecarError("URL_BLOCKED", `${url}: refused`);
+          }
+          return url;
+        },
+      }),
+    );
+    await client.ensureStarted();
+    await expect(
+      client.call("select", { html: "<p>x</p>", url: PUBLIC_URL, sitemapUrl: PRIVATE_SITEMAP }),
+    ).rejects.toMatchObject({ code: "URL_BLOCKED" });
+    await client.dispose();
+  });
+
   it("闸门归一化嵌套 URL 后，发往子进程的是归一串而不是入参", async () => {
     const sent: (Record<string, unknown> | undefined)[] = [];
     const spawned: { count: number; last?: FakeHandle } = { count: 0 };

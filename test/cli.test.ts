@@ -178,6 +178,58 @@ describe("runCli", () => {
     expect(lines.join("\n")).toContain('"core": "missing"');
   });
 
+  // 宿主按 profile 的 pythonBin 起 sidecar；CLI 不读 profile 时只能走自己的链，于是
+  // --status 会报 python3/path，而部署用的是别的解释器。没给 --profile 时不能假装
+  // 那个结果就是宿主会用的，必须在输出里说清「未读 profile」。
+  it("--status 没给 --profile 时明说没读 profile", async () => {
+    const { deps, lines } = harness();
+    await expect(runCli([SETUP, STATUS], deps)).resolves.toBe(0);
+    const status = JSON.parse(lines.join("\n")) as {
+      profile: { path: string | null; pythonBin: string | null; note?: string };
+      runtime: { via: string };
+    };
+    expect(status.profile.path).toBeNull();
+    expect(status.profile.pythonBin).toBeNull();
+    expect(status.profile.note ?? "").toContain("未读 profile");
+    expect(status.runtime.via).toBe("path");
+  });
+
+  it("--status --profile 用该 profile 的 pythonBin 解析解释器", async () => {
+    const { deps, lines, dataDir } = harness();
+    const configured = path.join(dataDir, "venv", "bin", "python");
+    const profile = profileDir(
+      dataDir,
+      `- id: scrapling\n  name: "@jayyuen66/dsh-scrapling"\n  config:\n    pythonBin: ${configured}\n`,
+    );
+    await expect(runCli([SETUP, STATUS, PROFILE, profile], deps)).resolves.toBe(0);
+    const status = JSON.parse(lines.join("\n")) as {
+      profile: { path: string | null; pythonBin: string | null; note?: string };
+      runtime: { pythonPath: string; via: string; version: string };
+    };
+    expect(status.profile.path).toBe(profile);
+    expect(status.profile.pythonBin).toBe(configured);
+    expect(status.profile.note).toBeUndefined();
+    expect(status.runtime).toStrictEqual({
+      pythonPath: configured,
+      via: "configured",
+      version: "unknown",
+    });
+  });
+
+  it("--status 的 profile 没写 pythonBin 时回落并说明", async () => {
+    const { deps, lines, dataDir } = harness();
+    const profile = profileDir(dataDir, `- id: scrapling\n  name: "@jayyuen66/dsh-scrapling"\n`);
+    await expect(runCli([SETUP, STATUS, PROFILE, profile], deps)).resolves.toBe(0);
+    const status = JSON.parse(lines.join("\n")) as {
+      profile: { path: string | null; pythonBin: string | null; note?: string };
+      runtime: { via: string };
+    };
+    expect(status.profile.path).toBe(profile);
+    expect(status.profile.pythonBin).toBeNull();
+    expect(status.profile.note ?? "").toContain("没有 scrapling 的 pythonBin");
+    expect(status.runtime.via).toBe("path");
+  });
+
   it("--feature core --apply 交给 installer 的包安装入口", async () => {
     const { deps, calls, lines } = harness();
     await expect(runCli([SETUP, FEATURE, CORE, APPLY], deps)).resolves.toBe(0);

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import os
 import struct
@@ -205,12 +206,12 @@ def _download_via_stream(
     try:
         session = curl_requests.Session(**session_kwargs)
     except Exception as error:
-        raise _error("DOWNLOAD_FAILED", f"download failed: {type(error).__name__}") from error
+        raise _error("DOWNLOAD_FAILED", f"download failed: {type(error).__name__}: {error}") from error
     try:
         try:
             response = session.request("GET", url, **request_kwargs)
         except Exception as error:
-            raise _error("DOWNLOAD_FAILED", f"download failed: {type(error).__name__}") from error
+            raise _error("DOWNLOAD_FAILED", f"download failed: {type(error).__name__}: {error}") from error
         try:
             status = int(getattr(response, "status_code", 0))
             if not 200 <= status < 300:
@@ -299,8 +300,19 @@ def _download_via_browser(
         browser_params["extra_headers"] = headers
     try:
         response = StealthyFetcher.fetch(url, **browser_params)
-    except Exception as error:
-        raise _error("DOWNLOAD_FAILED", f"download failed: {type(error).__name__}") from error
+    except Exception as error:  # noqa: BLE001 —— 把附件响应换一条路走完，而不是只剩一个类名
+        # 「Page.goto: Download is starting」：Chromium 不能把「触发下载的响应」当成一次
+        # 导航，fetch 这条路对附件/二进制响应天然走不通。换成等真实的 download 事件再把它
+        # 落盘。HTML 页走不到这里（fetch 成功就原样返回），所以既有成功路径不动。
+        return _download_via_browser_attachment(
+            url,
+            name=name,
+            directory=directory,
+            limit=limit,
+            timeout=timeout,
+            headers=headers,
+            cause=error,
+        )
     status = int(getattr(response, "status", 0))
     if not 200 <= status < 300:
         raise _error("DOWNLOAD_FAILED", f"download answered HTTP {status}")
@@ -316,6 +328,69 @@ def _download_via_browser(
         "sha256": hashlib.sha256(bytes(body)).hexdigest(),
         "contentType": _header_value(getattr(response, "headers", {}), "Content-Type"),
         "status": status,
+    }
+
+
+def _download_via_browser_attachment(
+    url: str,
+    *,
+    name: str,
+    directory: Path,
+    limit: int,
+    timeout: float,
+    headers: dict[str, str] | None,
+    cause: BaseException,
+) -> dict[str, Any]:
+    """浏览器路径的附件下载：等 ``download`` 事件，而不是等一次导航。
+
+    ``StealthyFetcher.fetch`` 走的是 ``page.goto``，而触发下载的响应在 Chromium 里不算
+    导航，于是它只回一句 ``Page.goto: Download is starting``。这里直接开一个会话、挂上
+    与一次性路径同一套网络守卫，然后等 Playwright 的 ``expect_download`` 把附件交出来。
+    """
+    import guard
+    from adapters import page_setup
+    from scrapling.fetchers import StealthySession
+
+    timeout_ms = int(timeout * 1000)
+    session_params: dict[str, Any] = {"timeout": timeout_ms}
+    proxy = guard.browser_proxy(url)
+    if proxy is not None:
+        session_params["proxy"] = proxy
+    session = StealthySession(**session_params)
+    page = None
+    try:
+        session.start()
+        page = session.context.new_page()
+        page.set_default_timeout(timeout_ms)
+        page_setup(page)
+        if headers is not None:
+            page.set_extra_http_headers(headers)
+        # 一触发下载这次导航就会失败，失败本身是预期的一部分（理由见上）。
+        with page.expect_download(timeout=timeout_ms) as pending, contextlib.suppress(Exception):
+            page.goto(url, wait_until="commit")
+        download = pending.value
+        source = download.path()
+        body = Path(source).read_bytes() if source is not None else b""
+    except Exception as error:
+        raise _error(
+            "DOWNLOAD_FAILED",
+            f"download failed: {type(cause).__name__}: {cause}; attachment fallback: {type(error).__name__}: {error}",
+        ) from error
+    finally:
+        if page is not None:
+            with contextlib.suppress(Exception):
+                page.close()
+        with contextlib.suppress(Exception):
+            session.close()
+    if len(body) > limit:
+        raise _error("DOWNLOAD_TOO_LARGE", f"download is {len(body)} bytes, over the {limit}-byte cap")
+    target = _commit_bytes(directory, name, body)
+    return {
+        "path": str(target),
+        "bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "contentType": None,
+        "status": 200,
     }
 
 

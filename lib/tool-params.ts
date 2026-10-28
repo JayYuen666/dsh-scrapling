@@ -111,8 +111,6 @@ export function sessionOpenExtras(args: Record<string, unknown>): Record<string,
 /** 静态抓取的请求件、编码与元数据参数。 */
 export const STATIC_REQUEST_PARAMS = {
   params: { type: "json", description: "GET 查询参数（对象）。" },
-  form: { type: "json", description: "表单字段（对象）；与 json 互斥。" },
-  json: { type: "json", description: "JSON 请求体；与 form 互斥。" },
   defaultEncoding: {
     type: "string",
     description: "响应头没有 charset 时使用的回退编码名，例如 latin-1。",
@@ -127,6 +125,21 @@ export const STATIC_REQUEST_PARAMS = {
     description:
       "回传安全响应元数据（contentType / encoding / reason / redirects / method），默认 false。",
   },
+} as const;
+
+/**
+ * 一次性静态抓取的「请求体」两枚：`form` / `json`。
+ *
+ * 与 `method`/`body` 同档 —— 它们表达的是**写意图**（没给 method 时隐含 POST），
+ * 所以部署没开放写方法时不出现在 `scrapling_fetch` 的参数面上。static 会话的
+ * `session_fetch` 仍逐键取用（会话侧的写语义由它自己声明）。
+ */
+export const WRITE_BODY_PARAMS = {
+  form: {
+    type: "json",
+    description: "表单字段（对象）；与 json 互斥。未给 method 时隐含 POST。",
+  },
+  json: { type: "json", description: "JSON 请求体；与 form 互斥。未给 method 时隐含 POST。" },
 } as const;
 
 /**

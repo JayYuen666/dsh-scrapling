@@ -86,6 +86,72 @@ function sectionCount(text: string): number {
   return text.split("\n").filter((line) => line.startsWith("## ")).length;
 }
 
+/** 设置卡表在正文里的起点：卡表紧跟在设置节的引言句后面。 */
+const CARD_TABLE_START = {
+  en: "Settings live on the **scrapling** card",
+  zh: "设置在插件详情页的 **scrapling** 卡上",
+} as const;
+
+/** 部署表的起点：这句标记之后只该出现部署级键。 */
+const DEPLOY_TABLE_START = {
+  en: "**Deployment-only knobs**",
+  zh: "**部署级旋钮**",
+} as const;
+
+/**
+ * 切出一份 README 里「设置卡表」与「部署表」两段的表格行。
+ *
+ * 只按 `| \`` 开头的行取行，是为了不让标题与说明句混进来；两份 README 里还有别的表
+ * （工具表、逐项能力表），所以起点用设置节自己的两句话定位，而不是从文件头往后数。
+ *
+ * @param text - 一份 README 正文
+ * @param cardStart - 设置卡表的定位句
+ * @param deployStart - 部署表的定位句
+ * @returns 两段表格行（不含表头与分隔行）
+ */
+function settingsTableRows(
+  text: string,
+  cardStart: string,
+  deployStart: string,
+): { card: readonly string[]; deploy: readonly string[] } {
+  const cardBegin = text.indexOf(cardStart);
+  const deployBegin = text.indexOf(deployStart);
+  if (cardBegin === -1 || deployBegin === -1 || deployBegin <= cardBegin) {
+    throw new Error("README 结构变了：找不到设置卡表或部署表的起始标记");
+  }
+  const heading = text.indexOf("\n## ", deployBegin);
+  const rowsIn = (from: number, to: number | undefined): readonly string[] =>
+    text
+      .slice(from, to)
+      .split("\n")
+      .filter((line) => line.startsWith("| `"));
+  return {
+    card: rowsIn(cardBegin, deployBegin),
+    deploy: rowsIn(deployBegin, heading === -1 ? undefined : heading),
+  };
+}
+
+/** 取表格行首列里的反引号 token —— 一行常写成 `a` / `b` 多枚键。 */
+function rowTokens(rows: readonly string[]): readonly string[] {
+  return rows.flatMap((row) => {
+    const first = row.split("|")[1] ?? "";
+    return [...first.matchAll(/`(?<token>[^`]+)`/gu)].map((found) => found.groups?.["token"] ?? "");
+  });
+}
+
+/**
+ * 把 `*MaxOutputChars` 这类族写法展开成实际配置键。
+ *
+ * @param tokens - 行首列里的 token
+ * @param all - `Config` 接口里的全部配置键
+ * @returns 展开后的键；未知 token 原样保留，好让断言把它当多出来的项报出来
+ */
+function expandFamilies(tokens: readonly string[], all: readonly string[]): readonly string[] {
+  return tokens.flatMap((token) =>
+    token.startsWith("*") ? all.filter((key) => key.endsWith(token.slice(1))) : [token],
+  );
+}
+
 describe("中英文文档对等", () => {
   it("两份 README 互相链接", async () => {
     const { en, zh } = await readPair();
@@ -163,6 +229,49 @@ describe("中英文文档对等", () => {
   it("二级章节数一致", async () => {
     const { en, zh } = await readPair();
     expect(sectionCount(zh), `${ZH} 的章节数与 ${EN} 不一致`).toBe(sectionCount(en));
+  });
+});
+
+describe("设置表与 schema 的 volatile 面对齐", () => {
+  it("卡片表恰是设置卡可见键，部署表只装部署级键", async () => {
+    const { en, zh } = await readPair();
+    const { all, volatile } = configKeys(await readFile(path.join(pkgDir, HOST), "utf8"));
+    const nonVolatile = all.filter((key) => !volatile.includes(key));
+    for (const [label, text, cardStart, deployStart] of [
+      [EN, en, CARD_TABLE_START.en, DEPLOY_TABLE_START.en],
+      [ZH, zh, CARD_TABLE_START.zh, DEPLOY_TABLE_START.zh],
+    ] as const) {
+      const { card, deploy } = settingsTableRows(text, cardStart, deployStart);
+      expect(card.length, `${label} 里找不到设置卡表`).toBeGreaterThan(0);
+      const cardKeys = expandFamilies(rowTokens(card), all);
+      expect(
+        [...new Set(cardKeys)].toSorted(),
+        `${label} 的卡片表与 schema 的 volatile 面不一致`,
+      ).toStrictEqual([...volatile].toSorted());
+      const deployKeys = [...new Set(expandFamilies(rowTokens(deploy), all))].toSorted();
+      // 部署表可以只写一部分（MCP 三枚键在 MCP 章节里讲），但混进设置卡字段就是放错表。
+      expect(
+        deployKeys.filter((key) => !nonVolatile.includes(key)),
+        `${label} 的部署表里混进了设置卡字段`,
+      ).toStrictEqual([]);
+      // 剩下没进部署表的，必须正好是 MCP 章节里单独文档化的那三枚。
+      expect(
+        nonVolatile.filter((key) => !deployKeys.includes(key)),
+        `${label} 的部署表缺了部署级键`,
+      ).toStrictEqual(["integrationMode", "mcpPort", "officialMcpEnabled"]);
+    }
+  });
+});
+
+describe("文档里的工具计数跟着工具表走", () => {
+  it("两份 README 与随包补丁注释都写现量", async () => {
+    const { en, zh } = await readPair();
+    // 工具表增删工具时，这两句文案与补丁注释要一起改——这条断言就是那个提醒。
+    expect(TOOL_SPECS, "工具表变了就把这几处计数文案一起改").toHaveLength(19);
+    expect(en).toContain("Nineteen tools");
+    expect(zh).toContain("十九个工具");
+    const patch = await readFile(path.join(pkgDir, "cordis.patch.yml"), "utf8");
+    expect(patch).toContain(`# ${TOOL_SPECS.length} 个工具`);
   });
 });
 

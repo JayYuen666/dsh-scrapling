@@ -5208,11 +5208,20 @@ def run_write_verbs(sidecar: Sidecar, base: str) -> None:
     lower = echo({**common, "method": "post", "body": "x"})
     check("方法名大小写不敏感", lower.get("method") == "POST", repr(lower)[:160])
 
+    bare_get = echo({**common, "method": "GET"})
+    check("不带请求体的 GET 照常到达对端", bare_get.get("method") == "GET", repr(bare_get)[:160])
+    # 显式 GET 配请求体是无解的组合：此前它被静默丢掉（请求照发、对端收到空体），
+    # 现在按参数错误拒绝 —— 判据落在「对端到底有没有收到那次请求」与错误码上。
     with_body_get = echo({**common, "method": "GET", "body": "ignored"})
-    check("GET 仍是 GET", with_body_get.get("method") == "GET", repr(with_body_get)[:160])
+    body_get_error = with_body_get.get("_frame", {}).get("error", {}) or {}
     check(
-        "GET 不带请求体（body 只在非 GET 时发，免得对端把 GET 当坏请求）",
-        with_body_get.get("received") == "",
+        "显式 GET 带请求体被明确拒绝（不再静默丢掉请求体）",
+        body_get_error.get("code") == "BAD_ARGS",
+        repr(with_body_get)[:200],
+    )
+    check(
+        "拒绝理由说明 GET 不能带请求体",
+        "GET cannot carry a request body" in str(body_get_error.get("message", "")),
         repr(with_body_get)[:200],
     )
 
@@ -6334,6 +6343,19 @@ def run_inprocess_adapters() -> None:
         "10.0.0.1" not in leaked_content and "10.0.0.2" not in leaked_content and "onclick" not in leaked_content,
         leaked_content[:220],
     )
+
+    # 0.1.3 缺陷修复（P1–P6）的用例集中在新文件里。这里把同一条 check 传进去 ——
+    # 另起一个没人调用的文件等于让那些断言安静地不跑，而它们本来正是回归的判据。
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import test_adapters
+
+    test_adapters.run_adapter_fixes(check)
+
+    # crawl 的两条修复（发现期上限、shopify notice）另开一份，同样是「不挂上去就等于
+    # 安静地不跑」。
+    import test_crawl_fixes
+
+    test_crawl_fixes.run_crawl_fixes(check)
 
 
 def run_inprocess_browser() -> None:

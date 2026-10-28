@@ -4,7 +4,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolDefinition, ToolRunContext } from "@deepseek-ai/dsh-tools";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { capText } from "./output.ts";
-import { SidecarError } from "./sidecar.ts";
+import { callSidecar, SidecarError } from "./sidecar.ts";
 import type { ToolDeps } from "./tools.ts";
 
 /** 宿主 attachment 服务的最小面；截图工具只调这一项。 */
@@ -114,7 +114,8 @@ export function createSessionReadTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext) {
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         "session.read",
         {
           sessionId: args["sessionId"],
@@ -185,7 +186,8 @@ export function createSessionActTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext) {
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         "session.act",
         {
           sessionId: args["sessionId"],
@@ -253,7 +255,8 @@ export function createDownloadTool(deps: ToolDeps): ToolDefinition {
       const requested =
         typeof args["maxBytes"] === "number" ? args["maxBytes"] : settings.downloadMaxBytes;
       const maxBytes = Math.min(requested, settings.downloadMaxBytes);
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         "download",
         {
           url: args["url"],
@@ -329,7 +332,8 @@ export function createScreenshotTool(deps: ToolDeps): ToolDefinition {
       if (attachments === undefined) {
         throw new SidecarError("ATTACHMENT_UNAVAILABLE", "no attachment service is mounted");
       }
-      const raw = await sidecar.call(
+      const raw = await callSidecar(
+        sidecar,
         "screenshot",
         {
           sessionId: args["sessionId"],

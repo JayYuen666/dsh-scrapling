@@ -526,6 +526,30 @@ function authorityOf(input: string): string {
 }
 
 /**
+ * 给模型看的 URL：抹掉 userinfo。
+ *
+ * 报错文本会被写进会话日志与模型上下文，而 `https://user:pass@host` 里的口令就这样
+ * 跟着泄露出去（F3）。无 scheme 的 `user:pass@host` 形态也要盖到 —— `new URL` 会把它
+ * 读成 scheme，按 `://` 写的正则抓不到那一段。
+ *
+ * @param input - 原始 URL
+ * @returns 脱敏后的串；没有 userinfo 时原样返回
+ */
+export function redactUrlSecrets(input: string): string {
+  const masked = input.replace(/^(?<scheme>[a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/iu, "$<scheme>***@");
+  if (masked !== input) {
+    return masked;
+  }
+  // 无 scheme：`user:pass@host/path` —— `@` 之前没有 `/` 才按 userinfo 处理，否则那是
+  // 路径里的普通 `@`，抹掉反而让文案失真。
+  const at = input.indexOf("@");
+  if (at > 0 && !input.slice(0, at).includes("/")) {
+    return `***@${input.slice(at + 1)}`;
+  }
+  return input;
+}
+
+/**
  * 默认 DNS 解析器：一次 lookup 取齐 A 与 AAAA。
  *
  * 为什么一次取全而不是先 A 后 AAAA：只查 A 会漏掉「A 记录是公网、AAAA 指向 NAT64
@@ -588,7 +612,11 @@ export function createUrlPolicy(options: UrlPolicyOptions): UrlPolicy {
     try {
       url = new URL(input);
     } catch {
-      return { ok: false, reason: "invalid-url", message: `invalid URL: ${input}` };
+      return {
+        ok: false,
+        reason: "invalid-url",
+        message: `invalid URL: ${redactUrlSecrets(input)}`,
+      };
     }
     if (!ALLOWED_PROTOCOLS.has(url.protocol)) {
       return {

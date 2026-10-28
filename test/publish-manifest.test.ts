@@ -384,6 +384,8 @@ describe("构建产物可载入", () => {
         flags: Record<string, boolean>,
         capabilities: unknown,
         jobsReady?: boolean,
+        attachmentsReady?: boolean,
+        sessionStateReady?: boolean,
       ) => {
         ready: readonly string[];
       };
@@ -400,7 +402,7 @@ describe("构建产物可载入", () => {
       version: "0.5",
     };
     expect(artifact.TOOL_SPECS).toHaveLength(19);
-    const { ready } = artifact.planTools(allOn, full, true);
+    const { ready } = artifact.planTools(allOn, full, true, true, true);
     // 有浏览器时十九个全注册；会话类各自独立，所以总数与工具数相等。
     expect(ready).toHaveLength(19);
     // 关掉浏览器的分支同样要成立，且恰好少掉那两个依赖浏览器的工具。写成差集而不是
@@ -412,7 +414,13 @@ describe("构建产物可载入", () => {
       "scrapling_session_act",
       "scrapling_screenshot",
     ]);
-    const { ready: withoutBrowser } = artifact.planTools(allOn, { ...full, browser: false }, true);
+    const { ready: withoutBrowser } = artifact.planTools(
+      allOn,
+      { ...full, browser: false },
+      true,
+      true,
+      true,
+    );
     expect(withoutBrowser).toStrictEqual(ready.filter((name) => !BROWSER_TOOLS.has(name)));
     expect(BROWSER_TOOLS.has("scrapling_render")).toBe(true);
   });

@@ -19,12 +19,14 @@ import { createCrawlTool } from "../lib/tools.ts";
 import type { CrawlSink, ToolDeps, ToolSettings } from "../lib/tools.ts";
 import type { AnswerResult } from "../lib/answer.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
+import { SidecarError } from "../lib/sidecar-error.ts";
 import { MCP_TOKEN_ENV } from "../lib/mcp-contract.ts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   Config as configSchema,
   apply,
+  crawlFailureDetail,
   createCrawlEventRouter,
   createUrlGate,
   guidanceFor,
@@ -420,14 +422,28 @@ describe("volatile 快照", () => {
 });
 
 describe("工具注册计划", () => {
-  it("全开且能力齐备时十九个工具全注册", () => {
-    const { ready } = planTools(ALL_ON, FULL_CAPS, true);
+  it("全开且环境齐备（含 sessionStateDir）时十九个工具全注册", () => {
+    const { ready, skipped } = planTools(ALL_ON, FULL_CAPS, true, true, true);
     expect(ready).toHaveLength(19);
     expect(ready).toStrictEqual(TOOL_SPECS.map((spec) => spec.name));
+    expect(skipped).toStrictEqual([]);
+  });
+
+  it("sessionStateDir 未配置时登录态两只不注册，其余十七个照常", () => {
+    // sessionStateDir 留空是出厂状态：sidecar 对这两只一律回 SESSION_STATE_DISABLED，
+    // 注册出去就是两只注定失败的工具，所以计划里直接不出现（F4/F11）。
+    const plan = planTools(ALL_ON, FULL_CAPS, true);
+    expect(plan.ready).toHaveLength(17);
+    expect(plan.ready).not.toContain("scrapling_session_state_save");
+    expect(plan.ready).not.toContain("scrapling_session_state_load");
+    expect(plan.skipped).toStrictEqual([
+      { name: "scrapling_session_state_save", reason: "session-state-unavailable" },
+      { name: "scrapling_session_state_load", reason: "session-state-unavailable" },
+    ]);
   });
 
   it("用户关掉的工具不注册，原因记为 disabled", () => {
-    const plan = planTools({ ...ALL_ON, crawl: false, answer: false }, FULL_CAPS, true);
+    const plan = planTools({ ...ALL_ON, crawl: false, answer: false }, FULL_CAPS, true, true, true);
     expect(plan.ready).toHaveLength(17);
     expect(plan.skipped).toStrictEqual([
       { name: "scrapling_crawl", reason: "disabled" },
@@ -439,7 +455,7 @@ describe("工具注册计划", () => {
     // 依赖 browser 的现在是 render / capture_xhr / session_read / session_act / screenshot；
     // 下载只依赖 scrapling，所以浏览器缺失时照常注册。
     const caps: SidecarCapabilities = { ...FULL_CAPS, browser: false };
-    const plan = planTools(ALL_ON, caps, true);
+    const plan = planTools(ALL_ON, caps, true, true, true);
     expect(plan.ready).toStrictEqual([
       "scrapling_fetch",
       "scrapling_extract",
@@ -498,7 +514,8 @@ describe("工具注册计划", () => {
   });
 
   it("全关时 ready 为空、skipped 记满 disabled", () => {
-    const plan = planTools(ALL_OFF, FULL_CAPS, true);
+    // 环境全部齐备（含 sessionStateDir），这样每条 skipped 的原因都只剩开关这一维。
+    const plan = planTools(ALL_OFF, FULL_CAPS, true, true, true);
     expect(plan.ready).toStrictEqual([]);
     expect(plan.skipped).toHaveLength(TOOL_SPECS.length);
     expect(plan.skipped.every((item) => item.reason === "disabled")).toBe(true);
@@ -736,8 +753,12 @@ describe("apply", () => {
     }
   });
 
-  it("pythonBin 留空时先用仓内 venv 的绝对路径", async () => {
+  it("pythonBin 留空且没有托管 runtime 时用仓内 venv 的绝对路径", async () => {
     const resolved: string[] = [];
+    // dataDir 必须显式给一个空目录：托管 runtime 只从 dataDir 里探，缺省会落到这台机器真实的
+    // ~/.dsh-scrapling。装过能力包的机器上那里有托管 Python，解析会走 managed（D13 的优先级是
+    // 显式 → 托管 → 仓内 → PATH），这条用例就随机器状态红绿。这里要验的是「没有托管时落仓内」。
+    const dataDir = mkdtempSync(path.join(os.tmpdir(), "dsh-python-default-"));
     const ctx = {
       get: (): undefined => undefined,
       subprocess: {
@@ -760,13 +781,21 @@ describe("apply", () => {
     } as unknown as never;
     // failFastOnMissingPython 默认 true：Python 起不来就拒绝加载，不静默降级成
     // 「所有工具不可用」——后者会让模型几轮之后才发现工具全没了。
-    await expect(apply(ctx, makeConfig({ pythonBin: "" }))).rejects.toThrow(INTERPRETER_UNUSABLE);
-    // 留空不再等于 PATH 上的名字：仓内 venv 的解释器可用时就用它。用同一份解析器
-    // 算出期望值之外的**独立**判据：这条路必须指向包根下的 venv，而不是 PATH 上的名字。
-    expect(resolved).toStrictEqual([LOCAL_PYTHON]);
+    try {
+      await expect(apply(ctx, makeConfig({ pythonBin: "", dataDir }))).rejects.toThrow(
+        INTERPRETER_UNUSABLE,
+      );
+      // 留空不再等于 PATH 上的名字：没有托管 runtime 时仓内 venv 的解释器可用就用它。用同一份
+      // 解析器算出期望值之外的**独立**判据：这条路必须指向包根下的 venv，而不是 PATH 上的名字。
+      expect(resolved).toStrictEqual([LOCAL_PYTHON]);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it("failFastOnMissingPython=false 时探测失败只 warn，降级为工具全不可用", async () => {
+    // 同一条理由：显式空 dataDir，避开这台机器 ~/.dsh-scrapling 里的托管 runtime。
+    const dataDir = mkdtempSync(path.join(os.tmpdir(), "dsh-python-warn-"));
     const warnings: string[] = [];
     const infos: string[] = [];
     const logger = {
@@ -793,17 +822,21 @@ describe("apply", () => {
       systemPrompt: promptStub(),
       effect: (): void => undefined,
     } as unknown as never;
-    await expect(
-      apply(ctx, makeConfig({ pythonBin: "", failFastOnMissingPython: false })),
-    ).resolves.toBeUndefined();
-    expect(warnings.some((line) => line.includes("未能启动"))).toBe(true);
-    // 选中哪支解释器必须每次都播报：这是「工具全没了」时唯一能对照的线索。
-    expect(infos.some((line) => line.includes("[dsh-scrapling] Python 解释器："))).toBe(true);
-    // 缺 Scrapling 时那条 warn 要点名解释器路径。这里写的是一条**独立的**事实：本仓
-    // venv 的解释器就在包根下，所以这条文案必须带它，而不是带一个泛称。
-    expect(warnings.some((line) => line.includes(LOCAL_PYTHON) && line.includes("Scrapling"))).toBe(
-      true,
-    );
+    try {
+      await expect(
+        apply(ctx, makeConfig({ pythonBin: "", failFastOnMissingPython: false, dataDir })),
+      ).resolves.toBeUndefined();
+      expect(warnings.some((line) => line.includes("未能启动"))).toBe(true);
+      // 选中哪支解释器必须每次都播报：这是「工具全没了」时唯一能对照的线索。
+      expect(infos.some((line) => line.includes("[dsh-scrapling] Python 解释器："))).toBe(true);
+      // 缺 Scrapling 时那条 warn 要点名解释器路径。这里写的是一条**独立的**事实：本仓
+      // venv 的解释器就在包根下，所以这条文案必须带它，而不是带一个泛称。
+      expect(
+        warnings.some((line) => line.includes(LOCAL_PYTHON) && line.includes("Scrapling")),
+      ).toBe(true);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it.runIf(process.platform !== "win32")("venv 存在但不可执行时落回 PATH；显式配置压过两者", () => {
@@ -929,7 +962,7 @@ describe("apply", () => {
     const settingsRegistrations: string[] = [];
     const registered: string[] = [];
     const jobsStub = {
-      // 这条验的是「全能力时 13 个工具全注册」，所以作业后端要报可用；
+      // 这条验的是「全能力时 19 个工具全注册」，所以作业后端要报可用；
       // 探测作业（kind='probe'）照实回一个 id。
       start: (): string => "probe-job",
       // 本包起作业时自己挂 controller（见 startUnderCrawlController）。
@@ -1014,14 +1047,12 @@ describe("apply", () => {
     );
     // 握手成功后必然打出注册计划这一行。
     expect(infos.some((line) => line.includes("注册"))).toBe(true);
-    // 真正注册上去的 =「静态四条」+「会话七条」+「爬虫一条」+「问答一条」+（浏览器可用时的两条）。
-    // 会话七条都是独立工具名，少一条就说明 TOOL_SPECS 与构造器又对不上了。
+    // 真正注册上去的 =「静态四条」+「会话五条」+「爬虫一条」+「问答一条」+（浏览器可用时的两条）。
+    // 这里 makeConfig 没配 sessionStateDir，登录态存取两只按设计不注册（F4/F11）。
     const sessionTools = [
       "scrapling_session_open",
       "scrapling_session_fetch",
       "scrapling_session_network",
-      "scrapling_session_state_save",
-      "scrapling_session_state_load",
       "scrapling_session_list",
       "scrapling_session_close",
     ];
@@ -1649,6 +1680,26 @@ async function startStallingSite(): Promise<{ base: string; close: () => Promise
   };
 }
 
+describe("crawlFailureDetail：作业结算行的错误文案（J9）", () => {
+  it("sidecar 错误把码放最前面", () => {
+    expect(crawlFailureDetail(new SidecarError("BAD_ARGS", "maxPages must be positive"))).toBe(
+      "BAD_ARGS: maxPages must be positive",
+    );
+  });
+
+  it("消息里已带过码时不重复拼（F18：Python 侧有时已拼前缀）", () => {
+    expect(crawlFailureDetail(new SidecarError("BAD_ARGS", "BAD_ARGS: too many pages"))).toBe(
+      "BAD_ARGS: too many pages",
+    );
+  });
+
+  it("非 sidecar 错误原样保留，不编假码", () => {
+    expect(crawlFailureDetail(new Error("jobs backend vanished"))).toBe(
+      "Error: jobs backend vanished",
+    );
+  });
+});
+
 describe("爬虫作业的取消与失败", () => {
   it.runIf(HAS_LOCAL_PYTHON)(
     "profile 没有作业后端时报可读错，而不是走到一半抛未捕获异常",
@@ -1715,7 +1766,7 @@ describe("爬虫作业的取消与失败", () => {
     }
   });
 
-  it.runIf(HAS_LOCAL_PYTHON)("爬虫报错时作业以 killed 结算，原因写进 detail", async () => {
+  it.runIf(HAS_LOCAL_PYTHON)("爬虫报错时作业以 failed 结算，码与原因写进 detail", async () => {
     const harness = makeJobHarness();
     await apply(
       harness.ctx,
@@ -1736,7 +1787,9 @@ describe("爬虫作业的取消与失败", () => {
     await tool.execute({ url: UNREACHABLE, maxPages: 0 }, { signal: new AbortController().signal });
     await waitFor(() => harness.hooks !== undefined);
     const outcome = (await harness.hooks?.done) as { status: string; detail: string };
-    expect(outcome.status).toBe("killed");
+    // 「它自己断了」不是取消：状态必须是 failed，且 detail 带 sidecar 的错误码（J9）。
+    expect(outcome.status).toBe("failed");
+    expect(outcome.detail).toContain("BAD_ARGS");
     expect(outcome.detail).toContain("positive integer");
   });
 
@@ -1831,6 +1884,18 @@ describe("出站 URL 闸门（Host 侧 SSRF 防线）", () => {
   it("URL 内嵌凭据判否", async () => {
     const gate = createUrlGate(makeConfig({}));
     await expect(gate("http://user:pw@93.184.216.34/")).rejects.toMatchObject(blocked);
+  });
+
+  it("判否文案里的 userinfo 脱敏：口令不进日志与模型上下文（F3/J3）", async () => {
+    const gate = createUrlGate(makeConfig({}));
+    const reason = await gate("http://user:sekret-pw@93.184.216.34/").then(
+      () => {
+        throw new Error("应当判否");
+      },
+      (error: unknown) => (error as Error).message,
+    );
+    expect(reason).toContain("***@93.184.216.34");
+    expect(reason).not.toContain("sekret-pw");
   });
 
   it("超过 maxUrlLength 判否", async () => {

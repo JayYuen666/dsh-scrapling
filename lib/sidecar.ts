@@ -190,15 +190,30 @@ export function parseCapabilities(value: unknown): SidecarCapabilities {
 }
 
 /**
+ * 这些方法的 `url` 只是解析基准，不是取回目标。
+ *
+ * `select` / `locate` / `links` 的 HTML 由调用方直接给，`url` 只当相对地址的 base 用 ——
+ * 它既不做 DNS 解析也不连网，拿它过 SSRF 闸门等于把一次纯静态解析判地拒掉（F2）。
+ * 反过来，其余方法的 `url` 都是真取回目标，照旧现场判定。
+ */
+const BASE_ONLY_METHODS: ReadonlySet<string> = new Set(["select", "locate", "links"]);
+
+/**
  * 把模型交进来的每一个 URL 送去判，归一过的写进一份新的参数对象。
  *
  * crawl 的 payload 里 URL 不止一处：`url` 之外还有 `sitemapUrl`、`feedUrl`。只筛 `params.url`
  * 就等于让宿主这道闸门对后两者不存在，而 Python 那道只按地址判。顺序判、判否即止：一次拒绝
  * 之后不再为后面的 URL 做解析。
+ *
+ * @param params - 调用参数
+ * @param gate - 单 URL 准入函数
+ * @param method - sidecar 方法名；决定 `url` 是取回目标还是解析基准
+ * @returns 归一后的参数对象
  */
 async function gateRequestUrls(
   params: object,
   gate: (url: string) => Promise<string | undefined>,
+  method: string,
 ): Promise<object> {
   const one = async (target: object, key: string): Promise<object> => {
     const value: unknown = Reflect.get(target, key);
@@ -214,7 +229,7 @@ async function gateRequestUrls(
     }
     return { ...target, [key]: normalized };
   };
-  const start = await one(params, "url");
+  const start = BASE_ONLY_METHODS.has(method) ? params : await one(params, "url");
   const withSitemap = await one(start, "sitemapUrl");
   return one(withSitemap, "feedUrl");
 }
@@ -544,9 +559,10 @@ export class SidecarClient {
     params: object = {},
     options: CallOptions = {},
   ): Promise<unknown> {
-    // URL 准入先于一切：判否就不必拉起子进程、更不必写管道。
+    // URL 准入先于一切：判否就不必拉起子进程、更不必写管道。`select`/`locate`/`links`
+    // 的 url 只是解析基准，放过它（见 BASE_ONLY_METHODS）。
     const gate = this.#options.urlGate;
-    const outgoing = gate === undefined ? params : await gateRequestUrls(params, gate);
+    const outgoing = gate === undefined ? params : await gateRequestUrls(params, gate, method);
     await this.ensureStarted(options.signal);
     const stdin = this.#handle?.stdin;
     // ensureStarted 成功即意味着 spawn 时拿到了管道（缺管道它自己就抛了），
@@ -699,6 +715,58 @@ export class SidecarClient {
  */
 export function createSidecar(ctx: Context, options: SidecarOptions): SidecarClient {
   return new SidecarClient(ctx, options);
+}
+
+/**
+ * 造一个文案已带 `CODE: ` 前缀的 sidecar 错误（幂等）。
+ *
+ * 模型可见的失败文本必须是 `CODE: message`：`SidecarError.code` 只住在对象上，不进
+ * 文案就等于模型永远看不见它，而按码分支（`BAD_ARGS` 改参数、`URL_BLOCKED` 换目标、
+ * `NO_SUCH_SESSION` 重开会话）正是它该做的事。已经拼过前缀的不再拼 —— 重复前缀会让
+ * 作业结算行出现 `BAD_ARGS: BAD_ARGS:` 这种噪音。
+ *
+ * @param code - 机器可读错误码
+ * @param message - 人读信息（可已带 `CODE: ` 前缀）
+ * @param options - 承载 `cause` 的选项包
+ * @param details - 可选的机器可读细节
+ * @returns 文案以 `CODE: ` 开头的错误
+ */
+export function sidecarErrorWithCode(
+  code: SidecarErrorCode,
+  message: string,
+  options?: ErrorOptions,
+  details: Record<string, unknown> = {},
+): SidecarError {
+  const prefixed = message.startsWith(`${code}: `);
+  return new SidecarError(code, prefixed ? message : `${code}: ${message}`, options, details);
+}
+
+/**
+ * 调 sidecar 的唯一一层：把对端（或测试替身）的错误归一成 `CODE: message` 后上抛。
+ *
+ * 没有 code 的错误原样上抛，不编一个假码。工具层与浏览器工具一律经这里调
+ * `client.call` —— 各写一份归一逻辑，迟早有一处忘了加前缀。
+ *
+ * @param client - sidecar 客户端
+ * @param method - sidecar 方法名
+ * @param params - 参数对象
+ * @param options - 超时与取消
+ * @returns 对端的 result 原值（形状未经验证，调用方需自行校验）
+ */
+export async function callSidecar(
+  client: SidecarClient,
+  method: string,
+  params: object = {},
+  options: CallOptions = {},
+): Promise<unknown> {
+  try {
+    return await client.call(method, params, options);
+  } catch (error) {
+    if (error instanceof SidecarError) {
+      throw sidecarErrorWithCode(error.code, error.message, { cause: error }, error.details);
+    }
+    throw error;
+  }
 }
 
 export { SidecarError } from "./sidecar-error.ts";
