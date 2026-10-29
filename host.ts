@@ -1843,8 +1843,14 @@ export async function apply(
       ctx.systemPrompt.section({
         name: "scrapling-usage",
         order: ctx.systemPrompt.getSectionOrder("TOOL_WEB_FETCH"),
-        text: ({ scope }) =>
-          guidanceFor(snapshotFlags(config), (tool) => ctx.tools.get(tool, scope) !== undefined),
+        // 装配上下文带步骤准入时按准入视图判（受限子代理/条件工具在这一档显形），
+        // 没有准入（rc 线或非步骤装配）时退回注册表 + scope 的既有判据。
+        text: ({ scope, toolSet }) =>
+          guidanceFor(snapshotFlags(config), (tool) =>
+            toolSet === undefined
+              ? ctx.tools.get(tool, scope) !== undefined
+              : toolSet.view(scope).has(tool),
+          ),
       }),
     "scrapling: system prompt guidance",
   );

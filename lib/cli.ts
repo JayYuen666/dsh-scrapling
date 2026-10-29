@@ -33,6 +33,10 @@ import {
 } from "./installer.ts";
 import { resolveRuntime, runtimeManifest } from "./runtime.ts";
 
+/** patch 文本的行分隔与行尾注释。 */
+const LINE_BREAK = /\r\n|\n|\r/u;
+const TRAILING_INLINE_COMMENT = /[\t ]#.*$/u;
+
 const FEATURES = ["core", "browser", "search", "media", "adaptive-redis", "mcp"] as const;
 type Feature = (typeof FEATURES)[number];
 const FEATURE_NAMES: ReadonlySet<string> = new Set(FEATURES);
@@ -255,14 +259,14 @@ function bareScalar(raw: string): string {
       return trimmed.slice(1, end);
     }
   }
-  return trimmed.replace(/[\t ]#.*$/u, "").trim();
+  return trimmed.replace(TRAILING_INLINE_COMMENT, "").trim();
 }
 
 /** 把 patch 文本里某个键第一次出现的标量取出来（整行注释跳过，行尾注释与引号由 bareScalar 剥掉）。 */
 function patchScalar(text: string, key: string): string | undefined {
   const line = new RegExp(`^[\\t ]*(?:-[\\t ]+)?${key}:(?<value>[^\\r\\n]*)$`, "u");
   const raw = text
-    .split(/\r\n|\n|\r/u)
+    .split(LINE_BREAK)
     .filter((line_) => !line_.trimStart().startsWith("#"))
     .map((line_) => line.exec(line_)?.groups?.["value"])
     .find((value) => value !== undefined);

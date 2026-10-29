@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Scrapling 网页抓取",
+    "description": "静态与浏览器抓取、CSS/XPath 结构化抽取、选择器自愈、会话登录态与后台爬虫，由一个常驻 Python 进程驱动。",
+    "detail": "docs/DETAIL.zh.md"
+  }
+}

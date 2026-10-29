@@ -76,7 +76,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`。包在公共 npm registry 上，安装不需要凭据，也不需要 scoped-registry 配置行。
 
 - **需要 Node.js `>= 22.12`。** 本包是 ESM-only；正是这条 Node 下限让 `require()` 一个 ESM 入口得以工作，`engines.node` 因此声明。
-- **需要宿主 `dsh` 处在 `0.2.1-rc.3` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.1-rc.3`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。
+- **需要宿主 `dsh` 处在 `0.2.1-rc.3` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.1-rc.3`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时最近的三个已发布宿主版本上逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
 - **需要 Python 3.14+ 且装好 Scrapling** —— 在仓内 `_env/.venv` 里、能从 `PATH` 找到、或由 `pythonBin` 指定。装出去的包里没有 `_env/.venv` 这一档，解释器就是你 `PATH` 上的 `python3`（Windows 上是 `python`）；选中哪一支会在装载时写进日志，缺 Scrapling 时报错里带着可直接照抄的安装命令。
 
 ```sh

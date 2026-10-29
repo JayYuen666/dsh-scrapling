@@ -1,7 +1,7 @@
 // 设置卡读宿主侧 runtime 的那一面（官方 Typert Remote 的消费侧）。
 //
 // descriptor 手写：网关在源模式下按方法签名取参数名，参数与结果都走 src-json；客户端贡献
-// 校验要求每个入参带 strict codec，所以这里手写 parser，只在本进程校验形状、不跨网。
+// 校验要求每个入参带 strict codec，所以这里用 zod schema 只在本进程校验形状、不跨网。
 //
 // remote 走 `ctx.get("remote")` 而不是 inject：没有远程面的部署里整张卡仍要渲染，把
 // `remote` 写进 inject 会让整条 client 入口不激活。
@@ -12,7 +12,8 @@ import type {
   TypertCodec,
 } from "@deepseek-ai/dsh-typert-protocol";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
-import { RUNTIME_REMOTE_NAMESPACE, isRuntimePack } from "../lib/runtime-shape.ts";
+import { z } from "zod";
+import { RUNTIME_PACKS, RUNTIME_REMOTE_NAMESPACE } from "../lib/runtime-shape.ts";
 import type {
   RuntimeActionResult,
   RuntimeCancelRequest,
@@ -29,16 +30,33 @@ function field(record: Record<string, unknown>, key: string): unknown {
 const NAMESPACE = RUNTIME_REMOTE_NAMESPACE;
 const SERVICE_KEY = `remote.${NAMESPACE}`;
 
+/** strict codec 的统一出口：失败交给 zod 的 `prettifyError`，读到的是一份带字段路径的说明。 */
+function parseOrThrow<Result>(schema: z.ZodType<Result>, value: unknown): Result {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    throw new TypeError(z.prettifyError(parsed.error));
+  }
+  return parsed.data;
+}
+
+const PACK_MESSAGE = "runtime request requires a known pack";
+const PACK_SCHEMA = z.object(
+  { pack: z.enum(RUNTIME_PACKS, { error: PACK_MESSAGE }) },
+  { error: PACK_MESSAGE },
+);
+
+const CANCEL_MESSAGE = "runtime cancel requires a jobId";
+const CANCEL_SCHEMA = z.object(
+  { jobId: z.string({ error: CANCEL_MESSAGE }).min(1, { error: CANCEL_MESSAGE }) },
+  { error: CANCEL_MESSAGE },
+);
+
 const PACK_CODEC: TypertCodec<RuntimePackRequest> = {
   mode: "strict",
   typeSymbol: `${PACKAGE_NAME}#runtime-pack-request`,
   create: () => ({
     parse(value: unknown): RuntimePackRequest {
-      const pack = isRecord(value) ? field(value, "pack") : undefined;
-      if (!isRuntimePack(pack)) {
-        throw new TypeError("runtime request requires a known pack");
-      }
-      return { pack };
+      return parseOrThrow(PACK_SCHEMA, value);
     },
   }),
 };
@@ -48,14 +66,44 @@ const CANCEL_CODEC: TypertCodec<RuntimeCancelRequest> = {
   typeSymbol: `${PACKAGE_NAME}#runtime-cancel-request`,
   create: () => ({
     parse(value: unknown): RuntimeCancelRequest {
-      const jobId = isRecord(value) ? field(value, "jobId") : undefined;
-      if (typeof jobId !== "string" || jobId.length === 0) {
-        throw new TypeError("runtime cancel requires a jobId");
-      }
-      return { jobId };
+      return parseOrThrow(CANCEL_SCHEMA, value);
     },
   }),
 };
+
+const PACK_STATE_SCHEMA = z.enum(["ready", "missing", "corrupt", "installing", "blocked"]);
+const JOB_STATUS_SCHEMA = z.enum(["running", "stopping", "completed", "killed", "failed"]);
+const RUNTIME_PACK_SCHEMA = z.enum(RUNTIME_PACKS);
+
+const JOB_VIEW_SCHEMA = z.object({
+  id: z.string(),
+  pack: RUNTIME_PACK_SCHEMA,
+  status: JOB_STATUS_SCHEMA,
+  output: z.string(),
+});
+
+/** 状态读面的返回形状：`ok` 是字面量 true，`job` 只可能是对象或 null。 */
+const STATUS_SCHEMA: z.ZodType<RuntimeStatusResult> = z.object({
+  ok: z.literal(true),
+  packs: z.partialRecord(RUNTIME_PACK_SCHEMA, PACK_STATE_SCHEMA),
+  python: z.object({ path: z.string(), via: z.string(), version: z.string() }),
+  dataDir: z.string(),
+  jobsReady: z.boolean(),
+  job: JOB_VIEW_SCHEMA.nullable(),
+});
+
+/** 动作读面的两支：启动成功带 jobId；拒绝带 error 与保留的状态码。
+ *  状态码用 zod v4 的 `z.literal(数组)` 重载（core 侧落在同一份 PrimitiveSet，
+ *  等价于逐值 union，但少三层 `z.literal(...)` 调用嵌套）。 */
+const REFUSED_STATUS_SCHEMA = z.literal([400, 404, 409, 500, 503]);
+const ACTION_SCHEMA: z.ZodType<RuntimeActionResult> = z.discriminatedUnion("ok", [
+  z.object({ ok: z.literal(true), jobId: z.string() }),
+  z.object({
+    ok: z.literal(false),
+    error: z.string(),
+    status: REFUSED_STATUS_SCHEMA,
+  }),
+]);
 
 /** 宿主四个方法的客户端描述符；测试拿它与宿主侧 `remoteMethods()` 对质。 */
 export const RUNTIME_DESCRIPTORS: readonly InvocationDescriptor[] = [
@@ -109,10 +157,10 @@ interface RemoteMounter {
 }
 
 interface RuntimeNamespace {
-  status: () => Promise<RemoteResult<RuntimeStatusResult>>;
-  installPack: (request: RuntimePackRequest) => Promise<RemoteResult<RuntimeActionResult>>;
-  repairPack: (request: RuntimePackRequest) => Promise<RemoteResult<RuntimeActionResult>>;
-  cancelJob: (request: RuntimeCancelRequest) => Promise<RemoteResult<RuntimeActionResult>>;
+  status: () => Promise<RemoteResult<unknown>>;
+  installPack: (request: RuntimePackRequest) => Promise<RemoteResult<unknown>>;
+  repairPack: (request: RuntimePackRequest) => Promise<RemoteResult<unknown>>;
+  cancelJob: (request: RuntimeCancelRequest) => Promise<RemoteResult<unknown>>;
 }
 
 export interface RuntimeReader {
@@ -140,12 +188,13 @@ function isNamespace(value: unknown): value is RuntimeNamespace {
 
 async function unwrapWire<Value>(
   call: Promise<
-    { ok: false; error: { code: string; message: string } } | { ok: true; value: Value }
+    { ok: false; error: { code: string; message: string } } | { ok: true; value: unknown }
   >,
+  schema: z.ZodType<Value>,
 ): Promise<Value> {
   const result = await call;
   if (result.ok) {
-    return result.value;
+    return parseOrThrow(schema, result.value);
   }
   throw new Error(`${result.error.code}: ${result.error.message}`);
 }
@@ -174,19 +223,19 @@ function buildReader(ctx: RemoteHost): RuntimeReader {
   return {
     async status(): Promise<RuntimeStatusResult> {
       const namespace = await namespaceOf();
-      return unwrapWire(namespace.status());
+      return unwrapWire(namespace.status(), STATUS_SCHEMA);
     },
     async install(pack: RuntimePack): Promise<RuntimeActionResult> {
       const namespace = await namespaceOf();
-      return unwrapWire(namespace.installPack({ pack }));
+      return unwrapWire(namespace.installPack({ pack }), ACTION_SCHEMA);
     },
     async repair(pack: RuntimePack): Promise<RuntimeActionResult> {
       const namespace = await namespaceOf();
-      return unwrapWire(namespace.repairPack({ pack }));
+      return unwrapWire(namespace.repairPack({ pack }), ACTION_SCHEMA);
     },
     async cancel(jobId: string): Promise<RuntimeActionResult> {
       const namespace = await namespaceOf();
-      return unwrapWire(namespace.cancelJob({ jobId }));
+      return unwrapWire(namespace.cancelJob({ jobId }), ACTION_SCHEMA);
     },
   };
 }

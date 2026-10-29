@@ -27,6 +27,10 @@ import { Context } from "@deepseek-ai/cordis";
 import { applyEntryPatches, entryListSchema } from "@deepseek-ai/cordis-plugin-include";
 import { Loader } from "@deepseek-ai/cordis-plugin-loader";
 import { ToolRuntime } from "@deepseek-ai/dsh-tools";
+import {
+  apply as applyNativeExecutor,
+  inject as nativeExecutorInject,
+} from "@deepseek-ai/dsh-tool-executor-native";
 import { WebRuntime } from "@deepseek-ai/dsh-web";
 import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
 
@@ -102,6 +106,9 @@ async function load(dataDir: string): Promise<Loaded> {
   await ctx.plugin(SystemPrompt, {});
   await ctx.plugin(WebRuntime, {});
   await ctx.plugin(ToolRuntime, {});
+  // alpha.2 起批次与工具声明都经组合里显式提供的执行器；不装这一枚，指引段装配会以
+  // TOOL_EXECUTOR_UNAVAILABLE 拒绝。用官方原生执行器，不在台架里复述它的实现。
+  await ctx.plugin({ inject: nativeExecutorInject, apply: applyNativeExecutor });
 
   // 手写的两枚，理由见文件头。
   ctx.provide("settings", { configure: () => noop });
@@ -223,7 +230,8 @@ describe("经真实 Loader 装载本插件", () => {
 
   it("发布的 cordis.patch.yml 仍是这一条（改了补丁就得同步这条断言）", async () => {
     const text = await readFile(path.resolve(import.meta.dirname, "../cordis.patch.yml"), "utf8");
-    const rows = [...text.matchAll(/^\s+name:\s*"?(?<name>[\w@/.-]+)"?\s*$/gmu)].map(
+    const rows = Array.from(
+      text.matchAll(/^\s+name:\s*"?(?<name>[\w@/.-]+)"?\s*$/gmu),
       (match) => match.groups?.["name"] ?? "",
     );
     // 补丁只该引入我们这一行：多出一条就是「装了别的东西」，而这条测试只对本包负责。

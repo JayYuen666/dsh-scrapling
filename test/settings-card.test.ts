@@ -35,6 +35,11 @@ import type { DocumentFace, StyleTag } from "../src/settings-card.ts";
 /** 「没找到」的一个返回：既非 null 也非 undefined 的第三种写法，正用它检验按真值判的分支。 */
 const noMatch = (): undefined => undefined;
 
+/** URL 字段的样例值：同一个字面量在断言里出现多次会被 sonarjs 的重复串规则盯上。 */
+const PROXY_HTTP_URL = "http://127.0.0.1:7890";
+const PROXY_SOCKS_URL = "socks5://user:pass@127.0.0.1:7890";
+const SEARXNG_URL = "https://searx.example.com";
+
 /** schema 的单条属性：只取本用例要用的两个面。 */
 interface PropertySchema {
   readonly meta?: { readonly volatile?: boolean; readonly default?: unknown };
@@ -239,9 +244,37 @@ describe("controlType", () => {
 });
 
 describe("parseInput", () => {
-  it("布尔按 true/false 两串", () => {
+  it("布尔按 true/false 两串，域外原文判非法而不是猜成 false", () => {
     expect(parseInput(fieldOf("headless"), "true")).toStrictEqual({ kind: "value", value: true });
     expect(parseInput(fieldOf("headless"), "false")).toStrictEqual({ kind: "value", value: false });
+    expect(parseInput(fieldOf("headless"), "yes")).toStrictEqual({ kind: "invalid" });
+  });
+
+  it("枚举只收下拉候选里的值，域外原文判非法", () => {
+    expect(parseInput(fieldOf("extractionType"), "markdown")).toStrictEqual({
+      kind: "value",
+      value: "markdown",
+    });
+    expect(parseInput(fieldOf("extractionType"), "yaml")).toStrictEqual({ kind: "invalid" });
+  });
+
+  it("URL 字段走 z.url：http/socks5 都收，缺 scheme 的原文判非法", () => {
+    expect(parseInput(fieldOf("proxyUrl"), PROXY_HTTP_URL)).toStrictEqual({
+      kind: "value",
+      value: PROXY_HTTP_URL,
+    });
+    expect(parseInput(fieldOf("proxyUrl"), PROXY_SOCKS_URL)).toStrictEqual({
+      kind: "value",
+      value: PROXY_SOCKS_URL,
+    });
+    expect(parseInput(fieldOf("proxyUrl"), "127.0.0.1:7890")).toStrictEqual({ kind: "invalid" });
+    expect(parseInput(fieldOf("searxngEndpoint"), SEARXNG_URL)).toStrictEqual({
+      kind: "value",
+      value: SEARXNG_URL,
+    });
+    expect(parseInput(fieldOf("searxngEndpoint"), "searx.example.com")).toStrictEqual({
+      kind: "invalid",
+    });
   });
 
   it("清空即清除这一项", () => {
@@ -266,9 +299,9 @@ describe("parseInput", () => {
   });
 
   it("文本去掉首尾空白后原样保留", () => {
-    expect(parseInput(fieldOf("proxyUrl"), "  http://127.0.0.1:7890  ")).toStrictEqual({
+    expect(parseInput(fieldOf("proxyUrl"), `  ${PROXY_HTTP_URL}  `)).toStrictEqual({
       kind: "value",
-      value: "http://127.0.0.1:7890",
+      value: PROXY_HTTP_URL,
     });
   });
 });

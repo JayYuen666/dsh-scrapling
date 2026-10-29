@@ -20,6 +20,7 @@
 
 import { createElement, useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
+import { z } from "zod";
 import { RUNTIME_PACKS, packLabelKey, packStateKey } from "../lib/runtime-shape.ts";
 import type {
   PackState,
@@ -30,6 +31,18 @@ import type {
 import type { RuntimeReader } from "./runtime-reader.ts";
 import { SETTINGS_FIELDS, SETTINGS_GROUPS } from "./settings-fields.ts";
 import type { FieldSpec, GroupSpec } from "./settings-fields.ts";
+import {
+  CARD_UI_CSS,
+  CardForm,
+  Field,
+  SaveBar,
+  Section,
+  SelectField,
+  StatusBar,
+  TextField,
+  ToggleField,
+  splitHint,
+} from "@jayyuen66/dsh-plugin-shared/lib/card-ui";
 
 /** 宿主 locale 服务给的翻译函数；键域是本包的字典键。 */
 export type Translate = (key: string, params?: Record<string, unknown>) => string;
@@ -147,6 +160,20 @@ export type ParsedInput =
   /** 此刻的输入不是合法值：既不写出去，也不当作清除。 */
   | { readonly kind: "invalid" };
 
+/** 布尔控件只给 "true" / "false" 两串；其余原文不是可写值。 */
+const BOOLEAN_INPUT_SCHEMA = z.enum(["true", "false"]);
+
+/**
+ * 数字输入：只认十进制正整数，不走 Number()。Number 会把 "0x10" 读成 16、
+ * 把 " 1e3 " 读成 1000，用户看到输入框里写着 0x10、存进去的却是 16，是很难
+ * 自己发现的错。正则与 `transform` 都写在 zod schema 上，host 的 natural().min(1)
+ * 是同一道判据。
+ */
+const NUMBER_INPUT_SCHEMA = z
+  .string()
+  .regex(/^[1-9]\d*$/u)
+  .transform(Number);
+
 /**
  * 把控件里敲进去的一串字翻成设置值。
  *
@@ -161,17 +188,29 @@ export type ParsedInput =
  */
 export function parseInput(field: FieldSpec, raw: string): ParsedInput {
   if (field.kind === "boolean") {
-    return { kind: "value", value: raw === "true" };
+    const parsed = BOOLEAN_INPUT_SCHEMA.safeParse(raw);
+    return parsed.success ? { kind: "value", value: parsed.data === "true" } : { kind: "invalid" };
   }
   const text = raw.trim();
   if (text === "") {
     return { kind: "clear" };
   }
   if (field.kind === "number") {
-    // 只认十进制正整数，不走 Number()：Number 会把 "0x10" 读成 16、把 " 1e3 " 读成 1000，
-    // 用户看到输入框里写着 0x10、存进去的却是 16，是很难自己发现的错。schema 那边是
-    // natural().min(1)，这里与它逐字对齐 —— 存不进 schema 的值就不替用户编一个。
-    return /^[1-9]\d*$/u.test(text) ? { kind: "value", value: Number(text) } : { kind: "invalid" };
+    const parsed = NUMBER_INPUT_SCHEMA.safeParse(text);
+    return parsed.success ? { kind: "value", value: parsed.data } : { kind: "invalid" };
+  }
+  if (field.kind === "enum") {
+    const parsed = z
+      .string()
+      .refine((value) => (field.options ?? []).includes(value), {
+        error: "取值不在字段选项内",
+      })
+      .safeParse(text);
+    return parsed.success ? { kind: "value", value: parsed.data } : { kind: "invalid" };
+  }
+  if (field.format === "url") {
+    const parsed = z.url().safeParse(text);
+    return parsed.success ? { kind: "value", value: parsed.data } : { kind: "invalid" };
   }
   return { kind: "value", value: text };
 }
@@ -199,46 +238,18 @@ export function buildOps(draft: Readonly<Record<string, unknown>>): PathOp[] {
     });
 }
 
-const BUTTON_CLASS = "dss-button";
-const STATUS_CLASS = "dss-status";
+const BUTTON_CLASS = "dsu-btn";
+const STATUS_CLASS = "dsu-hint";
 
-/** 卡片样式。跟着宿主的语义色走，因此明暗两套主题都成立。 */
+/** 卡片样式：字段版式与控件外观由 @jayyuen66/dsh-plugin-shared/lib/card-ui 提供，这里只留本卡特有的运行环境区。 */
 const CARD_CSS = `
-.dss-card{display:flex;flex-direction:column;gap:16px;color:var(--dsw-alias-label-primary)}
-.dss-group{display:flex;flex-direction:column;gap:10px}
-.dss-group+.dss-group{border-top:.5px solid var(--dsw-alias-border-l2);padding-top:16px}
-.dss-groupTitle{margin:0;font-size:14px;font-weight:600;line-height:22px}
-.dss-note{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
-.dss-fields{display:flex;flex-direction:column;gap:10px}
-.dss-field{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:4px 16px;align-items:start}
-.dss-label{font-size:13px;line-height:20px}
-.dss-hint{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;grid-column:1}
-.dss-control{grid-column:2;display:flex;justify-content:flex-end}
-.dss-secret{display:flex;gap:8px;align-items:center;justify-content:flex-end;width:100%}
-.dss-reveal{flex:none;padding:5px 8px;white-space:nowrap}
-.dss-control input[type=text],.dss-control input[type=number]{border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;padding:5px 8px;width:100%;max-width:280px}
-.dss-control input:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
-.dss-control select{border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;padding:5px 8px;max-width:280px}
-.dss-switch{appearance:none;width:36px;height:20px;border-radius:10px;background:var(--dsw-alias-border-l3);position:relative;cursor:pointer;border:0}
-.dss-switch:checked{background:var(--dsw-alias-state-business-primary)}
-.dss-switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .14s}
-.dss-switch:checked::after{transform:translateX(16px)}
-.dss-switch:disabled{cursor:not-allowed;opacity:.55}
-.dss-actions{display:flex;gap:8px;align-items:center}
-.dss-button{border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:0 0;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;cursor:pointer;padding:5px 14px}
-.dss-button[data-primary=true]{background:var(--dsw-alias-state-business-primary);border-color:transparent}
-.dss-button:disabled{opacity:.5;cursor:not-allowed}
-.dss-status{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px}
-.dss-status[data-error=true]{color:var(--dsw-alias-state-error-primary)}
-.dss-runtime{display:flex;flex-direction:column;gap:10px;border-top:.5px solid var(--dsw-alias-border-l2);padding-top:16px}
-.dss-runtimeInfo{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;word-break:break-all}
+.dss-secret{display:flex;gap:8px;align-items:center;width:100%}
+.dss-reveal{flex:none;white-space:nowrap}
 .dss-packs{display:flex;flex-direction:column;gap:8px}
 .dss-pack{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center}
-.dss-packState{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px}
 .dss-packActions{display:flex;gap:6px;grid-column:2;justify-content:flex-end}
-.dss-command{display:block;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all}
-.dss-job{margin:0;max-height:180px;overflow:auto;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap}
-@media (max-width:560px){.dss-field{grid-template-columns:minmax(0,1fr)}.dss-hint,.dss-control{grid-column:1}}
+.dss-command{display:block;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-3);padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all}
+.dss-job{margin:0;max-height:180px;overflow:auto;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-3);padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap}
 `;
 
 /**
@@ -325,7 +336,7 @@ export function installStyle(doc: DocumentFace, id: string, css: string): () => 
  * @returns 摘掉本次注入的样式
  */
 export function installStyles(doc: DocumentFace): () => void {
-  return installStyle(doc, "dsh-scrapling-settings-css", CARD_CSS);
+  return installStyle(doc, "dsh-scrapling-settings-css", `${CARD_CSS}\n${CARD_UI_CSS}`);
 }
 
 /**
@@ -343,8 +354,8 @@ export function controlType(field: FieldSpec, revealed: boolean): "text" | "pass
   return field.secret === true && !revealed ? "password" : "text";
 }
 
-/** 一个字段的控件。 */
-function renderControl(props: {
+/** 凭据型文本控件：密码框 + 显式「显示/隐藏」开关。 */
+function renderSecretControl(props: {
   readonly field: FieldSpec;
   readonly label: string;
   readonly shown: string;
@@ -355,79 +366,65 @@ function renderControl(props: {
   readonly onChange: (raw: string) => void;
 }): ReactNode {
   const { field, label, shown, disabled, revealed, onReveal, t, onChange } = props;
-  if (field.kind === "boolean") {
-    return createElement("input", {
-      type: "checkbox",
-      className: "dss-switch",
-      role: "switch",
-      checked: shown === "true",
-      disabled,
-      "aria-label": label,
-      onChange: (event: { target: { checked: boolean } }): void => {
-        onChange(String(event.target.checked));
-      },
-    });
-  }
-  if (field.kind === "enum") {
-    return createElement(
-      "select",
-      {
-        disabled,
-        value: shown,
-        "aria-label": label,
-        onChange: (event: { target: { value: string } }): void => {
-          onChange(event.target.value);
-        },
-      },
-      (field.options ?? []).map((option) =>
-        createElement("option", { key: option, value: option }, option),
-      ),
-    );
-  }
   const input = createElement("input", {
-    // 数字字段刻意用 text + inputMode，而不是 type="number"：后者的值由浏览器清洗，
-    // 粘贴非数字、只敲一个 `-` 或 `e` 时 event.target.value 会变成空串，于是 parseInput
-    // 读到空串判 clear、buildOps 生成 unset —— 用户输错一位就把自己那条覆盖静默删掉，
-    // 正是这份实现一路在避免的事。text 把原文完整交回来，非法与否由 parseInput 判。
     type: controlType(field, revealed),
-    value: shown,
-    disabled,
-    ...(field.kind === "number" ? { inputMode: "numeric" } : {}),
     // 代理地址会被浏览器与密码管理器当成登录凭据：那会把部署方的代理密码收进一个
     // 它根本不打算保管的地方，所以这里显式关掉自动填充。
-    ...(field.secret === true ? { autoComplete: "off", spellCheck: false } : {}),
+    autoComplete: "off",
+    spellCheck: false,
+    className: "dsu-input",
+    value: shown,
+    disabled,
+    "data-field": field.key,
     "aria-label": label,
     onChange: (event: { target: { value: string } }): void => {
       onChange(event.target.value);
     },
   });
-  if (field.secret !== true) {
-    return input;
-  }
-  // 遮罩的字段配一个显式开关：用户改代理地址时要确认自己填对了，而圆点里看不出 host、
-  // 也看不出端口。默认收起，所以「一眼扫过页面」看到仍然是圆点。
-  return createElement(
-    "span",
-    { className: "dss-secret" },
-    input,
-    createElement(
-      "button",
-      {
-        type: "button",
-        className: "dss-button dss-reveal",
-        disabled,
-        "aria-pressed": revealed,
-        "aria-label": label,
-        onClick: (): void => {
-          onReveal();
-        },
+  const reveal = createElement(
+    "button",
+    {
+      type: "button",
+      className: "dsu-btn dss-reveal",
+      disabled,
+      "aria-pressed": revealed,
+      "aria-label": label,
+      onClick: (): void => {
+        onReveal();
       },
-      t(revealed ? "conceal" : "reveal"),
-    ),
+    },
+    t(revealed ? "conceal" : "reveal"),
   );
+  return createElement("div", { className: "dss-secret" }, input, reveal);
 }
 
-/** 一行：左边标签与说明，右边控件。 */
+/** 数字控件保留「原文进出」语义：非法输入留在框里、由 parseInput 判，保存因此被挡住。 */
+function renderNumberControl(props: {
+  readonly field: FieldSpec;
+  readonly label: string;
+  readonly shown: string;
+  readonly disabled: boolean;
+  readonly onChange: (raw: string) => void;
+}): ReactNode {
+  const { field, label, shown, disabled, onChange } = props;
+  return createElement("input", {
+    // text + inputMode 而不是 type=number：后者的值由浏览器清洗，粘贴非数字或只敲一个
+    // `-`/`e` 时 event.target.value 会变成空串，于是 parseInput 判 clear、buildOps 生成
+    // unset —— 用户输错一位就把自己那条覆盖静默删掉。text 把原文完整交回来。
+    type: "text",
+    inputMode: "numeric",
+    className: "dsu-input",
+    value: shown,
+    disabled,
+    "data-field": field.key,
+    "aria-label": label,
+    onChange: (event: { target: { value: string } }): void => {
+      onChange(event.target.value);
+    },
+  });
+}
+
+/** 一行：共享字段组件负责行式版式与 label↔control 关联。 */
 function renderFieldRow(props: {
   readonly field: FieldSpec;
   readonly t: Translate;
@@ -439,19 +436,40 @@ function renderFieldRow(props: {
 }): ReactNode {
   const { field, t, shown, disabled, revealed, onReveal, onChange } = props;
   const label = t(`field.${field.key}.label`);
-  const control = renderControl({ field, label, shown, disabled, revealed, onReveal, t, onChange });
-  const caption = createElement(
-    "div",
-    { className: "dss-label" },
-    label,
-    createElement("p", { className: "dss-hint" }, t(`field.${field.key}.hint`)),
-  );
-  return createElement(
-    "div",
-    { className: "dss-field", key: field.key },
-    caption,
-    createElement("div", { className: "dss-control" }, control),
-  );
+  const hint = splitHint(t(`field.${field.key}.hint`));
+  const common = { label, ...hint, field: field.key, disabled };
+  if (field.kind === "boolean") {
+    return createElement(ToggleField, {
+      ...common,
+      checked: shown === "true",
+      onChange: (next: boolean): void => {
+        onChange(String(next));
+      },
+    });
+  }
+  if (field.kind === "enum") {
+    return createElement(SelectField, {
+      ...common,
+      value: shown,
+      options: (field.options ?? []).map((option) => ({ value: option, label: option })),
+      onChange,
+    });
+  }
+  if (field.secret === true) {
+    return createElement(
+      Field,
+      common,
+      renderSecretControl({ field, label, shown, disabled, revealed, onReveal, t, onChange }),
+    );
+  }
+  if (field.kind === "number") {
+    return createElement(
+      Field,
+      common,
+      renderNumberControl({ field, label, shown, disabled, onChange }),
+    );
+  }
+  return createElement(TextField, { ...common, value: shown, onChange });
 }
 
 /** 一组字段。 */
@@ -466,28 +484,22 @@ function renderGroup(props: {
 }): ReactNode {
   const { group, t, shown, disabled, revealed, onReveal, onChange } = props;
   return createElement(
-    "section",
-    { className: "dss-group", key: group.id },
-    createElement("h3", { className: "dss-groupTitle" }, t(`group.${group.id}.title`)),
-    createElement("p", { className: "dss-note" }, t(`group.${group.id}.note`)),
-    createElement(
-      "div",
-      { className: "dss-fields" },
-      group.fields.map((field) =>
-        renderFieldRow({
-          field,
-          t,
-          shown: shown(field),
-          disabled,
-          revealed: revealed(field),
-          onReveal: () => {
-            onReveal(field);
-          },
-          onChange: (raw) => {
-            onChange(field, raw);
-          },
-        }),
-      ),
+    Section,
+    { title: t(`group.${group.id}.title`), hint: t(`group.${group.id}.note`) },
+    group.fields.map((field) =>
+      renderFieldRow({
+        field,
+        t,
+        shown: shown(field),
+        disabled,
+        revealed: revealed(field),
+        onReveal: () => {
+          onReveal(field);
+        },
+        onChange: (raw) => {
+          onChange(field, raw);
+        },
+      }),
     ),
   );
 }
@@ -520,43 +532,31 @@ interface Draft {
 
 const EMPTY_DRAFT: Draft = { values: {}, baseRevision: undefined, invalid: [], invalidText: {} };
 
-/** 底部那一行按钮。 */
+/** 底部保存条：非法输入时保存被挡住，并在状态位说明原因。 */
 function renderActions(props: {
   readonly t: Translate;
   readonly saving: boolean;
   readonly editable: boolean;
-  readonly blocked: boolean;
   readonly changed: number;
+  readonly invalid: number;
   readonly onSave: () => void;
   readonly onUndo: () => void;
 }): ReactNode {
-  const { t, saving, editable, blocked, changed, onSave, onUndo } = props;
-  const idle = changed === 0;
-  return createElement(
-    "div",
-    { className: "dss-actions" },
-    createElement(
-      "button",
-      {
-        type: "button",
-        className: BUTTON_CLASS,
-        "data-primary": "true",
-        disabled: idle || blocked || saving || !editable,
-        onClick: onSave,
-      },
-      saving ? t("saving") : t("save"),
-    ),
-    createElement(
-      "button",
-      {
-        type: "button",
-        className: BUTTON_CLASS,
-        disabled: idle || blocked || saving,
-        onClick: onUndo,
-      },
-      t("undo"),
-    ),
-  );
+  const { t, saving, editable, changed, invalid, onSave, onUndo } = props;
+  return createElement(SaveBar, {
+    dirty: changed > 0 && invalid === 0,
+    busy: saving,
+    writable: editable,
+    error: invalid > 0 ? t("statusInvalid", { count: invalid }) : null,
+    saveLabel: t("save"),
+    savingLabel: t("saving"),
+    revertLabel: t("undo"),
+    dirtyLabel: t("statusChanged", { count: changed }),
+    cleanLabel: t("statusClean"),
+    readOnlyLabel: t("statusReadonly"),
+    onSave,
+    onDiscard: onUndo,
+  });
 }
 
 /** 运行环境一节的交互状态与动作。 */
@@ -725,8 +725,8 @@ function renderPackRow(props: {
     createElement(
       "div",
       null,
-      createElement("div", { className: "dss-label" }, packLabel),
-      createElement("p", { className: "dss-packState" }, stateText),
+      createElement("div", { className: "dsu-label" }, packLabel),
+      createElement("p", { className: STATUS_CLASS }, stateText),
     ),
     createElement("div", { className: "dss-packActions" }, ...actions),
   );
@@ -743,8 +743,6 @@ function renderRuntime(props: {
   readonly onCancel: () => void;
 }): ReactNode {
   const { reader, t, snapshot, busy, failure, onAct, onCancel } = props;
-  const header = createElement("h3", { className: "dss-groupTitle" }, t("runtimeTitle"));
-  const hint = createElement("p", { className: "dss-note" }, t("runtimeHint"));
   const command = createElement(
     "code",
     { className: "dss-command" },
@@ -755,15 +753,13 @@ function renderRuntime(props: {
       ? null
       : createElement(
           "p",
-          { className: STATUS_CLASS, "data-error": "true", role: "alert" },
+          { className: `${STATUS_CLASS} dsu-error`, role: "alert" },
           t("runtimeError", { reason: failure }),
         );
   if (reader === undefined) {
     return createElement(
-      "section",
-      { className: "dss-runtime" },
-      header,
-      hint,
+      Section,
+      { title: t("runtimeTitle"), hint: t("runtimeHint") },
       createElement("p", { className: STATUS_CLASS }, t("runtimeUnavailable")),
       command,
     );
@@ -776,7 +772,7 @@ function renderRuntime(props: {
       ? null
       : createElement(
           "p",
-          { className: "dss-runtimeInfo" },
+          { className: STATUS_CLASS },
           `${t("runtimePython")}: ${snapshot.python.path} (${snapshot.python.via})`,
           createElement("br"),
           `${t("runtimeDataDir")}: ${snapshot.dataDir}`,
@@ -819,10 +815,8 @@ function renderRuntime(props: {
         )
       : null;
   return createElement(
-    "section",
-    { className: "dss-runtime" },
-    header,
-    hint,
+    Section,
+    { title: t("runtimeTitle"), hint: t("runtimeHint") },
     info,
     failureLine,
     jobLine,
@@ -898,11 +892,16 @@ export function SettingsCard(props: CardProps): ReactNode {
   // 摘要视图不画表单；宿主只在官方插件的卡片上才用这个视图，本包是 bundle 走不到，真走到
   // 时返回一个空 div 也好过抛错把整张卡顶掉。
   if (props.view !== "page" || form === undefined) {
-    return createElement("div", { className: "dss-card" });
+    return createElement(CardForm, null);
   }
   const editable = state.writable && state.status === "ready";
   const ops = buildOps(draft.values);
   const save = async (): Promise<void> => {
+    // 按钮在非法输入/无改动时是禁用的，但禁用的按钮收不到点击；这里再挡一次，
+    // 程序化调用也不会把空操作串（或只带合法字段、却留下非法草稿）写进宿主。
+    if (draft.invalid.length > 0 || ops.length === 0) {
+      return;
+    }
     await commitDraft({ form, draft, ops, state, t, setDraft, setFailure, setSaving });
   };
   const onFieldChange = (field: FieldSpec, raw: string): void => {
@@ -945,13 +944,12 @@ export function SettingsCard(props: CardProps): ReactNode {
       onChange: onFieldChange,
     }),
   );
-  const blocked = draft.invalid.length > 0;
   const actions = renderActions({
     t,
     saving,
     editable,
-    blocked,
     changed: ops.length,
+    invalid: draft.invalid.length,
     onSave: (): void => {
       void save();
     },
@@ -960,27 +958,24 @@ export function SettingsCard(props: CardProps): ReactNode {
       setFailure("");
     },
   });
-  const status = createElement(
-    "p",
-    { className: STATUS_CLASS, "data-error": "false", role: "status", "aria-live": "polite" },
-    statusLine(t, state, ops.length, draft.invalid.length),
-  );
+  const status = createElement(StatusBar, {
+    items: [statusLine(t, state, ops.length, draft.invalid.length)],
+  });
   const reported =
     failure === ""
       ? null
       : createElement(
           "p",
           {
-            className: STATUS_CLASS,
-            "data-error": "true",
+            className: "dsu-error",
             role: "alert",
             "aria-live": "assertive",
           },
           failure,
         );
   return createElement(
-    "div",
-    { className: "dss-card" },
+    CardForm,
+    null,
     status,
     reported,
     ...groups,

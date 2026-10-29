@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // dsh-scrapling/build-client.ts —— 构建 client.js。
 //
-// 用 rolldown 把 src/client-entry.ts 打包为 CJS（react 按包名段外部化），再包进
+// 用 rolldown 把 src/client-entry.ts 打包为 CJS（react / zod 按包名段外部化），再包进
 // window.__ModuleLoader__.load({ id, factory }) 外壳。id 取 package.json 的 name，
 // 与 dsh.client 模块表键一致。
 //
@@ -26,14 +26,15 @@ import {
 
 const root = import.meta.dirname;
 
-// react 按**包名段**外部化：字符串项是精确匹配，只写 "react" 时 react/jsx-runtime 与
-// react-dom 的任意子路径都会被内联进产物，宿主与产物各持一份 React 实例 —— hook 报
-// Invalid hook call、状态互不可见，而构建照样成功退出。本包目前只 import "react"，
-// 但这条判据不该依赖「将来没人改用 JSX 自动运行时」。
+// react 与 zod 按**包名段**外部化：字符串项是精确匹配，只写 "react" 时 react/jsx-runtime
+// 与 react-dom 的任意子路径都会被内联进产物，宿主与产物各持一份 React 实例 —— hook 报
+// Invalid hook call、状态互不可见，而构建照样成功退出。本包目前只 import "react" 与
+// "zod"，但这条判据不该依赖「将来没人改用 JSX 自动运行时」。
 //
 // 其余裸说明符（node: 前缀与相对路径已由 rolldown 处理，不在此列）不外部化：产物是
-// 浏览器侧的单文件，除宿主提供的 react 之外不该在运行期解析任何东西。
-const isExternal = externalizePackages(["react"]);
+// 浏览器侧的单文件，除宿主提供的 react 与 zod 之外不该在运行期解析任何东西。
+// zod 同样是宿主 `PLATFORM_MODULES` 冻结模块表里的一枚；内联会得到第二份 zod 身份。
+const isExternal = externalizePackages(["react", "zod"]);
 
 const pkgJson = readPackageJson(root);
 

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Scrapling web scraping",
+    "description": "Fetches and extracts web pages with self-healing selectors, browser rendering, session state and background crawling, driven by one resident Python process.",
+    "detail": "docs/DETAIL.md"
+  }
+}

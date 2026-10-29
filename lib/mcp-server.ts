@@ -66,7 +66,7 @@ export interface McpServerHandle {
 }
 
 /** MCP server 自述的版本；由 test/publish-manifest.test.ts 钉成 package.json 同值。 */
-export const MCP_SERVER_VERSION = "0.1.4";
+export const MCP_SERVER_VERSION = "0.1.5";
 
 const RAW_PREFIX = "scrapling_";
 
@@ -392,7 +392,10 @@ function endpointNames(host: string): string[] {
  * @returns 允许的 Host 与 Origin 列表
  */
 export function allowedEndpoints(host: string, port: number): McpAllowedEndpoints {
-  const allowedHosts = [...new Set(endpointNames(host))].map((name) => `${name}:${String(port)}`);
+  const allowedHosts = Array.from(
+    new Set(endpointNames(host)),
+    (name) => `${name}:${String(port)}`,
+  );
   return { allowedHosts, allowedOrigins: allowedHosts.map((entry) => `http://${entry}`) };
 }
 

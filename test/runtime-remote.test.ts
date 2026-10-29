@@ -594,7 +594,17 @@ describe("官方 Typert Remote：runtime 服务", () => {
 
 function namespaceStub(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    status: async () => ({ ok: true, value: { packs: {}, job: null } }),
+    status: async () => ({
+      ok: true,
+      value: {
+        ok: true,
+        packs: {},
+        python: { path: "/usr/bin/python3", via: "PATH", version: "3.14" },
+        dataDir: "/tmp/scrapling",
+        jobsReady: true,
+        job: null,
+      },
+    }),
     installPack: async () => ({ ok: true, value: { ok: true, jobId: "job-1" } }),
     repairPack: async () => ({ ok: true, value: { ok: true, jobId: "job-2" } }),
     cancelJob: async () => ({ ok: true, value: { ok: true, jobId: "job-1" } }),
@@ -685,6 +695,23 @@ describe("客户端读取器", () => {
     await expect(
       refusing?.cancel("job-1") ?? Promise.reject(new Error("no reader")),
     ).rejects.toThrow(/refused/u);
+  });
+
+  it("返回面的拒绝码不在保留集合时判坏，不把未知状态码当合法回执", async () => {
+    const reader = createRuntimeReader(
+      hostOf({
+        namespace: namespaceStub({
+          cancelJob: async () => ({
+            ok: true,
+            value: { ok: false, error: "unknown refusal", status: 502 },
+          }),
+        }),
+      }).host,
+    );
+    if (reader === undefined) {
+      throw new TypeError(READER_MISSING);
+    }
+    await expect(reader.cancel("job-1")).rejects.toThrow(/at status/u);
   });
 
   it("strict codec 拒绝未知包与空 jobId", () => {

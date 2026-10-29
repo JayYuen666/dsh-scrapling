@@ -28,6 +28,11 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const STATE_FILE = "state.json";
+
+/** 空白切分与 pip 失败措辞。 */
+const WHITESPACE_RUNS = /\s+/u;
+const PIP_NO_WHEEL = /No matching distribution|Could not find a version/iu;
+const PIP_NETWORK = /Network|Temporary failure|Connection|timed out/iu;
 const STORAGE_DB = "elements_storage.db";
 
 // 只认完整 Chromium 的可执行文件。headless shell 不算：V2 实测它的组件不足，
@@ -196,7 +201,7 @@ async function readLockOwner(lockPath: string): Promise<number | undefined> {
   } catch {
     // 读不到（文件已被清、路径被占）就当没有属主：调用方据此不删锁，宁可留一把也不误删。
   }
-  const pid = Math.trunc(Number(text.trim().split(/\s+/u)[0]));
+  const pid = Math.trunc(Number(text.trim().split(WHITESPACE_RUNS)[0]));
   return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
@@ -217,7 +222,7 @@ async function lockHeldByLivingProcess(lockPath: string): Promise<boolean> {
   } catch {
     return true;
   }
-  const [pidText = ""] = text.trim().split(/\s+/u);
+  const [pidText = ""] = text.trim().split(WHITESPACE_RUNS);
   const pid = Math.trunc(Number(pidText));
   // pid 先于时间戳：一次正常的 pip 安装要下载几百 MB，跑过一小时完全可能。
   // 拿「锁写了一小时」去接管一把**活进程**持有的锁，等于让两个安装同时写同一个 venv。
@@ -650,12 +655,10 @@ export async function installCore(options: {
       );
       if (installed.code !== 0) {
         const text = `${installed.stdout}\n${installed.stderr}`;
-        if (
-          /No matching distribution|Could not find a version|no matching distribution/iu.test(text)
-        ) {
+        if (PIP_NO_WHEEL.test(text)) {
           throw new InstallError("INSTALL_NO_WHEEL", "a dependency has no wheel for this platform");
         }
-        if (/Network|Temporary failure|Connection|timed out/iu.test(text)) {
+        if (PIP_NETWORK.test(text)) {
           throw new InstallError("INSTALL_NETWORK", "pip could not reach the package index");
         }
         throw new InstallError("INSTALL_FAILED", `pip failed: ${installed.stderr.slice(0, 400)}`);

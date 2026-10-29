@@ -21,6 +21,11 @@ import {
 } from "./mcp-contract.ts";
 import type { McpMode } from "./mcp-contract.ts";
 
+/** profile 文本的行分隔、URL 端口与版本行首引号。 */
+const LINE_BREAK = /\r\n|\n|\r/u;
+const URL_PORT = /:(?<port>\d+)/u;
+const LEADING_QUOTE = /^['"]/u;
+
 export type ProfileMode = McpMode;
 
 export interface ProfileInspection {
@@ -63,7 +68,7 @@ const CONFIG_KEY = /^(?<key>[\w-]+): +(?<value>\S.*)$/u;
  * 表现是条目「一条都不存在」。按行终止符切，别只切 `\n`。
  */
 function splitLines(text: string): string[] {
-  return text.split(/\r\n|\n|\r/u);
+  return text.split(LINE_BREAK);
 }
 
 function parseEntries(text: string): ProfileEntry[] {
@@ -91,7 +96,7 @@ function parseEntries(text: string): ProfileEntry[] {
 
 function portOf(entry: ProfileEntry): string | undefined {
   const { url } = entry.config;
-  return url === undefined ? undefined : /:(?<port>\d+)/u.exec(url)?.groups?.["port"];
+  return url === undefined ? undefined : URL_PORT.exec(url)?.groups?.["port"];
 }
 
 function isOfficial(entry: ProfileEntry): boolean {
@@ -106,7 +111,7 @@ function clientFindings(input: ProfileInspection): McpFinding[] {
       detail: `profile 没有 ${MCP_CLIENT_PACKAGE}：跑 ${clientInstallCommand()} 装上它`,
     });
   }
-  const pinned = input.clientVersion?.replace(/^['"]/u, "");
+  const pinned = input.clientVersion?.replace(LEADING_QUOTE, "");
   if (pinned !== undefined && !MCP_CLIENT_PINS.includes(pinned)) {
     findings.push({
       code: "MCP_CLIENT_UNPINNED",

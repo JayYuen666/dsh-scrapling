@@ -142,7 +142,8 @@ function listAfter(source: string, marker: string): string[] {
   if (start === -1 || open === -1 || close === -1) {
     throw new Error(`源码里找不到 ${marker} [...] 这个数组字面量`);
   }
-  return [...source.slice(open + 1, close).matchAll(/"(?<name>\w+)"/gu)].map(
+  return Array.from(
+    source.slice(open + 1, close).matchAll(/"(?<name>\w+)"/gu),
     (item) => item.groups?.["name"] ?? "",
   );
 }

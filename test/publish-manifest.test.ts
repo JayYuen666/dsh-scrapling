@@ -75,6 +75,7 @@ interface Manifest {
   readonly bin?: Record<string, string>;
   readonly publishConfig?: Record<string, unknown>;
   readonly dependencies?: Record<string, string>;
+  readonly devDependencies?: Record<string, string>;
   readonly peerDependencies?: Record<string, string>;
 }
 
@@ -296,33 +297,51 @@ describe("发布形态", () => {
   });
 });
 
+/** 宿主 dsh 家族的包名前缀（本组三条判据都要按它筛，收常量）。 */
+const DSH_PREFIX = "@deepseek-ai/dsh-";
+
 describe("宿主依赖的版本形状（升级防线）", () => {
-  it("dsh-* 家族一律精确钉，不留任何范围算子", async () => {
+  it("devDependencies 里的 dsh-* 家族一律精确钉，不留任何范围算子", async () => {
     // registry 上的 dist-tag 是实测出来的陷阱：`latest` 可能指向远早于宿主 ABI 的版本。
-    // 精确钉是让「不带版本地装成远古版本」这件事不可能发生的最小条件；一旦放宽成 `^`/`~`，
-    // 宿主某天发新 minor 就会自动跟上去，而插件与宿主 ABI 耦合，那等于让消费方在没有测试的
-    // 情况下换掉宿主类型面。
+    // 精确钉是让「不带版本地装成远古版本」这件事不发生的最小条件；一旦放宽成 `^`/`~`，
+    // 宿主某天发新 minor 就会自动跟上去，而插件与宿主 ABI 耦合，那等于让本包在没有测试的
+    // 情况下换掉编译用的宿主类型面。
+    // 只判 dev 这一侧：它才是本包真正装下来的那一份。peer 记的是「运行期由宿主提供」，
+    // 装什么版本由宿主决定，判据在下面那条。
     const { manifest } = await readSurface();
     // 过滤出违规项再一次性断言，而不是在循环里按条件 expect：失败时 diff 直接列出
     // 「哪个包钉成了什么」，比逐条抛错更好读。
-    const ranged = Object.entries(manifest.dependencies ?? {}).filter(
-      ([name, range]) => name.startsWith("@deepseek-ai/dsh-") && !/^\d+\.\d+\.\d+-/u.test(range),
+    const ranged = Object.entries(manifest.devDependencies ?? {}).filter(
+      ([name, range]) => name.startsWith(DSH_PREFIX) && !/^\d+\.\d+\.\d+-/u.test(range),
     );
-    expect(ranged, "这些 dsh-* 依赖没有精确钉住版本").toStrictEqual([]);
+    expect(ranged, "这些 dsh-* 开发依赖没有精确钉住版本").toStrictEqual([]);
   });
 
-  it("dsh-* 全部与 peer 的 dsh 同版本（不许装出第二份宿主类型）", async () => {
-    // 宿主类型面被这些包以 type-only 方式消费；同一个会话里出现两个 dsh-session 的拷贝，
+  it("devDependencies 里的 dsh-* 全部同版本（不许装出第二份宿主类型）", async () => {
+    // 宿主类型面被这些包以 type-only 方式消费；同一次安装里出现两枚 dsh-session 的拷贝，
     // nominal 类型（品牌串、投影状态）会开始互相不认，而那不报编译错、只报运行期
     // 「认不出这个 callId」。同版本是让这件事不发生的最小条件。
     const { manifest } = await readSurface();
-    const peer = manifest.peerDependencies?.["@deepseek-ai/dsh"];
-    expect(peer, "peer 依赖缺失：宿主版本就失去基准了").toBeDefined();
-    const hostVersion = (peer ?? "").replace(/^[\^~]/u, "");
-    const drifted = Object.entries(manifest.dependencies ?? {}).filter(
-      ([name, range]) => name.startsWith("@deepseek-ai/dsh-") && range !== hostVersion,
+    const dshDev = Object.entries(manifest.devDependencies ?? {}).filter(([name]) =>
+      name.startsWith(DSH_PREFIX),
     );
-    expect(drifted, "这些 dsh-* 与宿主 dsh 不同版本").toStrictEqual([]);
+    expect(dshDev.length, "至少要钉住一枚 dsh-* 开发依赖，否则这条是空转").toBeGreaterThan(0);
+    const baseline = dshDev[0]?.[1];
+    const drifted = dshDev.filter(([, range]) => range !== baseline);
+    expect(drifted, `这些 dsh-* 与 ${baseline} 不同版本`).toStrictEqual([]);
+  });
+
+  it("peerDependencies 里的 dsh 家族写支持窗口范围，与裸 dsh 逐条同一条", async () => {
+    // peer 由宿主拿自己安装的那版去满足：钉成精确版本等于要求两者版本号完全相等，而滚动支持
+    // 窗口本来就含三个版本。宿主侧只在 manifest 没有 engines.dsh 时才读 peer（app-boot 的
+    // plugin-compatibility 里 engines.dsh 存在即独判），所以这一位是发布元数据的含义问题。
+    const { manifest } = await readSurface();
+    const bare = manifest.peerDependencies?.["@deepseek-ai/dsh"] ?? "";
+    expect(bare, "裸 dsh 的 peer 缺失：支持窗口就失去基准了").toMatch(/^\^/u);
+    const offPolicy = Object.entries(manifest.peerDependencies ?? {}).filter(
+      ([name, range]) => name.startsWith(DSH_PREFIX) && range !== bare,
+    );
+    expect(offPolicy, "这些 dsh-* peer 与裸 dsh 不是同一条范围").toStrictEqual([]);
   });
 });
 
@@ -365,7 +384,8 @@ describe("构建产物可载入", () => {
     const code = await readFile(path.join(pkgDir, "host.js"), "utf8");
     // 内联的痕迹是模块自己的 JSDoc 头（`@module @deepseek-ai/…`）。宿主提供的包必须以裸
     // 说明符留在产物里，否则拿到的是本包私有的那一份副本 —— 模块级状态会裂成多份。
-    const inlined = [...code.matchAll(/@module (?<pkg>@deepseek-ai\/[\w-]+)/gu)].map(
+    const inlined = Array.from(
+      code.matchAll(/@module (?<pkg>@deepseek-ai\/[\w-]+)/gu),
       (found) => found.groups?.["pkg"],
     );
     expect(inlined, `这些宿主包被内联进产物了: ${[...new Set(inlined)].join(", ")}`).toStrictEqual(

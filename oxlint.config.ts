@@ -103,47 +103,47 @@ export default definePluginConfig({
   ],
   offReasons: {
     "typescript/dot-notation": {
-      kind: "对侧互斥",
+      kind: "与已启用规则互斥",
       measured: 1,
       note: "唯一命中在 src/client-entry.ts：Record<string, unknown> 的属性访问被 TS 的 noPropertyAccessFromIndexSignature 强制要求方括号（TS4111），而本规则要求点号。两条规则在索引签名上无解，只能关一侧，且必须关本条 —— 留点号就编译不过。",
     },
     "typescript/require-await": {
-      kind: "对侧互斥",
+      kind: "与已启用规则互斥",
       measured: 1,
       note: "startCrawlJob 只是把同步的 ctx.jobs.start 包成 Promise 以匹配工具层的 async 契约，本仓 1 处，这里没有任何真实异步步骤。加上 async 就撞上 promise-function-async，两条规则在「无异步工作的 Promise 返回函数」上直接互斥，而契约本身就是这么定的。",
     },
     "typescript/promise-function-async": {
-      kind: "对侧互斥",
+      kind: "与已启用规则互斥",
       measured: 1,
       note: "与 typescript/require-await 互斥，同一处代码：加上 async 会被 require-await 判掉，不加 async 会被本条判掉。两条只能关一侧，故一并记录。",
     },
     "node/no-top-level-await": {
-      kind: "对侧互斥",
+      kind: "与已启用规则互斥",
       measured: 4,
       note: "构建脚本必须 await rolldown()，bin 入口必须 await 一次 CLI 运行。改用 promise 链就会撞上本文件本该满足的 unicorn/prefer-top-level-await 与 promise/prefer-await-to-then —— 两条规则在这些文件上互斥，只能关一侧。它们只由 node 按 ESM 直接执行，不进 bundler 的 require(esm) 路径，顶层 await 的真实代价不存在。",
     },
     "promise/avoid-new": {
-      kind: "实测否证",
+      kind: "实测有害",
       measured: 4,
       note: "sidecar 是请求/响应协议：握手等待与单次调用都必须先拿到一个「以后再兑现」的 Promise，再按 id 把响应接回去；mcp-server 那两处包的是 node http server 的 listen 成功/失败事件与 close 回调。按该规则改写就只能轮询，CPU 空转且把延迟从 O(响应时间) 变成 O(轮询间隔)。命中都在协议实现本身，不在 async 函数的包装上。",
     },
     "promise/prefer-await-to-then": {
-      kind: "实测否证",
+      kind: "实测有害",
       measured: 1,
       note: "唯一命中是 `void child.done.catch(...)`：子进程存活期间这条链永远 pending，本就不存在可 await 的位置。改成 async/await 会让 spawn 一直挂在 await 上，sidecar 永远起不来。",
     },
     "promise/prefer-await-to-callbacks": {
-      kind: "对侧互斥",
+      kind: "与已启用规则互斥",
       measured: 1,
       note: "与上一条同处：要让这条满足就必须把进程退出清理改成 await，而那正是上一条实测否证掉的写法。两条规则在这行上互斥。",
     },
     "typescript/no-unnecessary-condition": {
-      kind: "契约冲突",
+      kind: "与官方形态冲突",
       measured: 1,
       note: "只作用于 lib/jsonl.ts 的 pumpFrames：循环里的 stopped 守卫被 onFrame 回调间接翻转，TS 看不见跨闭包的副作用而误判为死分支。实测删除该守卫后，stop() 之后的同 chunk 帧会继续被投递（test/jsonl.test.ts 的「停止后不再回调」一条即为此设）。",
     },
     "unicorn/prefer-spread": {
-      kind: "对侧互斥",
+      kind: "与已启用规则互斥",
       measured: 1,
       note: "基线同时开着 unicorn/no-useless-spread，它会把 `[...map.values()]` 判成无用展开；改用 Array.from 又被本条判成应用展开。同一表达式在两条开启的规则下无解，只能关一侧 —— 这里选关 prefer-spread，因为 no-useless-spread 的判据（迭代器展开成无用数组）确实成立。",
     },

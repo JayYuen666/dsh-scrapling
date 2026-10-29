@@ -76,7 +76,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 Remove with `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`. The package is on the public npm registry, so installation needs no credentials and no scoped-registry line.
 
 - **Requires Node.js `>= 22.12`.** This is an ESM-only package; that Node floor is what makes `require()` of an ESM entry work at all, which is why `engines.node` is declared.
-- **Requires host `dsh` at the `0.2.1-rc.3` line.** The requirement the host actually reads is `engines.dsh` (`^0.2.1-rc.3`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`.
+- **Requires host `dsh` at the `0.2.1-rc.3` line.** The requirement the host actually reads is `engines.dsh` (`^0.2.1-rc.3`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against the three most recently released host versions at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
 - **Requires Python 3.14+ with Scrapling installed** — in the repository's `_env/.venv`, or reachable from `PATH`, or named by `pythonBin`. In an installed package the `_env/.venv` leg does not exist, so the interpreter is the `python3` on your `PATH` (`python` on Windows); whichever one is chosen is logged at load time, and a missing Scrapling reports an error carrying the install line to copy.
 
 ```sh

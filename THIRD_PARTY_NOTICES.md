@@ -53,6 +53,7 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包通过它们的
 | `playwright` | 1.64.1 | Apache-2.0（Microsoft） | 网络守卫 |
 | `patchright` | 1.64.2 | Apache-2.0（Microsoft，patch 由 Kaliiiiiiiiii-Vinyzu 提供） | 浏览器渲染与网络守卫 |
 | `ipaddr.js` | 2.5.0 | MIT | Host 侧 URL 策略的地址分类 |
+| `zod` | catalog（伞根 4.6.7） | MIT | 设置卡 `src/runtime-reader.ts` 的 strict codec 形状校验；client 产物由宿主 `PLATFORM_MODULES` 提供 |
 
 其余随 venv 安装的固定版本（含 `click`、`protego`、`curl_cffi`、`lxml` 等）见
 `py/runtime-requirements.txt`，每一行都带 SHA256；本文件不复述整张表。

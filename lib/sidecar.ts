@@ -17,6 +17,7 @@
 
 import type { Context } from "@deepseek-ai/cordis";
 import type { SubprocessHandle } from "@deepseek-ai/dsh-subprocess";
+import { z } from "zod";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { decodeFrame, encodeFrame, pumpFrames } from "./jsonl.ts";
 import { asText, SidecarError } from "./sidecar-error.ts";
@@ -148,20 +149,45 @@ interface ReadyWaiter {
 }
 
 /**
- * 归一代理摘要；三个字段都齐且类型对才认。
+ * 握手帧的 zod 形状：跨语言协议只在这里认一次，坏字段各自降级、不拖掉整帧。
  *
- * @param value - 握手帧里的 capabilities.proxy 原值
- * @returns 摘要，或 undefined 表示这一项不可读
+ * - 四个能力开关按 `=== true` 归一（`"yes"` / `1` 都算缺报，与旧口径一致）；
+ * - `websocketGuard` / `version` 缺报时折成 undefined，保留「没上报」与 false 的区别；
+ * - `proxy` 三个字段都齐才收，否则整项当没报。
  */
-function parseProxySummary(value: unknown): SidecarProxySummary | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  const { configured, source, server } = value;
-  const usable =
-    typeof configured === "boolean" && typeof source === "string" && typeof server === "string";
-  return usable ? { configured, source, server } : null;
-}
+const PROXY_SUMMARY_SCHEMA = z.object({
+  configured: z.boolean(),
+  source: z.string(),
+  server: z.string(),
+});
+
+const CAPABILITIES_SCHEMA = z.object({
+  scrapling: z.preprocess((value) => value === true, z.boolean()),
+  static: z.preprocess((value) => value === true, z.boolean()),
+  extract: z.preprocess((value) => value === true, z.boolean()),
+  browser: z.preprocess((value) => value === true, z.boolean()),
+  writeMethods: z.preprocess((value) => value === true, z.boolean()),
+  websocketGuard: z.preprocess(
+    (value) => (typeof value === "boolean" ? value : undefined),
+    z.boolean().optional(),
+  ),
+  version: z.preprocess(
+    (value) => (typeof value === "string" ? value : undefined),
+    z.string().optional(),
+  ),
+  proxy: z.preprocess(
+    (value) => (PROXY_SUMMARY_SCHEMA.safeParse(value).success ? value : undefined),
+    PROXY_SUMMARY_SCHEMA.optional(),
+  ),
+});
+
+const EMPTY_CAPABILITIES: SidecarCapabilities = {
+  scrapling: false,
+  static: false,
+  extract: false,
+  browser: false,
+  writeMethods: false,
+};
 
 /**
  * 校验并归一 sidecar 上报的能力。
@@ -173,19 +199,29 @@ function parseProxySummary(value: unknown): SidecarProxySummary | null {
  * @returns 归一后的能力
  */
 export function parseCapabilities(value: unknown): SidecarCapabilities {
-  const record = isRecord(value) ? value : {};
-  const flag = (key: string): boolean => record[key] === true;
-  const { version, proxy, websocketGuard } = record;
-  const summary = parseProxySummary(proxy);
+  const parsed = CAPABILITIES_SCHEMA.safeParse(value);
+  if (!parsed.success) {
+    return EMPTY_CAPABILITIES;
+  }
+  const {
+    scrapling,
+    static: staticCapability,
+    extract,
+    browser,
+    writeMethods,
+    websocketGuard,
+    version,
+    proxy,
+  } = parsed.data;
   return {
-    scrapling: flag("scrapling"),
-    static: flag("static"),
-    extract: flag("extract"),
-    browser: flag("browser"),
-    writeMethods: flag("writeMethods"),
-    ...(typeof websocketGuard === "boolean" ? { websocketGuard } : {}),
-    ...(typeof version === "string" ? { version } : {}),
-    ...(summary === null ? {} : { proxy: summary }),
+    scrapling,
+    static: staticCapability,
+    extract,
+    browser,
+    writeMethods,
+    ...(websocketGuard === undefined ? {} : { websocketGuard }),
+    ...(version === undefined ? {} : { version }),
+    ...(proxy === undefined ? {} : { proxy }),
   };
 }
 

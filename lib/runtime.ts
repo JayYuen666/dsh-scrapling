@@ -2,6 +2,7 @@
 
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 
 /** 本次实际选中的解释器。 */
 export interface RuntimeResolution {
@@ -26,26 +27,20 @@ export interface RuntimeManifest {
   unsupported: Record<string, string>;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const RUNTIME_ASSET_SCHEMA = z.object({
+  platform: z.string(),
+  arch: z.string(),
+  pythonVersion: z.string(),
+  release: z.string(),
+  url: z.url(),
+  sha256: z.string(),
+  sizeBytes: z.int().positive(),
+});
 
-function isAsset(value: unknown): value is RuntimeAsset {
-  return (
-    isRecord(value) &&
-    typeof value["platform"] === "string" &&
-    typeof value["arch"] === "string" &&
-    typeof value["pythonVersion"] === "string" &&
-    typeof value["release"] === "string" &&
-    typeof value["url"] === "string" &&
-    typeof value["sha256"] === "string" &&
-    typeof value["sizeBytes"] === "number"
-  );
-}
-
-function isManifest(value: unknown): value is RuntimeManifest {
-  return isRecord(value) && isAsset(value["darwinArm64"]) && isRecord(value["unsupported"]);
-}
+const RUNTIME_MANIFEST_SCHEMA: z.ZodType<RuntimeManifest> = z.object({
+  darwinArm64: RUNTIME_ASSET_SCHEMA,
+  unsupported: z.record(z.string(), z.string()),
+});
 
 // 这个模块同时被源码（lib/）、host.js（包根）与 CLI 产物（bin/）载入，`..` 不是固定的包根。
 // 以 runtime-manifest.json 实际所在的那一级为准；右侧只在打包产物里成立，源码态恒走左侧。
@@ -58,10 +53,11 @@ const packageRoot = existsSync(path.join(import.meta.dirname, "runtime-manifest.
 /** 解析并校验清单文本；坏清单在加载期就要炸，不能等到安装时才落一个半截 runtime。 */
 export function parseRuntimeManifest(text: string): RuntimeManifest {
   const parsed: unknown = JSON.parse(text);
-  if (!isManifest(parsed)) {
-    throw new Error("runtime-manifest.json is missing the darwinArm64 asset");
+  const result = RUNTIME_MANIFEST_SCHEMA.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(`runtime-manifest.json is invalid: ${z.prettifyError(result.error)}`);
   }
-  return parsed;
+  return result.data;
 }
 
 /** 与 `runtime-manifest.json` 同源；构建后按包根解析。 */

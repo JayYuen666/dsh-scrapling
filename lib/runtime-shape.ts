@@ -42,7 +42,7 @@ export interface RuntimePython {
 
 export interface RuntimeStatusResult {
   readonly ok: true;
-  readonly packs: Readonly<Record<RuntimePack, PackState>>;
+  readonly packs: Readonly<Partial<Record<RuntimePack, PackState>>>;
   readonly python: RuntimePython;
   readonly dataDir: string;
   /** 宿主有没有作业后端；没有时卡片禁用安装按钮并显示 CLI 命令。 */

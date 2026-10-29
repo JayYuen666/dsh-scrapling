@@ -67,8 +67,11 @@ async function run(command, args, options = {}) {
 async function main() {
   const root = await mkdtemp(path.join(os.tmpdir(), "dsh-install-probe-"));
   try {
-    const packed = await run("npm", ["pack", "--pack-destination", root]);
-    const tgz = path.join(root, packed.stdout.trim().split("\n").at(-1) ?? "");
+    // 必须用 pnpm pack：本仓的运行期依赖以 `catalog:` 书写，npm pack 原样保留这个协议，
+    // 干净目录里 `npm install` 会直接 EUNSUPPORTEDPROTOCOL；pnpm pack 会把它落成版本号。
+    const packed = await run("pnpm", ["pack", "--pack-destination", root]);
+    const packedPath = packed.stdout.trim().split("\n").at(-1) ?? "";
+    const tgz = path.isAbsolute(packedPath) ? packedPath : path.join(root, packedPath);
     const info = await stat(tgz);
     const bytes = await readFile(tgz);
     const digest = createHash("sha256").update(bytes).digest("hex");
@@ -88,16 +91,21 @@ async function main() {
     await mkdir(install, { recursive: true });
     await writeFile(path.join(install, "package.json"), '{"type":"module","private":true}\n');
     // 显式装可选 peer，模拟宿主；其余必装 peer 由 npm 按 tarball 的 peerDependencies 自动装。
+    // 版本取本仓的 devDependency（编译与测试所对的精确宿主），不取 peer 范围：npm 会把
+    // peer 范围解析成 registry 上的另一格，与 tarball 其余 peer 的解析结果互斥
+    //（实测 dsh-tools rc.3 与 dsh-web rc.4 各自要求不同的 dsh-llm）。
+    const manifest = JSON.parse(await readFile(path.join(repo, "package.json"), "utf8"));
+    const hostTools = manifest.devDependencies?.["@deepseek-ai/dsh-tools"];
+    assert.equal(typeof hostTools, "string", "package.json 缺 dsh-tools 的 devDependency 精确钉版");
+    // 把同一宿主线的全部 dsh-* peer 一起按 devDependency 的精确版装：只装 dsh-tools 时，
+    // npm 会按各自的 peer 范围解析出 rc.3/rc.4 混排的树，而这些宿主包互相要求同一个精确
+    // dsh-llm，安装因此必冲突。`@deepseek-ai/dsh` 本体不参与：host.js 不 import 它。
+    const hostPeers = Object.keys(manifest.peerDependencies ?? {})
+      .filter((name) => name.startsWith("@deepseek-ai/dsh-") && name !== "@deepseek-ai/dsh")
+      .map((name) => `${name}@${manifest.devDependencies?.[name] ?? hostTools}`);
     await run(
       "npm",
-      [
-        "install",
-        tgz,
-        "@deepseek-ai/dsh-tools@0.2.1-rc.3",
-        "--ignore-scripts",
-        "--no-audit",
-        "--no-fund",
-      ],
+      ["install", tgz, ...hostPeers, "--ignore-scripts", "--no-audit", "--no-fund"],
       { cwd: install },
     );
 

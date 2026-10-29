@@ -21,5 +21,9 @@ export default definePackageConfig({
     // 解释器不在位时把整次运行顶红，而不是让用例一条条跳过去：跳过去的代价是覆盖率
     // 跟着掉，而门禁只会说「覆盖率不达标」，真正的原因不落在任何一行日志里。
     globalSetup: ["test/global-setup.ts"],
+    // registry 版 shared 的 dist/card-ui.js 在单仓安装态会被 vitest 当成外部依赖，
+    // 它内部的 require("react") 绕过 vi.mock("react")；测试架因此拿到真实 React 的
+    // hook 并报 "Cannot read properties of null (reading 'useState')"。内联后 mock 才生效。
+    server: { deps: { inline: [/@jayyuen66\/dsh-plugin-shared/u] } },
   },
 });

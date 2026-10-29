@@ -16,6 +16,10 @@
 
 import ipaddr from "ipaddr.js";
 
+/** authority 的终点字符与 URL 内嵌凭据形态。 */
+const AUTHORITY_END = /[/?#]/u;
+const URL_USERINFO = /^(?<scheme>[a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/iu;
+
 /** 策略判定被拒的原因；用机器可读码，便于测试与错误文案分离。 */
 export type BlockReason =
   | "invalid-url"
@@ -521,7 +525,7 @@ function isAuthorityAmbiguity(char: string): boolean {
 function authorityOf(input: string): string {
   const schemeEnd = input.indexOf("://");
   const rest = schemeEnd === -1 ? input : input.slice(schemeEnd + 3);
-  const end = rest.search(/[/?#]/u);
+  const end = rest.search(AUTHORITY_END);
   return end === -1 ? rest : rest.slice(0, end);
 }
 
@@ -536,7 +540,7 @@ function authorityOf(input: string): string {
  * @returns 脱敏后的串；没有 userinfo 时原样返回
  */
 export function redactUrlSecrets(input: string): string {
-  const masked = input.replace(/^(?<scheme>[a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/iu, "$<scheme>***@");
+  const masked = input.replace(URL_USERINFO, "$<scheme>***@");
   if (masked !== input) {
     return masked;
   }

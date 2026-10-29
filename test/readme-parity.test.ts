@@ -51,7 +51,8 @@ function configKeys(source: string): { all: readonly string[]; volatile: readonl
   if (body === undefined) {
     throw new Error(`${HOST} 里找不到 Config 接口`);
   }
-  const entries = [...body.matchAll(/^ {2}(?<key>[A-Za-z][A-Za-z0-9]*): (?<decl>.*)$/gmu)].map(
+  const entries = Array.from(
+    body.matchAll(/^ {2}(?<key>[A-Za-z][A-Za-z0-9]*): (?<decl>.*)$/gmu),
     (found) => [found.groups?.["key"] ?? "", found.groups?.["decl"] ?? ""] as const,
   );
   return {
@@ -75,7 +76,8 @@ function discoverable(key: string, text: string): boolean {
   if (text.includes(key)) {
     return true;
   }
-  const families = [...text.matchAll(/`\*(?<suffix>[A-Za-z][A-Za-z0-9]*)`/gu)].map(
+  const families = Array.from(
+    text.matchAll(/`\*(?<suffix>[A-Za-z][A-Za-z0-9]*)`/gu),
     (found) => found.groups?.["suffix"] ?? "",
   );
   return families.some((suffix) => suffix !== "" && key.endsWith(suffix));
@@ -135,7 +137,10 @@ function settingsTableRows(
 function rowTokens(rows: readonly string[]): readonly string[] {
   return rows.flatMap((row) => {
     const first = row.split("|")[1] ?? "";
-    return [...first.matchAll(/`(?<token>[^`]+)`/gu)].map((found) => found.groups?.["token"] ?? "");
+    return Array.from(
+      first.matchAll(/`(?<token>[^`]+)`/gu),
+      (found) => found.groups?.["token"] ?? "",
+    );
   });
 }
 

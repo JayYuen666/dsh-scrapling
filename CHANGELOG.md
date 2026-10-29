@@ -3,6 +3,46 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。最新版本在最上。
 
+## 0.1.5
+
+这一版把设置卡与读面校验统一到 shared 组件和 zod，让提示指引跟随宿主的步骤准入视图，
+并把插件页展示面收进包。宿主开发线抬到 0.2.2-alpha.2。
+
+### Changed
+
+- **设置卡迁到 shared 组件**：字段版式、保存条与状态条改用 `@jayyuen66/dsh-plugin-shared/lib/card-ui`，
+  本卡只保留运行环境区样式；布尔、数字、枚举与 URL 输入改由 zod schema 校验，非法原文留在控件里并
+  挡住保存。
+- **读面形状校验改 zod**：`src/runtime-reader.ts` 的 strict codec、`lib/sidecar.ts` 的 capabilities、
+  `lib/runtime.ts` 的 manifest 都改用 zod；client 对 `status` / 动作回执也按 schema 收，坏形状不再当
+  合法值渲染。
+- **runtime 状态里的能力包改为可选**：旧宿主少报某个包时整份状态照常解析，不再因为一个缺键把整张
+  运行环境区判成坏数据。
+- **提示指引跟随步骤准入**：宿主提供 `toolSet` 时，指引按 `view(scope)` 的实际可见集生成，受限子代理
+  与条件工具不再沿用全量注册表；没有准入时退回原判据。
+- **`zod` 进入运行期依赖**：client 产物按宿主 `PLATFORM_MODULES` 外置；CLI 单文件产物包含 zod。
+- **宿主开发线抬到 `0.2.2-alpha.2`**：devDependencies 与 catalog/overrides 同值；`engines.dsh` 与 peer
+  仍写支持窗口 `^0.2.1-rc.3`，README 补滚动窗口说明；MCP server 自述版本同步到 0.1.5。
+- **插件页展示面进包**：新增 `locale/en.json`、`locale/zh.json` 与 `docs/DETAIL.md`、`docs/DETAIL.zh.md`；
+  `exports` 增加 `./locale/*.json`，`files` 收进 locale 与 docs。
+- **正则常量与迭代写法收口**：CLI、安装器、MCP profile、URL 策略与测试里的内联正则提取为命名常量，
+  展开迭代器改用 `Array.from`，行为不变。
+
+### Fixed
+
+- **单仓安装态下设置卡测试拿到真实 React hook**：registry 版 shared 的 `dist/card-ui.js` 被 vitest
+  外部化，它内部的 `require("react")` 绕过 `vi.mock("react")`；vitest 配置把
+  `@jayyuen66/dsh-plugin-shared` 内联，测试架重新走 mock。
+- **pack-probe 的 `npm pack` 留下未解析的 `catalog:`**：`zod` 以 `catalog:` 写进运行期依赖，
+  npm pack 原样保留这个协议，干净目录 `npm install` 直接 `EUNSUPPORTEDPROTOCOL`；探针改用
+  pnpm pack（发布同款，会落成版本号）。
+- **pack-probe 安装可选 peer 时解析出互斥的宿主版本**：探针原先只显式装 `dsh-tools`，npm 按
+  peer 范围解析出 rc.3，而 `dsh-web` 同一次安装里解析到 rc.4，两者要求不同的 `dsh-llm`；
+  探针改按 devDependency 的精确版装同一宿主线，安装树回到同一档。
+- **`@deepseek-ai/dsh*` 的 peer 范围覆盖 alpha.2**：`^0.2.1-rc.3` 的预发布语义不含
+  `0.2.2-alpha.2`（不是同一 patch 元组），而本包装配和测试正是对着 alpha.2；范围改为
+  `^0.2.1-rc.3 || ^0.2.2-alpha.2`，与 README 的三版窗口一致。
+
 ## 0.1.4
 
 ### Fixed

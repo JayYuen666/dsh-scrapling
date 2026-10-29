@@ -36,6 +36,8 @@ export interface FieldSpec {
   readonly fallback: string | number | boolean;
   /** 枚举字段的取值，取自 schema 的 union。 */
   readonly options?: readonly string[];
+  /** 文本字段的值形态；`url` 由 `z.url()` 校验，空串仍是「清除覆盖」。 */
+  readonly format?: "url";
   /**
    * 值里可能带凭据，控件默认遮罩显示。
    *
@@ -460,6 +462,7 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
       {
         key: "proxyUrl",
         kind: "text",
+        format: "url",
         secret: true,
         label: { zh: "代理地址", en: "Proxy URL" },
         hint: {
@@ -585,6 +588,7 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
       {
         key: "searxngEndpoint",
         kind: "text",
+        format: "url",
         label: { zh: "SearXNG 实例地址", en: "SearXNG instance URL" },
         hint: {
           zh: "SearXNG 后端必填，例如 https://searx.example.com；会拼上 /search?format=json。留空表示这条后端不可用。",

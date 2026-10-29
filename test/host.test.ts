@@ -175,12 +175,18 @@ function settingsStub(registrations: string[] = []): unknown {
 interface PromptRecord {
   name: string;
   order: number;
-  /** 静态文本，或上游那种「每次装配现取」的函数；`scope` 本包只转交给 `ctx.tools.get`。 */
-  text: string | ((context: { scope?: object }) => string);
+  /** 静态文本，或上游那种「每次装配现取」的函数；`scope` 本包只转交给 `ctx.tools.get`，
+   *  `toolSet`（步骤准入）在 alpha.2 的装配上下文里可选。 */
+  text: string | ((context: { scope?: object; toolSet?: ToolSetFace }) => string);
 }
 
 /** 假 systemPrompt 收到的段。 */
 const SECTIONS: PromptRecord[] = [];
+
+/** 步骤准入的读面（官方 `ResolvedToolSet.view` 的结构投影）。 */
+interface ToolSetFace {
+  readonly view: (scope: object | undefined) => Map<string, unknown>;
+}
 
 /**
  * 假 ctx 的 systemPrompt 面。
@@ -670,6 +676,28 @@ describe("system prompt 指引段", () => {
     expect(text).toContain("scrapling_render");
     expect(text).not.toContain("scrapling_crawl");
     expect(text).not.toContain("scrapling_session_network");
+
+    // 装配上下文带步骤准入时按准入视图判（受限子代理/条件工具在这一档显形），
+    // 且把装配 scope 原样交给 view——换一个作用域就是另一份准入。
+    const scopes: unknown[] = [];
+    const admitted = (names: string[]): ToolSetFace => ({
+      view: (scope: object | undefined) => {
+        scopes.push(scope);
+        return new Map(names.map((tool) => [tool, {}]));
+      },
+    });
+    const scope = { tag: "agent-scope" };
+    const restricted =
+      typeof section?.text === "function"
+        ? section.text({ scope, toolSet: admitted(["scrapling_fetch"]) })
+        : "";
+    expect(restricted).toContain("scrapling_fetch");
+    expect(restricted).not.toContain("scrapling_render");
+    expect(scopes.length).toBeGreaterThan(0);
+    expect(
+      scopes.every((entry) => entry === scope),
+      "每次查准入都用同一个装配 scope",
+    ).toBe(true);
   });
 });
 
