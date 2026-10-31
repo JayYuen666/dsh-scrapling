@@ -17,6 +17,41 @@ def _json_len(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False))
 
 
+def _fit_text(text: str, available: int) -> str:
+    """把文本收到 JSON 序列化后不超过 available 个字符；预算不足时给空串。
+
+    按字符裁再量一次是不够的：JSON 会转义引号/反斜杠/控制字符，裁到 N 个字符的串
+    序列化后可能远超 N。这里直接按序列化长度二分，保证返回值的 json 长度落在预算内。
+    """
+    if available < _json_len(""):
+        return ""
+    if _json_len(text) <= available:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _json_len(text[:middle]) <= available:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low]
+
+
+def _json_value_within(value: Any, room: int) -> tuple[Any, int, bool]:
+    """把值收进 room 的 JSON 预算；返回 (值, 实际长度, 是否被裁)。
+
+    字符串按序列化长度收缩；其它形态（列表、对象）没有便宜的收缩方式，超预算时
+    降级为 null —— 留着整段会让调用方拿到的载荷远超 maxContentChars。
+    """
+    size = _json_len(value)
+    if size <= room:
+        return value, size, False
+    if isinstance(value, str) and room >= _json_len(""):
+        fitted = _fit_text(value, room)
+        return fitted, _json_len(fitted), True
+    return None, _json_len(None), True
+
+
 def _resolve_url(page: Any, value: str) -> str:
     """把相对地址拼成绝对地址；空值或拼不出来时保留原值。"""
     if not value:
@@ -35,7 +70,7 @@ def _query_type(selector: str, query_type: str | None, use_xpath: bool) -> str:
 def query_nodes(
     page: Any,
     selector: str,
-    query_type: str = "css",
+    query_type: str | None = None,
     *,
     use_xpath: bool = False,
     partial: bool = False,
@@ -199,23 +234,21 @@ def collect_fields(
     rows: list[dict[str, Any]] = []
     spent = 0
     truncated = False
-    for node in nodes:
+    node_iter = iter(nodes)
+    for node in node_iter:
         row: dict[str, Any] = {}
         for name, spec in fields.items():
             value = field_value(node, spec, page=page, resolve_urls=resolve_urls)
             room = max(0, max_content_chars - spent)
-            size = _json_len(value)
-            if size > room:
-                if isinstance(value, str):
-                    # JSON 字符串带两个引号；留出它们再把正文裁到剩余预算。
-                    value = value[: max(0, room - 2)]
-                    size = _json_len(value)
-                truncated = True
+            value, size, dropped = _json_value_within(value, room)
+            truncated = truncated or dropped
             spent += size
             row[str(name)] = value
         rows.append(row)
         if spent >= max_content_chars:
-            truncated = True
+            # 只有确实还有下一条时才算截断：最后一条刚好用尽预算不是截断。
+            if next(node_iter, None) is not None:
+                truncated = True
             break
     return rows, truncated
 
@@ -234,11 +267,13 @@ def locate(args: dict[str, Any]) -> dict[str, Any]:
     if url is not None and not isinstance(url, str):
         raise ValueError("url must be a string or null")
     query_type = args.get("queryType")
-    if query_type is not None and not isinstance(query_type, str):
-        raise ValueError("queryType must be a string")
-    query_type = query_type or "css"
-    if query_type not in ("css", "xpath", "text", "regex", "similar"):
-        raise ValueError(f"unknown queryType: {query_type}")
+    if query_type is not None:
+        if not isinstance(query_type, str):
+            raise ValueError("queryType must be a string")
+        if query_type not in ("css", "xpath", "text", "regex", "similar"):
+            raise ValueError(f"unknown queryType: {query_type}")
+    # 缺省留 None 交给 query_nodes 归一：显式 queryType 优先，其次 useXpath，最后 css。
+    # 这里先落成 "css" 会让调用方传的 useXpath 永远失效（"//p" 被当 CSS 选择器，命中 0）。
     limit = _positive_int(args.get("limit"), "limit", 200)
     budget = _positive_int(args.get("maxContentChars"), "maxContentChars", 200_000)
     include_ancestors = bool(args.get("includeAncestors", True))
@@ -259,16 +294,13 @@ def locate(args: dict[str, Any]) -> dict[str, Any]:
     matches: list[dict[str, Any]] = []
     spent = 0
     truncated = False
-    for node in nodes:
+    node_iter = iter(nodes)
+    for node in node_iter:
         if len(matches) >= limit:
             truncated = True
             break
         text = str(node.get_all_text(strip=True))
         room = max(0, budget - spent)
-        if len(text) > room:
-            text = text[:room]
-            truncated = True
-        spent += len(text)
         item: dict[str, Any] = {
             "tag": str(getattr(node, "tag", "") or ""),
             "text": text,
@@ -289,9 +321,23 @@ def locate(args: dict[str, Any]) -> dict[str, Any]:
                 else []
             ),
         }
+        size = _json_len(item)
+        if size > room:
+            # 预算按整条载荷算：attributes、四个选择器与 ancestors 都占字符，只量 text
+            # 会让真实返回体远超 maxContentChars。先把正文收到剩余预算，再复核一次。
+            fixed = _json_len({**item, "text": ""})
+            item["text"] = _fit_text(text, max(0, room - fixed))
+            size = _json_len(item)
+            truncated = True
+            if size > room:
+                # 连不含正文的固定结构都放不下：这一条不再进结果，预算到此为止。
+                break
+        spent += size
         matches.append(item)
         if spent >= budget:
-            truncated = True
+            # 只有确实还有下一条时才算截断：最后一条刚好用尽预算不是截断。
+            if next(node_iter, None) is not None:
+                truncated = True
             break
     return {
         "count": len(nodes),

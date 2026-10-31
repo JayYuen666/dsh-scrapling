@@ -26,6 +26,7 @@ import {
   buildOps,
   controlType,
   displayValue,
+  draftAfterWrite,
   installStyle,
   installStyles,
   parseInput,
@@ -39,6 +40,8 @@ const noMatch = (): undefined => undefined;
 const PROXY_HTTP_URL = "http://127.0.0.1:7890";
 const PROXY_SOCKS_URL = "socks5://user:pass@127.0.0.1:7890";
 const SEARXNG_URL = "https://searx.example.com";
+/** 非法协议样例：拼出来而不是写成字面量，`no-script-url` 会拦下 `javascript:` 字面量。 */
+const SCRIPT_SCHEME_URL = ["javascript", ":alert(1)"].join("");
 
 /** schema 的单条属性：只取本用例要用的两个面。 */
 interface PropertySchema {
@@ -277,8 +280,60 @@ describe("parseInput", () => {
     });
   });
 
+  it("URL 协议按字段白名单收口：file:/data:/javascript: 不收，socks5h 收", () => {
+    expect(parseInput(fieldOf("proxyUrl"), "file:///etc/passwd")).toStrictEqual({
+      kind: "invalid",
+    });
+    expect(parseInput(fieldOf("proxyUrl"), SCRIPT_SCHEME_URL)).toStrictEqual({
+      kind: "invalid",
+    });
+    expect(parseInput(fieldOf("proxyUrl"), "socks5h://127.0.0.1:7890")).toStrictEqual({
+      kind: "value",
+      value: "socks5h://127.0.0.1:7890",
+    });
+    // SearXNG 端点只发 http(s) 请求：socks 代理的串在这里同样是非法值。
+    expect(parseInput(fieldOf("searxngEndpoint"), "socks5://127.0.0.1:7890")).toStrictEqual({
+      kind: "invalid",
+    });
+    expect(parseInput(fieldOf("searxngEndpoint"), "http://searx.local")).toStrictEqual({
+      kind: "value",
+      value: "http://searx.local",
+    });
+  });
+
   it("清空即清除这一项", () => {
     expect(parseInput(fieldOf("proxyUrl"), "   ")).toStrictEqual({ kind: "clear" });
+  });
+
+  it("保存成功后的草稿：只摘掉发出去的字段，剩余草稿清掉已失效的围栏", () => {
+    const leftover = draftAfterWrite(
+      {
+        values: { proxyUrl: PROXY_HTTP_URL, headless: false },
+        baseRevision: 7,
+        invalid: [],
+        invalidText: {},
+      },
+      [{ op: "set", path: ["proxyUrl"], value: PROXY_HTTP_URL }],
+    );
+    // 还剩 headless：它没进这一笔，仍要保留；围栏已过期，下一笔按宿主当时那版重新取。
+    expect(leftover.values).toStrictEqual({ headless: false });
+    expect(leftover.baseRevision).toBeUndefined();
+    // 全部发出去 ⇒ 回到干净起点（非法原文与围栏都不该跟着留）。
+    const cleared = draftAfterWrite(
+      {
+        values: { proxyUrl: PROXY_HTTP_URL },
+        baseRevision: 9,
+        invalid: ["headless"],
+        invalidText: { headless: "yes" },
+      },
+      [{ op: "unset", path: ["proxyUrl"] }],
+    );
+    expect(cleared).toStrictEqual({
+      values: {},
+      baseRevision: undefined,
+      invalid: [],
+      invalidText: {},
+    });
   });
 
   it("正整数照原样收下", () => {

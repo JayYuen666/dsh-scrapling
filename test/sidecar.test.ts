@@ -570,19 +570,6 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
-  it("对端回不可解析的帧不影响后续请求", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
-      fakeCtx({ reply: (id) => (id === "h1" ? null : okReply(id)) }, spawned) as never,
-      options(),
-    );
-    await client.ensureStarted();
-    const logs: string[] = [];
-    await expect(client.call("ping", {}, { timeoutMs: 300 })).rejects.toThrow(/timed out/u);
-    expect(logs).toStrictEqual([]);
-    await client.dispose();
-  });
-
   it("对端送来不可解析的帧时跳过它，后续请求照常", async () => {
     const spawned: { count: number; last?: FakeHandle } = { count: 0 };
     const client = new SidecarClient(
@@ -667,9 +654,15 @@ describe("sidecar client 与假 runtime", () => {
       },
     });
     await client.ensureStarted();
+    // 必须真往 stderr 推一行：原来这条只断言 lines.length > 0，而那一句是 dispose 的
+    // teardown 日志撑起来的 —— 把整段转发删掉也照样绿。握手帧并不走日志（#log 只出现在
+    // 坏帧、未知 id、回调抛错、teardown 与 stderr 这几处）。
+    const before = lines.length;
+    spawned.last?.stderr.push("bridge: 一行诊断\n\n");
+    await delay(0);
+    // 按行拆，空白行丢掉：尾部那个空行不该变成第二条。
+    expect(lines.slice(before)).toStrictEqual(["[sidecar] bridge: 一行诊断"]);
     await client.dispose();
-    // ready 帧也会走日志，所以至少要有一条。
-    expect(lines.length).toBeGreaterThan(0);
   });
 
   it("对端把 error 写成非对象时也报得出可读信息", async () => {
@@ -726,6 +719,54 @@ describe("sidecar client 与假 runtime", () => {
     await delay(20);
     controller.abort();
     await expect(pending).rejects.toThrow(/aborted/u);
+    await client.dispose();
+  });
+
+  it("不设超时（timeoutMs: null）的请求被取消时，结算不依赖定时器", async () => {
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      fakeCtx(
+        {
+          reply: (id: string, method: string) =>
+            method === "slow" ? null : { id, ok: true, result: { pong: true } },
+        },
+        spawned,
+      ) as never,
+      options({ requestTimeoutMs: 5000 }),
+    );
+    await client.ensureStarted();
+    const controller = new AbortController();
+    // 爬虫这类量级不定的任务会传 null（不设超时）；取消路径必须照样把这条请求结清。
+    const pending = client.call("slow", {}, { signal: controller.signal, timeoutMs: null });
+    await delay(20);
+    controller.abort();
+    await expect(pending).rejects.toThrow(/aborted/u);
+    await client.dispose();
+  });
+
+  it("首个调用方在启动途中取消：不拆共享进程，后来的调用照常", async () => {
+    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const client = new SidecarClient(
+      // 把 spawn 前的解析拖慢，让取消落在「启动途中」而不是进入时已中止。
+      fakeCtx(
+        {
+          spawnDelayMs: 30,
+          reply: (id: string) => ({ id, ok: true, result: { pong: true } }),
+        },
+        spawned,
+      ) as never,
+      options({ requestTimeoutMs: 5000 }),
+    );
+    const controller = new AbortController();
+    const first = client.call("ping", {}, { signal: controller.signal });
+    const second = client.call("ping");
+    await delay(5);
+    controller.abort();
+    await expect(first).rejects.toThrow(/aborted/u);
+    // 共享进程不能跟着首个调用方的取消一起死：否则并发抓取会被一个人的取消全带走。
+    await expect(second).resolves.toStrictEqual({ pong: true });
+    expect(spawned.count).toBe(1);
+    expect(client.alive).toBe(true);
     await client.dispose();
   });
 
@@ -851,7 +892,9 @@ describe("sidecar client 与假 runtime", () => {
     const spawned: { count: number; last?: FakeHandle } = { count: 0 };
     const client = new SidecarClient(
       fakeCtx({}, spawned) as never,
-      options({ requestTimeoutMs: 5000 }),
+      // 这里测的是 stderr 管道错误被接住，不是超时预算本身；100ms 足够让失败快速落地，
+      // 5000 会让用例实际等满 5s 的 SIDECAR_TIMEOUT。
+      options({ requestTimeoutMs: 100 }),
     );
     await client.ensureStarted();
     spawned.last?.stderr.emit("error", new Error("stderr pipe broke"));

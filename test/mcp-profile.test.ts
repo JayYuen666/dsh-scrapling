@@ -18,9 +18,33 @@ import type { ProfileMode } from "../lib/mcp-profile.ts";
 const DATA_DIR = "/tmp/dsh-scrapling-data";
 const CLIENT = "@deepseek-ai/dsh-mcp-client";
 const PINNED = "0.2.1-rc.3";
+
+describe("官方 MCP 入口：跟 venv 布局同源", () => {
+  it("入口按平台选目录：POSIX 在 bin/scrapling-mcp，Windows 在 Scripts/scrapling-mcp.exe", () => {
+    const venv = path.join(DATA_DIR, "runtime", "venv");
+    const expected =
+      process.platform === "win32"
+        ? path.join(venv, "Scripts", "scrapling-mcp.exe")
+        : path.join(venv, "bin", "scrapling-mcp");
+    expect(officialMcpBinary(DATA_DIR)).toBe(expected);
+  });
+
+  it("win32 分支即使不在 Windows 上跑也要钉住（CI 的 darwin/linux 格覆盖不到它）", () => {
+    const original = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      expect(officialMcpBinary(DATA_DIR)).toBe(
+        path.join(DATA_DIR, "runtime", "venv", "Scripts", "scrapling-mcp.exe"),
+      );
+    } finally {
+      Object.defineProperty(process, "platform", { value: original, configurable: true });
+    }
+  });
+});
 const OFFICIAL = "official-mcp";
 
 const SERVER_LINE = "serverName: scrapling";
+const ENTRY_ID_LINE = "- id: scrapling-mcp";
 const TRANSPORT_HTTP_LINE = "transport: streamable-http";
 const URL_LINE = "url: http://127.0.0.1:39217/mcp";
 
@@ -36,7 +60,7 @@ function pad(width: number): string {
 
 function entryAt(nameIndent: number, keyIndent: number, wrapped: boolean): string {
   return [
-    ...(wrapped ? ["- insert:", `    - id: scrapling-mcp`] : ["- id: scrapling-mcp"]),
+    ...(wrapped ? ["- insert:", `    ${ENTRY_ID_LINE}`] : [ENTRY_ID_LINE]),
     `${pad(nameIndent)}name: '${CLIENT}'`,
     `${pad(nameIndent)}config:`,
     `${pad(keyIndent)}${SERVER_LINE}`,
@@ -49,6 +73,9 @@ function entryAt(nameIndent: number, keyIndent: number, wrapped: boolean): strin
 /** 一条 streamable-http 条目：本插件自己的 MCP server（patch 写法）。 */
 const PLUGIN_ENTRY = entryAt(6, 8, true);
 
+/** stdio 条目的 transport 行（8 格缩进）：测试里要给它加行尾注释，抽成常量免得同一字面量写三遍。 */
+const TRANSPORT_STDIO = "        transport: stdio";
+
 /** 一条 stdio 条目：官方 scrapling-mcp。 */
 function officialEntry(): string {
   return [
@@ -57,7 +84,7 @@ function officialEntry(): string {
     `      name: '${CLIENT}'`,
     "      config:",
     `        ${SERVER_LINE}`,
-    "        transport: stdio",
+    TRANSPORT_STDIO,
     `        command: ${officialMcpBinary(DATA_DIR)}`,
     "        args: []",
     "",
@@ -108,6 +135,69 @@ describe("inspectProfile", () => {
 
   it("official-mcp 模式只有本插件条目那一类", () => {
     expect(codes(PLUGIN_ENTRY, PINNED, OFFICIAL)).toContain("MCP_MODE_ENTRY_MISMATCH");
+  });
+
+  it("引号形式的标量同样识别（serverName / transport / url 带引号不改变语义）", () => {
+    const quoted = [
+      "- insert:",
+      `    ${ENTRY_ID_LINE}`,
+      `      name: '${CLIENT}'`,
+      "      config:",
+      '        serverName: "scrapling"',
+      '        transport: "streamable-http"',
+      '        url: "http://127.0.0.1:39217/mcp"',
+      "",
+    ].join("\n");
+    expect(codes(quoted, PINNED)).toStrictEqual([]);
+  });
+
+  it("ipv6 与省略端口的 URL 都按真实端口判，不取第一个冒号后的数字", () => {
+    const ipv6 = PLUGIN_ENTRY.replace(URL_LINE, "url: http://[::1]:45991/mcp");
+    const ipv6Same = inspectProfile({
+      mode: "mcp",
+      patchText: ipv6,
+      clientVersion: PINNED,
+      officialMcpEnabled: false,
+      expectedPort: 45_991,
+    });
+    expect(ipv6Same.map((finding) => finding.code)).toStrictEqual([]);
+    const defaultPort = inspectProfile({
+      mode: "mcp",
+      patchText: PLUGIN_ENTRY.replace(URL_LINE, "url: http://127.0.0.1/mcp"),
+      clientVersion: PINNED,
+      officialMcpEnabled: false,
+      expectedPort: 80,
+    });
+    expect(defaultPort.map((finding) => finding.code)).toStrictEqual([]);
+    const httpsDefault = inspectProfile({
+      mode: "mcp",
+      patchText: PLUGIN_ENTRY.replace(URL_LINE, "url: https://127.0.0.1/mcp"),
+      clientVersion: PINNED,
+      officialMcpEnabled: false,
+      expectedPort: 443,
+    });
+    expect(httpsDefault.map((finding) => finding.code)).toStrictEqual([]);
+    // 不是完整 URL 的手写值退回冒号匹配：`host:443/mcp` 仍读成 443。
+    const legacy = inspectProfile({
+      mode: "mcp",
+      patchText: PLUGIN_ENTRY.replace(URL_LINE, "url: 127.0.0.1:443/mcp"),
+      clientVersion: PINNED,
+      officialMcpEnabled: false,
+      expectedPort: 443,
+    });
+    expect(legacy.map((finding) => finding.code)).toStrictEqual([]);
+  });
+
+  it("配置值只有注释时按未配置处理；非 http(s) URL 不猜默认端口", () => {
+    const commented = PLUGIN_ENTRY.replace(TRANSPORT_HTTP_LINE, "transport: # 只有注释");
+    expect(codes(commented, PINNED)).toStrictEqual([]);
+    const ftp = inspectProfile({
+      mode: "mcp",
+      patchText: PLUGIN_ENTRY.replace(URL_LINE, "url: ftp://127.0.0.1/mcp"),
+      clientVersion: PINNED,
+      officialMcpEnabled: false,
+    });
+    expect(ftp.map((finding) => finding.code)).toStrictEqual([]);
   });
 
   it("两条 streamable 条目端口不一致时点名", () => {
@@ -161,12 +251,31 @@ describe("inspectProfile", () => {
     expect(codes(entryAt(0, 2, false), PINNED)).toStrictEqual([]);
   });
 
+  // 合法 YAML 的标量写法不止一种：双引号、裸标量、行尾注释、行尾空格、列表项短横。
+  // 只认「单引号 + 干净行尾」那一种，doctor 会把真存在的条目读成没有 —— 假红与漏报残留。
+  const NAME_LINE_SINGLE = "      name: '@deepseek-ai/dsh-mcp-client'";
+
+  it.each([
+    ["双引号", NAME_LINE_SINGLE.replaceAll("'", String.fromCodePoint(34))],
+    ["裸标量", "      name: @deepseek-ai/dsh-mcp-client"],
+    ["行尾注释", `${NAME_LINE_SINGLE} # ours`],
+    ["行尾空格", `${NAME_LINE_SINGLE}   `],
+    ["列表项短横", `      - name: '@deepseek-ai/dsh-mcp-client'`],
+  ])("条目名写成%s时照样认得出来", (_label, nameLine) => {
+    expect(codes(PLUGIN_ENTRY.replace(NAME_LINE_SINGLE, nameLine), PINNED)).toStrictEqual([]);
+  });
+
+  it("config 值的行尾注释不算值的一部分：stdio 条目带注释仍是官方条目", () => {
+    const commented = officialEntry().replace(TRANSPORT_STDIO, `${TRANSPORT_STDIO} # official`);
+    expect(codes(commented, PINNED, OFFICIAL)).toStrictEqual([]);
+  });
+
   it("比 name 更浅的键不属于这一条目", () => {
     // 层级判据要真的在判：transport 写在比 name 更浅的一格，就不该被算进这条条目，
     // 否则 doctor 会把「不属于它的键」当成条目的事实，一条假绿就出来了。
     const shallow = [
       "- insert:",
-      "    - id: scrapling-mcp",
+      `    ${ENTRY_ID_LINE}`,
       "      name: '@deepseek-ai/dsh-mcp-client'",
       "    transport: stdio",
       "      config:",

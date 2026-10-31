@@ -8,9 +8,9 @@
 // 进程组（`kill(-pid)` 能打到后代）、宿主退出时的自动回收、环境变量脱敏。
 //
 // **一条必须自己接的线**：`dsh-tool-call-timeout-policy` 是**协作式**的，超时只通过
-// `exec.signal` 通知，不会杀子进程。所以本客户端把每次调用的 signal 一路传到 spawn，
-// 并在超时或 abort 时主动 `terminate()` + `waitForExit()` —— 否则一次超时的抓取会把
-// 浏览器进程挂在后台，直到宿主退出。
+// `exec.signal` 通知，不会杀子进程。调用级的取消只作废那一个请求（见 call() 的 abort 分支）；
+// 进程本身的收口交给握手超时与协议失败，这两条会主动 `terminate()` + `waitForExit()` ——
+// 否则一次启动失败会把 Python 进程漏在后台，直到宿主退出。
 //
 // **返回值一律是 `unknown`**：sidecar 的载荷是跨语言的 JSON，宿主不该凭信任就断言形状。
 // 工具层必须自己校验；多这一次校验换来的是「Python 侧改坏协议不会静默污染模型上下文」。
@@ -118,7 +118,7 @@ export interface SidecarOptions {
 
 /** 单次调用的可选参数。 */
 export interface CallOptions {
-  /** 取消信号。abort 会连带拆掉整个进程。 */
+  /** 取消信号。只作废本次调用，不拆共享进程；启动前的取消由 ensureStarted 早退。 */
   readonly signal?: AbortSignal;
   /**
    * 覆盖本次调用的超时；传 null 表示**不设超时**。
@@ -472,7 +472,7 @@ export class SidecarClient {
     });
   }
 
-  async #spawnOnce(signal?: AbortSignal): Promise<SidecarCapabilities> {
+  async #spawnOnce(): Promise<SidecarCapabilities> {
     // 这里不再判 ctx.subprocess 是否存在：插件的 inject 里声明了 subprocess，
     // 没有对应 provider 时 apply 根本不会被调用。真要在单测里跑，就把一个假的
     // runtime 塞进注入的 ctx —— 那本来就是测试该做的事。
@@ -485,7 +485,6 @@ export class SidecarClient {
       graceMs: this.#options.graceMs,
       // PYTHONUNBUFFERED 是冗余的（已传 -u），但多一道不依赖启动参数的保险。
       env: { PYTHONUNBUFFERED: "1", ...this.#options.env },
-      ...(signal === undefined ? {} : { signal }),
     });
     this.#handle = child;
 
@@ -555,6 +554,9 @@ export class SidecarClient {
   /**
    * 确保进程就绪（必要时拉起）。
    *
+   * `signal` 只用于「这次调用在启动前就已取消」的早退，**不传给 spawn**：进程是共享的，
+   * 首个调用方的取消不能拆掉同一进程上所有并行请求；启动失败由 handshakeTimeoutMs 收口。
+   *
    * @param signal - 取消信号
    * @returns 握手后的能力
    */
@@ -562,12 +564,15 @@ export class SidecarClient {
     if (this.#stopped) {
       throw new SidecarError("SIDECAR_UNAVAILABLE", "sidecar client has been disposed");
     }
+    if (signal?.aborted === true) {
+      throw new SidecarError("SIDECAR_ABORTED", "sidecar start was aborted");
+    }
     if (this.#capabilities !== undefined) {
       return this.#capabilities;
     }
     let starting = this.#starting;
     if (starting === undefined) {
-      starting = this.#spawnOnce(signal);
+      starting = this.#spawnOnce();
       this.#starting = starting;
     }
     try {

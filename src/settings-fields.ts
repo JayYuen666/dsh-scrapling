@@ -38,6 +38,11 @@ export interface FieldSpec {
   readonly options?: readonly string[];
   /** 文本字段的值形态；`url` 由 `z.url()` 校验，空串仍是「清除覆盖」。 */
   readonly format?: "url";
+  /** `format: "url"` 的协议白名单，取值按 `URL.protocol` 的写法（含冒号）。
+   *  `z.url()` 只判「解析得成 URL」，`file:`/`data:`/`javascript:` 一样通过；这些值写进
+   *  设置后要到真正建连（curl / Playwright 拿它当代理）才失败，错误点离用户动作很远。
+   *  白名单按下游实际能用的协议列，缺省表示不限。 */
+  readonly schemes?: readonly string[];
   /**
    * 值里可能带凭据，控件默认遮罩显示。
    *
@@ -463,6 +468,9 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         key: "proxyUrl",
         kind: "text",
         format: "url",
+        // 代理交给 curl 与 Playwright：两者都认 http(s)，socks 只认 5 系；file:/data:/javascript:
+        // 这类值写进设置后要到建连才失败，所以在录入时按下游真实能力收口。
+        schemes: ["http:", "https:", "socks5:", "socks5h:"],
         secret: true,
         label: { zh: "代理地址", en: "Proxy URL" },
         hint: {
@@ -589,6 +597,8 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         key: "searxngEndpoint",
         kind: "text",
         format: "url",
+        // 后端按 http(s) 请求 /search?format=json；其它协议的串写得进去也发不出去。
+        schemes: ["http:", "https:"],
         label: { zh: "SearXNG 实例地址", en: "SearXNG instance URL" },
         hint: {
           zh: "SearXNG 后端必填，例如 https://searx.example.com；会拼上 /search?format=json。留空表示这条后端不可用。",

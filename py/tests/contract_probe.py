@@ -252,14 +252,21 @@ def _install_recorders() -> dict[str, Any]:
     :returns: 还原所需的原对象（本脚本一次性运行，不还原也行，但留着便于单点调试）
     """
     import scrapling.fetchers as fetchers
+    from scrapling.fetchers import requests as fetcher_requests
 
+    # 探针只用 127.0.0.1:1 制造检索失败；上游默认 retries=3、retry_delay=1，
+    # 9 个失败请求会白等 18s。这里只验证上游读到的键，不验证重试策略。
+    client = fetcher_requests.__FetcherClientInstance__
     originals = {
         "Fetcher": adapters.Fetcher,
         "StealthyFetcher": adapters.StealthyFetcher,
         "fetchers": fetchers,
         "names": ("FetcherSession", "StealthySession"),
         "sessions": (fetchers.FetcherSession, fetchers.StealthySession),
+        "retry": (client, client._default_retries, client._default_retry_delay),
     }
+    client._default_retries = 1
+    client._default_retry_delay = 0
     adapters.Fetcher = _StaticEngine()  # type: ignore[misc,assignment]
     adapters.StealthyFetcher = _BrowserEngine("browser.render")  # type: ignore[misc,assignment]
     fetchers.FetcherSession = _StaticSession  # type: ignore[misc,assignment]
@@ -277,6 +284,9 @@ def _restore(originals: dict[str, Any]) -> None:
     fetchers = originals["fetchers"]
     for name, obj in zip(originals["names"], originals["sessions"], strict=True):
         setattr(fetchers, name, obj)
+    client, retries, retry_delay = originals["retry"]
+    client._default_retries = retries
+    client._default_retry_delay = retry_delay
 
 
 # 每个调用点该出现在上游哪一份参数面里。
@@ -620,8 +630,12 @@ READ_VARIANTS: dict[str, list[dict[str, Any]]] = {
     ],
     "render": [{"cookies": [{"name": "c", "value": "1"}]}],
     "capture": [{"cookies": [{"name": "c", "value": "1"}]}],
+    # session.fetch 的静态分支现在会认 method：基础入参里的 GET + body 是非法组合，会在读到
+    # params / timeoutSeconds 之前就被 BAD_ARGS 拒掉。对表只该驱动**合法**请求（非法组合本身由
+    # py/tests/test_bridge.py 的「显式 GET 带体」用例单独钉住），所以这里把请求体去掉，
+    # 让静态分支真正走到参数读取点。
     "session.fetch": [
-        {"sessionType": kind, "cookies": [{"name": "c", "value": "1"}]} for kind in ("static", "stealth")
+        {"sessionType": kind, "cookies": [{"name": "c", "value": "1"}], "body": None} for kind in ("static", "stealth")
     ],
     "session.network": [{"sessionType": "stealth"}],
     "session.state_save": [{"sessionType": "stealth"}],

@@ -1,3 +1,22 @@
+/**
+ * 本次调用的数值参数：调用值优先，缺省用部署值；给了 cap 就只压上限。
+ *
+ * 只压上限、不动非法值（0 / 负数原样透下去，由 Python 侧报 BAD_ARGS）：静默夹成合法值
+ * 等于把一次明确的参数错误换成一次静默跑起来的调用。
+ *
+ * @param value - 模型给的调用值
+ * @param fallback - 部署级取值，也是没给时的结果
+ * @param cap - 上限；不传表示本参数不设上限
+ * @returns 要发给 sidecar 的数值
+ */
+export function callNumber(
+  value: unknown,
+  fallback: number,
+  cap = Number.POSITIVE_INFINITY,
+): number {
+  return typeof value === "number" ? Math.min(value, cap) : fallback;
+}
+
 /** `mainContentOnly` 在三处工具参数表里共用同一句说明。 */
 export const MAIN_CONTENT_ONLY_DESC = "只保留 body 内容，默认 true。";
 

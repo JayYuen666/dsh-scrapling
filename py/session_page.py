@@ -107,22 +107,29 @@ def _require_selector(action: dict[str, Any], kind: str) -> str:
     return target
 
 
-def _perform(page: Any, action: dict[str, Any], timeout_ms: int) -> None:
-    """执行一个已校验的动作。"""
+def _perform(page: Any, action: dict[str, Any], timeout_ms: int) -> Any:
+    """执行一个已校验的动作；dialog 注册的处理器会返回，由调用方在批次结束时摘掉。"""
     kind = str(action["type"])
     if kind == "wait_time":
         page.wait_for_timeout(int(action["ms"]))
-        return
+        return None
     if kind == "wait_load":
         page.wait_for_load_state(str(action.get("state", "load")), timeout=timeout_ms)
-        return
+        return None
     if kind == "wheel":
         page.mouse.wheel(float(action["deltaX"]), float(action["deltaY"]))
-        return
+        return None
     if kind == "dialog":
         accept = action.get("accept", True) is not False
-        page.once("dialog", lambda dialog: dialog.accept() if accept else dialog.dismiss())
-        return
+
+        def handler(dialog: Any) -> None:
+            if accept:
+                dialog.accept()
+            else:
+                dialog.dismiss()
+
+        page.once("dialog", handler)
+        return handler
     if kind == "press_key":
         key = str(action.get("key", ""))
         target = action.get("target")
@@ -130,10 +137,10 @@ def _perform(page: Any, action: dict[str, Any], timeout_ms: int) -> None:
             page.locator(target).press(key, timeout=timeout_ms)
         else:
             page.keyboard.press(key)
-        return
+        return None
     if kind == "move" and not isinstance(action.get("target"), str):
         page.mouse.move(float(action["x"]), float(action["y"]))
-        return
+        return None
 
     selector = _require_selector(action, kind)
     locator = page.locator(selector)
@@ -156,6 +163,7 @@ def _perform(page: Any, action: dict[str, Any], timeout_ms: int) -> None:
         locator.wait_for(state=str(action.get("state", "visible")), timeout=timeout_ms)
     else:  # pragma: no cover —— 类型白名单已挡住
         raise _adapter_error("ACTION_INVALID", f"unknown action type: {kind}")
+    return None
 
 
 def _validate_actions(value: Any, max_actions: int) -> list[dict[str, Any]]:
@@ -168,17 +176,21 @@ def _validate_actions(value: Any, max_actions: int) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             raise _adapter_error("ACTION_INVALID", f"action {index} must be an object")
         kind = item.get("type")
-        if kind not in _ACTION_TYPES:
+        # frozenset 的成员判断先哈希：type 写成 list/dict 会抛 TypeError 而不是 ACTION_INVALID，
+        # 宿主看到的就是内部异常。非字符串与未知类型在这里走同一条判据。
+        if not isinstance(kind, str) or kind not in _ACTION_TYPES:
             raise _adapter_error("ACTION_INVALID", f"action {index} has an unknown type: {kind!r}")
         action = dict(item)
         if kind in _SELECTOR_ACTIONS:
             _require_selector(action, str(kind))
-        if (
-            kind == "move"
-            and not isinstance(action.get("target"), str)
-            and (not isinstance(action.get("x"), (int, float)) or not isinstance(action.get("y"), (int, float)))
-        ):
-            raise _adapter_error("ACTION_INVALID", "move needs a target or x/y coordinates")
+        if kind == "move":
+            target = action.get("target")
+            # 空串 target 不算 target：_perform 会把它当「有 target」交给 locator，
+            # 执行期再抛 ACTION_INVALID 又被包装成 ACTION_FAILED，错误码与下标语义都错位。
+            has_target = isinstance(target, str) and bool(target)
+            has_point = isinstance(action.get("x"), (int, float)) and isinstance(action.get("y"), (int, float))
+            if not has_target and not has_point:
+                raise _adapter_error("ACTION_INVALID", "move needs a non-empty target selector or x/y coordinates")
         if kind == "wheel" and (
             not isinstance(action.get("deltaX"), (int, float)) or not isinstance(action.get("deltaY"), (int, float))
         ):
@@ -189,18 +201,30 @@ def _validate_actions(value: Any, max_actions: int) -> list[dict[str, Any]]:
                 raise _adapter_error("ACTION_INVALID", "wait_time needs a non-negative ms")
         if kind == "wait_element":
             state = action.get("state", "visible")
-            if state not in _ELEMENT_STATES:
+            if not isinstance(state, str) or state not in _ELEMENT_STATES:
                 raise _adapter_error("ACTION_INVALID", f"unknown element state: {state!r}")
         if kind == "wait_load":
             state = action.get("state", "load")
-            if state not in _LOAD_STATES:
+            if not isinstance(state, str) or state not in _LOAD_STATES:
                 raise _adapter_error("ACTION_INVALID", f"unknown load state: {state!r}")
-        if kind == "press_key" and not isinstance(action.get("key"), str):
-            raise _adapter_error("ACTION_INVALID", "press_key needs a key")
+        if kind == "press_key":
+            key = action.get("key")
+            # 空字符串 key 能过 isinstance，执行期才由 Playwright 抛错并被包装成 ACTION_FAILED。
+            if not isinstance(key, str) or not key:
+                raise _adapter_error("ACTION_INVALID", "press_key needs a non-empty key")
+        if kind == "checkbox" and not isinstance(action.get("checked", True), bool):
+            raise _adapter_error("ACTION_INVALID", "checkbox checked must be a boolean")
         if kind == "dialog" and not isinstance(action.get("accept", True), bool):
             raise _adapter_error("ACTION_INVALID", "dialog accept must be a boolean")
         actions.append(action)
     return actions
+
+
+def _release_dialog_handler(page: Any, handler: Any) -> None:
+    """摘掉一个 dialog 处理器；页已关闭时不必再碰它（处理器随页一起消失）。"""
+    if page.is_closed():
+        return
+    page.remove_listener("dialog", handler)
 
 
 def run_actions(
@@ -216,25 +240,34 @@ def run_actions(
     page_info = _ready_page(session)
     page = page_info.page
     completed = 0
+    dialog_handlers: list[Any] = []
     try:
         if page.is_closed():
             raise _adapter_error("PAGE_BUSY", "the session's page has been closed")
         for index, action in enumerate(prepared, start=1):
             try:
-                _perform(page, action, timeout_ms)
+                handler = _perform(page, action, timeout_ms)
+                if handler is not None:
+                    dialog_handlers.append(handler)
+                completed = index
+                if slowly:
+                    page.wait_for_timeout(100)
             except Exception as error:
+                # 慢速间隔也在这一层里：页在动作之间被关掉时同样按 ACTION_FAILED 点名下标，
+                # 而不是把裸异常漏给宿主。
                 raise _adapter_error(
                     "ACTION_FAILED",
                     f"action {index} ({action['type']}) failed: {type(error).__name__}: {error}",
                     details={"actionIndex": index},
                 ) from error
-            completed = index
-            if slowly:
-                page.wait_for_timeout(100)
         return {
             "completed": completed,
             "finalUrl": str(page.url),
             "title": str(page.title()),
         }
     finally:
+        # 页面在共享的 page pool 里跨请求复用：批次一结束就摘掉 dialog 处理器，
+        # 否则后续请求弹出的对话框会被这一次动作留下的处理器替用户应答。
+        for handler in dialog_handlers:
+            _release_dialog_handler(page, handler)
         _finish_page(session.page_pool, page_info)

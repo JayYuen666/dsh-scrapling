@@ -39,6 +39,9 @@ const PRIVATE = "private-address";
 /** 命中 scheme 判定时的原因码，出现多次故抽常量。 */
 const SCHEME = "scheme-not-allowed";
 
+/** authority 歧义判定时的原因码，出现多次故抽常量。 */
+const AMBIGUOUS_AUTHORITY = "ambiguous-authority";
+
 /**
  * 取被拒时的原因码；结论是放行就直接让用例炸掉。
  *
@@ -127,6 +130,24 @@ describe("无需 DNS 的检查", () => {
   it("拒绝超长 URL", () => {
     const long = `http://example.com/${"a".repeat(2048)}`;
     expect(reasonOf(defaultPolicy().screen(long))).toBe("too-long");
+  });
+
+  it("authority 里的反斜杠、C0 控制字符与 DEL 三类歧义都拒", () => {
+    // Node 的 WHATWG 解析把 `\` 当路径分隔符、把控制字符直接删掉，libcurl 按 RFC 3986 两者都
+    // 保留 —— 同一个串在两侧落到不同主机上，`@` 前成了 userinfo 而建连的是后面那个内网地址。
+    // host.test.ts 从工具入口钉过反斜杠那一类；这三枚字符本身归策略层判，逐类钉在这里。
+    const observed = (
+      [
+        ["反斜杠", String.raw`http://a.example\@127.0.0.1/x`],
+        ["C0 控制字符", "http://a.example\u0001@127.0.0.1/x"],
+        ["DEL", "http://a.example\u007F@127.0.0.1/x"],
+      ] as const
+    ).map(([label, sneaky]) => [label, reasonOf(defaultPolicy().screen(sneaky))]);
+    expect(observed).toStrictEqual([
+      ["反斜杠", AMBIGUOUS_AUTHORITY],
+      ["C0 控制字符", AMBIGUOUS_AUTHORITY],
+      ["DEL", AMBIGUOUS_AUTHORITY],
+    ]);
   });
 
   it("任何端口都放行（与 dsh 内置同取舍，本插件不提供端口白名单）", () => {
@@ -303,11 +324,13 @@ describe("默认 dns 解析器", () => {
     // 断言「解析不了就拒」等于把用例绑死在运行它的网络形状上——而带通配解析器的网络里没有
     // 「解析不了」这回事。resolve-failed 那条由注入 reject 的 resolve 确定性覆盖。
     const verdict = await policy.verify("http://this-host-does-not-exist.invalid/");
-    // 放行时必须仍指向原主机（没有被悄悄换成别处），被拒时原因必须是解析失败那一类。
-    // 放行时主机名必须原样保留（没有被悄悄换成别处），被拒时原因必须是解析失败那一类。
-    const observed = verdict.ok ? allowedUrl(verdict).hostname : verdict.reason;
-    const expected = verdict.ok ? "this-host-does-not-exist.invalid" : "resolve-failed";
-    expect(observed).toBe(expected);
+    // 放行时主机名必须原样保留（没有被悄悄换成别处）；被拒时不断言 reason——通配解析器
+    // 网络里同一个域名会落到 private-address，而不是 resolve-failed。resolve-failed 那条
+    // 由注入 reject 的 resolve 确定性覆盖（见上一节）。
+    const hostWhenAllowed = verdict.ok
+      ? allowedUrl(verdict).hostname
+      : "this-host-does-not-exist.invalid";
+    expect(hostWhenAllowed).toBe("this-host-does-not-exist.invalid");
   });
 });
 
@@ -498,6 +521,41 @@ describe("自动识别合成解析器", () => {
     expect(reasonOf(await policy.verify(TARGET_URL))).toBe(PRIVATE);
   });
 
+  it("全公网答案不触发控制域名探测", async () => {
+    // 探测要额外解析三个控制域名，控制域名不可达时会把首个请求拖到 DNS 超时；答案全公网
+    // 时不需要这份放宽。
+    const called: string[] = [];
+    const policy = createUrlPolicy({
+      maxUrlLength: 2048,
+      resolve: async (hostname) => {
+        called.push(hostname);
+        if (hostname === TARGET_HOST) {
+          return [PUBLIC_V4];
+        }
+        throw new Error(`ENOTFOUND ${hostname}`);
+      },
+    });
+    expect(allowedUrl(await policy.verify(TARGET_URL)).hostname).toBe(TARGET_HOST);
+    expect(called).toStrictEqual([TARGET_HOST]);
+  });
+
+  it("手动合成段已覆盖时同样不触发自动探测", async () => {
+    const called: string[] = [];
+    const policy = createUrlPolicy({
+      maxUrlLength: 2048,
+      syntheticRanges: ["198.18.0.0/15"],
+      resolve: async (hostname) => {
+        called.push(hostname);
+        if (hostname === TARGET_HOST) {
+          return [FAKE_IP];
+        }
+        throw new Error(`ENOTFOUND ${hostname}`);
+      },
+    });
+    expect(allowedUrl(await policy.verify(TARGET_URL)).hostname).toBe(TARGET_HOST);
+    expect(called).toStrictEqual([TARGET_HOST]);
+  });
+
   it("控制域名解析不了时不误判", async () => {
     const policy = createUrlPolicy({
       maxUrlLength: 2048,
@@ -510,6 +568,36 @@ describe("自动识别合成解析器", () => {
     });
     const verdict = await policy.verify(TARGET_URL);
     expect(reasonOf(verdict)).toBe(PRIVATE);
+  });
+
+  it("只有一个控制域名回多答案、其余无答案时不误判", async () => {
+    // 只校验答案总数时，一枚域名回三条、另外两枚空着也能凑够 3——同源答案不构成
+    // 「所有主机名都被指到同一个池」的指纹。
+    const policy = createUrlPolicy({
+      maxUrlLength: 2048,
+      resolve: async (hostname) => {
+        if (hostname === "example.com") {
+          return ["198.18.0.1", "198.18.0.2", "198.18.0.3"];
+        }
+        if (hostname === TARGET_HOST) {
+          return ["198.18.0.9"];
+        }
+        return [];
+      },
+    });
+    expect(reasonOf(await policy.verify(TARGET_URL))).toBe(PRIVATE);
+  });
+
+  it("控制答案分散在两个池时不判为合成解析器", async () => {
+    // 100.64.0.0/10 同时是 Tailscale 等真实内网常用的 CGNAT 段。分散在两个池时若把两段
+    // 都放宽，一条指向真实 100.64.x.x 的域名就会借 198.18 的检测结果通过闸门。
+    const policy = detectingPolicy({
+      "example.com": ["198.18.0.1"],
+      "www.iana.org": [CGNAT],
+      "www.wikipedia.org": [FAKE_IP],
+      [TARGET_HOST]: ["100.64.0.9"],
+    });
+    expect(reasonOf(await policy.verify(TARGET_URL))).toBe(PRIVATE);
   });
 
   // ↓ 下面三条是**回归用例**：早期实现按「覆盖控制答案的最小 2 的幂对齐块」切池，
@@ -647,5 +735,19 @@ describe("redactUrlSecrets：展示层脱敏", () => {
 
   it("scheme 大小写不影响识别", () => {
     expect(redactUrlSecrets("HTTPS://u:p@example.com/")).toBe("HTTPS://***@example.com/");
+  });
+
+  it("协议相对形态 //user:pass@host 也要抹（原实现要求 scheme://，会原样放过）", () => {
+    expect(redactUrlSecrets("//user:pw@example.com/a")).toBe("//***@example.com/a");
+  });
+
+  it("前导空白不挡住识别，且空白原样保留", () => {
+    expect(redactUrlSecrets("  https://user:pw@example.com/")).toBe("  https://***@example.com/");
+    expect(redactUrlSecrets("  //user:pw@example.com/")).toBe("  //***@example.com/");
+    expect(redactUrlSecrets("  user:pw@example.com/")).toBe("  ***@example.com/");
+  });
+
+  it("协议相对但 @ 前有路径分隔的是普通路径，不动", () => {
+    expect(redactUrlSecrets("//example.com/users/@me")).toBe("//example.com/users/@me");
   });
 });

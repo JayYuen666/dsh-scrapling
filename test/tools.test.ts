@@ -12,6 +12,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ToolArgsError } from "@deepseek-ai/dsh-tools";
 import { pageToText, rowToText } from "../lib/crawl-output.ts";
+import { anySignal, drainCrawl } from "../lib/crawl-support.ts";
 import { capText } from "../lib/output.ts";
 import { CRAWL_MODE_PARAMS } from "../lib/tool-params.ts";
 import {
@@ -43,6 +44,11 @@ import { SidecarClient } from "../lib/sidecar.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
 import { LOCAL_PYTHON } from "./python-bin.ts";
 
+const PAGE_PROGRESS = "1 page(s) crawled";
+const CRAWL_STOP = "crawl.stop";
+const listenerCountOf = (signal: AbortSignal): number =>
+  (signal as unknown as { listeners?: () => unknown[] }).listeners?.().length ?? 0;
+
 const REPO = path.resolve(import.meta.dirname, "..");
 const BRIDGE = path.join(REPO, "py", "bridge.py");
 
@@ -51,6 +57,9 @@ const SAMPLE_API = "https://api.test/items";
 
 /** 测试里反复用到的示例 URL。 */
 const SAMPLE_URL = "http://example.test/";
+
+/** 回环上没人监听的端口：真 sidecar 那条用例拿它验「闸门在读到字节之前就拒掉」。 */
+const LOOPBACK_UNREACHABLE = "http://127.0.0.1:1/never";
 
 /** 只做相对链接解析用的基址（同一字面量在多处出现，按 lint 要求收成常量）。 */
 const LINKS_URL = "https://a.test/";
@@ -1875,21 +1884,23 @@ describe("scrapling_fetch 与真实 sidecar", () => {
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
     });
-    const selected = (await extractTool.execute({ html, selector: "li" }, exec)) as {
-      count: number;
-      matches: { text: string }[];
-    };
-    expect(selected.count).toBe(2);
-    expect(selected.matches.map((item) => item.text)).toStrictEqual(["alpha", "beta"]);
+    try {
+      const selected = (await extractTool.execute({ html, selector: "li" }, exec)) as {
+        count: number;
+        matches: { text: string }[];
+      };
+      expect(selected.count).toBe(2);
+      expect(selected.matches.map((item) => item.text)).toStrictEqual(["alpha", "beta"]);
 
-    // fetch 走的是网络，这里只验证参数能被 sidecar 接受并给出可读错误（本地无服务）。
-    const fetched = await fetchTool
-      .execute({ url: "http://127.0.0.1:1/never" }, exec)
-      .then(() => "ok")
-      .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
-    expect(fetched).toBeTypeOf("string");
-    void fetchTool;
-    await client.dispose();
+      // fetch 走的是网络，这里钉的是「闸门在 Python 侧真生效」：回环地址要在读到任何字节之前
+      // 被点名拒掉。原先写成 toBeTypeOf("string") —— 成功与失败两分支都是 string，把整道闸门
+      // 删掉也照样绿。dispose 挪进 finally：断言一抛就跳过它，实测会留下一个活着的 bridge.py。
+      await expect(fetchTool.execute({ url: LOOPBACK_UNREACHABLE }, exec)).rejects.toMatchObject({
+        code: "URL_BLOCKED",
+      });
+    } finally {
+      await client.dispose();
+    }
   });
 });
 
@@ -3883,6 +3894,54 @@ describe("浏览器会话读/动作/媒体工具", () => {
     const blocks = tool.output.render({}, result as never) as { type: string }[];
     expect(blocks[0]?.type).toBe("image");
   });
+
+  it("session_act 与 screenshot 的单次超时夹在本次调用的截止之内", async () => {
+    // pageTimeoutMs 故意与 timeoutMs 不同：夹错了来源（比如照抄 render 那一支）这条就红了。
+    const settings: ToolSettings = { ...SETTINGS, timeoutMs: 4000, pageTimeoutMs: 9000 };
+    const actFake = fakeSidecar({ completed: 1, finalUrl: SAMPLE_URL, title: "T" });
+    const act = createSessionActTool({
+      sidecar: actFake.client,
+      settings,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const shotFake = fakeSidecar({
+      url: SAMPLE_URL,
+      mediaType: "image/png",
+      base64: "aGk=",
+      width: 2,
+      height: 3,
+    });
+    const shot = createScreenshotTool({
+      sidecar: shotFake.client,
+      settings,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+      attachments: { saveImage: async () => ({ attachmentId: "a" }) },
+    });
+    // 外层帧按 settings.timeoutMs 到期，而超时按设计拆进程：模型给得比它大时，
+    // 一次点击或截图超时会换成全部浏览器会话陪葬，所以只许往下调。
+    await act.execute({ sessionId: "s1", actions: [] }, exec);
+    expect(actFake.calls[0]?.params).toMatchObject({ timeoutMs: 4000 });
+    await act.execute({ sessionId: "s1", actions: [], timeoutMs: 1234 }, exec);
+    expect(actFake.calls[1]?.params).toMatchObject({ timeoutMs: 1234 });
+    await act.execute({ sessionId: "s1", actions: [], timeoutMs: 60_000 }, exec);
+    expect(actFake.calls[2]?.params).toMatchObject({ timeoutMs: 4000 });
+    // 0 与负数不在这一层改写：由 Python 的 _positive_int 报 BAD_ARGS。
+    await act.execute({ sessionId: "s1", actions: [], timeoutMs: 0 }, exec);
+    expect(actFake.calls[3]?.params).toMatchObject({ timeoutMs: 0 });
+    await act.execute({ sessionId: "s1", actions: [], timeoutMs: -5 }, exec);
+    expect(actFake.calls[4]?.params).toMatchObject({ timeoutMs: -5 });
+
+    await shot.execute({ sessionId: "s1" }, exec);
+    expect(shotFake.calls[0]?.params).toMatchObject({ timeoutMs: 4000 });
+    await shot.execute({ sessionId: "s1", timeoutMs: 1234 }, exec);
+    expect(shotFake.calls[1]?.params).toMatchObject({ timeoutMs: 1234 });
+    await shot.execute({ sessionId: "s1", timeoutMs: 60_000 }, exec);
+    expect(shotFake.calls[2]?.params).toMatchObject({ timeoutMs: 4000 });
+    await shot.execute({ sessionId: "s1", timeoutMs: -5 }, exec);
+    expect(shotFake.calls[3]?.params).toMatchObject({ timeoutMs: -5 });
+  });
 });
 
 describe("scrapling_crawl", () => {
@@ -4257,7 +4316,7 @@ describe("scrapling_crawl", () => {
       signal: new AbortController().signal,
     } as never);
     expect(statusCalls).toBe(2);
-    expect(progress.at(-1)).toBe("1 page(s) crawled");
+    expect(progress.at(-1)).toBe(PAGE_PROGRESS);
   });
 });
 
@@ -4480,7 +4539,7 @@ describe("爬虫报错的传播", () => {
     } as never);
     const text = notes.join("\n");
     expect(text).toContain("runtime budget");
-    expect(text).toContain("1 page(s) crawled");
+    expect(text).toContain(PAGE_PROGRESS);
   });
 
   it("收尾拍透传 sidecar 的 notice：shopify/sitemap 的人读原因不再被吞掉（J9）", async () => {
@@ -4596,7 +4655,7 @@ describe("爬虫报错的传播", () => {
     await tool.execute({ url: SAMPLE_URL, maxPages: 1 }, {
       signal: new AbortController().signal,
     } as never);
-    expect(methods).toStrictEqual(["crawl.run", "crawl.status", "crawl.stop"]);
+    expect(methods).toStrictEqual(["crawl.run", "crawl.status", CRAWL_STOP]);
     expect(String(caught)).toContain("aborted");
   });
 
@@ -4609,7 +4668,7 @@ describe("爬虫报错的传播", () => {
         if (method === "crawl.run") {
           return { crawlId: "c1" };
         }
-        if (method === "crawl.stop") {
+        if (method === CRAWL_STOP) {
           throw new Error("sidecar is gone");
         }
         throw new Error("status poll failed");
@@ -4866,5 +4925,101 @@ describe("sidecar 失败的归一（J5：模型可见文案带码、且不重复
         (error_: unknown) => error_ as Error,
       );
     expect(error.message).toBe("BAD_ARGS: too many pages");
+  });
+});
+
+describe("anySignal / drainCrawl 的边界", () => {
+  it("空信号列表按已中止处理（与旧行为一致）", () => {
+    expect(anySignal([]).aborted).toBe(true);
+  });
+
+  it("任一中止即整体中止，且不向长命源信号累积监听", () => {
+    const turn = new AbortController();
+    const job = new AbortController();
+    const before = listenerCountOf(turn.signal);
+    const merged = anySignal([turn.signal, job.signal]);
+    expect(merged.aborted).toBe(false);
+    // AbortSignal.any 以弱引用登记源信号，不往源信号上挂普通监听。
+    expect(listenerCountOf(turn.signal)).toBe(before);
+    job.abort();
+    expect(merged.aborted).toBe(true);
+  });
+
+  it("对端回 more:true 却没有任何新条目 ⇒ 报协议错误而不是忙循环", async () => {
+    const calls: string[] = [];
+    const sidecar = {
+      call: async (method: string): Promise<unknown> => {
+        calls.push(method);
+        return { more: true, running: true, error: null, pages: [], rows: [] };
+      },
+    };
+    const sink = {
+      append: (): void => undefined,
+      progress: (): void => undefined,
+      signal: new AbortController().signal,
+    };
+    await expect(drainCrawl(sidecar as never, "c1", sink, sink.signal, 0)).rejects.toThrow(
+      /more=true without new pages or rows/u,
+    );
+    // 失败路径必须顺手叫停 Python 侧那个蜘蛛，否则它会继续跑。
+    expect(calls).toContain(CRAWL_STOP);
+  });
+
+  it("pages/rows 非数组或含非对象项 ⇒ 过滤后按可消费条目计数", async () => {
+    const appended: string[] = [];
+    const progress: string[] = [];
+    const sidecar = {
+      call: async (): Promise<unknown> => ({
+        more: false,
+        running: false,
+        error: null,
+        pages: "nope",
+        rows: [1, { title: "A" }],
+      }),
+    };
+    const sink = {
+      append: (text: string): void => {
+        appended.push(text);
+      },
+      progress: (line: string): void => {
+        progress.push(line);
+      },
+      signal: new AbortController().signal,
+    };
+    await expect(drainCrawl(sidecar as never, "c1", sink, sink.signal, 0)).resolves.toBe(1);
+    expect(appended).toStrictEqual(['- {"title":"A"}\n']);
+    expect(progress.at(-1)).toBe(PAGE_PROGRESS);
+  });
+
+  it("回包不是对象 ⇒ 按空状态收尾，不抛 TypeError", async () => {
+    const progress: string[] = [];
+    const sidecar = { call: async (): Promise<unknown> => null };
+    const sink = {
+      append: (): void => undefined,
+      progress: (line: string): void => {
+        progress.push(line);
+      },
+      signal: new AbortController().signal,
+    };
+    await expect(drainCrawl(sidecar as never, "c1", sink, sink.signal, 0)).resolves.toBe(0);
+    expect(progress.at(-1)).toBe("0 page(s) crawled");
+  });
+
+  it("rows 非数组时同样按空处理", async () => {
+    const sidecar = {
+      call: async (): Promise<unknown> => ({
+        more: false,
+        running: false,
+        error: null,
+        pages: [{ url: "u", title: "t", markdown: "m" }],
+        rows: {},
+      }),
+    };
+    const sink = {
+      append: (): void => undefined,
+      progress: (): void => undefined,
+      signal: new AbortController().signal,
+    };
+    await expect(drainCrawl(sidecar as never, "c1", sink, sink.signal, 0)).resolves.toBe(1);
   });
 });

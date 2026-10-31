@@ -11,6 +11,14 @@ print("== [1] Scrapling Fetcher (curl_cffi, TLS impersonation) ==")
 t = time.time()
 try:
     from scrapling.fetchers import Fetcher
+except Exception as e:
+    # Both legs need this import; reporting it once and stopping beats printing a
+    # second FAILED that is really the same missing package.
+    print(f"   scrapling 不可用：{type(e).__name__}: {e}")
+    print(f"   [2] 也跑不了，跳过")
+    raise SystemExit(1)
+
+try:
     r = Fetcher.get(URL, timeout=30, stealthy_headers=True, impersonate="chrome")
     print(f"   status={r.status} reason={r.reason} elapsed={time.time()-t:.2f}s")
     print(f"   body bytes={len(r.body)} | .text len={len(r.get_all_text(strip=True))}")
@@ -30,10 +38,7 @@ except Exception as e:
 print("\n== [2] dsh-equivalent: raw HTML -> text (NO JS execution) ==")
 try:
     from lxml import html as LH
-    raw = r2.html_content if False else None
-except Exception:
-    pass
-try:
+
     r2 = Fetcher.get(URL, timeout=30, stealthy_headers=True, impersonate="chrome")
     raw = r2.html_content
     doc = LH.fromstring(raw)

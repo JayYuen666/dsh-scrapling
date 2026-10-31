@@ -1,6 +1,6 @@
 // 解释器解析与托管 runtime 清单。Host 与 CLI 共用这一份，避免两处各答一套。
 
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 
@@ -27,13 +27,22 @@ export interface RuntimeManifest {
   unsupported: Record<string, string>;
 }
 
+/** sha256 的清单形态：installer 用 `createHash("sha256").digest("hex")`（64 位小写）逐字节比对，
+ *  大写、缺位或空串在比对时必然失败。这里先按同一形态收口，让清单写错在加载期就暴露，
+ *  而不是等下载完 25 MB 资产后落到一句「hash 不匹配」。 */
+const SHA256_HEX = /^[0-9a-f]{64}$/u;
+
+/** pythonVersion 会被当作目录名拼进托管落点（`managedPythonPath`，installer 复用同一落点），
+ *  故只收形如 `3.14.9` 的三段数字：`../x` 或带分隔符的值会让 `path.join` 落到 dataDir 之外。 */
+const PYTHON_VERSION = /^\d+\.\d+\.\d+$/u;
+
 const RUNTIME_ASSET_SCHEMA = z.object({
   platform: z.string(),
   arch: z.string(),
-  pythonVersion: z.string(),
+  pythonVersion: z.string().regex(PYTHON_VERSION, "pythonVersion 必须是三段数字的版本号"),
   release: z.string(),
   url: z.url(),
-  sha256: z.string(),
+  sha256: z.string().regex(SHA256_HEX, "sha256 必须是 64 位小写十六进制"),
   sizeBytes: z.int().positive(),
 });
 
@@ -50,9 +59,16 @@ const packageRoot = existsSync(path.join(import.meta.dirname, "runtime-manifest.
   ? import.meta.dirname
   : path.resolve(import.meta.dirname, "..");
 
-/** 解析并校验清单文本；坏清单在加载期就要炸，不能等到安装时才落一个半截 runtime。 */
+/** 解析并校验清单文本；坏清单在加载期就要炸，不能等到安装时才落一个半截 runtime。
+ *  语法错与形态错给同一句前缀：`JSON.parse` 原样抛出的 SyntaxError 只说明「哪一行多了个逗号」，
+ *  调用方（含 CLI 产物）读不出错的是哪份文件，故障现场对不上。 */
 export function parseRuntimeManifest(text: string): RuntimeManifest {
-  const parsed: unknown = JSON.parse(text);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`runtime-manifest.json is invalid: ${String(error)}`, { cause: error });
+  }
   const result = RUNTIME_MANIFEST_SCHEMA.safeParse(parsed);
   if (!result.success) {
     throw new Error(`runtime-manifest.json is invalid: ${z.prettifyError(result.error)}`);
@@ -80,7 +96,14 @@ export function managedPythonPath(dataDir: string): string {
 function executable(file: string): boolean {
   // X_OK 在 Windows 上没有效果（等同 F_OK），所以这一条在两边都成立：POSIX 判可执行位，
   // Windows 判文件在。缺文件在两边都会抛同一个错误。
+  //
+  // 先按普通文件收口：POSIX 的 X_OK 对目录同样成立，托管落点若在安装中断后被替换成同名
+  // 目录（或符号链接指向目录），只判 X_OK 会把目录当成可用解释器，并带上清单声明的版本
+  // 返回出去——错误要到子进程启动时才以 EISDIR/ENOENT 的形式出现，来源比「没找到」更难查。
   try {
+    if (!statSync(file).isFile()) {
+      return false;
+    }
     accessSync(file, constants.X_OK);
     return true;
   } catch {
@@ -129,7 +152,10 @@ export function resolveRuntime(options: {
     return { pythonPath: repoPython, via: "repo", version: "unknown" };
   }
   // PATH 这一档交回裸名字，由宿主的 subprocess.resolveExecutable 去展开。这里自己扫 PATH
-  // 会与宿主那套解析答出两个不同的路径。
-  const pathBinary = process.platform === "win32" ? "python.exe" : "python3";
+  // 会与宿主那套解析答出两个不同的路径。win32 名字必须与 py-launcher.mjs 的 PATH_PYTHON
+  // 同为 "python"：本包的「解释器解析只有一个入口」承诺覆盖所有门禁与运行时读法，
+  // 两个名字在宿主 resolveExecutable 的 PATHEXT 展开下等价，但答案是两个字符串就会让
+  // 「门禁选的解释器」与「运行时用的解释器」在日志里对不上。
+  const pathBinary = process.platform === "win32" ? "python" : "python3";
   return { pythonPath: pathBinary, via: "path", version: "unknown" };
 }

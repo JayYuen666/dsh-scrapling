@@ -278,8 +278,15 @@ def _duckduckgo_target(href: str) -> str:
     """DuckDuckGo 的结果链接是 `/l/?uddg=<enc>` 跳板；取出真正的目标。"""
     from urllib.parse import parse_qs, urlparse, urlunparse
 
-    parts = urlparse(href if "://" in href else f"https:{href}" if href.startswith("//") else href)
-    if "duckduckgo.com" in parts.netloc and parts.path.startswith("/l/"):
+    absolute = f"https:{href}" if href.startswith("//") else href
+    parts = urlparse(absolute)
+    host = (parts.hostname or "").lower()
+    # 跳板可能以相对形式出现（netloc 为空）；主机按 hostname 精确/后缀匹配，
+    # 子串判断会把 duckduckgo.com.evil.example 也当成自家跳板。
+    is_wrapper = parts.path.startswith("/l/") and (
+        host == "" or host == "duckduckgo.com" or host.endswith(".duckduckgo.com")
+    )
+    if is_wrapper:
         target = parse_qs(parts.query).get("uddg")
         if target:
             return target[0]

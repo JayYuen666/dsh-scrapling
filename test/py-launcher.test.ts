@@ -86,8 +86,11 @@ describe("py-launcher", () => {
     const root = venvRoot();
     const withVenv = await run(["--bin", `--root=${root}`]);
     expect(withVenv.stdout.trim()).toBe(path.join(root, "_env", ".venv", VENV_DIR));
+    // 没有 venv 时不能给个空行：调用方会把它拼进 PATH 的空段（等于把当前目录塞进 PATH）。
     const withoutVenv = await run(["--bin", `--root=${tempDir()}`]);
     expect(withoutVenv.stdout).toBe("");
+    expect(withoutVenv.status).not.toBe(0);
+    expect(withoutVenv.stderr).toContain("--bin");
   });
 
   it("--which 与 --path 指向同一支", async () => {
@@ -116,6 +119,42 @@ describe("py-launcher", () => {
     expect(resolvePythonBin("", REPO)).toStrictEqual({ path: LOCAL_PYTHON, via: "_env/.venv" });
     const resolved = await run(["--path"]);
     expect(resolved.stdout.trim()).toBe(LOCAL_PYTHON);
+  });
+
+  it("venv 里同名的是目录时不算解释器", async () => {
+    const root = tempDir();
+    mkdirSync(path.join(root, "_env", ".venv", VENV_DIR, VENV_EXE), { recursive: true });
+    const result = await run(["--path", `--root=${root}`]);
+    expect(result.stdout.trim()).toBe(PATH_PYTHON);
+  });
+
+  it("--root 的空格形式与等号形式等价", async () => {
+    const root = venvRoot();
+    const result = await run(["--path", "--root", root]);
+    expect(result.stdout.trim()).toBe(path.join(root, "_env", ".venv", VENV_DIR, VENV_EXE));
+  });
+
+  it("参数写错时退 2，而不是当成跑模式", async () => {
+    const duplicate = await run(["--which", "--path"]);
+    expect(duplicate.status).toBe(2);
+    expect(duplicate.stderr).toContain("只接受一个模式");
+    const emptyRoot = await run(["--which", "--root="]);
+    expect(emptyRoot.status).toBe(2);
+    expect(emptyRoot.stderr).toContain("--root=");
+    const missingRoot = await run(["--which", "--root"]);
+    expect(missingRoot.status).toBe(2);
+    const reportWithArgs = await run(["--which", "extra"]);
+    expect(reportWithArgs.status).toBe(2);
+    expect(reportWithArgs.stderr).toContain("报告模式");
+  });
+
+  it.runIf(!WINDOWS)("子进程被信号结束时按 128+信号号退", async () => {
+    const result = await run([
+      `--root=${tempDir()}`,
+      "-c",
+      "import os,signal;os.kill(os.getpid(),signal.SIGTERM)",
+    ]);
+    expect(result.status).toBe(143);
   });
 
   it.runIf(!WINDOWS)("没有可执行位的 venv 解释器不算可用", async () => {

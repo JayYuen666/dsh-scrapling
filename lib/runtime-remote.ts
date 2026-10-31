@@ -37,7 +37,7 @@ const JOB_OUTPUT_VIEW_CHARS = 4000;
 /** 本模块用到的作业注册表面（不取整个 JobRegistry）。 */
 export type RuntimeJobs = Pick<
   JobRegistry,
-  "start" | "attachController" | "get" | "readAt" | "kill"
+  "start" | "attachController" | "list" | "get" | "readAt" | "kill"
 >;
 
 export interface RuntimeRemoteDeps {
@@ -110,19 +110,30 @@ export class ScraplingRuntimeService extends TypertRemoteService {
   /**
    * 读上一次安装作业的实时状态。
    *
-   * 读失败**不**等于「没有作业」：上一次安装可能还在写 venv/state.json，把这个失败
-   * 当成 null 就会放行第二次安装（两个安装器同时写同一份状态）。所以这里让异常向上
-   * 走，由 start() 转成一次明确的拒收 —— fail-closed 是这里的唯一选项。
+   * 「注册表里没有这一条」与「读不到」是两件事，得分开对待：
+   * · 缺席是自愈信号。宿主在显式 `remove()`（@deepseek-ai/dsh-jobs-local
+   *   `src/index.ts:340-343`）与作业服务销毁（同文件 :674-682）时都会把记录摘掉，此后
+   *   `get()` 对陌生 id 抛 `unknown job <id>`（:399-400）。把这种抛错当成「还在跑」，
+   *   下一次安装就永远被拒，而那份旧作业其实已经不存在。
+   * · 读失败仍然 fail-closed：上一次安装可能还在写 venv/state.json，把它当成 null 就会
+   *   放行第二次安装（两个安装器同时写同一份状态）。
+   * 所以先用不抛错的 `list()` 判存在性（`src/index.ts:310-314`：无主作业对任何 caller 都
+   * 可见，本包建作业不记 owner），确认还在册才用 `get()` 读状态。
    *
    * @param jobs - 当前作业注册表
-   * @returns 仍在跑的作业；没有或已终态时为 null
+   * @returns 仍在跑的作业；没有、已终态或注册表已不认识这条时为 null
    */
   private liveJob(jobs: RuntimeJobs): TrackedJob | null {
     if (this.job === null) {
       return null;
     }
-    const view = jobs.get(this.job.id);
-    return isLive(view.status) ? this.job : null;
+    const tracked = this.job;
+    if (!jobs.list().some((view) => view.id === tracked.id)) {
+      this.job = null;
+      return null;
+    }
+    const view = jobs.get(tracked.id);
+    return isLive(view.status) ? tracked : null;
   }
 
   public async status(): Promise<RuntimeStatusResult> {

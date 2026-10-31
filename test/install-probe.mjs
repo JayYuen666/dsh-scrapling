@@ -39,26 +39,37 @@ const REQUIRED = [
   "package/py/runtime-requirements.txt",
 ];
 
-/** 出货面禁止出现的路径片段。 */
-const FORBIDDEN = [/(?:^|\/)test\//u, /(?:^|\/)_env\//u, /site-packages/u, /chromium/iu];
+/** 出货面禁止出现的路径片段。
+ * `tests?` 而不是 `test`：Python 用例目录是 `py/tests/`，只匹配 `test/` 会把它当干净面放过。 */
+const FORBIDDEN = [/(?:^|\/)tests?\//u, /(?:^|\/)_env\//u, /site-packages/u, /chromium/iu];
 
 const repo = path.resolve(import.meta.dirname, "..");
 
 /**
  * 跑一个外部命令并交回回执。
  *
+ * 每一步都带超时：pack / install / 载入里任何一条挂住，没有超时就会一直挂到 CI job
+ * 自己的上限，看不出一句话说明是哪一步。失败时把命令本身与回执一起带进错误，
+ * 否则断言只剩「Command failed」而看不到是哪个程序、什么输出。
+ *
  * @param {string} command - 程序
  * @param {readonly string[]} args - 参数
- * @param {{ cwd?: string, env?: NodeJS.ProcessEnv }} options - 工作目录与环境
+ * @param {{ cwd?: string, env?: NodeJS.ProcessEnv, timeoutMs?: number }} options - 工作目录、环境与超时
  * @returns {Promise<{ stdout: string, stderr: string }>} 回执
  */
 async function run(command, args, options = {}) {
-  const { stdout, stderr } = await exec(command, args, {
-    cwd: options.cwd ?? repo,
-    env: { ...process.env, ...options.env },
-    maxBuffer: 32 * 1024 * 1024,
-  });
-  return { stdout, stderr };
+  try {
+    const { stdout, stderr } = await exec(command, args, {
+      cwd: options.cwd ?? repo,
+      env: { ...process.env, ...options.env },
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: options.timeoutMs ?? 10 * 60 * 1000,
+    });
+    return { stdout, stderr };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${command} ${args.join(" ")} failed: ${detail}`, { cause: error });
+  }
 }
 
 /**
@@ -100,23 +111,81 @@ async function main() {
     // 把同一宿主线的全部 dsh-* peer 一起按 devDependency 的精确版装：只装 dsh-tools 时，
     // npm 会按各自的 peer 范围解析出 rc.3/rc.4 混排的树，而这些宿主包互相要求同一个精确
     // dsh-llm，安装因此必冲突。`@deepseek-ai/dsh` 本体不参与：host.js 不 import 它。
+    // --legacy-peer-deps：peer 写的是支持窗口，dev 线的精确版落在窗口文本外——宿主自己
+    // 按 engines.dsh 以 includePrerelease 单独判兼容、不比较 peer，npm 的严格 peer 解析
+    // 不认 includePrerelease，会把这组钉版当成冲突拒装；探针要验的是出货面可装可载，
+    // 不是 npm 的 peer 视图。
     const hostPeers = Object.keys(manifest.peerDependencies ?? {})
       .filter((name) => name.startsWith("@deepseek-ai/dsh-") && name !== "@deepseek-ai/dsh")
       .map((name) => `${name}@${manifest.devDependencies?.[name] ?? hostTools}`);
     await run(
       "npm",
-      ["install", tgz, ...hostPeers, "--ignore-scripts", "--no-audit", "--no-fund"],
-      { cwd: install },
-    );
-
-    const host = await run(
-      "node",
       [
-        "-e",
-        'import("@jayyuen66/dsh-scrapling").then((m) => console.info("HOST", Object.keys(m).length))',
+        "install",
+        tgz,
+        ...hostPeers,
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--legacy-peer-deps",
       ],
       { cwd: install },
     );
+
+    // --legacy-peer-deps 同时关掉了 npm 的自动 peer 安装：显式装进来的宿主包自己还有
+    // peer（dsh-tools 要 dsh-agent / dsh-llm / dsh-session 等，dsh-typert-protocol 要
+    // cordis），漏一个装载就是 ERR_MODULE_NOT_FOUND。所以装载驱动地补：报错点名谁，
+    // 就按同一条版本规则（本仓 devDeps 同名钉版，缺则退宿主线锚点）补装谁，直到装载
+    // 通过；点不出名的失败照常抛出。
+    const hostLoad = () =>
+      run(
+        "node",
+        [
+          "-e",
+          'import("@jayyuen66/dsh-scrapling").then((m) => console.info("HOST", Object.keys(m).length))',
+        ],
+        { cwd: install },
+      );
+    let host;
+    for (let round = 0; ; round += 1) {
+      try {
+        // 每轮装载都要等上一轮补装完成，串行是循环的语义。
+        // oxlint-disable-next-line eslint/no-await-in-loop
+        host = await hostLoad();
+        break;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const names = [
+          ...new Set(
+            Array.from(
+              detail.matchAll(/Cannot find package '(?<missing>@deepseek-ai\/[^']+)'/gu),
+              (match) => match.groups?.missing,
+            ),
+          ),
+        ];
+        if (round >= 6 || names.length === 0) {
+          throw error;
+        }
+        const missing = names.map(
+          (name) => `${name}@${manifest.devDependencies?.[name] ?? hostTools}`,
+        );
+        console.info(`装载缺 peer，补装：${missing.join(" ")}`);
+        // 补装循环本质串行：装 → 载 → 再装，后一步依赖前一步的报错点名，无法并行。
+        // oxlint-disable-next-line eslint/no-await-in-loop
+        await run(
+          "npm",
+          [
+            "install",
+            ...missing,
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--legacy-peer-deps",
+          ],
+          { cwd: install },
+        );
+      }
+    }
     assert.match(host.stdout, /HOST \d+/u);
 
     const loaderProbe = path.join(root, "client-probe.mjs");

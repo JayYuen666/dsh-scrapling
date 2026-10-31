@@ -18,7 +18,14 @@
 // 写入用**第一笔改动落地时**读到的 revision 作围栏，而不是点击保存那一刻的最新值 ——
 // 后者会让宿主的冲突检测失效，把别处刚写下的值无声覆盖掉。
 
-import { createElement, useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import {
+  createElement,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { ReactNode } from "react";
 import { z } from "zod";
 import { RUNTIME_PACKS, packLabelKey, packStateKey } from "../lib/runtime-shape.ts";
@@ -175,16 +182,36 @@ const NUMBER_INPUT_SCHEMA = z
   .transform(Number);
 
 /**
- * 把控件里敲进去的一串字翻成设置值。
+ * `format: "url"` 字段的取值判定：先过 `z.url()` 的形态，再按字段声明的协议白名单收口。
  *
- * 清空 = 交回默认值，所以空串给 `clear`。数字字段按 schema 的下界夹住；非数字、零、负数与
- * 小数一律给 `invalid` 而不是 `clear`。早先把它们当成清除，用户填错一个数就会把自己原来
- * 那条覆盖静默删掉，而且界面上看不出发生过什么 —— 非法输入留在控件里、保存按钮因此不可用，
- * 比悄悄改掉用户的配置好。
+ * 白名单只对需要它的字段存在（代理地址与 SearXNG 端点）：`z.url()` 只判「能解析成 URL」，
+ * `file:`/`data:` 这类值同样通过，而那些值要到下游真正建连时才失败。
  *
- * @param field - 字段描述
- * @param raw - 控件里的原始字符串
+ * @param field - 字段规格（读 `schemes`）
+ * @param text - 已 trim 的原文
  * @returns 解析结果
+ */
+function parseUrlValue(field: FieldSpec, text: string): ParsedInput {
+  const parsed = z.url().safeParse(text);
+  if (!parsed.success) {
+    return { kind: "invalid" };
+  }
+  const allowed = field.schemes;
+  if (allowed !== undefined && !allowed.includes(new URL(parsed.data).protocol)) {
+    return { kind: "invalid" };
+  }
+  return { kind: "value", value: parsed.data };
+}
+
+/** 把控件里的原文按字段形态解析成「写入值 / 清除 / 非法」三态。
+ *
+ *  空串一律是「清除覆盖」：宿主 schema 的每一项都有默认值，留空表示回到默认。
+ *  数字字段的非数字、零、负数与小数一律给 `invalid` 而不是 `clear`——早先把它们当成清除，
+ *  用户填错一个数就会把自己原来的覆盖静默删掉，界面上也看不出发生过什么；非法输入留在控件里、
+ *  保存按钮因此不可用，比悄悄改掉配置好。
+ *  @param field - 字段规格
+ *  @param raw - 控件里的原始字符串
+ *  @returns 解析结果
  */
 export function parseInput(field: FieldSpec, raw: string): ParsedInput {
   if (field.kind === "boolean") {
@@ -209,8 +236,7 @@ export function parseInput(field: FieldSpec, raw: string): ParsedInput {
     return parsed.success ? { kind: "value", value: parsed.data } : { kind: "invalid" };
   }
   if (field.format === "url") {
-    const parsed = z.url().safeParse(text);
-    return parsed.success ? { kind: "value", value: parsed.data } : { kind: "invalid" };
+    return parseUrlValue(field, text);
   }
   return { kind: "value", value: text };
 }
@@ -532,6 +558,28 @@ interface Draft {
 
 const EMPTY_DRAFT: Draft = { values: {}, baseRevision: undefined, invalid: [], invalidText: {} };
 
+/**
+ * 一笔写入被宿主接受之后草稿的下一状态。
+ *
+ * 只摘掉这次真正发出去的字段；若仍有剩余（`await` 期间的程序化改动），围栏必须清掉：
+ * 这一笔已经落盘，旧 revision 对应的那一版不复存在，带着它提交只会被判成 stale。
+ * 下一次改动会按那一刻的宿主快照重新取围栏。
+ *
+ * @param previous - 提交前的草稿
+ * @param ops - 这次真正发出的写入操作
+ * @returns 下一份草稿
+ */
+export function draftAfterWrite(previous: Draft, ops: readonly PathOp[]): Draft {
+  const values = { ...previous.values };
+  for (const op of ops) {
+    const [key] = op.path;
+    Reflect.deleteProperty(values, key);
+  }
+  return Object.keys(values).length === 0
+    ? EMPTY_DRAFT
+    : { ...previous, values, baseRevision: undefined };
+}
+
 /** 底部保存条：非法输入时保存被挡住，并在状态位说明原因。 */
 function renderActions(props: {
   readonly t: Translate;
@@ -581,14 +629,26 @@ function useRuntime(reader: RuntimeReader | undefined): RuntimeState {
   const [snapshot, setSnapshot] = useState<RuntimeStatusResult | null>(null);
   const [busy, setBusy] = useState("");
   const [failure, setFailure] = useState("");
+  // 读面的请求序号：轮询、动作后的回读与初始装载会同时在途，晚返回的**旧**响应不能覆盖
+  // 新快照（作业状态会因此倒退）。只认最后发出的那一笔。
+  const requestSeq = useRef(0);
   const refresh = useCallback(async (): Promise<void> => {
     if (reader === undefined) {
       return;
     }
+    requestSeq.current += 1;
+    const seq = requestSeq.current;
     try {
-      setSnapshot(await reader.status());
+      const next = await reader.status();
+      if (seq !== requestSeq.current) {
+        return;
+      }
+      setSnapshot(next);
       setFailure("");
     } catch (error) {
+      if (seq !== requestSeq.current) {
+        return;
+      }
       setFailure(String(error));
     }
   }, [reader]);
@@ -675,7 +735,8 @@ function renderPackRow(props: {
   const { pack, state, t, disabled, running, activePack, onAct, onCancel } = props;
   const stateText = state === null ? t("statusLoading") : t(packStateKey(state));
   const packLabel = t(packLabelKey(pack));
-  const rowDisabled = disabled || state === null || state === "blocked" || state === "installing";
+  const rowDisabled =
+    disabled || running || state === null || state === "blocked" || state === "installing";
   const actions: ReactNode[] = [
     createElement(
       "button",
@@ -845,17 +906,8 @@ async function commitDraft(args: {
     // 被别处改过时，本卡的陈旧草稿会带着新 revision 提交，冲突检测形同不存在。
     const accepted = await form.mutate(ops, draft.baseRevision);
     if (accepted) {
-      // 只摘掉这次真正发出去的字段：控件在 await 期间是锁着的，但程序化改动仍可能落进来。
-      setDraft((previous) => {
-        const values = { ...previous.values };
-        for (const op of ops) {
-          const [key] = op.path;
-          Reflect.deleteProperty(values, key);
-        }
-        // 围栏与非法原文都只对「草稿里还剩东西」有意义：清空之后就该回到干净起点，
-        // 否则下一次改动会继承一个已经过期的 revision 与一条没人再看的非法原文。
-        return Object.keys(values).length === 0 ? EMPTY_DRAFT : { ...previous, values };
-      });
+      // 只摘掉这次真正发出去的字段，并重置已失效的围栏（见 draftAfterWrite 的注释）。
+      setDraft((previous) => draftAfterWrite(previous, ops));
     } else {
       setFailure(
         draft.baseRevision !== undefined && draft.baseRevision !== state.revision
@@ -955,6 +1007,9 @@ export function SettingsCard(props: CardProps): ReactNode {
     },
     onUndo: (): void => {
       setDraft(EMPTY_DRAFT);
+      // 遮罩状态跟草稿一起回到干净起点：撤销之后字段显示的是宿主那一版，值已不再是用户
+      // 刚敲的凭据，继续「显示」只会在屏幕上多留一份明文。
+      setRevealed([]);
       setFailure("");
     },
   });

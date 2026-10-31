@@ -20,6 +20,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
+import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { MCP_SERVER_NAME } from "../lib/mcp-contract.ts";
 import { MCP_SERVER_VERSION } from "../lib/mcp-server.ts";
 
@@ -70,7 +71,7 @@ interface Manifest {
   readonly version?: string;
   readonly main?: string;
   readonly types?: string;
-  readonly exports?: Record<string, unknown>;
+  readonly exports?: unknown;
   readonly files?: readonly string[];
   readonly bin?: Record<string, string>;
   readonly publishConfig?: Record<string, unknown>;
@@ -151,14 +152,45 @@ function asRelative(target: string): string {
 }
 
 /**
+ * 把 `exports` 摊成「说明符 + 值」清单。
+ *
+ * 官方 `exports` 有三种合法写法：字符串（整包一个入口）、条件数组（按序回退）、以说明符为键
+ * 的对象。直接把对象版的 `Object.entries` 套在字符串上会把它拆成字符索引 —— 实测拿到
+ * `{label:"0",file:"."}`、`{label:"2",file:"h"}` 这类目标，入口断言于是去查一批毫不相关的
+ * 路径：换个写法就可能误红，也可能一个真入口都没查到却照样打绿。形态不认识时抛错而不是
+ * 交回空清单：空清单在这道门禁里长得和「全部通过」一模一样。
+ *
+ * @param value - manifest 里的 exports 原值
+ * @returns 每条入口的标签与它的值
+ */
+function exportsEntries(value: unknown): { label: string; value: unknown }[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (typeof value === "string") {
+    return [{ label: ".", value }];
+  }
+  if (Array.isArray(value)) {
+    return value.map((item: unknown, index: number) => ({
+      label: `exports[${String(index)}]`,
+      value: item,
+    }));
+  }
+  if (isRecord(value)) {
+    return Object.entries(value).map(([label, item]) => ({ label, value: item }));
+  }
+  throw new Error(`${PACKAGE_JSON} 的 exports 形态不认识：${typeof value}`);
+}
+
+/**
  * manifest 里全部需要落地的入口文件：main、types 与每个 exports 具体目标。
  *
  * @param manifest - 解析后的 package.json
  * @returns 目标清单，每项带来源标签以便失败时点名
  */
 function entryFiles(manifest: Manifest): readonly { label: string; file: string }[] {
-  const flat = Object.entries(manifest.exports ?? {}).flatMap(([specifier, value]) =>
-    filesOf(value).map((file) => ({ label: specifier, file })),
+  const flat = exportsEntries(manifest.exports).flatMap(({ label, value }) =>
+    filesOf(value).map((file) => ({ label, file })),
   );
   const scalars = [
     ...(typeof manifest.main === "string" ? [{ label: "main", file: manifest.main }] : []),
@@ -234,6 +266,41 @@ function commentLines(file: string, text: string): string[] {
   }
   return text.split("\n").filter((line) => /^\s*(?:\/\/|\/\*|\*|#)/u.test(line));
 }
+
+describe("entryFiles 认全 exports 的三种合法写法", () => {
+  it("字符串形态给一个根入口，而不是被拆成字符索引", () => {
+    expect(entryFiles({ exports: "./index.js" })).toStrictEqual([
+      { label: ".", file: "./index.js" },
+    ]);
+  });
+
+  it("条件数组按序给出每条回退目标", () => {
+    expect(entryFiles({ exports: ["./fallback.js", { types: "./fallback.d.ts" }] })).toStrictEqual([
+      { label: "exports[0]", file: "./fallback.js" },
+      { label: "exports[1]", file: "./fallback.d.ts" },
+    ]);
+  });
+
+  it("对象形态按说明符给标签；通配条目没有可核对的固定文件", () => {
+    expect(
+      entryFiles({
+        exports: { ".": { types: "./a.d.ts", default: "./a.js" }, "./py/*": "./py/*" },
+      }),
+    ).toStrictEqual([
+      { label: ".", file: "./a.d.ts" },
+      { label: ".", file: "./a.js" },
+    ]);
+  });
+
+  it("main 与 types 各自带来源标签；形态不认识时抛错，不交回空清单", () => {
+    expect(entryFiles({ main: "./host.js", types: "./host.d.ts" })).toStrictEqual([
+      { label: "main", file: "./host.js" },
+      { label: "types", file: "./host.d.ts" },
+    ]);
+    expect(() => entryFiles({ exports: 7 })).toThrow(/形态不认识/u);
+    expect(() => entryFiles({ exports: null })).toThrow(/形态不认识/u);
+  });
+});
 
 describe("发布形态", () => {
   it("files 覆盖运行模块、CLI 与运行时资产，bin 指向产物", async () => {

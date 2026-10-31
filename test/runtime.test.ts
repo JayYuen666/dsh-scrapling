@@ -26,6 +26,14 @@ function fakeExecutable(file: string): void {
   chmodSync(file, 0o755);
 }
 
+/** 在已验清单的基础上改一处字段，供加载期形态校验的用例（值一律走 JSON 文本入口）。 */
+function manifestWith(patch: Record<string, unknown>): string {
+  return JSON.stringify({
+    darwinArm64: { ...runtimeManifest.darwinArm64, ...patch },
+    unsupported: {},
+  });
+}
+
 describe("resolveRuntime", () => {
   let restorePlatform: (() => void) | undefined;
   beforeAll(() => {
@@ -102,12 +110,12 @@ describe("resolveRuntime", () => {
     }
   });
 
-  it("win32 上交回 python.exe", () => {
+  it("win32 上交回 python（与 py-launcher 的 PATH_PYTHON 同名）", () => {
     const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     try {
       expect(
         resolveRuntime({ pythonBin: "", dataDir: tempDir(), repoRoot: tempDir() }),
-      ).toMatchObject({ pythonPath: "python.exe", via: "path" });
+      ).toMatchObject({ pythonPath: "python", via: "path" });
     } finally {
       platform.mockRestore();
     }
@@ -130,6 +138,41 @@ describe("resolveRuntime", () => {
 
   it("坏清单在加载期抛错", () => {
     expect(() => parseRuntimeManifest('{"darwinArm64":{}}')).toThrow(/darwinArm64/u);
+  });
+
+  it("清单不是合法 JSON 时，报错点明是哪份文件", () => {
+    expect(() => parseRuntimeManifest('{"darwinArm64": {}')).toThrow(
+      /runtime-manifest\.json is invalid/u,
+    );
+  });
+
+  it("sha256 必须是小写 64 位十六进制：大写或缺位在加载期就拒", () => {
+    const sha = runtimeManifest.darwinArm64.sha256;
+    for (const value of [sha.toUpperCase(), sha.slice(1), ""]) {
+      expect(() => parseRuntimeManifest(manifestWith({ sha256: value }))).toThrow(/sha256/u);
+    }
+  });
+
+  it("pythonVersion 必须是三段数字：带路径分隔符的值会被拒（它要拼进落点路径）", () => {
+    for (const value of ["../../x", "/abs/path", "3.14"]) {
+      expect(() => parseRuntimeManifest(manifestWith({ pythonVersion: value }))).toThrow(
+        /pythonVersion/u,
+      );
+    }
+  });
+
+  it("托管落点被替换成同名目录时不算可用解释器", () => {
+    const dataDir = tempDir();
+    const repoRoot = tempDir();
+    const fakeManaged = managedPythonPath(dataDir);
+    mkdirSync(fakeManaged, { recursive: true });
+    chmodSync(fakeManaged, 0o755);
+    const python = path.join(repoRoot, "_env", ".venv", "bin", "python");
+    fakeExecutable(python);
+    expect(resolveRuntime({ pythonBin: "", dataDir, repoRoot })).toMatchObject({
+      pythonPath: python,
+      via: "repo",
+    });
   });
 
   it("manifest 钉死 macOS arm64 的哈希与版本", () => {

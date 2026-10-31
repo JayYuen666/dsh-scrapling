@@ -3,14 +3,15 @@
 本包自身编写的代码以 MIT 发布，见 [`LICENSE`](./LICENSE)。本文件记录**与第三方的边界**：
 哪一部分来自第三方、在什么意义上「来自」，以及本包自身代码与第三方代码的分界在哪里。
 
-## 结论：随包分发的第三方内容只有一处
+## 结论：随包分发的第三方内容有两处
 
 `py/`、`lib/`、`host.ts`、`src/` 下全部是本仓原创代码，不含任何第三方源码、词表或文案。
-Scrapling 及浏览器引擎都是**运行期依赖**——本包通过它们的公开 API 调用它们，它们不由本包
-分发，许可文本也随各自的包走，本文件不重复。
+Scrapling 及浏览器引擎都是**运行期依赖**——本包调用它们暴露的接口，其中反注入清洗用的
+`Convertor._strip_noise_tags` 与 `Convertor._sanitize_for_ai` 是上游的私有下划线方法，不在上游文档面
+里（见「机制与接口来源」）。它们不由本包分发，许可文本也随各自的包走，本文件不重复。
 
-唯一随包分发的第三方内容是**图标**（`icon.svg`），见下节。它是一段路径数据，MIT 允许再分发，
-且本包已在下方保留其版权与许可声明。
+随包分发的第三方内容有两处：**图标**（`icon.svg`）与**CLI 单文件产物内联的 zod**
+（`bin/dsh-scrapling.mjs`）。两者都是 MIT，且本包在下方保留各自的版权与许可声明。
 
 ## 图标：Tabler Icons
 
@@ -20,9 +21,21 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包通过它们的
 - 取用图标：`spider`
 - 来源：https://icones.js.org/icons/tabler/spider
 
-`icon.svg` 中的形状路径取自该图标的 `spider`。改动仅有两处，都不涉及形状本身：把
-`currentColor` 换成本包插件图标配色（`#658EFF` 主色 + `#54ECE7` 底衬），以及把外层 `<g>` 与
-画布尺寸对齐本族插件统一的 `36×36` / `viewBox 0 0 24 24` 规格。路径数据未作改动。
+`icon.svg` 中的形状路径取自该图标的 `spider`。改动有三处：把 `<g>` 上的 `currentColor` 换成本包
+插件图标主色 `#658EFF`；把外层 `<g>` 与画布尺寸对齐本族插件统一的 `36×36` / `viewBox 0 0 24 24`
+规格；以及把腹部与头部两条路径各复制一份，加上 `fill="#54ECE7"`、`opacity=".2"` 与同色 `stroke`
+作底衬。三份源路径的 `d` 数据与上游一致，未作改动；底衬复用同一条 `d`，只是多了填充与描边颜色。
+
+## CLI 单文件产物内联的 zod
+
+- 上游项目：`zod`
+- 上游仓库：https://github.com/colinhacks/zod
+- 上游许可：MIT，Copyright (c) 2020 Colin McDonnell
+- 版本：伞根 catalog 4.6.7（`package.json` 写作 `catalog:`）
+
+`bin/dsh-scrapling.mjs` 由 `build-cli.ts` 用 rolldown 打成单文件、只外置 `node:` 内置模块，
+因此 zod 的实现被内联进该产物；host 侧的 `client.js` 按宿主 `PLATFORM_MODULES` 外置 zod。
+所以 zod 既是运行期依赖，也是 CLI 产物里的一份第三方代码，此处保留其版权与许可声明。
 
 ## 机制与接口来源：Scrapling
 
@@ -52,8 +65,10 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包通过它们的
 | `apify-fingerprint-datapoints` | 0.15.0 | Apache-2.0 | browserforge 的指纹数据 |
 | `playwright` | 1.64.1 | Apache-2.0（Microsoft） | 网络守卫 |
 | `patchright` | 1.64.2 | Apache-2.0（Microsoft，patch 由 Kaliiiiiiiiii-Vinyzu 提供） | 浏览器渲染与网络守卫 |
+| `@modelcontextprotocol/sdk` | 1.32.2 | MIT | `lib/mcp-server.ts` 的 MCP server 实现 |
 | `ipaddr.js` | 2.5.0 | MIT | Host 侧 URL 策略的地址分类 |
-| `zod` | catalog（伞根 4.6.7） | MIT | 设置卡 `src/runtime-reader.ts` 的 strict codec 形状校验；client 产物由宿主 `PLATFORM_MODULES` 提供 |
+| `fs-native-extensions` | 1.5.3 | Apache-2.0 | `lib/installer.ts` 的安装锁：OS 级 `flock`/`LockFileEx` 互斥，进程退出自动释放 |
+| `zod` | catalog（伞根 4.6.7） | MIT | Host 侧 `lib/runtime.ts` / `lib/sidecar.ts` 的形状校验走本包 dependencies 里的 zod；设置卡 `src/runtime-reader.ts`、`src/settings-card.ts` 的 strict codec 由宿主 `PLATFORM_MODULES` 提供；CLI 单文件产物内联 |
 
 其余随 venv 安装的固定版本（含 `click`、`protego`、`curl_cffi`、`lxml` 等）见
 `py/runtime-requirements.txt`，每一行都带 SHA256；本文件不复述整张表。
@@ -61,7 +76,9 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包通过它们的
 ## 运行时下载的资产（不随 npm 分发）
 
 安装器按需下载下面两项到 `dataDir/runtime`，它们**不在 npm tarball 内**，因此不属于本包
-分发的第三方内容：
+分发的第三方内容。这条下载路径只在 macOS arm64 上走到：`lib/installer.ts` 的
+`installCapabilityPack` 先判平台，其余平台在任何下载之前抛 `INSTALL_PACK_BLOCKED`；
+`runtime-manifest.json` 也只收录 `darwinArm64` 一份资产，另列出不支持的三种平台。
 
 - **Python 3.14.9**：来自 `astral-sh/python-build-standalone` 的
   `cpython-3.14.9+20261021-aarch64-apple-darwin-install_only.tar.gz`；URL、体积与 SHA256
@@ -74,4 +91,8 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包通过它们的
 `patchright` 是 Playwright 的补丁分支，与 `playwright` 并存安装：两者是不同的 Python 包，
 本包按能力探测判断浏览器抓取能不能用。
 
-dsh 宿主包（`@deepseek-ai/dsh` 及其子包）是 peer 依赖，由宿主提供、不随本包分发。
+dsh 宿主族包里本仓声明为 peer 的只有 `@deepseek-ai/dsh`、`@deepseek-ai/dsh-output-retention`、
+`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-typert-protocol`、`@deepseek-ai/dsh-web` 与
+`@deepseek-ai/schemastery`，由宿主提供、不随本包分发。产物里运行期 import 到的是除
+`@deepseek-ai/dsh` 之外的那五个（`host.js`），`client.js` 只外置 `react` 与 `zod`。其余
+`@deepseek-ai/*` 是本仓 devDependencies，只用于类型检查与客户端构建，产物里没有对它们的运行期 import。

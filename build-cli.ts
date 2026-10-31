@@ -5,10 +5,10 @@
 // CLI 也不能 import host.js（那会把宿主 peer 依赖一起拉进来）。这里把入口、参数编排与
 // installer/runtime 打成单文件，只留 node: 内置模块外部。
 
-import { chmod, writeFile } from "node:fs/promises";
+import { chmod, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { rolldown } from "rolldown";
-import { singleChunkCode } from "./build-helpers.ts";
+import { invokedDirectly, singleChunkCode, writeArtifact } from "./build-helpers.ts";
 
 const root = import.meta.dirname;
 
@@ -31,9 +31,21 @@ async function buildCli(): Promise<string> {
 async function main(): Promise<void> {
   const code = await buildCli();
   const target = path.join(root, "bin", "dsh-scrapling.mjs");
-  await writeFile(target, code);
+  // 这是会随包发布的产物：直接 writeFile 覆盖时，进程被杀 / CI 取消 / 磁盘写满都会
+  // 在目标位置留下半截 JS，而 npm pack 照样把它发出去。与 host.js / client.js 同一套
+  // 原子写（临时文件 + 同目录 rename）。bin/ 只因产物被提交才存在，干净检出或从
+  // files 白名单重组目录时不会有这个目录，所以先建出来。
+  await mkdir(path.dirname(target), { recursive: true });
+  writeArtifact(target, code);
   await chmod(target, 0o755);
   console.info("bin/dsh-scrapling.mjs written:", code.length, "chars");
 }
 
-await main();
+if (invokedDirectly(import.meta.filename, import.meta.url)) {
+  try {
+    await main();
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  }
+}

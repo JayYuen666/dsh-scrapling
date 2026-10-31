@@ -33,6 +33,7 @@ import { callSidecar, sidecarErrorWithCode } from "./sidecar.ts";
 import type { SidecarClient } from "./sidecar.ts";
 import {
   BROWSER_REQUEST_PARAMS,
+  callNumber,
   CRAWL_MODE_PARAMS,
   MAIN_CONTENT_ONLY_DESC,
   NETWORK_ITEM,
@@ -339,11 +340,6 @@ function attributesOf(value: unknown): Record<string, Jsonish> {
     out[key] = toJsonish(item);
   }
   return out;
-}
-
-/** 本次调用的数值参数：调用值优先，缺省用部署值；给了 cap 就只压上限。 */
-function callNumber(value: unknown, fallback: number, cap = Number.POSITIVE_INFINITY): number {
-  return typeof value === "number" ? Math.min(value, cap) : fallback;
 }
 
 /**

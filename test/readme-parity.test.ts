@@ -294,4 +294,86 @@ describe("第三方声明随包发出", () => {
     expect(zh, `${ZH} 没有引用 ${NOTICES}`).toContain(NOTICES);
     expect(manifest.files ?? [], `files 里缺 ${NOTICES}`).toContain(NOTICES);
   });
+
+  it("package.json 的每一条运行期依赖都进声明表的表格行", async () => {
+    const manifest = JSON.parse(
+      await readFile(path.join(pkgDir, "package.json"), "utf8"),
+    ) as unknown as {
+      dependencies?: Record<string, string>;
+    };
+    const notices = await readFile(path.join(pkgDir, NOTICES), "utf8");
+    // 只认表格行首的那一格：正文里提一次包名不能顶替一行条目，否则漏记的那一格会被
+    // 附近的一句解释盖过去。
+    const rows = new Set(
+      Array.from(
+        notices.matchAll(/^\| `(?<name>[^`]+)` \|/gmu),
+        (found) => found.groups?.["name"] ?? "",
+      ),
+    );
+    const declared = Object.keys(manifest.dependencies ?? {});
+    expect(declared.length, "本包没有解析到任何运行期依赖，这条判据没跑到东西").toBeGreaterThan(0);
+    expect(
+      declared.filter((name) => !rows.has(name)),
+      `${NOTICES} 的运行期依赖表少了这些包`,
+    ).toStrictEqual([]);
+  });
+});
+
+/**
+ * 每个搜索后端在隐私表里的写法。
+ *
+ * 键与 `searchBackend` 的取值同源，值取自 README 的措辞：表里写的是产品名而不是 id，
+ * 这张对照表按「新增后端要同时登记」的意图独立写死，不由 README 正文派生。
+ */
+const PRIVACY_NAMES: Readonly<Record<string, string>> = {
+  tavily: "Tavily",
+  bing: "Bing",
+  brave: "Brave",
+  serper: "Serper",
+  duckduckgo: "DuckDuckGo",
+  searxng: "SearXNG",
+};
+
+/** 两份 README 隐私表里「网络」那一行的行首标记。 */
+const NETWORK_ROW = { en: "| Network |", zh: "| 网络 |" } as const;
+
+describe("隐私表逐条点名搜索后端", () => {
+  it("searchBackend 的每个非 auto 取值都出现在两份 README 的网络行里", async () => {
+    const { en, zh } = await readPair();
+    const host = await readFile(path.join(pkgDir, HOST), "utf8");
+    const union = /searchBackend: Schema\.union\(\[(?<body>[\s\S]*?)\]\)/u.exec(host)?.groups?.[
+      "body"
+    ];
+    if (union === undefined) {
+      throw new Error(`${HOST} 里找不到 searchBackend 的 Schema.union`);
+    }
+    const backends = Array.from(
+      union.matchAll(/"(?<id>[a-z]+)"/gu),
+      (found) => found.groups?.["id"] ?? "",
+    ).filter((id) => id !== "" && id !== "auto");
+    expect(
+      backends.length,
+      "searchBackend 的取值一条也没解析到，这条判据没跑到东西",
+    ).toBeGreaterThan(0);
+    const named = backends.map((id) => {
+      const name = PRIVACY_NAMES[id];
+      if (name === undefined) {
+        throw new Error(`新增搜索后端 ${id} 没在 PRIVACY_NAMES 登记隐私表写法`);
+      }
+      return [id, name] as const;
+    });
+    for (const [label, text, marker] of [
+      [EN, en, NETWORK_ROW.en],
+      [ZH, zh, NETWORK_ROW.zh],
+    ] as const) {
+      const row = text.split("\n").find((line) => line.startsWith(marker));
+      if (row === undefined) {
+        throw new Error(`${label} 里找不到隐私表的网络行（行首 ${marker}）`);
+      }
+      expect(
+        named.filter(([, name]) => !row.includes(name)).map(([id]) => id),
+        `${label} 的网络行没点名这些搜索后端`,
+      ).toStrictEqual([]);
+    }
+  });
 });

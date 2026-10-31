@@ -20,6 +20,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -70,12 +71,16 @@ interface Loaded {
 }
 
 /**
- * 本仓库根的 file:// 前缀。
+ * 本仓库根的 file:// URL。
  *
- * @returns 不带尾分隔符的 URL
+ * 不手拼 `file://${path}`：Windows 上盘符前少一道斜杠、反斜杠也没转义，含空格或非 ASCII
+ * 的路径同样不会被百分号编码；Loader 按 URL 解析裸名，拼错的表现是「装载失败」而不是
+ * 一条能读懂的报错。
+ *
+ * @returns 不带尾斜杠的 URL
  */
 function pathToFileHref(): string {
-  return `file://${path.resolve(import.meta.dirname, "..")}`;
+  return pathToFileURL(path.resolve(import.meta.dirname, "..")).href.replace(/\/$/u, "");
 }
 
 /**
@@ -101,7 +106,7 @@ async function load(dataDir: string): Promise<Loaded> {
 
   // 顺序要紧：baseUrl 必须在 plugin(Loader) 之前设 —— Loader 在 super(ctx) 之后就抓住
   // ctx 了，之后再改不会传进去（app-boot 也是这个次序）。
-  ctx.baseUrl = `${pathToFileHref()}${path.sep}`;
+  ctx.baseUrl = `${pathToFileHref()}/`;
   await ctx.plugin(Loader);
   await ctx.plugin(SystemPrompt, {});
   await ctx.plugin(WebRuntime, {});

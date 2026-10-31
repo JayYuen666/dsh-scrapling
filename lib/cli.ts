@@ -9,7 +9,9 @@ import {
   clientInstallCommand,
   DEFAULT_MCP_PORT,
   isMcpMode,
+  MCP_MODES,
   MCP_CLIENT_PINS,
+  MCP_TOKEN_ENV,
 } from "./mcp-contract.ts";
 import type { McpMode } from "./mcp-contract.ts";
 import { officialMcpBinary, officialMcpPlan, OfficialMcpError } from "./official-mcp.ts";
@@ -53,6 +55,16 @@ const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   "accept-risk",
 ]);
 
+/** 取值旗标：拼错的 `--ofline /assets` 不能被当成一个取值旗标静默吞掉后面的参数。 */
+const VALUE_FLAGS: ReadonlySet<string> = new Set([
+  "port",
+  "mode",
+  "profile",
+  "offline",
+  "uninstall",
+  "feature",
+]);
+
 export interface CliDeps {
   io: InstallerIO;
   dataDir: string;
@@ -77,28 +89,59 @@ function isFeature(value: string): value is Feature {
   return FEATURE_NAMES.has(value);
 }
 
+/** 一个命令行 token 的归类结果：布尔旗标、取值旗标（已带值），或不可接受。 */
+type FlagToken =
+  | { readonly kind: "boolean"; readonly name: string }
+  | { readonly kind: "value"; readonly name: string; readonly value: string }
+  | { readonly kind: "invalid" };
+
+/**
+ * 判一个 token 是哪一类旗标。
+ *
+ * 未知旗标一律判不可接受：把它当取值旗标吞掉下一项，拼错的 `--offline` 会让离线安装
+ * 静默退化成在线安装，命令还照常往下跑。
+ * @param token - 形如 `--name` 的一项
+ * @param next - 紧跟其后的那一项（取值旗标的值），末尾时为 undefined
+ * @returns 归类结果
+ */
+function classifyFlag(token: string, next: string | undefined): FlagToken {
+  if (!token.startsWith("--")) {
+    return { kind: "invalid" };
+  }
+  const name = token.slice(2);
+  if (BOOLEAN_FLAGS.has(name)) {
+    return { kind: "boolean", name };
+  }
+  if (!VALUE_FLAGS.has(name)) {
+    return { kind: "invalid" };
+  }
+  if (next === undefined || next.startsWith("--")) {
+    return { kind: "invalid" };
+  }
+  return { kind: "value", name, value: next };
+}
+
 function parseArgs(argv: readonly string[]): { command: string; flags: FlagMap } | null {
   const [command, ...rest] = argv;
   if (command === undefined || !COMMANDS.has(command)) {
     return null;
   }
   const flags: FlagMap = new Map();
-  for (let index = 0; index < rest.length; index += 1) {
-    /* v8 ignore next 1 —— 循环条件保证 rest[index] 存在；`?? ""` 只为满足 noUncheckedIndexedAccess。 */
-    const item = rest[index] ?? "";
-    if (!item.startsWith("--")) {
-      return null;
-    }
-    const name = item.slice(2);
-    if (BOOLEAN_FLAGS.has(name)) {
-      flags.set(name, true);
-    } else {
-      const value = rest[index + 1];
-      if (value === undefined || value.startsWith("--")) {
+  // 用 entries() 而不是下标取值：`noUncheckedIndexedAccess` 让 `rest[index]` 带 undefined，
+  // 而下标循环又要自己跳过被取值旗标消费掉的那一项 —— 两头凑齐就会多出一条构造上到不了的
+  // 分支，只能靠豁免过覆盖率。改成标记「已消费的下标」，元素类型就是 string，
+  // 既不需要兜底值也不需要抑制注释。
+  const consumed = new Set<number>();
+  for (const [index, item] of rest.entries()) {
+    if (!consumed.has(index)) {
+      const token = classifyFlag(item, rest[index + 1]);
+      if (token.kind === "invalid") {
         return null;
       }
-      flags.set(name, value);
-      index += 1;
+      flags.set(token.name, token.kind === "value" ? token.value : true);
+      if (token.kind === "value") {
+        consumed.add(index + 1);
+      }
     }
   }
   return { command, flags };
@@ -147,6 +190,13 @@ function modeValue(flags: FlagMap): McpMode | null {
   return value === undefined || !isMcpMode(value) ? null : value;
 }
 
+/** `--mode` 取不到合法值时点名合法取值；与 pin 那条提示同一口径。 */
+function modeHint(flags: FlagMap): string {
+  const value = stringFlag(flags, "mode");
+  const given = value === undefined ? "（缺省）" : JSON.stringify(value);
+  return `--mode 要写 ${MCP_MODES.join(" / ")} 之一；现在给的是 ${given}`;
+}
+
 interface ModeOutput {
   readonly text: string;
   readonly note: string;
@@ -175,9 +225,12 @@ function patchForMode(input: {
     };
   }
   if (input.mode === "mcp") {
+    const authNote = input.withAuth
+      ? `Authorization 在宿主装载时从宿主进程环境的 ${MCP_TOKEN_ENV} 求值：变量缺席会写成 "Bearer undefined"，加鉴权前先确认宿主环境里已设置它。`
+      : "";
     return {
       text: mcpClientPatch({ port: input.port, withAuth: input.withAuth }),
-      note: `mcp 模式起的是本插件的 server，URL 里的端口要与部署项 mcpPort 同值（当前按 ${String(input.port)} 生成）。`,
+      note: `mcp 模式起的是本插件的 server，URL 里的端口要与部署项 mcpPort 同值（当前按 ${String(input.port)} 生成）。${authNote}`,
       install: clientInstallCommand(),
     };
   }
@@ -203,6 +256,7 @@ async function writePatch(file: string, text: string): Promise<void> {
 async function setupMode(flags: FlagMap, deps: CliDeps): Promise<number> {
   const mode = modeValue(flags);
   if (mode === null) {
+    deps.log(modeHint(flags));
     return 2;
   }
   const given = portFlag(flags);
@@ -422,6 +476,7 @@ function searchDiagnostics(patchText: string, coreReady: boolean): SearchDiagnos
 async function runDoctor(flags: FlagMap, deps: CliDeps): Promise<number> {
   const mode = modeValue(flags);
   if (mode === null) {
+    deps.log(modeHint(flags));
     return 2;
   }
   const profile = stringFlag(flags, "profile");
@@ -557,15 +612,22 @@ function reportFailure(error: unknown, deps: CliDeps): number {
  * @param overrides - 测试替换项
  * @returns 退出码：0 成功、1 失败、2 参数错误
  */
+const USAGE =
+  "用法：dsh-scrapling setup [--feature <core|browser|search|media|adaptive-redis|mcp>] " +
+  "[--mode <native|mcp|official-mcp>] [--profile <目录>] [--port <1-65535>] [--apply] " +
+  "[--repair] [--status] [--uninstall <包> [--purge]]；dsh-scrapling doctor --mode <...> --profile <目录>";
+
 export async function runCli(
   argv: readonly string[],
   overrides: Partial<CliDeps> = {},
 ): Promise<number> {
+  const deps = withDefaults(overrides);
   const parsed = parseArgs(argv);
   if (parsed === null) {
+    // 解析失败时仅退出 2 会让用户不知道是哪一段写错了；用法行至少点名命令与旗标形状。
+    deps.log(USAGE);
     return 2;
   }
-  const deps = withDefaults(overrides);
   const { flags } = parsed;
   try {
     if (parsed.command === "doctor") {

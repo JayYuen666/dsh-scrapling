@@ -151,7 +151,9 @@ def _allowed_domains(url: str) -> set[str]:
     # 主机名与 host:port 都放进去：Scrapling 的域过滤可能按 hostname 比，也可能按
     # netloc 比。少放一个的表现是「只爬到第一页就停」，不报错，很难一眼看出原因。
     parsed = urlparse(url)
-    return {value for value in (parsed.hostname, parsed.netloc) if value}
+    # 统一小写：_within_allowed_domains 拿 netloc.lower() 来比，集合里保留原大小写
+    # 会让 `http://Example.com:8080/` 的每一页都判成站外（只抓到 0 页且不报错）。
+    return {value.lower() for value in (parsed.hostname, parsed.netloc) if value}
 
 
 def _within_allowed_domains(url: str, allowed: set[str]) -> bool:
@@ -280,17 +282,6 @@ def _session_config(manager: Any, url: str) -> None:
     if proxies is not None:
         session_kwargs["proxies"] = proxies
     manager.add("default", FetcherSession(**session_kwargs))
-
-
-def _policy_attrs(policy: dict[str, Any]) -> dict[str, Any]:
-    """Spider 类属性上的待站策略（三种模板共用同一份）。"""
-    return {
-        "robots_txt_obey": policy["obey_robots"],
-        "download_delay": policy["delay_seconds"],
-        "concurrent_requests": policy["concurrency"],
-        "crawl_strategy": policy["strategy"],
-        "autothrottle_enabled": policy["autothrottle"],
-    }
 
 
 def _make_spider(
@@ -751,7 +742,7 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
     # shopify 模式真正抓的主机可以来自 sitemapUrl：_make_shopify_spider 用它的 netloc 拼
     # collections/products 两个 URL。而站内判定用的是 allowed_domains —— 两处取不同来源时
     # spider 发出的每个请求都会被判成站外，一页都收不到。所以主机以真正要打的那一个为准。
-    domain_source = sitemap_url if mode == "shopify" and sitemap_url else url
+    domain_source = _domain_source_of(mode, url, sitemap_url, feed_url)
     domains = _allowed_domains(domain_source)
 
     # Host 闸门判的是这条 URL，但协议层不该假设调用方一定判过：这道复核与浏览器路径上
@@ -847,7 +838,7 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
                     "exclude_patterns": exclude_patterns,
                 },
             )
-    except BaseException as error:
+    except Exception as error:
         with _CRAWL_LOCK:
             _CRAWLS.pop(crawl_id, None)
         if isinstance(error, AdapterError):
@@ -875,12 +866,8 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
     # crawlStarted 必须在 start() **之前**发。反过来有两处会出错：一是快蜘蛛可能在这一帧落地
     # 之前就先推了 progress，宿主侧「第一条是 crawlStarted」的读法于是变成随缘；二是万一这一帧
     # 发不出去（stdout 断了、序列化炸了），异常抛给调用方时蜘蛛已经在跑 —— 调用方拿不到
-    # crawlId，就叫不停它，那个名额要一直占到进程退出。
-    _emit_event(
-        "crawlStarted",
-        crawlId=crawl_id,
-        text=f"crawling {url} in {mode} mode (max {max_pages} items)",
-    )
+    # crawlId，就叫不停它，那个名额要一直占到进程退出。撤占位与重抛在 _announce_crawl_started 里。
+    _announce_crawl_started(crawl_id, f"crawling {url} in {mode} mode (max {max_pages} items)")
     try:
         thread.start()
     except RuntimeError:
@@ -889,6 +876,25 @@ def crawl_run(args: dict[str, Any]) -> dict[str, Any]:
             _CRAWLS.pop(crawl_id, None)
         raise
     return {"crawlId": crawl_id}
+
+
+def _announce_crawl_started(crawl_id: str, message: str) -> None:
+    """发 crawlStarted 帧；发不出去就撤掉占位再抛。
+
+    调用方此时已经登记了 spider 与 thread，但还没 start()。这一帧发不出去（stdout
+    断了、序列化炸了）时异常要抛给调用方，登记也必须撤掉：调用方拿不到 crawlId
+    就叫不停这条爬虫，留着的登记会被 _is_running 当成「正在跑」，名额一直占到
+    进程退出。
+
+    :param crawl_id: 爬虫登记键
+    :param message: 帧正文
+    """
+    try:
+        _emit_event("crawlStarted", crawlId=crawl_id, text=message)
+    except BaseException:
+        with _CRAWL_LOCK:
+            _CRAWLS.pop(crawl_id, None)
+        raise
 
 
 def _is_running(entry: dict[str, Any]) -> bool:
@@ -940,6 +946,24 @@ def _get_crawl(crawl_id: Any) -> dict[str, Any]:
     return entry
 
 
+def _domain_source_of(
+    mode: str,
+    url: str,
+    sitemap_url: str | None,
+    feed_url: str | None,
+) -> str:
+    """真正被 spider 请求的那个地址：站内判定以它的主机为准。
+
+    sitemap / shopify 抓的是 sitemapUrl，feed 抓的是 feedUrl；起点 url 只决定默认值。
+    两处取不同来源时，spider 发出的每个请求都会被引擎判成站外。
+    """
+    if mode in ("shopify", "sitemap"):
+        return sitemap_url or url
+    if mode == "feed":
+        return feed_url or url
+    return url
+
+
 def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
     """查一个爬虫的状态与已收结果。
 
@@ -963,10 +987,12 @@ def crawl_status(args: dict[str, Any]) -> dict[str, Any]:
     # 进锁里取一段：一边序列化一边追加，结果要么漏一页要么撞上 RuntimeError。
     with _CRAWL_LOCK:
         feed_rows = state.get("mode") in ("feed", "shopify")
-        source = state["rows"] if feed_rows else state["pages"]
-        total = len(source)
-        taken, more = _take_pages(source, since)
+        # 锁内只取稳定快照：序列化计量与截断是纯 CPU 工作，放进全局锁会把所有
+        # worker 的 crawl.run / stop / close_all_crawls 串行化到回包速度上。
+        source = list(state["rows"] if feed_rows else state["pages"])
         running = _is_running(entry)
+    total = len(source)
+    taken, more = _take_pages(source, since)
     pages = [] if feed_rows else taken
     rows = taken if feed_rows else []
     return {
@@ -1006,7 +1032,19 @@ def _shrink_page(page: dict[str, Any], budget: int) -> dict[str, Any]:
     :returns: 压过的新页（不就地改原对象，state 里留全量）
     """
     if "markdown" not in page:
-        return page
+        # feed/shopify 的行没有 markdown：退化成「反复把最长的字符串字段减半」。
+        # 不处理这一类，超大的行仍会顶过 Host 的 8 MiB 切帧线。
+        shrunk = dict(page)
+        while len(json.dumps(shrunk, ensure_ascii=False).encode("utf-8")) > budget:
+            key = max(
+                (name for name, value in shrunk.items() if isinstance(value, str) and value),
+                key=lambda name: len(shrunk[name]),
+                default=None,
+            )
+            if key is None:
+                break
+            shrunk[key] = shrunk[key][: len(shrunk[key]) // 2]
+        return {**shrunk, "truncated": True}
     overhead = len(json.dumps({**page, "markdown": ""}, ensure_ascii=False).encode("utf-8"))
     room = max(0, budget - overhead)
     markdown = str(page.get("markdown", ""))
@@ -1062,10 +1100,14 @@ def _request_stop(entry: dict[str, Any]) -> bool:
     state["deadline"] = time.monotonic()
     with _CRAWL_LOCK:
         spider = entry.get("spider")
-        running = _is_running(entry)
-        if spider is None:
-            # 线程还没起：置个标志，worker 起手看见它就直接退出，一页都不抓。
+        worker = entry.get("thread")
+        # 线程对象已登记但还没 start()（ident 为 None）也算「还没跑起来」：这段窗口里
+        # 只调 pause 对未启动的引擎无效，worker 起手仍会照常抓取。
+        if spider is None or worker is None or worker.ident is None:
             entry["stop_requested"] = True
+            running = False
+        else:
+            running = _is_running(entry)
     if spider is not None and running:
         with suppress(RuntimeError):
             spider.pause()

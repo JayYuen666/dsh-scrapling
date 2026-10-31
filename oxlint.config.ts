@@ -3,22 +3,33 @@ import { definePluginConfig } from "@jayyuen66/dsh-plugin-shared/config/oxlint";
 export default definePluginConfig({
   // bin/ 是构建产物（压缩后的单文件 CLI），与 host.js/client.js 同类，不参与源码 lint。
   extraIgnorePatterns: ["bin/**"],
-  // 本包真实用到的同步写盘 API —— node/no-sync 的包内例外。
-  // 构建脚本（build-helpers.ts 及其两个调用方）按需同步读写产物；renameSync 是原子写的
-  // 最后一步（先写临时文件再改名），readdirSync/unlinkSync 只在清理上一次中断留下的
-  // 临时文件时用到 —— 全部只出现在构建脚本里，不进运行期路径。
-  syncWrites: [
-    "writeFileSync",
-    "readFileSync",
-    "existsSync",
-    "mkdirSync",
-    "rmSync",
-    "renameSync",
-    "accessSync",
-    "chmodSync",
-    "mkdtempSync",
-    "readdirSync",
-    "unlinkSync",
+  // node/no-sync 的例外按文件登记（基线的只读组 existsSync / readFileSync / readdirSync /
+  // statSync 统一放行，这里不重复）。
+  // 构建脚本放在包根且是 .ts，落不进 SCRIPTS_OVERRIDES 的 `scripts/**`、`*.mjs`、`*.mts`，
+  // 所以要自己点名：writeFileSync/mkdirSync/mkdtempSync 造产物与临时目录，renameSync 是原子写
+  // 的最后一步（先写临时文件再改名），rmSync/unlinkSync 只清理上次中断留下的临时文件，
+  // chmodSync 给 venv 入口补可执行位。
+  syncIoScopes: [
+    {
+      files: ["build-helpers.ts", "build-client.ts", "build-host.ts", "build-cli.ts"],
+      apis: [
+        "writeFileSync",
+        "mkdirSync",
+        "mkdtempSync",
+        "renameSync",
+        "rmSync",
+        "unlinkSync",
+        "chmodSync",
+      ],
+    },
+    // 测试夹具造现场要落盘；同步写在这里没有并发问题，但也不许外溢到 lib/ 与 host.ts。
+    {
+      files: ["test/**"],
+      apis: ["writeFileSync", "mkdirSync", "mkdtempSync", "rmSync", "chmodSync", "accessSync"],
+    },
+    // lib/runtime.ts 用 accessSync 判「venv 解释器还能不能跑」：插件装载期的一次性探测，
+    // 不在热路径上，而基线的只读组不含这一枚。
+    { files: ["lib/runtime.ts"], apis: ["accessSync"] },
   ],
   titlePrefixes: [
     "ADR",

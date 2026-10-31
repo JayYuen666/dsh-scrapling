@@ -84,8 +84,8 @@ const ANSWER_SYSTEM =
  */
 export function escapePageText(text: string): string {
   return text
-    .replaceAll(/<\s*\/\s*page\s*>/giu, "〔page-close〕")
-    .replaceAll("§page_end§", "〔page-end〕");
+    .replaceAll(/<\s*\/\s*page[\s/]*>/giu, "〔page-close〕")
+    .replaceAll(/§\s*page_end\s*§/giu, "〔page-end〕");
 }
 
 /**
@@ -94,11 +94,15 @@ export function escapePageText(text: string): string {
  * 标签只是给人看的框架，真正的边界是上面那个转义：页面作者关不掉标签、也伪造不出「标签
  * 之外的用户问题」。URL 另做属性转义，否则一个带引号的地址就能自己把属性关掉。
  *
+ * URL 同样要过正文那套转义：属性值里的 `§page_end§` 或 `</page>` 出现在开标签之前，
+ * 模型照样会把它们读成边界 —— 一个由页面自己决定的地址（跳转后的地址、相对地址解析结果）
+ * 就能把后面的正文挪到边界之外。属性转义只管「别把属性关掉」，管不了记号本身。
+ *
  * @param request - 一次问答的输入
  * @returns 用户消息文本
  */
 export function buildAnswerPrompt(request: AnswerRequest): string {
-  const url = request.url.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
+  const url = escapePageText(request.url).replaceAll("&", "&amp;").replaceAll('"', "&quot;");
   const body = escapePageText(request.context);
   return `<page url="${url}">\n${body}\n§page_end§\n\n问题：${request.question}`;
 }
@@ -145,9 +149,17 @@ function routeOf(provider: unknown, model: unknown): AnswerRoute | undefined {
  * @returns 会话当前路由，或 undefined
  */
 export function sessionRoute(agent: unknown): AnswerRoute | undefined {
-  const header = methodOf(fieldOf(agent, "session"), "requestHeader");
-  const config = fieldOf(header, "config");
-  return routeOf(fieldOf(config, "provider"), fieldOf(config, "model"));
+  let route: AnswerRoute | undefined;
+  try {
+    const header = methodOf(fieldOf(agent, "session"), "requestHeader");
+    const config = fieldOf(header, "config");
+    route = routeOf(fieldOf(config, "provider"), fieldOf(config, "model"));
+  } catch {
+    // 活请求头可能在会话销毁/尚未就绪时抛错；契约是「读不到就给 undefined」，
+    // 让上层走 profile 兜底，而不是把正常降级报成 ANSWER_FAILED。
+    route = undefined;
+  }
+  return route;
 }
 
 /**
@@ -225,20 +237,56 @@ export interface AnswerDeps {
  * @param deps - 依赖
  * @returns 问答函数
  */
+/**
+ * 取消不是故障：宿主中止调用时抛的是它自己的取消异常（AbortError 一类），包成 ANSWER_FAILED
+ * 之后上层看到的是「模型坏了」，于是可能重试一个用户已经放弃的提问，取消也会被记进失败统计。
+ *
+ * 与 web-provider / search-provider 同一口径：signal 已中止时原样抛出，让取消沿途保持可识别。
+ * 判据抽成函数是为了让 createAnswerer 的分支数不因这条收口而上涨（复杂度门在 15）。
+ *
+ * @param signal - 请求的中止信号
+ * @param error - 刚捕获的异常
+ */
+function rethrowIfAborted(signal: AbortSignal, error: unknown): void {
+  if (signal.aborted) {
+    throw error;
+  }
+}
+
+/** `stream` 可调用的形状判据；宿主服务可能缺席，也可能是同名但版本不同的实现。 */
+function hasStream(value: Partial<LlmStreamer>): value is LlmStreamer {
+  return typeof value.stream === "function";
+}
+
+/** ctx.llm 不是必备服务：形状不对时给出指名道姓的错误，而不是让属性代理一路走到 root。 */
+function requireLlm(ctx: Context): LlmStreamer {
+  const llm = ctx.get("llm") as Partial<LlmStreamer> | undefined;
+  if (llm === undefined || !hasStream(llm)) {
+    throw new SidecarError(
+      "ANSWER_UNAVAILABLE",
+      "这个 profile 没有可用的 ctx.llm（服务缺席或 stream 不是函数），scrapling_answer 无法调用模型；其余抓取工具不受影响",
+    );
+  }
+  return llm;
+}
+
+/** finish 的收尾状态：重复 finish 忽略，缺省 reason 按正常收尾，其余原因抛出。 */
+function settleFinish(finished: boolean, reason: { kind: string } | undefined): boolean {
+  if (finished) {
+    return true;
+  }
+  if (reason !== undefined && reason.kind !== "stop") {
+    throw new SidecarError("ANSWER_FAILED", `模型没有正常收尾（结束原因 ${reason.kind}）`);
+  }
+  return true;
+}
+
 export function createAnswerer(
   deps: AnswerDeps,
 ): (request: AnswerRequest) => Promise<AnswerResult> {
   const { ctx, override, fallback, maxTokens } = deps;
   return async (request: AnswerRequest): Promise<AnswerResult> => {
-    // ctx.llm 不是必备服务：用 ctx.get 在使用点取，拿不到时给出指名道姓的错误，
-    // 而不是让属性代理一路走到 root 再抛一个看不懂的错。
-    const llm = ctx.get("llm") as LlmStreamer | undefined;
-    if (llm === undefined) {
-      throw new SidecarError(
-        "ANSWER_UNAVAILABLE",
-        "这个 profile 没有 ctx.llm，scrapling_answer 无法调用模型；其余抓取工具不受影响",
-      );
-    }
+    const llm = requireLlm(ctx);
     let answer = "";
     let finished = false;
     let route: AnswerRoute;
@@ -254,13 +302,8 @@ export function createAnswerer(
         signal: request.signal,
       })) {
         if (chunk.type === "finish") {
-          finished = true;
-          if (chunk.reason?.kind !== "stop") {
-            throw new SidecarError(
-              "ANSWER_FAILED",
-              `模型没有正常收尾（结束原因 ${String(chunk.reason?.kind)}）`,
-            );
-          }
+          // 重复的 finish 是协议冗余而不是失败：收尾之后的内容本来就不再接收。
+          finished = settleFinish(finished, chunk.reason);
         } else if (!finished && chunk.type === "text-delta" && typeof chunk.text === "string") {
           // 收尾之后的增量一律不收：协议上正文到 finish 为止，破了约的对端再吐什么都
           // 不该拼进答案里。
@@ -271,6 +314,11 @@ export function createAnswerer(
         throw new SidecarError("ANSWER_FAILED", "模型没有发出收尾事件就结束了流");
       }
     } catch (error: unknown) {
+      // 取消不是故障：宿主在调用被中止时抛的是它自己的取消异常（AbortError 一类），
+      // 包成 ANSWER_FAILED 之后上层看到的是「模型坏了」，于是可能重试一个用户已经
+      // 放弃的提问，取消也会被记进失败统计。与 web-provider / search-provider 同一
+      // 口径：signal 已中止时原样抛出，让取消沿途保持可识别。
+      rethrowIfAborted(request.signal, error);
       // 已经是本模块的错误就原样抛，保留机器可读码；其余一律归到 ANSWER_FAILED。
       if (error instanceof SidecarError) {
         throw error;

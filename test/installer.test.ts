@@ -13,7 +13,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { chmod, lstat, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, symlink, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
@@ -22,8 +22,11 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { mockPlatform } from "./managed-host.ts";
 import {
   acquireLock,
+  loadNativeLock,
+  lockFd,
   createCurlDownloader,
   defaultInstallerIO,
+  errorCodeOf,
   installBrowser,
   installCapabilityPack,
   installCore,
@@ -31,14 +34,32 @@ import {
   InstallError,
   packStates,
   readRuntimeState,
-  releaseLock,
   relocateScripts,
   repairCapabilityPack,
   uninstallCapabilityPack,
   withInstallLock,
 } from "../lib/installer.ts";
-import type { InstallerIO, LockHandle, SpawnResult } from "../lib/installer.ts";
+import type { InstallerIO, SpawnResult } from "../lib/installer.ts";
 import { managedPythonPath, runtimeManifest } from "../lib/runtime.ts";
+
+// 还原阶段的 rename 会被单独打开：只有「从 .tmp/venv-previous-* 出发」的那一次失败，
+// 其余文件操作全走真实实现。判的是「还原失败时旧 venv 不被收尾清理删掉」。
+const renameGate = vi.hoisted(() => ({ failRestore: false }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rename: async (
+      from: Parameters<typeof actual.rename>[0],
+      to: Parameters<typeof actual.rename>[1],
+    ) => {
+      if (renameGate.failRestore && String(from).includes("venv-previous-")) {
+        throw new Error("simulated restore failure");
+      }
+      await actual.rename(from, to);
+    },
+  };
+});
 
 const created: string[] = [];
 const MANAGED_PYTHON = "/managed/python3";
@@ -70,6 +91,17 @@ function tempDir(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "dsh-install-"));
   created.push(dir);
   return dir;
+}
+
+/** 跑一段必失败的调用并交回它抛出的值；不在测试里散写 try/catch。 */
+function thrownBy(run: () => unknown): unknown {
+  let thrown: unknown = null;
+  try {
+    run();
+  } catch (error_: unknown) {
+    thrown = error_;
+  }
+  return thrown;
 }
 
 function writePackState(dataDir: string, packs: unknown): void {
@@ -379,14 +411,19 @@ describe("installPython", () => {
     expect(existsSync(other)).toBe(true);
   });
 
-  it("安装锁被占用时报 INSTALL_BUSY", async () => {
+  it("安装锁被占用时报 INSTALL_BUSY（同一进程的第二个句柄也拿不到）", async () => {
     const dataDir = tempDir();
     mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
-    writeFileSync(path.join(dataDir, "runtime", INSTALL_LOCK), "other\n");
-    const error = await installPython(runtimeManifest.darwinArm64, dataDir, fakeIO()).catch(
-      (error_: unknown) => error_,
-    );
-    expect((error as InstallError).code).toBe("INSTALL_BUSY");
+    const lockPath = path.join(dataDir, "runtime", INSTALL_LOCK);
+    const held = await acquireLock(lockPath);
+    try {
+      const error = await installPython(runtimeManifest.darwinArm64, dataDir, fakeIO()).catch(
+        (error_: unknown) => error_,
+      );
+      expect((error as InstallError).code).toBe("INSTALL_BUSY");
+    } finally {
+      await held.release();
+    }
   });
 
   const usableExtract = {
@@ -405,91 +442,73 @@ describe("installPython", () => {
     });
   }
 
-  it("持锁进程已死时清掉陈旧锁继续安装", async () => {
+  it("持锁进程退出后，遗留的锁文件不再挡住安装", async () => {
     const dataDir = tempDir();
     mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
-    const departed = spawn(process.execPath, ["-e", ""]);
-    await once(departed, "exit");
-    writeFileSync(
-      path.join(dataDir, "runtime", INSTALL_LOCK),
-      `${String(departed.pid)} ${String(Date.now())}\n`,
-    );
+    // OS 锁随进程退出释放；盘上残留的内容与互斥无关。
+    writeFileSync(path.join(dataDir, "runtime", INSTALL_LOCK), "999999 0\n");
     const result = await installPython(installableAsset(), dataDir, installableIO());
     expect(result.pythonPath).toBe(managedPythonPath(dataDir));
   });
 
-  // 时间戳不是接管依据：一次正常的 pip 安装要下载几百 MB，跑过一小时完全正常。
-  // 拿「锁写了一小时」去接管一把**活进程**持有的锁，等于让两个安装同时写同一个 venv。
-  it("活进程持锁超过一小时也不接管", async () => {
+  it("跨进程：另一个进程持锁时 INSTALL_BUSY", async () => {
     const dataDir = tempDir();
     mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
-    const staleAt = Date.now() - 2 * 60 * 60 * 1000;
-    writeFileSync(
-      path.join(dataDir, "runtime", INSTALL_LOCK),
-      `${String(process.pid)} ${String(staleAt)}\n`,
-    );
-    const error = await installPython(runtimeManifest.darwinArm64, dataDir, fakeIO()).catch(
-      (error_: unknown) => error_,
-    );
-    expect((error as InstallError).code).toBe("INSTALL_BUSY");
-  });
-
-  it("活着的别的进程持锁时仍报 INSTALL_BUSY", async () => {
-    const dataDir = tempDir();
-    mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
-    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30_000);"], {
-      stdio: "ignore",
+    const lockPath = path.join(dataDir, "runtime", INSTALL_LOCK);
+    const script = [
+      'const { open } = require("node:fs/promises");',
+      'const { tryLock } = require("fs-native-extensions");',
+      "(async () => {",
+      '  const handle = await open(process.argv[1], "a+");',
+      "  if (!tryLock(handle.fd)) process.exit(2);",
+      String.raw`  process.stdout.write("locked\n");`,
+      // 心跳里引用 handle：FileHandle 被 GC 时 fd 会随之关闭，Linux 的 OFD 锁跟着
+      // 释放——子进程还活着、锁却没了，父进程就能拿锁走到安装面，用例随机变红
+      //（实测在 CI 上以 INSTALL_HASH_MISMATCH 露出）。句柄保持可达，「锁与子进程
+      // 存活绑定」的语义才成立。
+      "  setInterval(() => handle.fd, 1000);",
+      "})();",
+    ].join("\n");
+    const child = spawn(process.execPath, ["-e", script, lockPath], {
+      cwd: path.join(import.meta.dirname, ".."),
+      stdio: ["ignore", "pipe", "inherit"],
     });
     try {
-      writeFileSync(
-        path.join(dataDir, "runtime", INSTALL_LOCK),
-        `${String(holder.pid)} ${String(Date.now())}\n`,
-      );
+      child.stdout.setEncoding("utf8");
+      const [first] = (await once(child.stdout, "data")) as unknown[];
+      const chunk = typeof first === "string" ? first : "";
+      if (!chunk.includes("locked")) {
+        throw new Error(`child did not lock: ${chunk}`);
+      }
       const error = await installPython(runtimeManifest.darwinArm64, dataDir, fakeIO()).catch(
         (error_: unknown) => error_,
       );
       expect((error as InstallError).code).toBe("INSTALL_BUSY");
     } finally {
-      holder.kill();
-      await once(holder, "exit");
+      child.kill();
+      await once(child, "exit");
     }
   });
 
-  it("锁路径被目录占住时按 BUSY 处理", async () => {
+  it("锁路径被目录占住时报不可读，而不是让人反复重试的 BUSY", async () => {
     const dataDir = tempDir();
     mkdirSync(path.join(dataDir, "runtime", INSTALL_LOCK), { recursive: true });
     const error = await installPython(runtimeManifest.darwinArm64, dataDir, fakeIO()).catch(
       (error_: unknown) => error_,
     );
-    expect((error as InstallError).code).toBe("INSTALL_BUSY");
+    expect((error as InstallError).code).toBe("INSTALL_LOCK_UNREADABLE");
   });
 
-  it("锁由当前进程持有且未过期时报 INSTALL_BUSY", async () => {
+  it("lockFd 对坏 fd 报 INSTALL_LOCK_UNREADABLE", () => {
+    expect((thrownBy(() => lockFd(-1)) as InstallError).code).toBe("INSTALL_LOCK_UNREADABLE");
+  });
+
+  it("release 幂等：第二次 unlock 的 EBADF 不影响收工", async () => {
     const dataDir = tempDir();
     mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
-    writeFileSync(
-      path.join(dataDir, "runtime", INSTALL_LOCK),
-      `${String(process.pid)} ${String(Date.now())}\n`,
-    );
-    const error = await installPython(runtimeManifest.darwinArm64, dataDir, fakeIO()).catch(
-      (error_: unknown) => error_,
-    );
-    expect((error as InstallError).code).toBe("INSTALL_BUSY");
-  });
-
-  it("陈旧锁被移走后二次抢占失败时报 INSTALL_BUSY", async () => {
-    const dataDir = tempDir();
-    const lockPath = path.join(dataDir, "runtime", INSTALL_LOCK);
-    mkdirSync(path.dirname(lockPath), { recursive: true });
-    writeFileSync(lockPath, `999999 ${String(Date.now() - 2 * 60 * 60 * 1000)}\n`);
-    let calls = 0;
-    const openLock = async (): Promise<never> => {
-      calls += 1;
-      const code = calls === 1 ? "EEXIST" : "EACCES";
-      throw Object.assign(new Error(code), { code });
-    };
-    const error = await acquireLock(lockPath, openLock).catch((error_: unknown) => error_);
-    expect((error as InstallError).code).toBe("INSTALL_BUSY");
+    const handle = await acquireLock(path.join(dataDir, "runtime", INSTALL_LOCK));
+    await handle.release();
+    await expect(handle.release()).resolves.toBeUndefined();
   });
 });
 
@@ -500,41 +519,12 @@ describe("withInstallLock", () => {
     }
   });
 
-  // close 抛错时若直接放弃清锁，锁里写的是**本进程**的 pid，本进程此后每次安装都自撞 BUSY。
-  it("关锁时 close 抛错也照样把锁清掉", async () => {
+  it("同一进程可重入：内层不再取同一把锁", async () => {
     const dataDir = tempDir();
-    const lockPath = path.join(dataDir, "runtime", INSTALL_LOCK);
-    const closed: string[] = [];
-    const result = await withInstallLock(
-      dataDir,
-      async () => {
-        expect(existsSync(lockPath)).toBe(true);
-        return "done";
-      },
-      async (file) => ({
-        writeFile: async (data) => {
-          await writeFile(file, data, "utf8");
-        },
-        close: async () => {
-          closed.push("close");
-          throw new Error("close boom");
-        },
-      }),
+    const result = await withInstallLock(dataDir, () =>
+      withInstallLock(dataDir, async () => "nested"),
     );
-    expect(result).toBe("done");
-    expect(closed).toStrictEqual(["close"]);
-    expect(existsSync(lockPath)).toBe(false);
-  });
-
-  // 持有期间锁可能被判陈旧清掉、又被另一路重新写下它的 pid；这时删文件等于放行并发安装。
-  it("锁被接管后不删新持有者的锁", async () => {
-    const dataDir = tempDir();
-    const lockPath = path.join(dataDir, "runtime", INSTALL_LOCK);
-    await withInstallLock(dataDir, async () => {
-      writeFileSync(lockPath, `999999999 ${String(Date.now())}\n`);
-    });
-    expect(existsSync(lockPath)).toBe(true);
-    expect(readFileSync(lockPath, "utf8")).toContain("999999999");
+    expect(result).toBe("nested");
   });
 
   // spec §11.6：「runtime 目录 0700」。取锁是建 runtime 目录最常见的入口，量这一条即可
@@ -569,64 +559,42 @@ describe("withInstallLock", () => {
   });
 });
 
-describe("releaseLock", () => {
-  afterEach(() => {
-    for (const dir of created.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
+describe("loadNativeLock", () => {
+  it("模块加载失败或形状不符时返回 null", () => {
+    expect(
+      loadNativeLock(() => {
+        throw new Error("missing");
+      }),
+    ).toBeNull();
+    expect(loadNativeLock(() => 42)).toBeNull();
+    expect(loadNativeLock(() => ({}))).toBeNull();
+    expect(loadNativeLock(() => ({ tryLock: 1, unlock: 2 }))).toBeNull();
   });
 
-  const quietHandle: LockHandle = {
-    writeFile: () => Promise.resolve(),
-    close: () => Promise.resolve(),
-  };
-
-  it("close 抛错也照样把自己那把锁清掉", async () => {
-    const dataDir = tempDir();
-    const runtimeDir = path.join(dataDir, "runtime");
-    mkdirSync(runtimeDir, { recursive: true });
-    const lockPath = path.join(runtimeDir, INSTALL_LOCK);
-    writeFileSync(lockPath, `${String(process.pid)} ${String(Date.now())}\n`);
-    await releaseLock(lockPath, {
-      writeFile: () => Promise.resolve(),
-      close: () => Promise.reject(new Error("EBADF")),
-    });
-    expect(existsSync(lockPath)).toBe(false);
-  });
-
-  // 锁文件已经不在（被别路清掉）：读属主失败不能变成一次抛错。
-  it("锁文件不在时安静收工", async () => {
-    const dataDir = tempDir();
-    mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
-    await expect(
-      releaseLock(path.join(dataDir, "runtime", INSTALL_LOCK), quietHandle),
-    ).resolves.toBeUndefined();
-  });
-
-  // 读不出自己的 pid（写坏了、或是别人的锁）就保留它：宁可留一把等人清，也不能删别人的锁。
-  it("锁里读不出自己的 pid 时保留那把锁", async () => {
-    const dataDir = tempDir();
-    mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
-    const lockPath = path.join(dataDir, "runtime", INSTALL_LOCK);
-    writeFileSync(lockPath, "not-a-pid\n");
-    await releaseLock(lockPath, quietHandle);
-    expect(existsSync(lockPath)).toBe(true);
-  });
-
-  // 删不掉（目录只读）时只是收工：抛出去会盖掉调用方真正要报的那个错误。
-  it.skipIf(process.platform === "win32")("锁文件删不掉时安静收工", async () => {
-    const dataDir = tempDir();
-    const runtimeDir = path.join(dataDir, "runtime");
-    mkdirSync(runtimeDir, { recursive: true });
-    const lockPath = path.join(runtimeDir, INSTALL_LOCK);
-    writeFileSync(lockPath, `${String(process.pid)} ${String(Date.now())}\n`);
-    await chmod(runtimeDir, 0o500);
+  it("真实模块可加载、加锁与解锁", async () => {
+    const lock = loadNativeLock();
+    expect(lock).not.toBeNull();
+    const file = path.join(tempDir(), "native.lock");
+    const one = await open(file, "a+");
+    const two = await open(file, "a+");
     try {
-      await expect(releaseLock(lockPath, quietHandle)).resolves.toBeUndefined();
+      expect(lock?.tryLock(one.fd)).toBe(true);
+      expect(lock?.tryLock(two.fd)).toBe(false);
+      lock?.unlock(one.fd);
+      expect(lock?.tryLock(two.fd)).toBe(true);
     } finally {
-      await chmod(runtimeDir, 0o700);
+      lock?.unlock(two.fd);
+      await one.close();
+      await two.close();
     }
-    expect(existsSync(lockPath)).toBe(true);
+  });
+
+  it("原生模块缺席时 acquireLock 与 lockFd 都报不可读", async () => {
+    const lockPath = path.join(tempDir(), "runtime", INSTALL_LOCK);
+    await expect(acquireLock(lockPath, null)).rejects.toMatchObject({
+      code: "INSTALL_LOCK_UNREADABLE",
+    });
+    expect((thrownBy(() => lockFd(0, null)) as InstallError).code).toBe("INSTALL_LOCK_UNREADABLE");
   });
 });
 
@@ -899,6 +867,51 @@ describe("installCore", () => {
     expect(existsSync(path.join(dataDir, "runtime", STATE_FILE))).toBe(false);
   });
 
+  // 还原本身也失败时，旧 venv 仍留在 .tmp/venv-previous-*：那是用户原本可用的环境。
+  // 收尾清理若照删不误，就等于把「这次换装失败」升级成「旧环境也没了」。
+  it("还原也失败时旧 venv 留在 .tmp 里，不被收尾清理删掉", async () => {
+    const dataDir = tempDir();
+    const runtimeDir = path.join(dataDir, "runtime");
+    const venv = path.join(runtimeDir, "venv");
+    mkdirSync(path.join(venv, "bin"), { recursive: true });
+    writeFileSync(path.join(venv, "bin", OLD_MARKER), OLD_MARKER_BODY);
+    const io = fakeIO({
+      spawn: async (argv) => {
+        if (argv.includes("venv")) {
+          const target = argv.at(-1) ?? "";
+          mkdirSync(path.join(target, "bin"), { recursive: true });
+          writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n");
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        // pip 报成功却把暂存 venv 弄没了：rename(staging, venv) 必然失败，
+        // 于是走进还原分支；而还原那一步被 renameGate 判失败。
+        const staging = path.dirname(path.dirname(argv[0] ?? ""));
+        rmSync(staging, { recursive: true, force: true });
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    renameGate.failRestore = true;
+    try {
+      const error = await installCore({
+        pythonPath: MANAGED_PYTHON,
+        dataDir,
+        repoRoot: requirementsRepoRoot(),
+        io,
+      }).catch((error_: unknown) => error_);
+      expect((error as InstallError).code).toBe("INSTALL_FAILED");
+      const tmp = path.join(runtimeDir, ".tmp");
+      const previous = readdirSync(tmp).find((name) => name.startsWith("venv-previous-"));
+      expect(previous).toBeDefined();
+      expect(readFileSync(path.join(tmp, previous ?? "", "bin", OLD_MARKER), "utf8")).toBe(
+        OLD_MARKER_BODY,
+      );
+      // 旧环境没被搬回去（还原确实失败了），但也没有被删掉。
+      expect(existsSync(path.join(venv, "bin", OLD_MARKER))).toBe(false);
+    } finally {
+      renameGate.failRestore = false;
+    }
+  });
+
   it("离线安装只读资产目录：不下载，pip 走 --no-index --find-links", async () => {
     const dataDir = tempDir();
     const assets = tempDir();
@@ -972,6 +985,20 @@ describe("installCore", () => {
       (error_: unknown) => error_,
     );
     expect((missing as InstallError).code).toBe("INSTALL_OFFLINE_ASSETS");
+
+    // 清单 URL 解析不了 / 归档名里的百分号编码不合法：同样是安装资产的问题，
+    // 不能让 URL/decodeURIComponent 的裸异常穿透成 INSTALL_FAILED。
+    const badUrl = await installPython({ ...plain, url: "not a url" }, tempDir(), io, assets).catch(
+      (error_: unknown) => error_,
+    );
+    expect((badUrl as InstallError).code).toBe("INSTALL_OFFLINE_ASSETS");
+    const badPercent = await installPython(
+      { ...plain, url: "https://example.test/%ZZ.tar.gz" },
+      tempDir(),
+      io,
+      assets,
+    ).catch((error_: unknown) => error_);
+    expect((badPercent as InstallError).code).toBe("INSTALL_OFFLINE_ASSETS");
   });
 
   it("离线归档哈希不符同样报 INSTALL_HASH_MISMATCH", async () => {
@@ -1412,6 +1439,17 @@ describe("installCapabilityPack", () => {
   });
 });
 
+describe("errorCodeOf", () => {
+  it("只从对象上读出字符串 code；其它形态一律 undefined", () => {
+    const errno = Object.assign(new Error("x"), { code: "ENOENT" });
+    expect(errorCodeOf(errno)).toBe("ENOENT");
+    expect(errorCodeOf(new Error("x"))).toBeUndefined();
+    expect(errorCodeOf("ENOENT")).toBeUndefined();
+    expect(errorCodeOf(null)).toBeUndefined();
+    expect(errorCodeOf({ code: 42 })).toBeUndefined();
+  });
+});
+
 describe("uninstallCapabilityPack", () => {
   afterEach(() => {
     for (const dir of created.splice(0)) {
@@ -1419,15 +1457,23 @@ describe("uninstallCapabilityPack", () => {
     }
   });
 
-  it("卸 core 删 venv 与状态，不碰 adaptive 数据", async () => {
+  it("卸 core 删 venv、只摘 core 状态，保留 browser 标记与 adaptive 数据", async () => {
     const dataDir = tempDir();
     readyCore(dataDir);
-    writePackState(dataDir, { core: "ready" });
+    mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
+    writeFileSync(
+      path.join(dataDir, "runtime", STATE_FILE),
+      JSON.stringify({ packs: { core: "ready", browser: "ready" }, browsersPath: "/kept" }),
+    );
     writeFileSync(path.join(dataDir, STORAGE_DB), "db");
     mkdirSync(path.join(dataDir, "downloads"), { recursive: true });
     await uninstallCapabilityPack(CORE_PACK, { dataDir, purge: false });
     expect(existsSync(path.join(dataDir, "runtime", "venv"))).toBe(false);
-    expect(existsSync(path.join(dataDir, "runtime", STATE_FILE))).toBe(false);
+    const state = await readRuntimeState(dataDir);
+    // core 的标记摘掉；browser 的 ready 与 browsersPath 必须留着 —— chromium 还在盘上，
+    // 整份删状态会让它显示 missing 并重下几百 MB。
+    expect(state["packs"]).toStrictEqual({ browser: "ready" });
+    expect(state["browsersPath"]).toBe("/kept");
     expect(existsSync(path.join(dataDir, STORAGE_DB))).toBe(true);
     expect(existsSync(path.join(dataDir, "downloads"))).toBe(true);
   });
@@ -1479,14 +1525,18 @@ describe("uninstallCapabilityPack", () => {
     writePackState(dataDir, { core: "ready" });
     const marker = path.join(dataDir, "runtime", "venv", "bin", OLD_MARKER);
     writeFileSync(marker, OLD_MARKER_BODY);
-    writeFileSync(path.join(dataDir, "runtime", INSTALL_LOCK), `${process.pid} ${Date.now()}\n`);
-    const error = await uninstallCapabilityPack(CORE_PACK, { dataDir, purge: false }).catch(
-      (error_: unknown) => error_,
-    );
-    expect((error as InstallError).code).toBe("INSTALL_BUSY");
-    // 卸载是删文件：拿不到锁时一个字节都不该动，venv 与状态位都还在原处。
-    expect(readFileSync(marker, "utf8")).toBe(OLD_MARKER_BODY);
-    expect(existsSync(path.join(dataDir, "runtime", STATE_FILE))).toBe(true);
+    const held = await acquireLock(path.join(dataDir, "runtime", INSTALL_LOCK));
+    try {
+      const error = await uninstallCapabilityPack(CORE_PACK, { dataDir, purge: false }).catch(
+        (error_: unknown) => error_,
+      );
+      expect((error as InstallError).code).toBe("INSTALL_BUSY");
+      // 卸载是删文件：拿不到锁时一个字节都不该动，venv 与状态位都还在原处。
+      expect(readFileSync(marker, "utf8")).toBe(OLD_MARKER_BODY);
+      expect(existsSync(path.join(dataDir, "runtime", STATE_FILE))).toBe(true);
+    } finally {
+      await held.release();
+    }
   });
 
   it("外层持锁再调卸载不会自撞 BUSY（同一进程内可重入）", async () => {
@@ -1499,6 +1549,5 @@ describe("uninstallCapabilityPack", () => {
     });
     expect(result).toBe("uninstalled");
     expect(existsSync(path.join(dataDir, "runtime", "venv"))).toBe(false);
-    expect(existsSync(path.join(dataDir, "runtime", INSTALL_LOCK))).toBe(false);
   });
 });

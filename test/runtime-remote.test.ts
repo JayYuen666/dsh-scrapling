@@ -22,6 +22,7 @@ const MANIFEST_STATE = "state.json";
 const CHROMIUM_DIR = "chromium-1";
 const INSTALL_REFUSED = "install was refused";
 const READER_MISSING = "reader missing";
+const JOB_KIND = "scrapling-runtime";
 
 function tempDir(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "dsh-runtime-remote-"));
@@ -87,6 +88,8 @@ interface FakeJobs {
   outputs: Map<string, string>;
   progress: Map<string, string[]>;
   kills: string[];
+  /** 让注册表忘掉所有记录，对齐宿主 `remove()` 与服务销毁后的状态。 */
+  forget: () => void;
 }
 
 function fakeJobs(
@@ -105,6 +108,7 @@ function fakeJobs(
   const progress = new Map<string, string[]>();
   const kills: string[] = [];
   let sequence = 0;
+  let forgotten = false;
   const registry = {
     attachController: () => detach,
     start: (spec: JobSpec): JobId => {
@@ -131,14 +135,29 @@ function fakeJobs(
       });
       return id as never;
     },
+    list: (): JobView[] =>
+      forgotten
+        ? []
+        : Array.from(views.keys(), (id) => ({
+            id: id as never,
+            kind: JOB_KIND,
+            label: "runtime",
+            status: views.get(id) ?? "running",
+            startedAt: 0,
+            output: { total: 0, earliest: 0 },
+          })),
     get: (id: JobId): JobView => {
+      if (forgotten) {
+        // 宿主对陌生 id 的说法：jobs-local src/index.ts:399-400。
+        throw new Error(`unknown job ${String(id)}`);
+      }
       if (options.getThrows === true) {
         throw new Error("no view");
       }
       const status = views.get(String(id)) ?? "running";
       return {
         id,
-        kind: "scrapling-runtime",
+        kind: JOB_KIND,
         label: "runtime",
         status,
         startedAt: 0,
@@ -175,6 +194,9 @@ function fakeJobs(
     outputs,
     progress,
     kills,
+    forget: (): void => {
+      forgotten = true;
+    },
   };
 }
 
@@ -399,6 +421,24 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(second.error).toContain("no view");
     // 第二次真的没被启动：作业表里仍然只有第一条。
     expect(jobs.specs).toHaveLength(1);
+  });
+
+  it("注册表已不认识那条作业时放行下一次安装，并把陈旧的作业读数丢掉", async () => {
+    // 缺席与读失败不是一回事：宿主会在 remove() 与作业服务销毁时摘掉记录
+    // （@deepseek-ai/dsh-jobs-local src/index.ts:340-343、:674-682），此后 get() 抛
+    // unknown job。把这种抛错当「还在跑」会让安装按钮永久 500。
+    const jobs = fakeJobs();
+    const ctx = new Context();
+    installRuntimeRemote(ctx, depsOf(tempDir(), jobs));
+    const service = serviceOf(ctx);
+    expect(service.installPack({ pack: CORE }).ok).toBe(true);
+    jobs.forget();
+    const second = service.installPack({ pack: CORE });
+    expect(second.ok).toBe(true);
+    expect(jobs.specs).toHaveLength(2);
+    // 卡片不再拿那条陌生作业当现状。
+    const view = await service.status();
+    expect(view.job).toBeNull();
   });
 
   it("同一时刻只允许一条安装作业", async () => {

@@ -97,6 +97,18 @@ describe("decodeFrame", () => {
     expect(kindOf(() => decodeFrame("not json"))).toBe(FRAME_ERROR_KINDS.unparsableJson);
   });
 
+  it("解码失败的消息只报长度，不带帧原文（原文可能含凭据/页面正文）", () => {
+    const secret = "sk-live-abcdef123456";
+    let message = "";
+    try {
+      decodeFrame(`{"api_key":"${secret}",`);
+    } catch (error) {
+      message = String(error);
+    }
+    expect(message).toContain("length=");
+    expect(message).not.toContain(secret);
+  });
+
   it("数组与标量都算 not-an-object", () => {
     for (const line of ["[]", "123", '"x"', "null", "true"]) {
       expect(kindOf(() => decodeFrame(line))).toBe(FRAME_ERROR_KINDS.notAnObject);
@@ -136,6 +148,18 @@ describe("pumpFrames", () => {
     ]);
   });
 
+  it("流被 close 而没有 end 时，残留的最后一帧仍被投递", async () => {
+    const seen: string[] = [];
+    const stream = new Readable({ read: noop });
+    const stop = pumpFrames(stream, (line) => {
+      seen.push(line);
+    });
+    stream.emit("data", `{"tail":1}`);
+    stream.emit("close");
+    expect(seen).toStrictEqual(['{"tail":1}']);
+    stop();
+  });
+
   it("流末尾没有换行时靠 end 事件补出最后一帧", async () => {
     await expect(collect([`${FRAME_A}\n${FRAME_B}`])).resolves.toStrictEqual([FRAME_A, FRAME_B]);
   });
@@ -162,6 +186,71 @@ describe("pumpFrames", () => {
     await finished(stream);
     expect(seen).toStrictEqual([FRAME_A]);
   });
+
+  it("stop() 之后 end 与 error 都不再回调，且报错不会变成未捕获异常", async () => {
+    const frames: string[] = [];
+    const errors: unknown[] = [];
+    const stream = new Readable({ read: noop });
+    const stop = pumpFrames(
+      stream,
+      (line) => {
+        frames.push(line);
+      },
+      collectErrors(errors),
+    );
+    stop();
+    // 停止之后再喂 data / end / error：契约是「调用后不再回调」。error 还必须有人接住，
+    // 否则 EventEmitter 会把它抛成未捕获异常。
+    stream.emit("data", `${FRAME_A}\n`);
+    stream.emit("end");
+    expect(() => stream.emit("error", new Error("late pipe broke"))).not.toThrow();
+    await tick();
+    expect(frames).toStrictEqual([]);
+    expect(errors).toStrictEqual([]);
+  });
+
+  it("某一帧回调抛错不耽误同一个 chunk 里后面的帧", async () => {
+    const delivered: string[] = [];
+    const errors: unknown[] = [];
+    const stream = Readable.from([`${FRAME_A}\n${FRAME_B}\n`]);
+    pumpFrames(
+      stream,
+      (line) => {
+        delivered.push(line);
+        if (line === FRAME_A) {
+          throw new Error("first frame blew up");
+        }
+      },
+      collectErrors(errors),
+    );
+    await finished(stream);
+    await tick();
+    // 帧已经被 splitter 消费掉，不会重放：让异常中断循环等于静默丢掉后面那帧。
+    expect(delivered).toStrictEqual([FRAME_A, FRAME_B]);
+    expect(errors).toHaveLength(1);
+    expect(String(errors[0])).toContain("first frame blew up");
+  });
+
+  it("残帧超限时把 FrameError 转交 onError，而不是从 data 监听器里抛出去", async () => {
+    const frames: string[] = [];
+    const errors: unknown[] = [];
+    const stream = new Readable({ read: noop });
+    pumpFrames(
+      stream,
+      (line) => {
+        frames.push(line);
+      },
+      collectErrors(errors),
+    );
+    // 只喂不带换行的一大段：切帧器攒到 8 MiB 字符上限就抛 frame-too-large，泵必须把它
+    // 交给 onError（从 data 监听器里抛出去就是宿主进程的未捕获异常）。
+    stream.emit("data", "x".repeat(8 * 1024 * 1024 + 1));
+    await tick();
+    expect(frames).toStrictEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(FrameError);
+    expect(errors[0]).toMatchObject({ kind: FRAME_ERROR_KINDS.frameTooLarge });
+  });
 });
 
 describe("frame splitter 上限", () => {
@@ -175,6 +264,15 @@ describe("frame splitter 上限", () => {
       }
     });
     expect(kind).toBe(FRAME_ERROR_KINDS.frameTooLarge);
+  });
+
+  it("超长帧与换行落在同一个 chunk 里同样判超限（只看残片会漏掉）", () => {
+    const splitter = new FrameSplitter();
+    expect(kindOf(() => splitter.push(`${"x".repeat(8 * 1024 * 1024 + 1)}\n`))).toBe(
+      FRAME_ERROR_KINDS.frameTooLarge,
+    );
+    // 超限后缓冲被清空，后续正常帧不粘上半截坏内容。
+    expect(splitter.push(`${FRAME_B}\n`)).toStrictEqual([FRAME_B]);
   });
 
   it("超限后缓冲被丢弃，下一帧正常，不会永远卡在坏状态里", () => {

@@ -903,8 +903,10 @@ describe("apply", () => {
       path: path.join(venvBin, exe),
       via: "_env/.venv",
     });
+    // PATH 档交回裸名字：与 py-launcher 的 PATH_PYTHON 同为 "python"，.exe 由宿主的
+    // PATHEXT 展开落定——两个入口答两个字符串，日志里解释器就对不上。
     expect(resolvePythonBin("", path.join(root, "absent"))).toStrictEqual({
-      path: exe,
+      path: "python",
       via: "PATH",
     });
     const configured = String.raw`C:\py\python.exe`;
@@ -1787,8 +1789,9 @@ describe("爬虫作业的取消与失败", () => {
       const outcome = (await harness.hooks?.done) as { status: string };
       // 信号传对了的话，取消会让 sidecar 调用中止、作业主体抛错，最终落成 killed。
       expect(outcome.status).toBe("killed");
-      // teardown 是 fire-and-forget：done 先落定、terminate 随后才到，所以要等。
-      await waitFor(() => harness.terminated() > 0);
+      // 取消只 abort 请求，并不拆常驻 sidecar；原等待在等一个恒为 0 的计数，
+      // waitFor 预算耗尽后静默返回 —— 既没验证 terminate，又白等 10s。
+      expect(harness.terminated()).toBe(0);
     } finally {
       await stalling.close();
     }

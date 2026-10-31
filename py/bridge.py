@@ -22,8 +22,9 @@
 1. **stdout 只能是协议帧。** 任何 ``print`` 或第三方库的进度输出都会把 JSON-lines
    流打坏，所以本文件与 adapters 的一切日志都走 stderr。
 2. **一行一帧且不能交错。** 并发请求各自回帧时要串行化，否则两个响应会被拼在同一行。
-3. **读 stdin 要按字节自行切行。** 直接用 ``sys.stdin.readline()`` 在管道上会因预读
-   把两行一起吞掉，导致第二帧永远读不到。
+3. **读 stdin 要按字节自行切行。** 逐帧读取既不能等 ``read(n)`` 读满（管道上会一直
+   空等），也不能让 ``readline()`` 把整行先吃进内存（超长残帧会先占住无界缓冲）；
+   因此按块取字节、在自建的缓冲区里切行并增量判长。
 4. **worker 数与并发上限一致。** 浏览器抓取很吃内存（每个 Chromium 实例数百 MB），
    无上限会让几个并行的工具调用把机器拖垮。
 
@@ -40,7 +41,8 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Callable
+from io import BufferedReader
+from typing import Any, Callable, cast
 
 # 协议帧与日志一律 UTF-8：宿主按 UTF-8 解码本进程的 stdout/stderr，而两者都是管道。
 # 管道在 Windows 上默认走本地 ANSI 代码页；`LC_ALL=C` 配上 `PYTHONUTF8=0` 这类环境
@@ -94,8 +96,9 @@ PROTOCOL_VERSION = 1
 # 并发上限：与工作线程数一致，多了也只是排队。
 MAX_INFLIGHT = 4
 
-# 单帧字节上限。readline() 拿到的是整行，超大的行在 json.loads 之前就该判掉 —— 解析本身
-# 就要把这行再展开一份。宿主侧对每个工具的输出另有封顶，这条防的是「入参本身很大」。
+# 单帧字节上限。切出整行后先判长度再解析：解析本身就要把这行再展开一份。
+# 读侧按块累积，一旦缓冲超过上限就弃帧报 BAD_FRAME，不会为一个不带换行的写入
+# 继续累积。宿主侧对每个工具的输出另有封顶，这条防的是「入参本身很大」。
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 # 待处理队列的深度上限。队列只在 worker 全部占满时增长，而 worker 数是 MAX_INFLIGHT，
@@ -152,6 +155,25 @@ def fail(request_id: Any, code: str, message: str, details: dict[str, Any] | Non
     return {"id": request_id, "ok": False, "error": error}
 
 
+# scrapling 的可选 extra（fetchers / rag）会按需导入这些包；只有它们缺失才算
+# 「环境没装对」。其它 ModuleNotFoundError 是本插件自己的导入缺陷，不能包装成
+# 安装提示——用户照提示装完仍然会失败。
+OPTIONAL_DEPENDENCIES = frozenset(
+    {
+        "markdownify",
+        "playwright",
+        "patchright",
+        "curl_cffi",
+        "browserforge",
+        "msgspec",
+        "protego",
+        "anyio",
+        "click",
+        "apify_fingerprint_datapoints",
+    }
+)
+
+
 def handle(frame: dict[str, Any]) -> dict[str, Any]:
     """分发一个请求帧。
 
@@ -184,7 +206,16 @@ def handle(frame: dict[str, Any]) -> dict[str, Any]:
             # 而模型与用户对这两种情况的正确反应完全不同：前者该退避重试，后者该去装包。
             # 报错必须指向后者，所以单列一个码，并把本插件的硬性安装命令直接写进去——
             # Scrapling 自己只说「装 markdownify」，而本插件要的是整个 extra。
-            missing = error.name or "某个可选依赖"
+            missing = error.name or "某个模块"
+            if missing not in OPTIONAL_DEPENDENCIES:
+                # 插件自身代码里的导入错误同样会抛 ModuleNotFoundError；把它说成
+                # 「去装 rag extra」会让用户装完仍然报同一个错。
+                log(f"{method} aborted: internal import failed: {missing}")
+                return fail(
+                    request_id,
+                    "FETCH_FAILED",
+                    f"内部依赖导入失败：{missing}（这是插件自身的缺陷，不是环境缺包）",
+                )
             log(f"{method} aborted: missing dependency {missing}")
             return fail(
                 request_id,
@@ -233,7 +264,15 @@ def _worker() -> None:
             try:
                 emit(handle(frame))
             except Exception as error:  # noqa: BLE001 —— 连序列化失败都不能让线程死掉
-                log(f"emit failed: {type(error).__name__}: {error}")
+                request_id = frame.get("id")
+                log(f"emit failed for request {request_id}: {type(error).__name__}: {error}")
+                try:
+                    emit(fail(request_id, "INTERNAL", f"failed to emit response: {type(error).__name__}: {error}"))
+                except Exception as fallback_error:  # noqa: BLE001 —— 兜底帧也写不出去，只能留日志
+                    log(
+                        f"fallback frame for request {request_id} also failed: "
+                        f"{type(fallback_error).__name__}: {fallback_error}"
+                    )
     finally:
         with _WORKERS_LOCK:
             current = threading.current_thread()
@@ -281,9 +320,9 @@ def _shutdown_sessions() -> None:
 
     浏览器会话是独立进程：sidecar 自己退了、Chromium 还活着，就成了没人管的孤儿。
     """
-    import adapters
-
     try:
+        import adapters
+
         adapters.close_all_sessions()
     except Exception as error:  # noqa: BLE001 —— 关不掉也不能拖住关机
         log(f"failed to close sessions: {type(error).__name__}: {error}")
@@ -331,14 +370,23 @@ def read_loop() -> int:
     except Exception as error:  # noqa: BLE001
         log(f"failed to report readiness: {type(error).__name__}: {error}")
 
-    # 必须用 readline()，不能用 read(65536)。
+    # 必须按块读（read1），既不能用 read(65536)，也不能用 readline()。
     # BufferedReader.read(n) 的语义是「读满 n 字节或遇到 EOF」：宿主只要保持管道开着
     # （而常驻进程本来就该一直开着），它就会一直等下去，第一个请求永远进不来。
     # 实测踩过：批量发完立刻 close stdin 的探针能过，逐帧交互的客户端会挂死。
-    # readline() 逐行返回、读到换行就走，既不会被预读吞掉下一帧，也不会空等。
-    for raw in iter(sys.stdin.buffer.readline, b""):
+    # readline() 则把整行读进内存**才**交回来：宿主侧 FrameSplitter 在
+    # MAX_FRAME_BYTES 处增量截断，这里若等整行，一个不带换行的超长写入仍会把无界字节
+    # 吃进内存（两侧同解的对称性缺口）。read1 有多少给多少，配合自建的 pending
+    # 增量判长，超限即弃帧报 BAD_FRAME 并清到下一行。
+    # typeshed 把 sys.stdin.buffer 标成 BinaryIO，那份协议里没有 read1；运行时它是
+    # _io.BufferedReader（管道与重定向文件都实测到这一型），cast 补这处过粗的标注。
+    stream = cast(BufferedReader, sys.stdin.buffer)
+    pending = bytearray()
+
+    def handle_raw(raw: bytes) -> bool:
+        """处理一个完整帧（含行尾换行）。交回 False = 收到 shutdown，读循环退出。"""
         if not raw.strip():
-            continue
+            return True
         if len(raw) > MAX_FRAME_BYTES:
             emit(
                 fail(
@@ -347,15 +395,15 @@ def read_loop() -> int:
                     f"frame of {len(raw)} bytes exceeds the {MAX_FRAME_BYTES} byte limit",
                 )
             )
-            continue
+            return True
         try:
             frame = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             emit(fail(None, "BAD_FRAME", f"unparsable frame: {error}"))
-            continue
+            return True
         if not isinstance(frame, dict):
             emit(fail(None, "BAD_FRAME", "frame must be an object"))
-            continue
+            return True
         if frame.get("method") == "shutdown":
             emit(ok(frame.get("id"), {"stopping": True}))
             _drain_before_exit()
@@ -363,7 +411,7 @@ def read_loop() -> int:
             # 本身。宿主的优雅关闭走的就是这一帧（见 lib/sidecar.ts 的 dispose）。
             _shutdown_crawls()
             _shutdown_sessions()
-            return 0
+            return False
         # 顺序要紧：先入队再起 worker。反过来的话，新起的线程可能立刻醒来、
         # 看到空队列就退出，这一帧就永远没人处理 —— 且只在时序凑巧时才会复现。
         busy_reply: dict[str, Any] | None = None
@@ -382,8 +430,30 @@ def read_loop() -> int:
             # emit 在锁外：stdout 一旦阻塞（宿主读得慢），持锁写流会把全部 worker 的
             # _drain 一起冻住 —— 回帧可以慢，队列不能停。
             emit(busy_reply)
-            continue
+            return True
         _ensure_worker(min(depth, MAX_INFLIGHT))
+        return True
+
+    for chunk in iter(lambda: stream.read1(65536), b""):
+        pending.extend(chunk)
+        while b"\n" in pending:
+            index = pending.index(b"\n")
+            raw = bytes(pending[: index + 1])
+            del pending[: index + 1]
+            if not handle_raw(raw):
+                log("stdin closed")
+                return 0
+        if len(pending) > MAX_FRAME_BYTES:
+            # 无换行的超长残帧：与宿主侧 FrameSplitter 同解——弃缓冲、报 BAD_FRAME、
+            # 进程不死，后续带换行的合法帧照常处理。
+            del pending[:]
+            emit(
+                fail(
+                    None,
+                    "BAD_FRAME",
+                    f"a frame went over the {MAX_FRAME_BYTES} byte limit without a newline",
+                )
+            )
     log("stdin closed")
     _drain_before_exit()
     _shutdown_crawls()

@@ -3,7 +3,12 @@
 Serves a local SPA shell whose content exists ONLY after JS runs, then compares:
   (a) raw HTML -> text  (what dsh web_fetch can produce: no JS execution)
   (b) Scrapling Fetcher  (curl_cffi, still no JS)
-  (c) Scrapling DynamicFetcher (Playwright, JS runs)
+  (c) Scrapling StealthySession (patchright Chromium, JS runs)
+
+Scrapling 0.5 removed `DynamicFetcher`; the dynamic leg is a session. The render leg waits
+on `wait_selector` for the node the timer inserts, because `network_idle` alone can settle
+before a 50 ms `setTimeout` fires — this page issues no subresources, so an idle network
+says nothing about the DOM.
 """
 
 import http.server, socketserver, threading, time
@@ -46,7 +51,7 @@ URL = f"http://127.0.0.1:{port}/"
 print(f"local SPA shell served at {URL}\n")
 
 MARK = "Server Price"
-from scrapling.fetchers import Fetcher, DynamicFetcher
+from scrapling.fetchers import Fetcher, StealthySession
 from lxml import html as LH
 
 print("== [a] dsh-equivalent: raw HTTP -> text (NO JS) ==")
@@ -64,15 +69,21 @@ print(f"   .get_all_text() = {r.get_all_text(strip=True)!r}")
 print(f"   title = {r.css('title::text').get()!r}")
 print(f"   contains {MARK!r}? -> {MARK in r.get_all_text(strip=True)}")
 
-print("\n== [c] Scrapling DynamicFetcher (Playwright — JS runs) ==")
+print("\n== [c] Scrapling StealthySession (patchright Chromium — JS runs) ==")
 t = time.time()
-r2 = DynamicFetcher.fetch(URL, headless=True, timeout=30000, network_idle=True)
-print(f"   {time.time()-t:.1f}s status={r2.status}")
-print(f"   title = {r2.css('title::text').get()!r}")
-print(f"   .get_all_text() = {r2.get_all_text(strip=True)!r}")
-print(f"   contains {MARK!r}? -> {MARK in r2.get_all_text(strip=True)}")
-print(f"\n   markdown(body):\n---\n{r2.markdown(main_content_only=True).strip()}\n---")
-print(f"   structured: total records = {r2.css('p::text').re_first(r'([\\d,]+)')}")
-print(f"   structured: table row     = {r2.css('table tr:nth-child(2) td::text').getall()}")
+session = StealthySession(headless=True)
+try:
+    session.start()
+    # wait_selector is a fetch-level key and it waits on the very node the timer appends.
+    r2 = session.fetch(URL, timeout=30000, wait_selector="#app h1")
+    print(f"   {time.time()-t:.1f}s status={r2.status}")
+    print(f"   title = {r2.css('title::text').get()!r}")
+    print(f"   .get_all_text() = {r2.get_all_text(strip=True)!r}")
+    print(f"   contains {MARK!r}? -> {MARK in r2.get_all_text(strip=True)}")
+    print(f"\n   markdown(body):\n---\n{r2.markdown(main_content_only=True).strip()}\n---")
+    print(f"   structured: total records = {r2.css('p::text').re_first(r'([0-9,]+)')}")
+    print(f"   structured: table row     = {r2.css('table tr:nth-child(2) td::text').getall()}")
+finally:
+    session.close()
 
 srv.shutdown()

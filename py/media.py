@@ -229,15 +229,16 @@ def _download_via_stream(
             try:
                 with open(temporary, "wb") as sink:
                     for chunk in response.iter_content(chunk_size=_DOWNLOAD_CHUNK_BYTES):
-                        sink.write(chunk)
-                        digest.update(chunk)
-                        total += len(chunk)
-                        if total > limit:
+                        # 先判后写：写盘再判会让落盘字节超过上限最多一个块（64 KiB）。
+                        if total + len(chunk) > limit:
                             raise _error(
                                 "DOWNLOAD_TOO_LARGE",
                                 f"download is over the {limit}-byte cap"
                                 + (f" (Content-Length declared {int(declared)})" if declared.isdigit() else ""),
                             )
+                        sink.write(chunk)
+                        digest.update(chunk)
+                        total += len(chunk)
                 target = _commit_temp(directory, name, temporary)
             except BaseException:
                 temporary.unlink(missing_ok=True)
@@ -300,10 +301,13 @@ def _download_via_browser(
         browser_params["extra_headers"] = headers
     try:
         response = StealthyFetcher.fetch(url, **browser_params)
-    except Exception as error:  # noqa: BLE001 —— 把附件响应换一条路走完，而不是只剩一个类名
+    except Exception as error:
         # 「Page.goto: Download is starting」：Chromium 不能把「触发下载的响应」当成一次
         # 导航，fetch 这条路对附件/二进制响应天然走不通。换成等真实的 download 事件再把它
-        # 落盘。HTML 页走不到这里（fetch 成功就原样返回），所以既有成功路径不动。
+        # 落盘。其它异常（超时、网络错误、路由拒绝）仍按失败上报：这里再导航一次会重复请求，
+        # 还会把真实原因盖成附件路径的异常类名。
+        if "download is starting" not in str(error).lower():
+            raise _error("DOWNLOAD_FAILED", f"download failed: {type(error).__name__}: {error}") from error
         return _download_via_browser_attachment(
             url,
             name=name,
@@ -331,6 +335,21 @@ def _download_via_browser(
     }
 
 
+def _body_from_download(source: Any, limit: int) -> bytes:
+    """读浏览器交出的下载临时文件；先量大小再读，超限时不把整份内容读进内存。
+
+    Download.path() 给的是本地临时文件，所以体积在打开之前就知道。先 read_bytes
+    再判上限意味着一个几 GB 的附件会先被整份读进内存、然后才被拒绝。
+    """
+    if source is None:
+        raise _error("DOWNLOAD_FAILED", "download produced no local file")
+    path = Path(source)
+    size = path.stat().st_size
+    if size > limit:
+        raise _error("DOWNLOAD_TOO_LARGE", f"download is {size} bytes, over the {limit}-byte cap")
+    return path.read_bytes()
+
+
 def _download_via_browser_attachment(
     url: str,
     *,
@@ -348,7 +367,7 @@ def _download_via_browser_attachment(
     与一次性路径同一套网络守卫，然后等 Playwright 的 ``expect_download`` 把附件交出来。
     """
     import guard
-    from adapters import page_setup
+    from adapters import AdapterError, page_setup
     from scrapling.fetchers import StealthySession
 
     timeout_ms = int(timeout * 1000)
@@ -369,8 +388,10 @@ def _download_via_browser_attachment(
         with page.expect_download(timeout=timeout_ms) as pending, contextlib.suppress(Exception):
             page.goto(url, wait_until="commit")
         download = pending.value
-        source = download.path()
-        body = Path(source).read_bytes() if source is not None else b""
+        body = _body_from_download(download.path(), limit)
+    except AdapterError:
+        # 超限是 caller 可读的结论（DOWNLOAD_TOO_LARGE），别再包成 DOWNLOAD_FAILED。
+        raise
     except Exception as error:
         raise _error(
             "DOWNLOAD_FAILED",

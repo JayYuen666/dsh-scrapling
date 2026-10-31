@@ -35,30 +35,13 @@ export type CrawlJobStarter = (label: string, run: CrawlJobRunner) => Promise<st
  * @returns 合并后的信号
  */
 export function anySignal(sources: readonly AbortSignal[]): AbortSignal {
-  if (sources.some((signal) => signal.aborted)) {
+  if (sources.length === 0) {
     return AbortSignal.abort();
   }
-  const alive = sources.filter((signal) => !signal.aborted);
-  /* v8 ignore start —— 调用方恒定传两个信号，空列表与单信号都是防御分支。 */
-  if (alive.length === 0) {
-    return AbortSignal.abort();
-  }
-  const [only] = alive;
-  if (alive.length === 1 && only !== undefined) {
-    return only;
-  }
-  /* v8 ignore stop */
-  const merged = new AbortController();
-  for (const signal of alive) {
-    signal.addEventListener(
-      "abort",
-      (): void => {
-        merged.abort();
-      },
-      { once: true },
-    );
-  }
-  return merged.signal;
+  // AbortSignal.any 用弱引用追踪源信号，合并信号中止或被回收后登记自动释放；
+  // 手写 addEventListener 会把监听留在长命的作业/轮次信号上，同一轮并发 N 个爬虫
+  // 就累积 N 份，最终触发 MaxListenersExceededWarning。
+  return AbortSignal.any([...sources]);
 }
 
 /** 轮询爬虫状态的间隔（毫秒）。 */
@@ -123,20 +106,18 @@ async function drainOnce(
   seen: number,
 ): Promise<number> {
   // 只取 seen 之后新增的那一段：整份 pages 每轮重发是 O(n²)。
-  const raw = await sidecar.call(
-    "crawl.status",
-    { crawlId, since: seen },
-    { signal, timeoutMs: null },
-  );
-  /* v8 ignore next 1 —— sidecar 回了非对象时的兜底：协议层已保证回包是对象。 */
+  // status 是受 MAX_STATUS_BYTES 封顶的短回包，沿用 sidecar 的默认请求超时：
+  // 对端卡死但不退出时，没有超时的轮询会让作业既无进度也无失败原因。
+  const raw = await sidecar.call("crawl.status", { crawlId, since: seen }, { signal });
+  // 协议层 decodeFrame 已拒绝非对象帧；这里的守卫只防第三方 SidecarClient 实现
+  // 不按协议回包（测试覆盖非对象分支）。
   const status = isRecord(raw) ? raw : {};
   const failure = typeof status["error"] === "string" ? status["error"] : "";
   if (failure !== "") {
     throw new Error(`crawl failed: ${failure}`);
   }
-  /* v8 ignore start —— 下面这段只在「sidecar 回了非数组 pages」时走到，
-     属于对端形状异常的防御：过滤掉非对象项。
-     正常路径（crawl.status 每轮返回新增的 pages 数组）由集成测试覆盖。 */
+  // 对端形状异常时按空数组处理，并过滤非对象项；正常路径每轮都会走到这里，
+  // 非数组分支由 malformed 回包用例覆盖。
   const allPages = Array.isArray(status["pages"]) ? status["pages"] : [];
   const pages = allPages.filter((page): page is Record<string, unknown> => isRecord(page));
   for (const page of pages) {
@@ -147,9 +128,13 @@ async function drainOnce(
   for (const row of rows) {
     sink.append(rowToText(row));
   }
-  /* v8 ignore stop */
   const total = seen + pages.length + rows.length;
   if (status["more"] === true) {
+    if (total === seen) {
+      // 对端说还有，却一个可消费条目都没给：继续递归既不等待也不校验 signal，
+      // 会变成打满 CPU 的忙循环。按协议错误收口。
+      throw new Error("crawl.status returned more=true without new pages or rows");
+    }
     // 对端按字节预算只回了一段（见 py/crawl.py 的 MAX_STATUS_BYTES）：紧接着取下一段，
     // 一页都不丢。这里不睡那一拍 —— 睡眠的意思是「还没跑完，等它攒点新页」，而现在是有
     // 现成的页等着读。

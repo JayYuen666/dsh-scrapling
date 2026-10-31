@@ -52,7 +52,7 @@ export interface UrlPolicyOptions {
   readonly nat64Prefixes?: readonly string[];
   /**
    * 显式放行的主机名。命中即跳过「答案集必须全是公网」那一条，其余检查（scheme、内嵌
-   * 凭据、长度、端口）照旧。
+   * 凭据、长度）照旧。
    *
    * 这是给「抓自建/内网站点」用的，与 Python 侧 guard.py 的 `ALLOWED_HOSTS` 同一份部署
    * 设置：两边必须同解，否则 Host 侧会先把用户明确放行的目标拦掉，Python 侧的放行集合
@@ -72,7 +72,8 @@ export interface UrlPolicyOptions {
 
 /** 策略对象。 */
 export interface UrlPolicy {
-  /** 只做**不需要 DNS** 的检查：解析、scheme、凭据、长度、端口。 */
+  /** 只做**不需要 DNS** 的检查：解析、scheme、凭据、长度。端口不在白名单里（与 dsh 内置
+   *  fetch provider 的取舍一致），见 README 的「没有端口白名单」。 */
   readonly screen: (input: string) => UrlVerdict;
   /** 补做 DNS 与地址判定，产出最终结论。 */
   readonly verify: (input: string) => Promise<UrlVerdict>;
@@ -320,11 +321,14 @@ function isPublicAddress(address: string, table: readonly Nat64Prefix[]): boolea
 }
 
 /**
- * 代理软件合成地址在 ipaddr.js 里的 range 名。
+ * 把 IPv4 点分地址折成一个整数，便于做区间比较。
  *
- * `reserved` 是 `198.18.0.0/15`（RFC 2544 基准测试段，fake-IP 的默认落点），
- * `carrierGradeNat` 是 `100.64.0.0/10`（部分 TUN 客户端的落点）。两者都不是 `unicast`。
+ * @param parsed - 已解析的 IPv4 地址
+ * @returns 32 位无符号值
  */
+function ipv4ToLong(parsed: ipaddr.IPv4): number {
+  return parsed.toByteArray().reduce((accumulator, byte) => accumulator * 256 + byte, 0);
+}
 
 /**
  * 判定一个 DNS 答案能否放行。
@@ -335,19 +339,9 @@ function isPublicAddress(address: string, table: readonly Nat64Prefix[]): boolea
  *
  * @param address - 解析得到的地址
  * @param table - NAT64 前缀表
- * @param relax - 解析结果是否不可信
+ * @param pools - 本次可用于放宽的合成池（手动段 ∪ 自动检测命中的那一池）
  * @returns 是否放行
  */
-/**
- * 把 IPv4 点分地址折成一个整数，便于做区间比较。
- *
- * @param parsed - 已解析的 IPv4 地址
- * @returns 32 位无符号值
- */
-function ipv4ToLong(parsed: ipaddr.IPv4): number {
-  return parsed.toByteArray().reduce((accumulator, byte) => accumulator * 256 + byte, 0);
-}
-
 function isAcceptableAnswer(
   address: string,
   table: readonly Nat64Prefix[],
@@ -419,7 +413,7 @@ function parseSyntheticRange(entry: string): SyntheticRange | null {
 const CONTROL_HOSTS: readonly string[] = ["example.com", "www.iana.org", "www.wikipedia.org"];
 
 /**
- * 判断当前解析器是不是在合成地址，并给出要放宽到的池。
+ * 判断当前解析器是不是在合成地址，并给出要放宽到的那**一个**池。
  *
  * 依据是 fake-ip 的指纹：**所有**主机名都被指到同一个非公网段里。实测在一台开着 TUN +
  * fake-ip 的机器上，example.com / github.com / wikipedia.org / echarts.apache.org /
@@ -431,27 +425,22 @@ const CONTROL_HOSTS: readonly string[] = ["example.com", "www.iana.org", "www.wi
  * `github.com`、`opencode.ai` 全被挡在门外，**连自己的控制域名都过不去**。三个样本不含
  * 任何池大小的信息，拿它估大小必然得到一个碰运气的小切片。
  *
- * 所以改成：全部控制答案都落在某个**已知合成池**里，就放宽到那个池的**整段**。clash/mihomo
- * 默认落 198.18.0.0/15（RFC 2544 基准测试段），部分 TUN 客户端落 100.64.0.0/10（RFC 6598
- * CGNAT），自建配置可以是别的段——那种由 `syntheticDnsRanges` 兜底。
+ * 所以改成：每个控制域名都至少有一个答案，全部答案都落在**同一个**已知合成池里，就放宽到
+ * 那个池的**整段**。clash/mihomo 默认落 198.18.0.0/15（RFC 2544 基准测试段），部分 TUN
+ * 客户端落 100.64.0.0/10（RFC 6598 CGNAT），自建配置可以是别的段——那种由
+ * `syntheticDnsRanges` 兜底。
  *
- * 放宽到整段是安全的，因为这两个段都不是公网可路由段、也都不是 SSFR 的目标段：后者是私网、
+ * 「同一个池」是判据的一部分，不是口味问题：100.64.0.0/10 同时是 Tailscale 等真实内网
+ * 常用的 CGNAT 段。若控制答案分散在两个池时把两段都放宽，一条指向真实 `100.64.x.x` 的
+ * 域名就会借 198.18 的检测结果通过闸门。分散即不成立，维持最严。
+ *
+ * 放宽到整段是安全的，因为这两个段都不是公网可路由段、也都不是 SSRF 的目标段：后者是私网、
  * 回环与链路本地，一个都不在这张表里。
  *
  * @param resolve - 解析器
  * @param table - NAT64 前缀表
  * @returns 要放宽到的池；判否时为空数组
  */
-/**
- * 这个值是否落在任一已知合成池内。
- *
- * @param value - 32 位无符号的 IPv4 值
- * @returns 是否落在已知池里
- */
-function isPoolMember(value: number): boolean {
-  return SYNTHETIC_POOLS.some((pool) => value >= pool.first && value <= pool.last);
-}
-
 async function detectSyntheticResolver(
   resolve: ResolveAddresses,
   table: readonly Nat64Prefix[],
@@ -465,9 +454,14 @@ async function detectSyntheticResolver(
       }
     }),
   );
+  // 每个控制域名都要有答案：只校验总数时，一个域名回三条、另外两个解析失败也能凑够 3，
+  // 那三条同源答案不构成「所有主机名都被指到同一个池」的指纹。
+  if (answers.some((addresses) => addresses.length === 0)) {
+    return [];
+  }
   const flat = answers.flat();
-  // 答案不够、或全指向同一处（解析器坏了）都当没检测到：判否只让闸门维持最严，不会误放行。
-  if (flat.length < CONTROL_HOSTS.length || new Set(flat).size < 2) {
+  // 全指向同一处（解析器坏了）不当成 fake-ip：判否只让闸门维持最严，不会误放行。
+  if (new Set(flat).size < 2) {
     return [];
   }
   if (!flat.every((address) => !isPublicAddress(address, table))) {
@@ -481,10 +475,11 @@ async function detectSyntheticResolver(
     }
     longs.push(ipv4ToLong(parsed));
   }
-  // 控制答案只**触发**模式判定，不参与选池：触发之后放宽到那份固定清单的整段。
-  // 「必须全落在同一个池」这种额外要求会让控制答案分散在两个池的解析器走到与 Python 侧不同的
-  // 结论，而这个包的硬不变式是两侧同解——所以刻意不做筛选。
-  return longs.every((value) => !isPoolMember(value)) ? [] : SYNTHETIC_POOLS;
+  // 全部答案必须落在**同一个**池：跨池分流（或有一部分落在池外）都不构成单一合成池的指纹。
+  const pool = SYNTHETIC_POOLS.find((candidate) =>
+    longs.every((value) => value >= candidate.first && value <= candidate.last),
+  );
+  return pool === undefined ? [] : [pool];
 }
 
 /**
@@ -540,15 +535,19 @@ function authorityOf(input: string): string {
  * @returns 脱敏后的串；没有 userinfo 时原样返回
  */
 export function redactUrlSecrets(input: string): string {
-  const masked = input.replace(URL_USERINFO, "$<scheme>***@");
-  if (masked !== input) {
-    return masked;
+  // 前导空白先剥掉再判：`^` 锚点的正则对「  https://user:pw@…」不命中，口令会原样进文案。
+  const trimmed = input.trimStart();
+  const lead = input.slice(0, input.length - trimmed.length);
+  const masked = trimmed.replace(URL_USERINFO, "$<scheme>***@");
+  if (masked !== trimmed) {
+    return `${lead}${masked}`;
   }
-  // 无 scheme：`user:pass@host/path` —— `@` 之前没有 `/` 才按 userinfo 处理，否则那是
-  // 路径里的普通 `@`，抹掉反而让文案失真。
-  const at = input.indexOf("@");
-  if (at > 0 && !input.slice(0, at).includes("/")) {
-    return `***@${input.slice(at + 1)}`;
+  // 无 scheme：`user:pass@host/path` 与协议相对 `//user:pass@host/path`。
+  // `@` 之前没有 `/` 才按 userinfo 处理，否则那是路径里的普通 `@`，抹掉反而让文案失真。
+  const at = trimmed.indexOf("@");
+  const authorityStart = trimmed.startsWith("//") ? 2 : 0;
+  if (at > authorityStart && !trimmed.slice(authorityStart, at).includes("/")) {
+    return `${lead}${trimmed.slice(0, authorityStart)}***@${trimmed.slice(at + 1)}`;
   }
   return input;
 }
@@ -680,18 +679,23 @@ export function createUrlPolicy(options: UrlPolicyOptions): UrlPolicy {
     }
     // 合成解析下，主机名的答案不是任何真实目标——按它判公网等于判了个不存在的东西。
     // 检测到就放宽（IP 字面量不走这条路，`literal` 一票否决）。手动白名单是兜底。
-    const pools = literal
-      ? []
-      : [...manualRanges, ...(await (detected ??= detectSyntheticResolver(resolve, table)))];
-    const offender = addresses.find((address) => !isAcceptableAnswer(address, table, pools));
-    if (offender !== undefined) {
-      return {
-        ok: false,
-        reason: "private-address",
-        message: `host resolves to a non-public address (${offender}): ${url.hostname}`,
-      };
+    // 先用手动白名单判一遍：全公网或已被手动段覆盖时直接返回，不为一个普通 URL
+    // 额外解析三个控制域名（控制域名不可达时还会把首个请求拖到 DNS 超时）。
+    const rejectPrivate = (offender: string): UrlVerdict => ({
+      ok: false,
+      reason: "private-address",
+      message: `host resolves to a non-public address (${offender}): ${url.hostname}`,
+    });
+    if (literal || addresses.every((address) => isAcceptableAnswer(address, table, manualRanges))) {
+      const offender = literal
+        ? addresses.find((address) => !isAcceptableAnswer(address, table, []))
+        : undefined;
+      return offender === undefined ? screened : rejectPrivate(offender);
     }
-    return screened;
+    const detectedPools = await (detected ??= detectSyntheticResolver(resolve, table));
+    const pools = [...manualRanges, ...detectedPools];
+    const offender = addresses.find((address) => !isAcceptableAnswer(address, table, pools));
+    return offender === undefined ? screened : rejectPrivate(offender);
   };
 
   return { screen, verify, isPublicAddress: (address: string) => isPublicAddress(address, table) };

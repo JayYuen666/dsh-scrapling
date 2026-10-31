@@ -534,29 +534,6 @@ interface SettingsFace {
   };
 }
 
-/**
- * Host 半真正用到的那一点 systemPrompt 服务面。
- *
- * 与 `SettingsFace` 同一个理由：`Context["systemPrompt"]` 挂在
- * `@deepseek-ai/dsh-system-prompt` 的模块增强上，本包不 import 它就进不了类型图。这里只声明
- * 用到的那两个方法。
- *
- * `text` 按上游的 `AssembleContext` 收「带 `scope` 的上下文」：上游每次装配都按调用方的 scope
- * 求值，而本包要按那个 scope **实际看得见哪些工具**来决定说哪几句 —— 与上游 `web_fetch` 的
- * 写法同一条（packages/web/tool-web/src/fetch.ts）。`scope` 在上游是 `ScopeKey = object`，
- * 本包不解读它，只是原样转交给 `ctx.tools.get`。
- */
-interface SystemPromptFace {
-  readonly systemPrompt: {
-    getSectionOrder: (name: string) => number;
-    section: (section: {
-      name: string;
-      order: number;
-      text: string | ((context: { scope?: object }) => string);
-    }) => () => void;
-  };
-}
-
 /** 每工具开关的**快照**。 */
 export interface ToolFlags {
   fetch: boolean;
@@ -1708,10 +1685,7 @@ function warnScraplingMissing(ctx: Context, plan: ToolPlan, python: PythonChoice
  * @param ctx - 宿主上下文
  * @param config - 已由 schemastery 填满默认值的配置
  */
-export async function apply(
-  ctx: Context & SettingsFace & SystemPromptFace,
-  config: Config,
-): Promise<void> {
+export async function apply(ctx: Context & SettingsFace, config: Config): Promise<void> {
   // 登记「本页由自带卡片编辑」。`auto: false` 是告诉宿主别再自动生成一份通用表单 ——
   // 自动那份会把整表字段摊成没有分组、没有说明的长列表，而真正在编辑这张卡的
   // client.js 已经按用途分了组、补了「改了会怎样」。

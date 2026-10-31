@@ -50,8 +50,13 @@ export interface McpFinding {
 
 interface ProfileEntry {
   readonly name: string;
-  readonly config: Record<string, string>;
+  readonly config: Record<string, string | undefined>;
 }
+
+/** YAML 里 `#` 只有前面是空白（或行首）时才开始注释；`true#x` 是一个字符串，不是布尔。 */
+const TRAILING_COMMENT = /[\t ]#.*$/u;
+
+const QUOTED_SCALAR = /^(?:"(?<double>[^"]*)"|'(?<single>[^']*)')$/u;
 
 /**
  * 条目认「`name:` 之后、比它更缩进的那一段键值」，不认第几格。
@@ -59,9 +64,31 @@ interface ProfileEntry {
  * 同一份条目文本有三种合法缩进：profile 的 patch 写法（`name:` 6 格、config 键 8 格）、
  * 宿主 `--dump-config` 打出的合成列表（2 格 / 4 格），以及人手写的别的层级。写死格数的解析
  * 会在后两种里把真存在的条目读成「没有条目」，doctor 于是报一条假红。
+ *
+ * 标量本身也不是只有一种写法：列表项可以写 `- name:`，值可以是单引号、双引号或裸标量，
+ * 行尾可以带注释或空格。这些都是合法 YAML（本仓自己的 `cordis.patch.yml` 用的就是双引号），
+ * 只认「单引号 + 行尾干净」那一种会把真存在的条目读成没有 —— 假红与漏报残留都从这里来。
  */
-const ENTRY_NAME = /^name: '?(?<name>[^'\s]+)'?$/u;
-const CONFIG_KEY = /^(?<key>[\w-]+): +(?<value>\S.*)$/u;
+const ENTRY_NAME = /^(?:-[\t ]*)?name:(?<value>.*)$/u;
+const CONFIG_KEY = /^(?<key>[\w-]+):[\t ]+(?<value>\S.*)$/u;
+
+/**
+ * 把一个 YAML 标量收成裸值：去掉行尾注释、两端空白与包裹的引号。
+ *
+ * 不处理转义序列：这里的值只用来比对 `serverName` / `transport` / URL 端口，不做语义还原。
+ *
+ * @param raw - `key:` 之后的原文
+ * @returns 裸值；整行只有注释或空白时为 undefined
+ */
+function scalarOf(raw: string): string | undefined {
+  const trimmed = raw.replace(TRAILING_COMMENT, "").trim();
+  const quoted = QUOTED_SCALAR.exec(trimmed)?.groups;
+  const bare = quoted?.["double"] ?? quoted?.["single"];
+  if (bare !== undefined) {
+    return bare;
+  }
+  return trimmed.length === 0 ? undefined : trimmed;
+}
 
 /**
  * 切行：Windows 上编辑器写出的 patch 是 CRLF，`\r` 留在行尾会让键值两侧的 `$` 锚点全部落空，
@@ -77,10 +104,10 @@ function parseEntries(text: string): ProfileEntry[] {
   for (const line of splitLines(text)) {
     const indent = line.length - line.trimStart().length;
     const body = line.slice(indent);
-    const named = ENTRY_NAME.exec(body)?.groups;
+    const named = scalarOf(ENTRY_NAME.exec(body)?.groups?.["value"] ?? "");
     const keyed = CONFIG_KEY.exec(body)?.groups;
-    if (named?.["name"] !== undefined) {
-      current = { entry: { name: named["name"], config: {} }, indent };
+    if (named !== undefined) {
+      current = { entry: { name: named, config: {} }, indent };
       entries.push(current.entry);
     } else if (
       keyed?.["key"] !== undefined &&
@@ -88,7 +115,11 @@ function parseEntries(text: string): ProfileEntry[] {
       current !== undefined &&
       indent > current.indent
     ) {
-      current.entry.config[keyed["key"]] = keyed["value"];
+      // 行尾注释不是值的一部分：`transport: stdio # …` 仍然是 stdio，
+      // 留着注释会让 isOfficial 把它读成非官方条目；引号同理。
+      // 值只有注释时 scalarOf 返回 undefined；存成 undefined 与缺席同义，
+      // 所有消费点（serverName / transport / url）都做字符串比较。
+      current.entry.config[keyed["key"]] = scalarOf(keyed["value"]);
     }
   }
   return entries;
@@ -96,7 +127,27 @@ function parseEntries(text: string): ProfileEntry[] {
 
 function portOf(entry: ProfileEntry): string | undefined {
   const { url } = entry.config;
-  return url === undefined ? undefined : URL_PORT.exec(url)?.groups?.["port"];
+  let port: string | undefined;
+  if (url !== undefined) {
+    try {
+      const { port: explicitPort, protocol } = new URL(url);
+      if (explicitPort === "") {
+        // URL 省略端口时按 scheme 默认值比对：否则 `https://host/mcp` 与 --port 443
+        // 会被判成不一致。
+        if (protocol === "http:") {
+          port = "80";
+        } else if (protocol === "https:") {
+          port = "443";
+        }
+      } else {
+        port = explicitPort;
+      }
+    } catch {
+      // 不是完整 URL（手写的半截值）时退回冒号匹配，至少保留旧行为。
+      port = URL_PORT.exec(url)?.groups?.["port"];
+    }
+  }
+  return port;
 }
 
 function isOfficial(entry: ProfileEntry): boolean {
@@ -214,11 +265,6 @@ export interface ProfileSnapshot {
  * 仍按 false 处理时 doctor 打绿——那比方红更贵。
  */
 const SWITCH_LINE = /^[\t ]*officialMcpEnabled:(?<value>[^\r\n]*)$/mu;
-
-/** YAML 里 `#` 只有前面是空白（或行首）时才开始注释；`true#x` 是一个字符串，不是布尔。 */
-const TRAILING_COMMENT = /[\t ]#.*$/u;
-
-const QUOTED_SCALAR = /^(?:"(?<double>[^"]*)"|'(?<single>[^']*)')$/u;
 
 /** 取 `officialMcpEnabled` 的标量文本；同一份文本里出现多次时取第一条。 */
 function switchScalar(text: string): string | undefined {

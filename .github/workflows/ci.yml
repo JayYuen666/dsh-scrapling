@@ -142,9 +142,10 @@ jobs:
       - name: 安装依赖
         shell: bash
         run: pnpm install --frozen-lockfile
-      # check 已含 check:py 的链条（py:which → face:py → deps:py → ruff → fmt → mypy → sidecar
-      # 端到端 → bandit → 覆盖率地板）。强度只写在那一条链里：在 CI 里另起一步就会出现两套说法
-      # 互相打脸的形状（一步拦、一步只记录），所以这里不重复跑 Python 面。
+      # check 已含 check:py 的链条（py:which → face:py → deps:py → ruff → fmt → mypy → bandit
+      # → 覆盖率地板；覆盖率那一步的 coverage run 就是 sidecar 端到端，只跑一次）。强度只写在
+      # 那一条链里：在 CI 里另起一步就会出现两套说法互相打脸的形状（一步拦、一步只记录），
+      # 所以这里不重复跑 Python 面。
       - name: 跑门禁
         shell: bash
         run: pnpm run check
@@ -393,8 +394,8 @@ jobs:
             "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
           printf '%s  %s\n' "$sha256" /tmp/actionlint.tar.gz | sha256sum -c -
           tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
-          # -ignore SC2016：探针脚本刻意用单引号包住 JS（脚本体里有 JS 模板串，
-          # 交给 shell 展开就坏了）。这是 shellcheck 的误报，而 shellcheck 指令在
-          # 跨行单引号构造上不被采信（已实测），所以只忽略这一条规则。
+          # SC2016 的豁免由 -config-file 显式指定的 .github/actionlint.yaml 提供，
+          # 且落在 paths 段上、只覆盖 ci.yml 那一份；命令行上的 -ignore 是全局正则，
+          # 一并传给四份工作流，按文件收窄就失效了（见该文件的注释）。
           # shell 先把 glob 展开，再把文件清单交给它。
-          /tmp/actionlint -ignore 'SC2016' .github/workflows/*.yml
+          /tmp/actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml

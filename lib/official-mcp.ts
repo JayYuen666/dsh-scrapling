@@ -48,9 +48,13 @@ export class OfficialMcpError extends Error {
 
 const CLIENT_VERSION = MCP_DEFAULT_CLIENT_PIN;
 
-/** 官方 server 在托管 venv 里的入口。 */
+/** 官方 server 在托管 venv 里的入口。
+ *  布局跟解释器同源：POSIX 在 `bin/`，Windows 在 `Scripts/` 且可执行体带 `.exe`。 */
 export function officialMcpBinary(dataDir: string): string {
-  return path.join(dataDir, "runtime", "venv", "bin", "scrapling-mcp");
+  const venv = path.join(dataDir, "runtime", "venv");
+  return process.platform === "win32"
+    ? path.join(venv, "Scripts", "scrapling-mcp.exe")
+    : path.join(venv, "bin", "scrapling-mcp");
 }
 
 /**

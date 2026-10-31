@@ -4,6 +4,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import http from "node:http";
+import type { ServerResponse } from "node:http";
 import type { NetworkInterfaceInfo } from "node:os";
 import { Server } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,13 +13,21 @@ import {
   allowedEndpoints,
   createMcpImageSink,
   boundPort,
+  headerWritable,
   mcpRawName,
   mcpSearchTool,
   mcpToolEntries,
+  pathOf,
   projectBlocks,
   startMcpServer,
 } from "../lib/mcp-server.ts";
-import type { McpImageSink, McpServerHandle, McpServerOptions } from "../lib/mcp-server.ts";
+import type {
+  McpAllowedEndpoints,
+  McpImageSink,
+  McpServerHandle,
+  McpServerOptions,
+  McpSession,
+} from "../lib/mcp-server.ts";
 import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
 
 /**
@@ -204,6 +213,76 @@ async function rawPost(port: number, headers: Record<string, string>): Promise<n
   });
 }
 
+/**
+ * 发一个不带 content-length 的 POST。
+ *
+ * 不写这个头时 node:http 会改用 chunked 传输 —— 正好是「客户端不声明长度」那一支，
+ * 而正文大小在读到之前不可知。
+ */
+async function rawPostChunked(port: number): Promise<number> {
+  // node:http 的客户端只有事件回调，要拿到一个可 await 的「响应到了」只能自己 deferred。
+  // oxlint-disable-next-line promise/avoid-new, typescript/return-await
+  return await new Promise<number>((resolve, reject) => {
+    const request = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: "/mcp",
+        method: "POST",
+        headers: { ...MCP_HEADERS, "content-type": "application/json" },
+      },
+      (response) => {
+        response.resume();
+        response.once("end", () => {
+          resolve(response.statusCode ?? 0);
+        });
+      },
+    );
+    request.once("error", reject);
+    // 分两次写且不带长度：node 会自己选 chunked。
+    request.write(INITIALIZE_BODY.slice(0, 20));
+    request.end(INITIALIZE_BODY.slice(20));
+  });
+}
+
+/**
+ * 用假会话起一条 server，把「这一条请求怎么处理」交给调用方。
+ *
+ * SDK 那两步只回错误响应、不抛，所以兜底分支只能从这一层注入失败 —— 判的是本模块对
+ * 失败的收口，不是 SDK 的脾气。
+ *
+ * @param behavior - 假会话在这条请求上做点什么
+ * @returns 起好的 handle 与装配记录
+ */
+async function withFakeSession(behavior: (response: ServerResponse) => Promise<void>): Promise<{
+  handle: McpServerHandle;
+  seen: { endpoints: McpAllowedEndpoints[]; order: string[]; closed: number };
+}> {
+  const seen = { endpoints: [] as McpAllowedEndpoints[], order: [] as string[], closed: 0 };
+  const session: McpSession = {
+    connect: async () => {
+      seen.order.push("connect");
+    },
+    close: async () => {
+      seen.order.push("close");
+      seen.closed += 1;
+    },
+    handle: async (_request, response) => {
+      seen.order.push("handle");
+      await behavior(response);
+    },
+  };
+  const handle = await serve({
+    port: 0,
+    entries: ENTRIES,
+    sessionFactory: (endpoints) => {
+      seen.endpoints.push(endpoints);
+      return session;
+    },
+  });
+  return { handle, seen };
+}
+
 describe("mcpToolEntries", () => {
   it("去掉 MCP 不端出去的工具，并换成短名", () => {
     expect(ENTRIES.map((entry) => entry.name)).toStrictEqual(["fetch"]);
@@ -225,6 +304,36 @@ describe("mcpToolEntries", () => {
       fakeTool("search", async () => ({ echo: "2" })),
     );
     expect(withSearch.map((entry) => entry.name)).toStrictEqual(["fetch", "search"]);
+  });
+});
+
+describe("createMcpImageSink 的容量与过期", () => {
+  it("超过容量上限时淘汰最旧的一份，不无界增长", async () => {
+    const sink = createMcpImageSink();
+    const saved = await Promise.all(
+      Array.from({ length: 17 }, (_value, index) =>
+        sink.saveImage({ data: new Uint8Array([index]), mediaType: "image/png" }),
+      ),
+    );
+    const [oldest] = saved;
+    expect(oldest).toBeDefined();
+    expect(sink.take(oldest?.id ?? "")).toBeUndefined();
+    const newest = saved.at(-1);
+    expect(newest).toBeDefined();
+    expect(sink.take(newest?.id ?? "")).toBeDefined();
+  });
+
+  it("超过时长的未取走条目在下次读写时被清掉", async () => {
+    const sink = createMcpImageSink();
+    const now = Date.now();
+    const spy = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const saved = await sink.saveImage({ data: new Uint8Array([1]), mediaType: "image/png" });
+      spy.mockReturnValue(now + 61_000);
+      expect(sink.take(saved.id)).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
@@ -262,6 +371,26 @@ describe("boundPort", () => {
   it("管道名与 null 都点名失败，而不是交出一个 0", () => {
     expect(() => boundPort("/tmp/mcp.sock")).toThrow(/did not report/u);
     expect(() => boundPort(null)).toThrow(/did not report/u);
+  });
+});
+
+describe("pathOf", () => {
+  it("查询串不参与比较，读不到请求行时按空串比出去", () => {
+    expect(pathOf("/mcp")).toBe("/mcp");
+    expect(pathOf("/mcp?sessionId=s1")).toBe("/mcp");
+    expect(pathOf("/mcp?")).toBe("/mcp");
+    // node 的类型上 url 是 optional；缺它只能算「不是本路径」，不能算通配。
+    expect(pathOf()).toBe("");
+    expect(pathOf(undefined)).toBe("");
+  });
+});
+
+describe("headerWritable", () => {
+  it("四种状态里只有「既没发头也没结束」还能写状态行", () => {
+    expect(headerWritable({ headersSent: false, writableEnded: false })).toBe(true);
+    expect(headerWritable({ headersSent: true, writableEnded: false })).toBe(false);
+    expect(headerWritable({ headersSent: false, writableEnded: true })).toBe(false);
+    expect(headerWritable({ headersSent: true, writableEnded: true })).toBe(false);
   });
 });
 
@@ -495,6 +624,15 @@ describe("startMcpServer", () => {
     ).resolves.not.toBe(403);
   });
 
+  it("非回环地址没有 token ⇒ 拒绝启动，不把工具表敞给局域网", async () => {
+    await expect(serve({ host: "0.0.0.0", port: 0, entries: ENTRIES })).rejects.toMatchObject({
+      code: "MCP_AUTH_REQUIRED",
+    });
+    await expect(
+      serve({ host: "0.0.0.0", port: 0, entries: ENTRIES, token: TOKEN }),
+    ).resolves.toBeDefined();
+  });
+
   it("没有 token 时启动就在 stderr 打一条无鉴权警告", async () => {
     const written = vi.spyOn(process.stderr, "write");
     try {
@@ -537,6 +675,12 @@ describe("startMcpServer", () => {
     await expect(statusOf(handle.port, "/mcp", huge)).resolves.toBe(413);
   });
 
+  it("没声明长度的 POST 被拒，而不是当成没有上限", async () => {
+    const handle = await serve({ port: 0, entries: ENTRIES });
+    // chunked 传输的字节数在读到之前不可知：放行等于这条端口没有正文上限。
+    await expect(rawPostChunked(handle.port)).resolves.toBe(411);
+  });
+
   it("关闭后端口不再有人监听", async () => {
     const handle = await serve({ port: 0, entries: ENTRIES });
     const { port } = handle;
@@ -567,5 +711,44 @@ describe("startMcpServer", () => {
     } finally {
       listen.mockRestore();
     }
+  });
+
+  describe("会话装配缝", () => {
+    it("会话抛错时收成一记 500，防护面仍按实际端口算好交出去", async () => {
+      const { handle, seen } = await withFakeSession(async () => {
+        throw new Error("transport 炸了");
+      });
+      await expect(statusOf(handle.port, "/mcp", { headers: MCP_HEADERS })).resolves.toBe(500);
+      // 先接上再处理；close 那一记在响应结束时才来，逐条钉在下一条用例里。
+      expect(seen.order.slice(0, 2)).toStrictEqual(["connect", "handle"]);
+      expect(seen.endpoints[0]?.allowedHosts).toStrictEqual([
+        `127.0.0.1:${String(handle.port)}`,
+        `localhost:${String(handle.port)}`,
+      ]);
+    });
+
+    it("响应已经写完时兜底不再写第二个状态行，也不漏出未处理拒绝", async () => {
+      const rejections: unknown[] = [];
+      const onRejection = (reason: unknown): void => {
+        rejections.push(reason);
+      };
+      process.on("unhandledRejection", onRejection);
+      try {
+        const { handle, seen } = await withFakeSession(async (response) => {
+          response.writeHead(202);
+          response.end("{}");
+          // 写完再抛：SDK 已经开始回包又失败的形态。此时再写一次头会同步抛
+          // ERR_HTTP_HEADERS_SENT，而那颗抛出发生在 catch 里。
+          throw new Error("半路炸了");
+        });
+        await expect(statusOf(handle.port, "/mcp", { headers: MCP_HEADERS })).resolves.toBe(202);
+        // 关掉服务端再判：未处理拒绝要等微任务队列排空才会被报出来，close 的回包是又一轮。
+        await handle.close();
+        expect(rejections).toStrictEqual([]);
+        expect(seen.order).toStrictEqual(["connect", "handle", "close"]);
+      } finally {
+        process.off("unhandledRejection", onRejection);
+      }
+    });
   });
 });

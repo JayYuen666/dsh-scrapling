@@ -33,7 +33,7 @@ import threading
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, Callable, Iterator, cast
 from urllib.parse import parse_qsl, urlparse
 
 REPO = Path(__file__).resolve().parents[2]
@@ -940,7 +940,7 @@ def run_guard() -> None:
 
         scripted = {"cafe.de": ["93.184.216.34"], "beef.be": ["93.184.216.34"]}
         real_getaddrinfo = guard.socket.getaddrinfo
-        real_cache = guard._SYNTHETIC_RESOLVER
+        real_cache = guard._SYNTHETIC_POOL
 
         def scripted_answers(host: str, *_args: object, **_kwargs: object) -> list[tuple]:
             if host in scripted:
@@ -948,7 +948,7 @@ def run_guard() -> None:
             raise OSError(f"no such host: {host}")
 
         guard.socket.getaddrinfo = scripted_answers  # type: ignore[assignment]
-        guard._SYNTHETIC_RESOLVER = False
+        guard._SYNTHETIC_POOL = None
         guard._dns_cache_clear()
         try:
             for domain in ("cafe.de", "beef.be"):
@@ -959,7 +959,7 @@ def run_guard() -> None:
                 )
         finally:
             guard.socket.getaddrinfo = real_getaddrinfo
-            guard._SYNTHETIC_RESOLVER = real_cache
+            guard._SYNTHETIC_POOL = real_cache
             guard._dns_cache_clear()
 
         # 守卫日志的脱敏面：日志会进宿主日志，URL 里的凭据不能原样出现在那里。
@@ -995,7 +995,7 @@ def run_guard() -> None:
         cache_scripted = {"cached.test": ["93.184.216.34"]}
         resolve_calls = {"count": 0}
         cache_real_getaddrinfo = guard.socket.getaddrinfo
-        cache_real_synthetic = guard._SYNTHETIC_RESOLVER
+        cache_real_synthetic = guard._SYNTHETIC_POOL
 
         def counting_answers(host: str, *_args: object, **_kwargs: object) -> list[tuple]:
             if host in cache_scripted:
@@ -1006,7 +1006,7 @@ def run_guard() -> None:
             raise OSError(f"no such host: {host}")
 
         guard.socket.getaddrinfo = counting_answers  # type: ignore[assignment]
-        guard._SYNTHETIC_RESOLVER = False
+        guard._SYNTHETIC_POOL = None
         guard._dns_cache_clear()
         try:
             first = guard.is_public_address("cached.test")
@@ -1036,8 +1036,39 @@ def run_guard() -> None:
             )
         finally:
             guard.socket.getaddrinfo = cache_real_getaddrinfo
-            guard._SYNTHETIC_RESOLVER = cache_real_synthetic
+            guard._SYNTHETIC_POOL = cache_real_synthetic
             guard._dns_cache_clear()
+
+        # 畸形 URL 在 urlparse 里就抛 ValueError，而 url_allowed 的契约是返回
+        # (False, reason)：异常漏出去会把一个坏输入变成调用方的崩溃。
+        for bad_url in ("http://[::1", "http://[::1]/x"):
+            try:
+                bad_allowed, bad_why = guard.url_allowed(bad_url)
+                check(
+                    f"畸形 URL 返回判定而不是抛：{bad_url}",
+                    bad_allowed is False and bool(bad_why),
+                    bad_why,
+                )
+            except ValueError as error:
+                check(f"畸形 URL 返回判定而不是抛：{bad_url}", False, repr(error))
+
+        # NO_PROXY=* 在两条路上同解：静态抓取（proxy_for）与会话开场（default_proxy）。
+        # 此前 _host_matches 把星号 lstrip 成空串判不命中，静态抓取仍走代理。
+        saved_proxy_url = guard.PROXY_URL
+        saved_bypass_entries = guard._BYPASS_ENTRIES
+        guard.PROXY_URL = "http://proxy.test:8080"
+        guard._BYPASS_ENTRIES = ("*",)
+        try:
+            check(
+                "NO_PROXY=* 时静态抓取也直连",
+                guard.proxy_for("https://example.com/x") == "",
+                guard.proxy_for("https://example.com/x"),
+            )
+            check("NO_PROXY=* 时会话开场同样直连", guard.default_proxy() == "", guard.default_proxy())
+            check("带空格的星号同样成立", guard._host_matches("example.com", " * ") is True, "")
+        finally:
+            guard.PROXY_URL = saved_proxy_url
+            guard._BYPASS_ENTRIES = saved_bypass_entries
 
         page = FakePage()
         guard.install(page)
@@ -1773,6 +1804,7 @@ class _UnitPage:
         self.mouse = _UnitInput(self.calls)
         self.keyboard = _UnitInput(self.calls)
         self.dialog_handler: Any = None
+        self.dialog_handlers: list[Any] = []
 
     def is_closed(self) -> bool:
         return self._closed
@@ -1796,6 +1828,13 @@ class _UnitPage:
     def once(self, event: str, handler: Any) -> None:
         self.calls.append(f"once:{event}")
         self.dialog_handler = handler
+        self.dialog_handlers.append(handler)
+
+    def remove_listener(self, event: str, handler: Any) -> None:
+        self.calls.append(f"off:{event}")
+        self.dialog_handlers = [item for item in self.dialog_handlers if item is not handler]
+        if self.dialog_handler is handler:
+            self.dialog_handler = None
 
     def locator(self, selector: str) -> _UnitLocator:
         return _UnitLocator(selector, self.calls, self.matches, self.shot)
@@ -2006,6 +2045,83 @@ def run_session_page_units() -> None:
         check("动作失败翻成 ACTION_FAILED", code == "ACTION_FAILED", code)
         check("ACTION_FAILED 带 actionIndex", details.get("actionIndex") == 1, repr(details))
 
+    # 白名单是 frozenset，成员判断先哈希 —— type/state 写成 list/dict 时抛的是 TypeError
+    # 而不是 ACTION_INVALID，宿主看到的是内部异常。预校验必须先判 str 再判白名单。
+    def invalid(action: dict[str, Any], label: str) -> None:
+        try:
+            session_page._validate_actions([action], 5)
+        except Exception as error:  # noqa: BLE001 —— 断言的是错误码
+            check(label, getattr(error, "code", None) == "ACTION_INVALID", repr(error))
+        else:
+            check(label, False, "放行")
+
+    invalid({"type": ["click"]}, "list 类型的 type 给 ACTION_INVALID 而不是 TypeError")
+    invalid({"type": {"kind": "click"}}, "dict 类型的 type 给 ACTION_INVALID")
+    invalid({"type": "wait_element", "target": "#x", "state": []}, "list 类型的 wait_element state 给 ACTION_INVALID")
+    invalid({"type": "wait_load", "state": {}}, "dict 类型的 wait_load state 给 ACTION_INVALID")
+    # 空 target / 空 key / 非布尔 checked 曾在执行期才炸，错误码被包装成 ACTION_FAILED。
+    invalid({"type": "move", "target": ""}, "move 的空 target 在预校验拒掉")
+    invalid({"type": "press_key", "key": ""}, "press_key 的空 key 在预校验拒掉")
+    invalid({"type": "checkbox", "target": "#c", "checked": "false"}, "checkbox 的非布尔 checked 在预校验拒掉")
+
+    # dialog 处理器在批次结束时必须摘掉：页在共享 pool 里跨请求复用。
+    dialog_page = _UnitPage()
+    session_page.run_actions(
+        _UnitSession(_UnitPool([_UnitPageInfo(dialog_page)])),
+        actions=[{"type": "dialog"}, {"type": "click", "target": "#go"}],
+        slowly=False,
+        max_actions=5,
+        timeout_ms=1_000,
+    )
+    check(
+        "dialog 处理器在批次结束时被摘掉",
+        "off:dialog" in dialog_page.calls and dialog_page.dialog_handlers == [],
+        repr(dialog_page.calls),
+    )
+
+    cleanup_page = _UnitPage()
+    cleanup_page.locator = lambda selector: type(  # type: ignore[method-assign]
+        "_CleanupBrokenLocator",
+        (),
+        {"click": _boom, "selector": selector},
+    )()
+    with contextlib.suppress(Exception):  # 只看 finally 里的清理是否发生
+        session_page.run_actions(
+            _UnitSession(_UnitPool([_UnitPageInfo(cleanup_page)])),
+            actions=[{"type": "dialog"}, {"type": "click", "target": "#go"}],
+            slowly=False,
+            max_actions=5,
+            timeout_ms=1_000,
+        )
+    check(
+        "动作中途失败也摘掉 dialog 处理器",
+        "off:dialog" in cleanup_page.calls and cleanup_page.dialog_handlers == [],
+        repr(cleanup_page.calls),
+    )
+
+    # slowly 的间隔等待原先在 try 之外：页在间隔里被关掉时裸异常直穿，不再点名下标。
+    class _SlowlyBoomPage(_UnitPage):
+        def wait_for_timeout(self, ms: int) -> None:
+            if ms == 100:
+                raise RuntimeError("page closed during slowly gap")
+            super().wait_for_timeout(ms)
+
+    try:
+        session_page.run_actions(
+            _UnitSession(_UnitPool([_UnitPageInfo(_SlowlyBoomPage())])),
+            actions=[{"type": "wait_time", "ms": 1}],
+            slowly=True,
+            max_actions=5,
+            timeout_ms=1_000,
+        )
+        check("slowly 间隔抛错也翻成 ACTION_FAILED", False, "放行")
+    except Exception as error:  # noqa: BLE001 —— 只看错误码与 details
+        check(
+            "slowly 间隔抛错也翻成 ACTION_FAILED",
+            getattr(error, "code", "") == "ACTION_FAILED" and getattr(error, "details", {}).get("actionIndex") == 1,
+            f"{getattr(error, 'code', '')} {getattr(error, 'details', {})}",
+        )
+
 
 def run_media_units() -> None:
     """下载落点与截图字节校验的纯逻辑：替身 page 返回构造好的 PNG/JPEG 头。"""
@@ -2074,6 +2190,27 @@ def run_media_units() -> None:
         )
         expect_error("BAD_ARGS", lambda: media._max_bytes({"deployment": {"downloadMaxBytes": 0}}))
 
+        # 浏览器下载的字节上限必须在整份读进内存之前判：先 read_bytes 再比长度，
+        # 一个 4 GB 的下载会先把进程撑爆，然后才报一个「超限」。
+        oversized = directory / "oversized.bin"
+        oversized.write_bytes(b"x" * 32)
+        read_calls: list[str] = []
+        real_read_bytes = Path.read_bytes
+
+        def _recording_read_bytes(self: Path) -> bytes:
+            """记下每次整读；下面要证明超限那次根本没走到这里。"""
+            read_calls.append(str(self))
+            return real_read_bytes(self)
+
+        Path.read_bytes = _recording_read_bytes  # type: ignore[method-assign]
+        try:
+            expect_error("DOWNLOAD_TOO_LARGE", lambda: media._body_from_download(oversized, 10))
+            check("超限的下载根本没被读入内存", read_calls == [], repr(read_calls))
+        finally:
+            Path.read_bytes = real_read_bytes  # type: ignore[method-assign]
+        check("上限之内的下载照常读出", media._body_from_download(oversized, 32) == b"x" * 32, "")
+        expect_error("DOWNLOAD_FAILED", lambda: media._body_from_download(None, 10))
+
         # 报告 §2.2：浏览器下载路径必须与 adapters.render 一样带上 page_setup（网络守卫）
         # 与 proxy（部署代理）。此前两者都缺：重定向/子资源不过 url_allowed，代理被绕过。
         import scrapling.fetchers as fetchers
@@ -2134,6 +2271,65 @@ def run_media_units() -> None:
             repr(browser_params)[:240],
         )
         check("浏览器下载照常落盘并回字节数", downloaded.get("bytes") == 5, repr(downloaded)[:200])
+
+        # 附件回退的触发面只有「Download is starting」：超时/网络错误必须按失败上报，
+        # 不能为一次真实失败再导航一次，也不能用附件路径的异常类名盖住原因。
+        class _GenericFailureFetcher:
+            @staticmethod
+            def fetch(url: str, **params: Any) -> Any:
+                """模拟一次普通网络失败。"""
+                raise RuntimeError("net::ERR_TIMED_OUT")
+
+        saved_fetch = fetchers.StealthyFetcher
+        fetchers.StealthyFetcher = _GenericFailureFetcher  # type: ignore[misc,assignment]
+        try:
+            expect_error(
+                "DOWNLOAD_FAILED",
+                lambda: media._download_via_browser(
+                    "https://file.test/report.txt",
+                    name="report.txt",
+                    directory=directory,
+                    limit=100,
+                    timeout=1.0,
+                    headers=None,
+                ),
+            )
+        finally:
+            fetchers.StealthyFetcher = saved_fetch  # type: ignore[misc]
+
+        class _DownloadStartFetcher:
+            @staticmethod
+            def fetch(url: str, **params: Any) -> Any:
+                """模拟 Chromium 对附件响应的固定报错。"""
+                raise RuntimeError("Page.goto: Download is starting")
+
+        fallbacks: list[str] = []
+        saved_fallback = media._download_via_browser_attachment
+
+        def _fake_fallback(url: str, **_kwargs: Any) -> dict[str, Any]:
+            """只记录回退是否被调用。"""
+            fallbacks.append(url)
+            return {"path": "x", "bytes": 0, "sha256": "", "contentType": ""}
+
+        media._download_via_browser_attachment = _fake_fallback
+        fetchers.StealthyFetcher = _DownloadStartFetcher  # type: ignore[misc,assignment]
+        try:
+            media._download_via_browser(
+                "https://file.test/report.txt",
+                name="report.txt",
+                directory=directory,
+                limit=100,
+                timeout=1.0,
+                headers=None,
+            )
+        finally:
+            media._download_via_browser_attachment = saved_fallback
+            fetchers.StealthyFetcher = saved_fetch  # type: ignore[misc]
+        check(
+            "附件回退只在 Download is starting 时触发",
+            fallbacks == ["https://file.test/report.txt"],
+            repr(fallbacks),
+        )
 
         check(
             "_image_size 读 PNG 固有尺寸",
@@ -2459,6 +2655,26 @@ def closed_endpoint() -> str:
     return f"http://127.0.0.1:{int(port)}"
 
 
+@contextlib.contextmanager
+def _no_search_retries() -> Iterator[None]:
+    """临时关掉上游检索重试：这里只验证错误码，不验证重试策略。
+
+    上游 Fetcher 默认 ``retries=3``、``retry_delay=1``，三个故意失败的请求会各睡 2s。
+    """
+    from scrapling.fetchers import requests as fetcher_requests
+
+    client = fetcher_requests.__FetcherClientInstance__
+    retries = client._default_retries
+    retry_delay = client._default_retry_delay
+    client._default_retries = 1
+    client._default_retry_delay = 0
+    try:
+        yield
+    finally:
+        client._default_retries = retries
+        client._default_retry_delay = retry_delay
+
+
 def run_search_shapes(base: str) -> None:
     """检索层的错误形状：参数收口、状态翻译、坏回包、超时与被拒的连接。"""
     sys.path.insert(0, str(PY_DIR))
@@ -2519,9 +2735,10 @@ def run_search_shapes(base: str) -> None:
         {"backend": "tavily", "query": "q", "apiKey": key, "apiEndpoint": base + "/tavilyjunk"}
     )
     check("坏形状的命中一条条被剔掉", [hit["url"] for hit in junk["hits"]] == ["https://a.test/1"], repr(junk))
-    expect_error("SEARCH_TIMEOUT", tavily("/tavlyslow", timeoutSeconds=0.05))
-    expect_error("SEARCH_FAILED", tavily("@closed"))
-    expect_error("SEARCH_FAILED", bing("@closed"))
+    with _no_search_retries():
+        expect_error("SEARCH_TIMEOUT", tavily("/tavlyslow", timeoutSeconds=0.05))
+        expect_error("SEARCH_FAILED", tavily("@closed"))
+        expect_error("SEARCH_FAILED", bing("@closed"))
     expect_error("SEARCH_RATE_LIMIT", bing("/bing429"))
     junk_bing = adapters.search_discover({"backend": "bing", "query": "q", "bingEndpoint": base + "/bingjunk"})
     check(
@@ -2873,6 +3090,17 @@ def run_extraction_helpers() -> None:
     check("fields 缺失为 null", rows[0]["missing"] is None, repr(rows[0]))
     check("fields 未截断", truncated is False, repr(truncated))
 
+    one_row, _ = extraction.collect_fields(nodes[:1], {"name": "h3::text"}, page=page, max_content_chars=10_000)
+    exact_budget = extraction._json_len(one_row[0])
+    same, same_truncated = extraction.collect_fields(
+        nodes[:1], {"name": "h3::text"}, page=page, max_content_chars=exact_budget
+    )
+    check(
+        "fields 最后一条刚好用尽预算不算截断",
+        same_truncated is False and len(same) == 1,
+        repr((same, same_truncated)),
+    )
+
     tight, tight_truncated = extraction.collect_fields(
         nodes,
         {"name": "h3::text", "again": "h3::text"},
@@ -2881,6 +3109,65 @@ def run_extraction_helpers() -> None:
     )
     check("fields 预算触发截断", tight_truncated is True, repr(tight))
     check("fields 截断后仍是字符串", not tight or isinstance(tight[0]["name"], str), repr(tight))
+
+    # useXpath 的优先级：曾经在 locate 里被 query_type or "css" 提前归一掉，显式 useXpath
+    # 永远输，xpath 选择器被当 CSS（命中 0）。契约是「显式 queryType > useXpath > css」。
+    xpath_html = "<div><p>A</p><p>B</p></div>"
+    by_xpath = extraction.locate({"html": xpath_html, "selector": "//p", "useXpath": True})
+    check(
+        "locate 认 useXpath",
+        by_xpath["count"] == 2 and len(by_xpath["matches"]) == 2,
+        repr(by_xpath["count"]),
+    )
+    explicit_text = extraction.locate({"html": xpath_html, "selector": "A", "useXpath": True, "queryType": "text"})
+    check("locate 显式 queryType 压过 useXpath", explicit_text["count"] == 1, repr(explicit_text["count"]))
+
+    # 字段预算按 JSON 序列化长度算：按字符裁会漏掉转义膨胀；列表/对象没有便宜的收缩
+    # 方式，留着整段就没有上限，所以超预算要降级成 null 并置 truncated。
+    quoted_page = Selector("<div><p>" + '"' * 40 + "</p></div>")
+    quoted_rows, quoted_flag = extraction.collect_fields(
+        quoted_page.css("p"),
+        {"t": {"selector": "::text", "mode": "text"}},
+        page=quoted_page,
+        max_content_chars=12,
+    )
+    check(
+        "字段预算按 JSON 长度裁（转义也算）",
+        quoted_flag is True and len(json.dumps(quoted_rows[0]["t"], ensure_ascii=False)) <= 12,
+        repr(quoted_rows),
+    )
+    many_page = Selector("<div><p><b>one</b><b>two</b></p></div>")
+    many_rows, many_flag = extraction.collect_fields(
+        many_page.css("p"),
+        {"bs": {"selector": "b", "mode": "text", "all": True}},
+        page=many_page,
+        max_content_chars=4,
+    )
+    check(
+        "非字符串超预算降级为 null 并置 truncated",
+        many_flag is True and many_rows[0]["bs"] is None,
+        repr(many_rows),
+    )
+
+    # locate 的预算要计整条载荷：attributes、四个生成选择器与 ancestors 都占字符。
+    # 只量 text 时真实返回体远超 maxContentChars（此前 locate 就只累加了 text）。
+    heavy_html = (
+        '<div><span data-a="1" data-b="2" data-c="3" data-d="4" data-e="5" data-f="6">' + "x" * 100 + "</span></div>"
+    )
+    heavy = extraction.locate({"html": heavy_html, "selector": "span", "maxContentChars": 1200})
+    heavy_len = len(json.dumps(heavy["matches"], ensure_ascii=False))
+    check(
+        "locate 预算按整条载荷算（属性与选择器计入）",
+        heavy_len <= 1200 and heavy["truncated"] is False,
+        f"len={heavy_len} truncated={heavy['truncated']}",
+    )
+    tiny = extraction.locate({"html": heavy_html, "selector": "span", "maxContentChars": 200})
+    tiny_len = len(json.dumps(tiny["matches"], ensure_ascii=False))
+    check(
+        "连固定结构都放不下时该条不进结果",
+        tiny["matches"] == [] and tiny["truncated"] is True and tiny_len <= 200,
+        f"len={tiny_len} kept={len(tiny['matches'])}",
+    )
 
 
 def run_output_shape() -> None:
@@ -2908,6 +3195,11 @@ def run_output_shape() -> None:
         "普通图片链接原样保留",
         drop("![图](/images/logo.png)") == "![图](/images/logo.png)",
         repr(drop("![图](/images/logo.png)")),
+    )
+    check(
+        "非图片 data: 属性不被改写",
+        drop('<a href="data:text/csv,a,b">x</a>', html=True) == '<a href="data:text/csv,a,b">x</a>',
+        repr(drop('<a href="data:text/csv,a,b">x</a>', html=True)),
     )
     check(
         "percent 编码的 svg 一样剥掉",
@@ -3179,6 +3471,12 @@ def run_crawl_guards() -> None:
 
     # 域内判定：口径与 Scrapling 引擎的 _is_domain_allowed 逐字一致。
     allowed = {"a.test", "a.test:8080"}
+    uppercase = crawl._allowed_domains("http://Example.COM:8080/start")
+    check(
+        "起始 URL 大写主机带端口：集合已归一为小写，后续页面不会被判站外",
+        crawl._within_allowed_domains("http://example.com:8080/next", uppercase) is True,
+        repr(uppercase),
+    )
     for url, note, wanted in (
         ("http://a.test/x", "整名相等", True),
         ("http://a.test:8080/x", "带端口的 netloc 相等", True),
@@ -3213,6 +3511,7 @@ def run_crawl_guards() -> None:
         _run_crawl_feed(crawl)
         _run_crawl_shopify(crawl)
         _run_crawl_stop(crawl)
+        _run_crawl_emit_failure(crawl)
         for bad_since in (-1, True, "1"):
             try:
                 crawl.crawl_status({"crawlId": "whatever", "since": bad_since})
@@ -3863,6 +4162,47 @@ def _run_crawl_stop(crawl: Any) -> None:
         server.shutdown()
 
 
+def _run_crawl_emit_failure(crawl: Any) -> None:
+    """crawlStarted 写不出去时：异常照抛，但并发名额必须当场还回去。
+
+    占位登记发生在 spider 构造之前，而 crawlStarted 事件在 thread.start() 之前发。
+    事件写失败（stdout 断开）时如果不撤占位，调用方拿不到 crawlId 就叫不停这条爬虫，
+    那份 thread 仍是 None 的登记会被 _is_running 当成「正在跑」，名额一直占到进程退出。
+    """
+    saved_make = crawl._make_spider
+    saved_emit = crawl._emit_event
+    before = len(crawl._CRAWLS)
+
+    class _IdleSpider:
+        """不该被启动的蜘蛛：线程一跑就说明结论错了。"""
+
+        def start(self) -> Any:
+            """到这里就证明 crawlStarted 已经发出去了。"""
+            raise AssertionError("spider must not start when crawlStarted could not be written")
+
+    def _broken_emit(*_args: Any, **_kwargs: Any) -> None:
+        """模拟 stdout 断开。"""
+        raise BrokenPipeError("stdout closed")
+
+    crawl._make_spider = lambda *args, **kwargs: _IdleSpider()
+    crawl._emit_event = _broken_emit
+    try:
+        try:
+            crawl.crawl_run({"url": "http://127.0.0.1:9/start"})
+            check("crawlStarted 发不出去时异常照抛", False, "没抛")
+        except BrokenPipeError:
+            check("crawlStarted 发不出去时异常照抛", True, "")
+        check(
+            "crawlStarted 发不出去时不留下占名额的登记",
+            len(crawl._CRAWLS) == before,
+            f"before={before} after={len(crawl._CRAWLS)}",
+        )
+    finally:
+        crawl._make_spider = saved_make
+        crawl._emit_event = saved_emit
+        crawl.close_all_crawls()
+
+
 def run_crawl_policy() -> None:
     """爬虫策略旋钮：部署命名空间读出来的值要一字不差地写进 Spider 的类属性。
 
@@ -4101,6 +4441,20 @@ def run_limits() -> None:
                 for session_id in list(adapters._SESSIONS):
                     adapters.session_close({"sessionId": session_id})
 
+        # close 与 fetch 的竞态：条目在 _get_session 之后被摘除并关闭，fetch 必须在
+        # 持锁后看到 closed 标记，报 NO_SUCH_SESSION 而不是 FETCH_FAILED。
+        stale_id = adapters.session_open({"sessionType": "static"})["sessionId"]
+        stale_entry = adapters._get_session(stale_id)
+        adapters.session_close({"sessionId": stale_id})
+        from unittest.mock import patch
+
+        with patch.object(adapters, "_get_session", lambda _sid: stale_entry):
+            try:
+                adapters.session_fetch({"sessionId": stale_id, "url": "http://localhost:9/x"})
+                check("关闭后的会话抓取被判会话不存在", False, "没有抛错")
+            except adapters.AdapterError as error:
+                check("关闭后的会话抓取被判会话不存在", error.code == "NO_SUCH_SESSION", error.code)
+
         # 爬虫起点复核：与浏览器路径同一个实现，两侧同解。
         for blocked in ("http://127.0.0.1:9/x", "http://169.254.169.254/", "http://[::1]/"):
             try:
@@ -4253,10 +4607,16 @@ def check_dependency_missing_mapping() -> None:
     def missing_markdownify(_params: dict[str, Any]) -> Any:
         raise ModuleNotFoundError("No module named 'markdownify'", name="markdownify")
 
+    def internal_import_typo(_params: dict[str, Any]) -> Any:
+        raise ModuleNotFoundError("No module named 'scrapling_typo'", name="scrapling_typo")
+
     adapters.METHODS["test-missing-dependency"] = missing_markdownify
+    adapters.METHODS["test-internal-import-typo"] = internal_import_typo
     try:
         frame = bridge.handle({"id": "d1", "method": "test-missing-dependency", "params": {}})
+        typo_frame = bridge.handle({"id": "d2", "method": "test-internal-import-typo", "params": {}})
     finally:
+        adapters.METHODS.pop("test-internal-import-typo", None)
         adapters.METHODS.pop("test-missing-dependency", None)
         if inserted:
             sys.path.remove(str(PY_DIR))
@@ -4272,6 +4632,12 @@ def check_dependency_missing_mapping() -> None:
         "缺依赖的报错点名了缺哪个包、要装哪条命令",
         "markdownify" in message and "scrapling[rag]" in message,
         message[:200],
+    )
+    typo_error = typo_frame.get("error", {}) if isinstance(typo_frame, dict) else {}
+    check(
+        "插件自身的导入错误不冒充缺可选依赖",
+        typo_error.get("code") == "FETCH_FAILED" and "scrapling_typo" in str(typo_error.get("message", "")),
+        repr(typo_error)[:200],
     )
 
 
@@ -4612,13 +4978,13 @@ def run_proxy() -> None:
         # 变成确定性事实，与运行环境无关。
         load(**{guard.PROXY_ENV: "http://127.0.0.1:7890"})
         real_getaddrinfo = guard.socket.getaddrinfo
-        real_cache = guard._SYNTHETIC_RESOLVER
+        real_cache = guard._SYNTHETIC_POOL
 
         def no_answers(*_args: object, **_kwargs: object) -> None:
             raise OSError("no such host")
 
         guard.socket.getaddrinfo = no_answers  # type: ignore[assignment]
-        guard._SYNTHETIC_RESOLVER = False
+        guard._SYNTHETIC_POOL = None
         try:
             check(
                 "本机解析不出来 + 走代理 = 放行（DNS 被按地区过滤的机器上，正是这些站点需要代理）",
@@ -4632,7 +4998,7 @@ def run_proxy() -> None:
             check("url_allowed 跟着代理口径一起放宽", allowed, why)
         finally:
             guard.socket.getaddrinfo = real_getaddrinfo
-            guard._SYNTHETIC_RESOLVER = real_cache
+            guard._SYNTHETIC_POOL = real_cache
 
         check("IP 字面量在代理下照旧判拒", not guard.is_public_address("127.0.0.1", proxied=True))
         check(
@@ -4719,7 +5085,7 @@ def run_synthetic_pools() -> None:
 
     answers: dict[str, list[str]] = {}
     real_getaddrinfo = guard.socket.getaddrinfo
-    real_cache = guard._SYNTHETIC_RESOLVER
+    real_cache = guard._SYNTHETIC_POOL
 
     def fake_lookup(host: str, *_args: object, **_kwargs: object) -> list[tuple]:
         """顶掉 getaddrinfo，按脚本回答。"""
@@ -4737,11 +5103,11 @@ def run_synthetic_pools() -> None:
                 "www.wikipedia.org": ["198.18.0.135"],
             }
         )
-        guard._SYNTHETIC_RESOLVER = None
-        check("认出合成解析器", guard.detect_synthetic_resolver())
+        guard._SYNTHETIC_POOL = None
+        check("认出合成解析器", guard.detect_synthetic_resolver() is not None)
         for answer in ("198.18.0.61", "198.18.0.28", "198.19.7.9"):
             answers["target.test"] = [answer]
-            guard._SYNTHETIC_RESOLVER = None
+            guard._SYNTHETIC_POOL = None
             guard._dns_cache_clear()
             allowed, why = guard.url_allowed("https://target.test/")
             check(f"池内任意落点 {answer} 都放行（不是切一小片）", allowed, why)
@@ -4749,7 +5115,7 @@ def run_synthetic_pools() -> None:
         # 收紧的那一侧：合成模式**只**放宽已知池，私网 / 回环 / 链路本地照旧拒。
         for answer in ("127.0.0.1", "192.168.1.1", "10.0.0.5", "169.254.169.254"):
             answers["target.test"] = [answer]
-            guard._SYNTHETIC_RESOLVER = None
+            guard._SYNTHETIC_POOL = None
             # 每次换答案都要清解析缓存：这一组判据正是「同主机、不同答案」的形态。
             guard._dns_cache_clear()
             allowed, why = guard.url_allowed("https://target.test/")
@@ -4764,14 +5130,14 @@ def run_synthetic_pools() -> None:
                 "target.test": ["100.127.255.254"],
             }
         )
-        guard._SYNTHETIC_RESOLVER = None
+        guard._SYNTHETIC_POOL = None
         guard._dns_cache_clear()
-        check("认出 CGNAT 池的合成解析器", guard.detect_synthetic_resolver())
+        check("认出 CGNAT 池的合成解析器", guard.detect_synthetic_resolver() is not None)
         allowed, why = guard.url_allowed("https://target.test/")
         check("CGNAT 池整段放行（含段尾）", allowed, why)
 
-        # 控制域名分散在**两个不同的池**里：仍判为合成模式，落在已知池内的目标照旧放行。
-        # 两侧同解是硬不变式，所以不做「必须全落在同一个池」的筛选。
+        # 控制域名分散在**两个不同的池**里：不构成单一合成池，判否；池内目标照旧拒。
+        # 100.64.0.0/10 同时是真实 CGNAT 段，跨池放宽会让指向真实内网的域名借道通过。
         answers.update(
             {
                 "example.com": ["198.18.0.1"],
@@ -4780,11 +5146,22 @@ def run_synthetic_pools() -> None:
                 "target.test": ["198.18.0.9"],
             }
         )
-        guard._SYNTHETIC_RESOLVER = None
+        guard._SYNTHETIC_POOL = None
         guard._dns_cache_clear()
-        check("控制域名分散在两个池时仍判为合成模式", guard.detect_synthetic_resolver())
+        check("控制域名分散在两个池时不判为合成模式", not guard.detect_synthetic_resolver())
         allowed, why = guard.url_allowed("https://target.test/")
-        check("分散在两个池时，落在已知池内的目标照旧放行", allowed, why)
+        check("分散在两个池时，池内答案照旧判拒", not allowed, why)
+
+        # 只有一枚控制域名回答案、另外两枚为空：总数够 3 也不构成指纹。
+        answers.update(
+            {
+                "example.com": ["198.18.0.1", "198.18.0.2", "198.18.0.3"],
+                "www.iana.org": [],
+                "www.wikipedia.org": [],
+            }
+        )
+        guard._SYNTHETIC_POOL = None
+        check("单个控制域名回多答案、其余无答案时不判为合成模式", not guard.detect_synthetic_resolver())
 
         # 控制域名正常解析（公网）时不误判：合成模式不成立，池不放行。
         answers.update(
@@ -4795,14 +5172,14 @@ def run_synthetic_pools() -> None:
                 "target.test": ["198.18.0.9"],
             }
         )
-        guard._SYNTHETIC_RESOLVER = None
+        guard._SYNTHETIC_POOL = None
         guard._dns_cache_clear()
         check("控制域名正常时不误判", not guard.detect_synthetic_resolver())
         allowed, why = guard.url_allowed("https://target.test/")
         check("未识别为合成解析器时，池内答案照旧判拒", not allowed, why)
     finally:
         guard.socket.getaddrinfo = real_getaddrinfo
-        guard._SYNTHETIC_RESOLVER = real_cache
+        guard._SYNTHETIC_POOL = real_cache
         answers.clear()
         guard._dns_cache_clear()
 
@@ -5014,9 +5391,25 @@ def run_network_summary() -> None:
     check("无查询串的 URL 不动", redacted("https://a.test/api/v1/users") == "https://a.test/api/v1/users")
     check("签名参数被脱敏", "99" not in redacted("https://a.test/x?sig=99"))
     check("大小写不敏感", "zz" not in redacted("https://a.test/x?ACCESS_TOKEN=zz"))
-    # urlsplit 并不挑剔普通垃圾串，只有真正畸形（IPv6 方括号没闭合）才会抛；抛了就原样返回。
+    # urlsplit 并不挑剔普通垃圾串，只有真正畸形（IPv6 方括号没闭合）才会抛；抛了也要
+    # 按参数名兜底脱敏，整串放行等于把凭据原样交出去。
     broken = "http://[::1/api?token=abc"
-    check("解析不了的 URL 原样返回", redacted(broken) == broken)
+    check(
+        "解析不了的 URL 按参数名兜底脱敏",
+        "abc" not in redacted(broken) and "<redacted>" in redacted(broken),
+        repr(redacted(broken)),
+    )
+    check(
+        "client_secret 与 x-api-key 被脱敏",
+        "s3" not in redacted("https://a.test/x?client_secret=s3&x-api-key=k9")
+        and "k9" not in redacted("https://a.test/x?client_secret=s3&x-api-key=k9"),
+        repr(redacted("https://a.test/x?client_secret=s3&x-api-key=k9")),
+    )
+    check(
+        "mailto 的 @ 不当成 userinfo",
+        redacted("mailto:user@example.com") == "mailto:user@example.com",
+        repr(redacted("mailto:user@example.com")),
+    )
     # authority 里的 user:pass@ 与片段里的令牌是同一类凭据，只是换了藏身位置。
     check(
         "authority 里的凭据整段丢掉",
@@ -5506,8 +5899,9 @@ def run_webrtc_guards() -> None:
     ``WEBRTC_NO_LEAK_FLAGS`` 那一套没有了。这里钉两条新不变量：
 
     - ``block_webrtc`` 的强制开启跟着 ``default_proxy()``（会话真正拿到的那份）走，而
-      ``proxyBypass=*`` 这种「整台机器直连」不算有代理 —— 前者按 ``browser_proxy("")`` 判，
-      空 URL 命中不了任何主机名条目，两条判据就在这里分歧。
+      ``proxyBypass=*`` 这种「整台机器直连」不算有代理 —— 前者按 ``browser_proxy("")`` 判。
+      两条判据必须同解：星号是整份绕过清单，不该因为 URL 为空就失效（此前它只在
+      ``default_proxy`` 里被单独特判，``_host_matches`` 把星号 lstrip 成空串后判不命中）。
     - 本仓任何路径都不发 ``extra_flags``：叠加语义下它不再破坏反检测，但发它没有正当理由。
     """
     sys.path.insert(0, str(PY_DIR))
@@ -5552,8 +5946,8 @@ def run_webrtc_guards() -> None:
         guard._BYPASS_ENTRIES = ("*",)  # 「整台机器直连」
         check("绕过清单写着 * 时会话按直连开", guard.default_proxy() == "", "")
         check(
-            "同一个 * 对空 URL 的 per-URL 判定却不生效（这就是两条判据的分歧点）",
-            guard.browser_proxy("") is not None,
+            "同一个 * 对空 URL 的 per-URL 判定也直连（两条判据同解）",
+            guard.browser_proxy("") is None,
             repr(guard.browser_proxy(""))[:120],
         )
 
@@ -5897,6 +6291,82 @@ def run_redis_storage() -> None:
         redis_storage.redacted_redis_url("redis://:secret@h.test:6379/0"),
     )
 
+    # 报告 §2.12：redacted_redis_url 只在构造异常消息时被调用，它自己抛错就顶替了该给的可读文本。
+    # urlsplit 对非法端口不报错，ValueError 来自惰性解析的 .port，所以解端口必须也在 try 里。
+    check(
+        "非法端口不抛错：点名 <invalid-port> 且主机仍可见",
+        redis_storage.redacted_redis_url("redis://h.test:abc/0") == "redis://h.test:<invalid-port>/0",
+        redis_storage.redacted_redis_url("redis://h.test:abc/0"),
+    )
+    check(
+        "IPv6 主机补回方括号（否则重建的连接串不可复用）",
+        redis_storage.redacted_redis_url("redis://[::1]:6379/0") == "redis://[::1]:6379/0",
+        redis_storage.redacted_redis_url("redis://[::1]:6379/0"),
+    )
+
+    # 报告 §2.12：lru_cache(1) 会把 close 过的实例继续发给下一次同参构造 —— 那一档存储永久坏死。
+    reopened: list[Any] = []
+
+    def _fresh_factory(_url: str, **_kwargs: Any) -> Any:
+        """每次构造都给一份新替身，用来数「缓存有没有把已关闭的旧实例发回来」。"""
+        client = _FakeRedis()
+        reopened.append(client)
+        return client
+
+    closed_once = redis_storage.RedisStorageSystem(
+        "redis://reopen.test:6379/0", "https://shop.example.com/p/1", client_factory=_fresh_factory
+    )
+    closed_once.close()
+    fresh_after_close = redis_storage.RedisStorageSystem(
+        "redis://reopen.test:6379/0", "https://shop.example.com/p/1", client_factory=_fresh_factory
+    )
+    check(
+        "close 之后同参构造拿到新实例，而不是已关闭的那个",
+        fresh_after_close is not closed_once and len(reopened) == 2,
+        str(len(reopened)),
+    )
+    fresh_after_close.close()
+
+    # 报告 §2.12：连接池要按连接串复用 —— 否则每抓一个新 URL 就新开一池，旧池被挤出缓存时没人关。
+    made_clients: list[Any] = []
+
+    class _RecordingRedis:
+        """只记 from_url 被调几次的替身客户端类。"""
+
+        @staticmethod
+        def from_url(_url: str, **_kwargs: Any) -> Any:
+            """每次调用造一份新替身并记下来。"""
+            client = _FakeRedis()
+            made_clients.append(client)
+            return client
+
+    recorder = types.ModuleType("redis")
+    recorder.Redis = _RecordingRedis  # type: ignore[attr-defined]
+    saved_recorder = sys.modules.get("redis")
+    sys.modules["redis"] = recorder
+    try:
+        reuse_a = redis_storage.RedisStorageSystem("redis://reuse.test:6379/0", "https://a.example.test/1")
+        reuse_b = redis_storage.RedisStorageSystem("redis://reuse.test:6379/0", "https://b.example.test/2")
+        check(
+            "同一连接串的不同页面共用一份客户端（连接池不随页面数增长）",
+            cast(Any, reuse_a)._client is cast(Any, reuse_b)._client and len(made_clients) == 1,
+            str(len(made_clients)),
+        )
+        reuse_a.close()
+        reuse_c = redis_storage.RedisStorageSystem("redis://reuse.test:6379/0", "https://c.example.test/3")
+        check(
+            "close 之后按原连接串重连，而不是发回已关闭的客户端",
+            cast(Any, reuse_c)._client is not made_clients[0] and len(made_clients) == 2,
+            str(len(made_clients)),
+        )
+        reuse_b.close()
+        reuse_c.close()
+    finally:
+        if saved_recorder is None:
+            sys.modules.pop("redis", None)
+        else:
+            sys.modules["redis"] = saved_recorder
+
     import builtins
 
     real_import = builtins.__import__
@@ -5916,7 +6386,8 @@ def run_redis_storage() -> None:
     finally:
         builtins.__import__ = real_import
 
-    def _refuse(_url: str) -> Any:
+    def _refuse(_url: str, **_kwargs: Any) -> Any:
+        """连不上的工厂：签名要跟上 timeout_seconds（否则那是 TypeError，不是连接故障）。"""
         raise OSError("connection refused")
 
     try:
@@ -5924,6 +6395,34 @@ def run_redis_storage() -> None:
         check("连不上时点名主机与端口（替身工厂）", False, "放行")
     except redis_storage.RedisUnavailable as error:
         check("连不上时点名主机与端口（替身工厂）", "127.0.0.1:9" in str(error), str(error))
+
+    # 报告 §2.12：工厂抛的不一定是「谁也没连上」。签名不匹配是代码问题，非法连接串是配置问题，
+    # 早先一律翻成 not reachable，排障会被引去查网络。
+    def _old_signature(_url: str) -> Any:
+        """不接受 timeout_seconds 的旧工厂。"""
+        return _FakeRedis()
+
+    try:
+        cast(Any, redis_storage.RedisStorageSystem).__wrapped__("redis://127.0.0.1:8/0", client_factory=_old_signature)
+        check("工厂签名不匹配时抛 TypeError 而不是不可达", False, "放行")
+    except TypeError:
+        check("工厂签名不匹配时抛 TypeError 而不是不可达", True, "")
+    except redis_storage.RedisUnavailable as error:
+        check("工厂签名不匹配时抛 TypeError 而不是不可达", False, str(error))
+
+    def _bad_config(_url: str, **_kwargs: Any) -> Any:
+        """非法连接串是配置写错，消息要点到那一面。"""
+        raise ValueError("Port could not be cast to integer value as 'abc'")
+
+    try:
+        cast(Any, redis_storage.RedisStorageSystem).__wrapped__("redis://h:abc/0", client_factory=_bad_config)
+        check("非法连接串的构造失败点名配置面", False, "放行")
+    except redis_storage.RedisUnavailable as error:
+        check(
+            "非法连接串的构造失败点名配置面",
+            "client setup failed" in str(error) and "Port could not be cast" in str(error),
+            str(error),
+        )
 
     if find_spec("redis") is None:
         # CI 的测试 venv 装的是 scrapling[rag] + requirements-dev，不含运行期的 redis 客户端；
@@ -6184,6 +6683,15 @@ def run_inprocess_adapters() -> None:
 
     adapters._strip_active_content(object())  # 没有 _root 应当是 no-op
     check("_strip_active_content 无 root 时不炸", True, "")
+
+    adapters._ACTIVE_CONTENT_WARNED.clear()
+    with contextlib.redirect_stderr(io.StringIO()) as degraded:
+        adapters._strip_active_content(object())
+    check(
+        "_strip_active_content 无 root 时报一次降级",
+        "active-content" in degraded.getvalue(),
+        degraded.getvalue(),
+    )
 
     class _FakeEl:
         """够 _strip_active_content 看的元素替身。"""
@@ -6723,6 +7231,8 @@ def run_inprocess_sessions() -> None:
             except adapters.AdapterError as error:
                 check(f"浏览器会话收到 {key} 被拒", error.code == "BAD_ARGS", error.code)
 
+        _run_static_session_methods(adapters)  # 方法路由与写方法门禁（见上面的契约说明）
+
         rows = adapters.session_list({})["sessions"]
         check("session_list 列出已登记会话", any(row["sessionId"] == "cov-stealth" for row in rows), repr(rows))
         stealth_row = next(row for row in rows if row["sessionId"] == "cov-stealth")
@@ -6936,6 +7446,90 @@ def run_inprocess_sessions() -> None:
         fetchers.StealthySession = saved_session  # type: ignore[misc]
         adapters._make_session = saved_make
         adapters.close_all_sessions()
+
+
+def _run_static_session_methods(adapters: Any) -> None:
+    """static 会话的方法路由与写方法门禁：session.fetch 与一次性 fetch 同源。"""
+    # static 会话的方法路由：session.fetch 曾只看 form/json 推 POST，method=PUT/DELETE
+    # 与裸 body 被静默丢掉（请求照发、语义错了）。契约是与一次性 fetch 同源。
+    import guard as guard_module
+
+    calls_static: list[tuple[str, str, dict[str, Any]]] = []
+
+    class _RecordingStaticSession:
+        """只记录被调的方法与参数；真正的请求不在这层。"""
+
+        def _record(self, method: str, url: str, **params: Any) -> dict[str, Any]:
+            """把方法、URL 与参数各记一笔。"""
+            calls_static.append((method, url, params))
+            return {"ok": True}
+
+        def get(self, url: str, **params: Any) -> dict[str, Any]:
+            """GET 路由。"""
+            return self._record("GET", url, **params)
+
+        def post(self, url: str, **params: Any) -> dict[str, Any]:
+            """POST 路由。"""
+            return self._record("POST", url, **params)
+
+        def put(self, url: str, **params: Any) -> dict[str, Any]:
+            """PUT 路由。"""
+            return self._record("PUT", url, **params)
+
+        def delete(self, url: str, **params: Any) -> dict[str, Any]:
+            """DELETE 路由。"""
+            return self._record("DELETE", url, **params)
+
+    adapters._SESSIONS["cov-static"] = {
+        "sessionId": "cov-static",
+        "type": "static",
+        "session": _RecordingStaticSession(),
+        "closer": object(),
+        "lock": threading.Lock(),
+        "pending": False,
+    }
+    saved_url_allowed = guard_module.url_allowed
+    saved_write_methods = guard_module.ALLOW_WRITE_METHODS
+    saved_to_payload = adapters.to_payload
+    guard_module.url_allowed = lambda url, **kwargs: (True, "")
+    guard_module.ALLOW_WRITE_METHODS = True
+    adapters.to_payload = lambda *args, **kwargs: {"ok": True}
+    try:
+        put_result = adapters.session_fetch(
+            {"sessionId": "cov-static", "url": "https://example.test/x", "method": "PUT", "body": "x"}
+        )
+        check(
+            "session.fetch 的 method=PUT 真的用 PUT 发出",
+            put_result.get("ok") is True and bool(calls_static) and calls_static[-1][0] == "PUT",
+            repr(calls_static[-1:]),
+        )
+        check(
+            "裸 body 进入 PUT 的请求体",
+            calls_static[-1][2].get("data") == "x",
+            repr(calls_static[-1][2]),
+        )
+        calls_static.clear()
+        adapters.session_fetch({"sessionId": "cov-static", "url": "https://example.test/x"})
+        check("没给方法也没给体时是 GET", calls_static[-1][0] == "GET", repr(calls_static[-1:]))
+        guard_module.ALLOW_WRITE_METHODS = False
+        for method in ("PUT", "DELETE"):
+            try:
+                adapters.session_fetch({"sessionId": "cov-static", "url": "https://example.test/x", "method": method})
+                check(f"写方法 {method} 在闸门关着时被拒", False, "放行")
+            except adapters.AdapterError as error:
+                check(f"写方法 {method} 在闸门关着时被拒", error.code == "WRITE_DISABLED", error.code)
+        try:
+            adapters.session_fetch(
+                {"sessionId": "cov-static", "url": "https://example.test/x", "method": "GET", "body": "x"}
+            )
+            check("显式 GET 带体被拒", False, "放行")
+        except adapters.AdapterError as error:
+            check("显式 GET 带体被拒", error.code == "BAD_ARGS", error.code)
+    finally:
+        guard_module.url_allowed = saved_url_allowed
+        guard_module.ALLOW_WRITE_METHODS = saved_write_methods
+        adapters.to_payload = saved_to_payload
+        adapters._SESSIONS.pop("cov-static", None)
 
 
 def run_inprocess_crawl() -> None:

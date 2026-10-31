@@ -4,6 +4,7 @@
 // 否则两套定义必然漂移（spec §9.1「不允许两套参数面漂移」）。SDK 只在 `mcp` 模式真的
 // 起服务时才动态载入，native 模式下这些依赖一行都不执行。
 
+import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
@@ -57,7 +58,30 @@ export interface McpServerOptions {
   readonly token?: string | undefined;
   readonly entries: readonly McpToolEntry[];
   readonly imageSink?: McpImageSink | undefined;
+  /**
+   * 装配缝：每条请求的协议会话由谁建。默认用 SDK 那一份；单测注入假的会话，
+   * 才能把「会话装配或 handleRequest 抛了」这一支跑到真判据，而不是标成不覆盖。
+   */
+  readonly sessionFactory?: McpSessionFactory | undefined;
 }
+
+/**
+ * 一条请求的 MCP 会话：协议对象与它的传输，加上「处理这一条请求」。
+ *
+ * 生产侧由 SDK 装配；这个面存在的理由是让失败注入点落在模块自己写的那一段，
+ * 而不是落在第三方 SDK 的内部行为上。
+ */
+export interface McpSession {
+  /** 把协议对象接到 transport 上。 */
+  readonly connect: () => Promise<void>;
+  /** 交出去的两端：关不上时自己收掉失败，不让它成为未处理的拒绝。 */
+  readonly close: () => Promise<void>;
+  /** 处理这一条 HTTP 请求。 */
+  readonly handle: (request: IncomingMessage, response: ServerResponse) => Promise<void>;
+}
+
+/** 装配一请求会话的那一步；参数是按实际端口展开后的 DNS 防护面。 */
+export type McpSessionFactory = (guard: McpAllowedEndpoints) => McpSession;
 
 export interface McpServerHandle {
   readonly port: number;
@@ -66,7 +90,7 @@ export interface McpServerHandle {
 }
 
 /** MCP server 自述的版本；由 test/publish-manifest.test.ts 钉成 package.json 同值。 */
-export const MCP_SERVER_VERSION = "0.1.5";
+export const MCP_SERVER_VERSION = "0.1.6";
 
 const RAW_PREFIX = "scrapling_";
 
@@ -127,23 +151,48 @@ export function mcpToolEntries(
  * 截图工具的产物形状要求它调 attachment 服务；MCP 客户端要的是 base64 image content，
  * 所以这里存字节、只回一个 id，投内容那一步按 id 取回并即时删除。
  */
+/** 截图字节最多留几份：正常路径 take 即删，这里兜的是 take 之前抛错的泄漏。 */
+const MAX_STORED_IMAGES = 16;
+/** 未被取走的截图最多留这么久。 */
+const IMAGE_TTL_MS = 60_000;
+
 export function createMcpImageSink(): McpImageSink {
-  const stored = new Map<string, { data: string; mimeType: string }>();
+  const stored = new Map<string, { data: string; mimeType: string; savedAt: number }>();
   let seq = 0;
+
+  /** 过期条目按插入顺序清理；Map 的插入顺序就是截图先后。 */
+  const prune = (now: number): void => {
+    for (const [id, entry] of stored) {
+      if (now - entry.savedAt <= IMAGE_TTL_MS) {
+        break;
+      }
+      stored.delete(id);
+    }
+  };
+
   return {
     saveImage: (input) => {
+      const now = Date.now();
+      prune(now);
+      // execute 抛错时 take 不会被调到，字节会留在表里；到上限整表清空，
+      // 既不让重复触发吃满内存，也不保留本该即时取走的旧截图。
+      if (stored.size >= MAX_STORED_IMAGES) {
+        stored.clear();
+      }
       seq += 1;
       const id = `mcp-${String(seq)}`;
       stored.set(id, {
         data: Buffer.from(input.data).toString("base64"),
         mimeType: input.mediaType,
+        savedAt: now,
       });
       return Promise.resolve({ id });
     },
     take: (id) => {
+      prune(Date.now());
       const found = stored.get(id);
       stored.delete(id);
-      return found;
+      return found === undefined ? undefined : { data: found.data, mimeType: found.mimeType };
     },
   };
 }
@@ -297,22 +346,80 @@ async function runEntry(
   }
 }
 
-function pathOf(url: string | undefined): string {
-  // node 给 server 侧请求的 url 总有值，类型上它是 optional。
-  /* v8 ignore next 2 —— 兜的是类型上的 undefined，不是运行期到得了的一支。 */
-  return (url ?? "").split("?")[0] ?? "";
+/**
+ * 请求行里的路径，查询串不参与比较。
+ *
+ * 读不到请求行时按「不是本路径」处理：这一条端口只服务 `MCP_PATH`，把它当空串比出去
+ * 就是 404，而不是放行。
+ *
+ * @param target - node 给的 `request.url`（类型上是 optional，服务侧总有值）
+ * @returns 去掉查询串的路径
+ */
+export function pathOf(target = ""): string {
+  const query = target.indexOf("?");
+  return query === -1 ? target : target.slice(0, query);
 }
 
-function oversized(req: IncomingMessage): boolean {
-  const length = Number(req.headers["content-length"]);
-  return Number.isFinite(length) && length > MAX_BODY_BYTES;
+type BodyRejection = "length-required" | "none" | "too-large";
+
+/**
+ * POST 的正文长度有没有问题。
+ *
+ * 这条端口不在宿主网关之后，正文上限只能自己判。两种情况要分开：声明了超限长度
+ * 是 413；**没声明**长度是 411，不能当「不大」放行 —— 没长度时 node 走 chunked，
+ * 真正的字节数在读到之前不可知，放行等于没有上限。
+ */
+function bodyRejection(req: IncomingMessage): BodyRejection {
+  if (req.method !== "POST") {
+    // GET 开的是 SSE 通知流，DELETE 结束会话：两者都没有正文，也就没有 content-length。
+    // 拿「缺头即拒」一刀切会把 SDK 的正常路径打掉。
+    return "none";
+  }
+  const length = req.headers["content-length"];
+  if (length === undefined) {
+    return "length-required";
+  }
+  // 非十进制取值（"abc"、"-5"、"1e3"）在 node 的 HTTP 解析器里就被 400 了，到不了这一层；
+  // 这里只需判上界。
+  return Number(length) > MAX_BODY_BYTES ? "too-large" : "none";
 }
 
 function authorized(req: IncomingMessage, token: string | undefined): boolean {
-  return token === undefined || req.headers.authorization === `Bearer ${token}`;
+  if (token === undefined) {
+    return true;
+  }
+  const header = req.headers.authorization;
+  if (typeof header !== "string") {
+    return false;
+  }
+  const expected = Buffer.from(`Bearer ${token}`, "utf8");
+  const actual = Buffer.from(header, "utf8");
+  // 长度不同时 timingSafeEqual 会抛；先比长度，再恒时比较内容，避免逐字符短路泄露前缀。
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+/**
+ * 这条响应还能不能写状态行。
+ *
+ * 两侧各挡一类：`headersSent` 是头已经出去，实测 node 只在这种状态上再 `writeHead` 会同步抛
+ * `ERR_HTTP_HEADERS_SENT`；`writableEnded` 是 `end()` 已经调过。本机 node 量到的每种写序里，
+ * `end()` 之后 `headersSent` 一定为真，所以后者眼下不额外挡什么 —— 留着是因为换一版 node
+ * 的写序不保证同形，而漏判的抛出发生在 catch 里，会变成未处理拒绝终止宿主进程。
+ *
+ * @param response - 待写的响应
+ * @returns 还没有任何状态行出去时为真
+ */
+export function headerWritable(response: {
+  headersSent: boolean;
+  writableEnded: boolean;
+}): boolean {
+  return !response.headersSent && !response.writableEnded;
 }
 
 function refused(res: ServerResponse, status: number, challenge: boolean): void {
+  if (!headerWritable(res)) {
+    return;
+  }
   res.writeHead(status, challenge ? { "www-authenticate": "Bearer" } : undefined);
   res.end();
 }
@@ -431,6 +538,12 @@ async function settled(http: HttpServer): Promise<void> {
  */
 export async function startMcpServer(options: McpServerOptions): Promise<McpServerHandle> {
   const host = options.host ?? MCP_LISTEN_HOST;
+  if (options.token === undefined && !isLoopbackHost(host)) {
+    throw new McpServerError(
+      "MCP_AUTH_REQUIRED",
+      `MCP server refuses to listen on ${host} without ${MCP_TOKEN_ENV}: a non-loopback bind must require a bearer token`,
+    );
+  }
   // 绑定端口要等 listen 回来才知道，而防护判据要的是 host:port 字面量 —— 所以先留空，
   // 由 accept 之前的第一次请求把它按「实际端口」展开并缓存。handle 只会在 listen 之后被调到。
   let bound = 0;
@@ -440,53 +553,67 @@ export async function startMcpServer(options: McpServerOptions): Promise<McpServ
   const { StreamableHTTPServerTransport } =
     await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
 
+  /** SDK 那一份装配：一请求一套协议对象与 transport，响应结束即回收。 */
+  function sdkSession(endpoints: McpAllowedEndpoints): McpSession {
+    // 高层 McpServer 只收 Zod 形状，而这里要端出去的正是 native 那份 JSON Schema。
+    // oxlint-disable-next-line typescript/no-deprecated
+    const protocol = new serverModule.Server(
+      { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+      { capabilities: { tools: {} } },
+    );
+    protocol.setRequestHandler(types.ListToolsRequestSchema, () => ({
+      tools: options.entries.map((entry) => ({
+        name: entry.name,
+        description: entry.definition.description,
+        inputSchema: entry.definition.parameters,
+      })),
+    }));
+    protocol.setRequestHandler(types.CallToolRequestSchema, async (call, extra) => {
+      const entry = options.entries.find((item) => item.name === call.params.name);
+      if (entry === undefined) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: `unknown tool: ${call.params.name}` }],
+        };
+      }
+      return runEntry(entry, call.params.arguments, extra.signal, options.imageSink);
+    });
+    // DNS 重绑定防护：SDK 会对 Host / Origin 做逐字比较，所以允许面必须是真实可达的字面量。
+    // 不写通配就是这条判据的全部意义 —— 没有它，恶意域名解析到 127.0.0.1 的请求看起来与本地请求一样。
+    // SDK 把这三项标成了 deprecated、建议改用外部中间件；本插件不起任何 web 框架，
+    // 「外部中间件」这一层就是这里 —— 仍用 SDK 自带判据，它与 handleRequest 同批执行，
+    // 不会出现中间件顺序错位那种漏判。
+    // oxlint-disable typescript/no-deprecated
+    const transport = new StreamableHTTPServerTransport({
+      enableDnsRebindingProtection: true,
+      allowedHosts: [...endpoints.allowedHosts],
+      allowedOrigins: [...endpoints.allowedOrigins],
+    });
+    // oxlint-enable typescript/no-deprecated
+    return {
+      connect: () => protocol.connect(transport),
+      handle: (request, response) => transport.handleRequest(request, response),
+      // 关不上也没有可做的事：allSettled 把两侧的失败都收进结果，不让它们成为未处理的拒绝
+      // （Node 默认会因此终止进程）。
+      close: async () => {
+        await Promise.allSettled([transport.close(), protocol.close()]);
+      },
+    };
+  }
+
+  const sessionFactory = options.sessionFactory ?? sdkSession;
+
   async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
-      // 高层 McpServer 只收 Zod 形状，而这里要端出去的正是 native 那份 JSON Schema。
-      // oxlint-disable-next-line typescript/no-deprecated
-      const protocol = new serverModule.Server(
-        { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
-        { capabilities: { tools: {} } },
-      );
-      protocol.setRequestHandler(types.ListToolsRequestSchema, () => ({
-        tools: options.entries.map((entry) => ({
-          name: entry.name,
-          description: entry.definition.description,
-          inputSchema: entry.definition.parameters,
-        })),
-      }));
-      protocol.setRequestHandler(types.CallToolRequestSchema, async (call, extra) => {
-        const entry = options.entries.find((item) => item.name === call.params.name);
-        if (entry === undefined) {
-          return {
-            isError: true,
-            content: [{ type: "text" as const, text: `unknown tool: ${call.params.name}` }],
-          };
-        }
-        return runEntry(entry, call.params.arguments, extra.signal, options.imageSink);
-      });
-      // DNS 重绑定防护：SDK 会对 Host / Origin 做逐字比较，所以允许面必须是真实可达的字面量。
-      // 不写通配就是这条判据的全部意义 —— 没有它，恶意域名解析到 127.0.0.1 的请求看起来与本地请求一样。
       guard ??= allowedEndpoints(host, bound);
-      // SDK 把这三项标成了 deprecated、建议改用外部中间件；本插件不起任何 web 框架，
-      // 「外部中间件」这一层就是这里 —— 仍用 SDK 自带判据，它与 handleRequest 同批执行，
-      // 不会出现中间件顺序错位那种漏判。
-      // oxlint-disable typescript/no-deprecated
-      const transport = new StreamableHTTPServerTransport({
-        enableDnsRebindingProtection: true,
-        allowedHosts: [...guard.allowedHosts],
-        allowedOrigins: [...guard.allowedOrigins],
-      });
-      // oxlint-enable typescript/no-deprecated
+      const session = sessionFactory(guard);
       response.on("close", () => {
-        void transport.close();
-        void protocol.close();
+        void session.close();
       });
-      await protocol.connect(transport);
-      await transport.handleRequest(request, response);
+      await session.connect();
+      await session.handle(request, response);
     } catch {
       // 回包之前就失败时没有可读的 JSON-RPC 载体，只能给状态码。
-      /* v8 ignore next 2 —— 到不了的一层：SDK 那两步只回错误响应，不抛。 */
       refused(response, 500, false);
     }
   }
@@ -500,10 +627,14 @@ export async function startMcpServer(options: McpServerOptions): Promise<McpServ
       refused(response, 404, false);
       return;
     }
-    if (oversized(request)) {
-      refused(response, 413, false);
+    const rejection = bodyRejection(request);
+    if (rejection !== "none") {
+      refused(response, rejection === "too-large" ? 413 : 411, false);
       return;
     }
+    // handle 的 try/catch 是总的：它的 catch 只调 refused()，而 refused() 在响应已经写过时
+    // 直接返回（见 headerWritable），不会再往一个已写完的响应上抛第二次状态行。所以这里不需要
+    // 第二层兜底 —— 早前那层在自己的兜底再抛时同样兜不住，只会把同一颗抛出走第二遍。
     void handle(request, response);
   }
 

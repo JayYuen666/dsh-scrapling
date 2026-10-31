@@ -1,6 +1,6 @@
 {
   "name": "@jayyuen66/dsh-scrapling",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Scrapling 网页抓取插件（dsh）：静态/浏览器抓取 + CSS/XPath 结构化抽取 + 选择器自愈 + capture_xhr 与会话网络历史 + 登录态存取 + Spider 爬虫，由常驻 Python 进程驱动。",
   "keywords": [
     "dsh",
@@ -15,7 +15,10 @@
     "url": "https://github.com/JayYuen666/dsh-scrapling/issues"
   },
   "license": "MIT",
-  "author": "JayYuen",
+  "author": {
+    "name": "JayYuen",
+    "url": "https://github.com/JayYuen666"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/JayYuen666/dsh-scrapling.git"
@@ -86,11 +89,12 @@
     "cov:py": "node py-launcher.mjs -m coverage erase && node py-launcher.mjs --env=DSH_PY_COVERAGE=1 -m coverage run --parallel-mode py/tests/test_bridge.py && node py-launcher.mjs -m coverage combine && node py-launcher.mjs -m coverage report -m && node py-launcher.mjs -m coverage erase",
     "coverage:floor": "node py-launcher.mjs -m coverage erase && node py-launcher.mjs --env=DSH_PY_COVERAGE=1 -m coverage run --parallel-mode py/tests/test_bridge.py && node py-launcher.mjs -m coverage combine && node py-launcher.mjs -m coverage report --omit=\"py/tests/*\" --fail-under=74 && node -e \"require('node:fs').mkdirSync('coverage',{recursive:true})\" && node py-launcher.mjs -m coverage json --omit=\"py/tests/*\" -o coverage/python-coverage.json && node coverage-floor.mjs && node py-launcher.mjs -m coverage erase",
     "deps:py": "node deps-check.mjs",
-    "check:py": "npm run --loglevel=warn py:which && npm run --loglevel=warn face:py && npm run --loglevel=warn deps:py && npm run --loglevel=warn lint:py && npm run --loglevel=warn fmt:py && npm run --loglevel=warn typecheck:py && npm run --loglevel=warn test:py && npm run --loglevel=warn bandit:py && npm run --loglevel=warn coverage:floor",
+    "check:py": "npm run --loglevel=warn py:which && npm run --loglevel=warn face:py && npm run --loglevel=warn deps:py && npm run --loglevel=warn lint:py && npm run --loglevel=warn fmt:py && npm run --loglevel=warn typecheck:py && npm run --loglevel=warn bandit:py && npm run --loglevel=warn coverage:floor",
     "build:cli": "node build-cli.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
+    "fs-native-extensions": "1.5.3",
     "ipaddr.js": "2.5.0",
     "zod": "catalog:"
   },
@@ -137,6 +141,7 @@
     "eslint-plugin-regexp": "catalog:",
     "eslint-plugin-sonarjs": "catalog:",
     "eslint-plugin-zod": "catalog:",
+    "fast-check": "4.10.2",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",
     "oxlint-tsgolint": "catalog:",
@@ -147,12 +152,12 @@
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": "^0.2.1-rc.3 || ^0.2.2-alpha.2",
-    "@deepseek-ai/dsh-output-retention": "^0.2.1-rc.3 || ^0.2.2-alpha.2",
-    "@deepseek-ai/dsh-tools": "^0.2.1-rc.3 || ^0.2.2-alpha.2",
-    "@deepseek-ai/dsh-typert-protocol": "^0.2.1-rc.3 || ^0.2.2-alpha.2",
-    "@deepseek-ai/dsh-web": "^0.2.1-rc.3 || ^0.2.2-alpha.2",
-    "@deepseek-ai/schemastery": "3.18.6-alpha.1"
+    "@deepseek-ai/dsh": "^0.2.1-rc.3",
+    "@deepseek-ai/dsh-output-retention": "^0.2.1-rc.3",
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.3",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.1-rc.3",
+    "@deepseek-ai/dsh-web": "^0.2.1-rc.3",
+    "@deepseek-ai/schemastery": "^3.18.6-alpha.1"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh": {
@@ -165,7 +170,7 @@
   "icon": "icon.svg",
   "engines": {
     "dsh": "^0.2.1-rc.3",
-    "node": ">=22.12.0"
+    "node": ">=22.18.0"
   },
   "dsh": {
     "manifestVersion": 1,

@@ -150,6 +150,14 @@ def configure(
         ALLOWED_HOSTS = allowed_hosts
     if nat64_prefixes is not None:
         EXTRA_NAT64_PREFIXES = nat64_prefixes
+        for raw in nat64_prefixes:
+            try:
+                network = ipaddress.ip_network(raw, strict=True)
+            except ValueError:
+                _log(f"ignoring an invalid extra NAT64 prefix {raw!r}")
+                continue
+            if not isinstance(network, ipaddress.IPv6Network) or network.prefixlen not in _NAT64_EMBEDDED_OFFSET:
+                _log(f"ignoring an unsupported extra NAT64 prefix {raw!r} (need /40, /48, /56, /64 or /96)")
     if allow_write_methods is not None:
         ALLOW_WRITE_METHODS = allow_write_methods
     if allow_browser_actions is not None:
@@ -228,7 +236,7 @@ def configure_from_env() -> None:
         PROXY_URL = ""
     if _PAC_NOTICE:
         _log(
-            f"system proxy is a PAC script ({_PAC_NOTICE}); it is not evaluated here — "
+            f"system proxy is a PAC script ({redact_url_secrets(_PAC_NOTICE)}); it is not evaluated here — "
             f"set {PROXY_ENV} (the settings card's proxy) to the proxy address you want"
         )
     if _SYSTEM_PROXIES and not (PROXY_URL or _ENV_PROXIES):
@@ -422,6 +430,11 @@ def _host_matches(host: str, entry: str) -> bool:
     :param entry: 清单里的一项（可能带前导 ``.`` 或 ``*``）
     :returns: 是否命中
     """
+    if entry.strip() == "*":
+        # 整条星号是「全部绕过」。不放这里认它，它会被 lstrip 成空串再落到
+        # not item 那条假分支上 —— default_proxy 单独特判过它，两条路于是对同一份
+        # 配置给出相反答案（会话直连、静态抓取仍走代理）。
+        return True
     item = entry.strip().lower().lstrip("*")
     if not item:
         return False
@@ -736,47 +749,59 @@ def effective_ip(
 # 检测合成解析器用的控制域名：与用户的目标无关，答案只反映解析器本身的行为。
 CONTROL_HOSTS: tuple[str, ...] = ("example.com", "www.iana.org", "www.wikipedia.org")
 
-# 检测结果；只算一次并缓存。
-_SYNTHETIC_RESOLVER: bool | None = None
+# 检测结果：认出的那个合成池；只算一次并缓存。None = 没有认出（或控制答案不构成单一池）。
+_SYNTHETIC_POOL: ipaddress.IPv4Network | None = None
 
 
-def detect_synthetic_resolver() -> bool:
-    """判断当前解析器是不是在合成地址。
+def detect_synthetic_resolver() -> ipaddress.IPv4Network | None:
+    """判断当前解析器是不是在合成地址，并给出要放宽到的那**一个**池。
 
     依据是 fake-ip 的指纹：**所有**主机名都被指到同一个非公网小池里。实测在一台开着 TUN +
     fake-ip 的机器上，example.com / github.com / wikipedia.org / echarts.apache.org /
     www.apple.com 全部落在 198.18.0.0/15 内且互不相同，而 IP 字面量原样不动。
 
-    这么判而不是枚举段：落点由代理自己定，用户不该被迫先知道自己代理用了哪一段。控制域名
-    解析失败时判否——判否只让守卫维持最严，不会误放行。
+    每个控制域名都要有答案，且全部答案落在**同一个**已知池里；跨池分流或有一枚落在池外都
+    判否。100.64.0.0/10 同时是 Tailscale 等真实内网常用的 CGNAT 段，拿另一个池的检测结果
+    把这一整段放宽，会让指向真实 ``100.64.x.x`` 的域名通过闸门。判否只让守卫维持最严，
+    不会误放行。
 
-    :returns: 解析器是否在合成地址
+    :returns: 认出的合成池；判否时 None
     """
-    global _SYNTHETIC_RESOLVER  # noqa: PLW0603 —— 缓存一次即可
-    if _SYNTHETIC_RESOLVER is not None:
-        return _SYNTHETIC_RESOLVER
+    global _SYNTHETIC_POOL  # noqa: PLW0603 —— 缓存一次即可
+    if _SYNTHETIC_POOL is not None:
+        return _SYNTHETIC_POOL
     resolved: list[str] = []
     for host in CONTROL_HOSTS:
         try:
             infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
         except OSError:
-            _SYNTHETIC_RESOLVER = False
-            return _SYNTHETIC_RESOLVER
+            return None
+        addresses = [str(info[4][0]) for info in infos]
+        # 每个域名都要有答案：只校验总数时，一个域名回三条、另外两个解析失败也能凑够 3，
+        # 那三条同源答案不构成「所有主机名都被指到同一个池」的指纹。
+        if not addresses:
+            return None
         # getaddrinfo 的答案元素是 str | int（sockaddr 的形状），而这里只要地址串。
-        resolved.extend(str(info[4][0]) for info in infos)
-    if len(resolved) < len(CONTROL_HOSTS):
-        _SYNTHETIC_RESOLVER = False
-        return _SYNTHETIC_RESOLVER
+        resolved.extend(addresses)
+    # 全指向同一处（解析器坏了）不当成 fake-ip。
+    if len(set(resolved)) < 2:
+        return None
     parsed = []
     for item in resolved:
         try:
             parsed.append(ipaddress.ip_address(item))
         except ValueError:
-            _SYNTHETIC_RESOLVER = False
-            return _SYNTHETIC_RESOLVER
-    # 全非公网且彼此不同 = 一个合成池。全指向同一处更像是解析器坏了，不当成 fake-ip。
-    _SYNTHETIC_RESOLVER = all(not item.is_global for item in parsed) and len(set(parsed)) > 1
-    return _SYNTHETIC_RESOLVER
+            return None
+    if not all(not item.is_global for item in parsed):
+        return None
+    if not all(isinstance(item, ipaddress.IPv4Address) for item in parsed):
+        return None
+    # 全部答案必须落在同一个池；命中不止一个池说明解析器跨池分流，判否。
+    for pool in SYNTHETIC_POOLS:
+        if isinstance(pool, ipaddress.IPv4Network) and all(item in pool for item in parsed):
+            _SYNTHETIC_POOL = pool
+            return _SYNTHETIC_POOL
+    return None
 
 
 def _acceptable_resolved(item: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -796,7 +821,8 @@ def _acceptable_resolved(item: ipaddress.IPv4Address | ipaddress.IPv6Address) ->
         return True
     if not isinstance(item, ipaddress.IPv4Address):
         return False
-    if detect_synthetic_resolver() and any(item in pool for pool in SYNTHETIC_POOLS):
+    synthetic_pool = detect_synthetic_resolver()
+    if synthetic_pool is not None and item in synthetic_pool:
         return True
     return bool(SYNTHETIC_NETWORKS) and any(item in network for network in SYNTHETIC_NETWORKS)
 
@@ -901,7 +927,12 @@ def url_allowed(url: str, *, websocket: bool = False) -> tuple[bool, str]:
     :param websocket: 按 WebSocket 握手的口径判（认 ws/wss）；发出请求的那几条路径都不传
     :returns: (是否允许, 原因)；允许时原因为空串
     """
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # 畸形 URL（如 http://[::1 缺少右括号）在 urlparse 里就抛 ValueError。
+        # 契约是「返回 (False, reason)」，让异常漏出去会把一个坏输入变成调用方的崩溃。
+        return False, "URL is malformed"
     # ws/wss 与 http/https 走同一套地址判定。WebSocket 握手是独立路由，page.route 拦不到，
     # 这里不认它就等于把公网 WebSocket 一起杀了 —— 不少站点的实时数据就靠它。
     # 而真正**发出请求**的那几条路径（fetch/crawl/download/session）不认 ws：它们不会用

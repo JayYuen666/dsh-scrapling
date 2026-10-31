@@ -34,8 +34,14 @@ export const MCP_CLIENT_PACKAGE = "@deepseek-ai/dsh-mcp-client";
  */
 export const MCP_DEFAULT_CLIENT_PIN = "0.2.1-rc.3";
 
-/** 客户端允许的两种钉法：与宿主同线的那一版，或 npm 的 `next` 标签。 */
-export const MCP_CLIENT_PINS: readonly string[] = [MCP_DEFAULT_CLIENT_PIN, "next"];
+/** 客户端允许的两种钉法：与宿主同线的那一版，或 npm 的 `next` 标签。
+ *
+ *  `next` 是刻意的例外：它随 npm dist-tag 漂移，可能偏离宿主线而让条目「装得上、
+ *  永不生效」。放行它是为了跟踪官方 server 的 beta 线；对稳定性优先的部署应使用默认
+ *  的字面版本，doctor 也会在发现不匹配时点名。 */
+const MCP_CLIENT_PIN_VALUES = [MCP_DEFAULT_CLIENT_PIN, "next"] as const;
+export type McpClientPin = (typeof MCP_CLIENT_PIN_VALUES)[number];
+export const MCP_CLIENT_PINS: readonly string[] = MCP_CLIENT_PIN_VALUES;
 
 /** 生成的条目里这条 insert 的 id：一个给本插件的 server，一个给官方 server。 */
 export const MCP_CLIENT_ENTRY_ID = "scrapling-mcp";
@@ -51,12 +57,24 @@ export function isMcpMode(value: string): value is McpMode {
   return MODE_NAMES.has(value);
 }
 
-/** server 的 URL：与 {@link startMcpServer} 实际 listen 的那个串由同一份常量拼出来。 */
+/** server 的 URL：与 {@link startMcpServer} 实际 listen 的那个串由同一份常量拼出来。
+ *
+ *  IPv6 字面量必须带方括号，否则 `http://::1:39217/mcp` 连主机的分界都没有；
+ *  端口在这里也校验一次，避免把越界值拼进一条客户端永远连不上的 URL。
+ */
 export function mcpUrl(port: number, host: string): string {
-  return `http://${host}:${String(port)}${MCP_PATH}`;
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`MCP port must be an integer in 1..65535, got ${String(port)}`);
+  }
+  const bracketed = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `http://${bracketed}:${String(port)}${MCP_PATH}`;
 }
 
 /** 给用户的安装命令；profile 名留成占位符，CLI 不知道用户在用哪个 profile。 */
-export function clientInstallCommand(pin: string = MCP_DEFAULT_CLIENT_PIN): string {
+export function clientInstallCommand(pin: McpClientPin = MCP_DEFAULT_CLIENT_PIN): string {
+  // JS 侧调用者（打包后的 CLI）拿不到联合类型；钉版越界会生成一条宿主拒绝装载的命令。
+  if (!MCP_CLIENT_PINS.includes(pin)) {
+    throw new Error(`unsupported MCP client pin: ${JSON.stringify(pin)}`);
+  }
   return `dsh plugin --profile <profile> add ${MCP_CLIENT_PACKAGE}@${pin}`;
 }

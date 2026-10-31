@@ -181,9 +181,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run check
       # Python 面不在这里另跑一遍：`check` 已经含 `check:py` 的链条（`py:which` → `face:py` →
-      # `deps:py` → ruff 检查/格式 → mypy → sidecar 端到端 → bandit → 覆盖率地板），解释器由该仓
-      # `py` 入口的解析规则选定。强度只写在那一条链里：要放宽或收紧 Python 面就改该仓
-      # `package.json` 的 `check:py`，在 CI 里另起一步就会出现两套说法互相打脸的形状（一步拦、一步只记录）。
+      # `deps:py` → ruff 检查/格式 → mypy → bandit → 覆盖率地板；覆盖率那一步的 `coverage run`
+      # 就是 sidecar 端到端，只跑一次），解释器由该仓 `py` 入口的解析规则选定。强度只写在那一条
+      # 链里：要放宽或收紧 Python 面就改该仓 `package.json` 的 `check:py`，在 CI 里另起一步就会
+      # 出现两套说法互相打脸的形状（一步拦、一步只记录）。
       # prepack 会重建 host.js / client.js；产物不入库也发得出去。
       # 凭据优先级是本文件最容易读反的地方：不是「配了 NPM_TOKEN 就用它、没配才 OIDC」，
       # 而是 OIDC 在前、token 在后（pnpm 的 publish_options.rs 原话 "OIDC takes precedence over

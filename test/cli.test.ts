@@ -15,7 +15,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { mockPlatform } from "./managed-host.ts";
 import { runCli } from "../lib/cli.ts";
 import type { CliDeps } from "../lib/cli.ts";
-import { InstallError } from "../lib/installer.ts";
+import { acquireLock, InstallError } from "../lib/installer.ts";
 
 const created: string[] = [];
 const SETUP = "setup";
@@ -306,15 +306,21 @@ describe("runCli", () => {
     expect(promoted.calls).toStrictEqual([MCP]);
   });
 
-  it("参数错误退 2", async () => {
-    const { deps } = harness();
+  it("参数错误退 2，--mode 非法时点名合法取值", async () => {
+    const { deps, lines } = harness();
     await expect(runCli(["nope"], deps)).resolves.toBe(2);
+    expect(lines.join("\n")).toContain("用法：dsh-scrapling");
     await expect(runCli([SETUP, FEATURE, "unknown"], deps)).resolves.toBe(2);
     await expect(runCli([SETUP, MODE, "x"], deps)).resolves.toBe(2);
+    expect(lines.join("\n")).toContain("native / mcp / official-mcp");
     await expect(runCli([SETUP, CORE], deps)).resolves.toBe(2);
     await expect(runCli([SETUP, FEATURE], deps)).resolves.toBe(2);
     await expect(runCli([SETUP, FEATURE, APPLY], deps)).resolves.toBe(2);
     await expect(runCli([SETUP, UNINSTALL], deps)).resolves.toBe(2);
+    // 拼错的取值旗标不能被当成「未知但合法的取值旗标」吞掉后面那一项：
+    // `--ofline /assets` 若被接受，离线安装会静默退化成在线安装。
+    await expect(runCli([SETUP, "--ofline", "/assets"], deps)).resolves.toBe(2);
+    await expect(runCli([SETUP, "--nope", "x"], deps)).resolves.toBe(2);
     await expect(runCli([SETUP, UNINSTALL, "unknown"], deps)).resolves.toBe(2);
   });
 
@@ -349,6 +355,8 @@ describe("runCli", () => {
     expect(authed.lines.join("\n")).toContain(
       `          Authorization: !!js '\`Bearer \${process.env.DSH_SCRAPLING_MCP_TOKEN}\`'`,
     );
+    // 生成阶段看不到宿主进程环境，只能把前提写进输出，避免 Bearer undefined 静默失效。
+    expect(authed.lines.join("\n")).toContain("DSH_SCRAPLING_MCP_TOKEN");
   });
 
   it("--dry-run 压过 --apply；端口不合法退 2", async () => {
@@ -666,12 +674,13 @@ describe("runCli", () => {
     const { deps, lines, calls, dataDir } = harness();
     mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
     // 活进程（就是本进程）持锁：与 install 同一把 runtime/install.lock。
-    writeFileSync(
-      path.join(dataDir, "runtime", "install.lock"),
-      `${String(process.pid)} ${String(Date.now())}\n`,
-    );
-    await expect(runCli([SETUP, UNINSTALL, CORE, APPLY], deps)).resolves.toBe(1);
-    expect(lines.join("\n")).toContain("INSTALL_BUSY");
-    expect(calls).toStrictEqual([]);
+    const held = await acquireLock(path.join(dataDir, "runtime", "install.lock"));
+    try {
+      await expect(runCli([SETUP, UNINSTALL, CORE, APPLY], deps)).resolves.toBe(1);
+      expect(lines.join("\n")).toContain("INSTALL_BUSY");
+      expect(calls).toStrictEqual([]);
+    } finally {
+      await held.release();
+    }
   });
 });

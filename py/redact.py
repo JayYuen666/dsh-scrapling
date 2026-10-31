@@ -6,7 +6,15 @@ guard 的日志与 adapters 的网络摘要在「给日志、给模型看」之�
 
 from __future__ import annotations
 
+import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+# 畸形 URL（urlsplit 抛 ValueError）上仍要按参数名兜底：解析失败不能等于「整串放行」。
+_QUERY_SECRET_FALLBACK = re.compile(
+    r"(?i)([?&;](?:token|key|secret|password|pwd|sig|signature|auth|session)[^=&#]*=)[^&#]*"
+)
+# 这些 scheme 的 ``@`` 属于地址本身（mailto/tel 之类），不是 user:pass@host 的 authority。
+_NON_AUTHORITY_SCHEMES = frozenset({"mailto", "tel", "data", "javascript", "urn", "about", "blob"})
 
 # 查询串里这些名字的参数装的是凭据而不是筛选条件。XHR 摘要与守卫日志都是要离开本进程的
 # 文本——摘要进会话上下文、进第三方 provider，日志进宿主日志面——而真实站点把 access
@@ -18,6 +26,14 @@ _SECRET_QUERY_KEYS = frozenset(
         "access_token",
         "api_key",
         "apikey",
+        "client_secret",
+        "x-api-key",
+        "x-amz-credential",
+        "x-amz-signature",
+        "x-amz-security-token",
+        "x-goog-signature",
+        "private_key",
+        "jwt",
         "auth",
         "auth_token",
         "authorization",
@@ -96,13 +112,15 @@ def redact_url_secrets(raw: str) -> str:
     try:
         parsed = urlsplit(raw)
     except ValueError:
-        return raw
+        return _QUERY_SECRET_FALLBACK.sub(r"\1<redacted>", raw)
     # 没有 scheme 的 ``user:pass@host:8080`` 会被 urlsplit 读成 scheme='user'、
     # path='pass@host:8080'：netloc 为空，下面按 netloc 摘 userinfo 的那一步什么都不做，
     # 整条代理口令于是原样漏进日志（PROXY_URL 不可用那条日志正是这么来的）。这种形态的
     # authority 落在 path 的第一段上，按同一套规则摘掉；误读成 scheme 的那段一起丢弃。
     authority, slash, rest = parsed.path.partition("/")
-    standalone_authority = not parsed.netloc and "@" in authority
+    standalone_authority = (
+        not parsed.netloc and "@" in authority and parsed.scheme.lower() not in _NON_AUTHORITY_SCHEMES
+    )
     if standalone_authority:
         path = authority.rpartition("@")[2] + slash + rest
         netloc = ""

@@ -203,7 +203,7 @@ def _network_summary(
                 "id": int(meta.get("network_id") or 0),
                 "url": redact_url_secrets(str(item.url)),
                 "status": item.status,
-                "bytes": len(body),
+                "bytes": len(body) if body else 0,
                 # 上游把方法记在 Response.method 上；从 meta / request_headers 读会退化成 GET，
                 # POST 的 XHR 在摘要里一律显示成 GET（V5 已复现）。
                 "method": str(getattr(item, "method", "GET")),
@@ -263,6 +263,9 @@ def _sanitized_page(response: Any, *, main_content_only: bool) -> Any:
     return Convertor._sanitize_for_ai(Convertor._strip_noise_tags(page))
 
 
+_ACTIVE_CONTENT_WARNED = threading.Event()
+
+
 def _strip_active_content(page: Any) -> None:
     """剥掉元素上的可执行残留，让清洗后的 HTML 真的只剩内容。
 
@@ -270,9 +273,19 @@ def _strip_active_content(page: Any) -> None:
     清洗后 ``onclick`` 照样在，``<meta http-equiv=refresh>`` 与 ``srcdoc`` 也照样在 ——
     那些是事件处理器与跳转指令，直接把内网地址带进模型上下文。html 那条路径还回传
     完整标签，所以得在这里补一刀；text 路径取的是文本，不受属性影响。
+
+    拿不到可迭的 ``_root`` 时不能静默放行：那意味着上游的树形态变了，本函数从「补一刀」
+    退化成「什么都不做」。每个进程只报一次，避免逐条抽取刷屏。
     """
     root = getattr(page, "_root", None)
     if root is None or not hasattr(root, "iter"):
+        if not _ACTIVE_CONTENT_WARNED.is_set():
+            _ACTIVE_CONTENT_WARNED.set()
+            print(
+                "[adapters] page._root has no iter(); active-content attributes were not stripped",
+                file=sys.stderr,
+                flush=True,
+            )
         return
     for element in list(root.iter()):
         tag = str(getattr(element, "tag", "") or "").lower()
@@ -299,7 +312,7 @@ def _strip_active_content(page: Any) -> None:
 # （百分号编码形式则多出 %），两者都不含右括号，所以这个非贪婪匹配不会提前截断。
 _MD_DATA_IMAGE = re.compile(r"!\[([^\]]*)\]\(\s*data:[^)]*\)", re.IGNORECASE)
 # HTML 路径：<img src="data:..."> 与 <source srcset="data:...">。
-_HTML_DATA_ATTR = re.compile(r"""(data:[^"'\s>]+)""", re.IGNORECASE)
+_HTML_DATA_ATTR = re.compile(r"""(data:image/[^"'\s>]+)""", re.IGNORECASE)
 # 代码围栏的分隔行。围栏**内部**的 data URI 必须原样保留 —— 那可能是教程里教的示例代码，
 # 剥掉它等于把文档本身改了。
 _FENCE = re.compile(r"\A\s*(?:```|~~~)")
@@ -1738,7 +1751,8 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
     :returns: 归一后的载荷
     :raises AdapterError: 会话不存在 / 类型不支持 / 抓取失败 / 把 static 专属的键给了浏览器会话
     """
-    entry = _get_session(args.get("sessionId"))
+    session_id = args.get("sessionId")
+    entry = _get_session(session_id)
     session = entry["session"]
     extraction_type, css_selector, main_content_only, limit = _extraction(args)
     url = _url(args)
@@ -1753,19 +1767,24 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
     try:
         if entry["type"] == "static":
             with entry["lock"]:
+                # 取到条目之后、拿到锁之前，close 可能已经把它摘下并关掉了。未置位时
+                # 会持锁使用一份已关闭的会话，异常最终被归成 FETCH_FAILED——语义错位。
+                if entry.get("closed") is True:
+                    raise AdapterError("NO_SUCH_SESSION", f"no such session: {session_id}")
                 # 与一次性 fetch 同一条复判：static 会话的请求不经过浏览器的 page.route，
                 # 少了这一道，「Host 判完 → curl_cffi 自己再解析」之间就是敞开的。
                 allowed, reason = guard.url_allowed(url)
                 if not allowed:
                     raise AdapterError("URL_BLOCKED", f"{url}: {reason}")
-                # form/json 是 POST 的请求体：没有写方法表态时按写意图拒绝，而不是把
-                # 它们塞进一次 GET（那会变成「发出去但语义错了」，比报错更难查）。
-                write_body = args.get("form") is not None or args.get("json") is not None
-                static_method = "POST" if write_body else "GET"
+                # 方法与一次性 fetch 同源：显式 method 优先，没给时由 form/json/body
+                # 推 POST，显式 GET 带体会报错。只看 form/json 的两行写法会让
+                # session.fetch 的 method=PUT/DELETE 与裸 body 静默落地（请求照发、
+                # 语义错了），而调用方从回包上看不出这件事。
+                static_method = _static_method(args)
                 if static_method != "GET" and not guard.ALLOW_WRITE_METHODS:
                     raise AdapterError(
                         "WRITE_DISABLED",
-                        "form/json change the request into POST; the deployment must set "
+                        f"{static_method} changes state on the remote side; the deployment must set "
                         f"allowWriteMethods (env {guard.ALLOW_WRITE_METHODS_ENV}) to allow it",
                     )
                 static_params = _static_params(args, url)
@@ -2042,6 +2061,9 @@ def _close_entry(session_id: Any) -> None:
             # 写在锁外会留下这个时序 —— 这里已 pop 并释放锁，构造方接着在锁内读到 False
             # 并把建好的会话登记回 _SESSIONS，之后才轮到写 True，那条会话就没人关了。
             entry["closed_while_pending"] = True
+        elif entry is not None:
+            # 已构造好的条目：置位与摘除同一临界区，之后抢到 entry 锁的 fetch 会看到它。
+            entry["closed"] = True
     if entry is None:
         return
     if entry.get("pending") is True:

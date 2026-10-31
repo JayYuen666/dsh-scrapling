@@ -1,24 +1,25 @@
 // 能力包安装器：只写 dataDir/runtime，不碰系统 Python 与用户 Playwright 缓存。
 
 import { createHash, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { constants } from "node:fs";
 import {
   access,
   chmod,
   cp,
   mkdir,
-  open,
   readFile,
   readdir,
+  open,
   rename,
   rm,
   rmdir,
-  stat,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import type { FileHandle } from "node:fs/promises";
 import type { RuntimeAsset } from "./runtime.ts";
 import { managedPythonPath, runtimeManifest } from "./runtime.ts";
 import type { PackState, RuntimePack } from "./runtime-shape.ts";
@@ -30,7 +31,6 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 const STATE_FILE = "state.json";
 
 /** 空白切分与 pip 失败措辞。 */
-const WHITESPACE_RUNS = /\s+/u;
 const PIP_NO_WHEEL = /No matching distribution|Could not find a version/iu;
 const PIP_NETWORK = /Network|Temporary failure|Connection|timed out/iu;
 const STORAGE_DB = "elements_storage.db";
@@ -59,6 +59,7 @@ export type InstallErrorCode =
   | "INSTALL_BROWSER_FAILED"
   | "INSTALL_PACK_BLOCKED"
   | "INSTALL_OFFLINE_ASSETS"
+  | "INSTALL_LOCK_UNREADABLE"
   | "INSTALL_STATE_CORRUPT";
 
 export class InstallError extends Error {
@@ -69,6 +70,11 @@ export class InstallError extends Error {
     this.name = "InstallError";
     this.code = code;
   }
+}
+
+/** Node 的 errno 异常是带 code 的对象；这里只读 code，不做收窄断言。 */
+export function errorCodeOf(error: unknown): string | undefined {
+  return isPlainRecord(error) && typeof error["code"] === "string" ? error["code"] : undefined;
 }
 
 export interface SpawnResult {
@@ -179,114 +185,89 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-/** 锁里写不出 pid 时按文件年龄判的宽限窗：刚创建的空锁是持有者「正在写」的瞬间，不能抢。 */
-const LOCK_GRACE_MS = 10_000;
+/** OS 级文件锁的最小面；模块缺失或形状不符时返回 null，由调用方报可行动错误。 */
+export interface NativeLock {
+  tryLock: (fd: number) => boolean;
+  unlock: (fd: number) => void;
+}
 
-/** 安装锁的句柄面：只用到「写属主」与「关闭」两件事，测试可以交一个更小的替身。 */
+/** 按依赖名加载原生锁；`load` 可注入，单测用它覆盖模块缺失/形状不符两条失败面。 */
+export function loadNativeLock(
+  load: (id: string) => unknown = createRequire(import.meta.url),
+): NativeLock | null {
+  let loaded: unknown;
+  try {
+    loaded = load("fs-native-extensions");
+  } catch {
+    loaded = undefined;
+  }
+  if (isPlainRecord(loaded)) {
+    const tryLockFn = loaded["tryLock"];
+    const unlockFn = loaded["unlock"];
+    if (typeof tryLockFn === "function" && typeof unlockFn === "function") {
+      return {
+        tryLock: (fd) => Boolean(tryLockFn.call(loaded, fd)),
+        unlock: (fd) => {
+          unlockFn.call(loaded, fd);
+        },
+      };
+    }
+  }
+  return null;
+}
+
+const NATIVE_LOCK = loadNativeLock();
+
+/** 安装锁的句柄面：互斥由 OS 级锁维护，释放动作只负责解锁并关闭句柄。 */
 export interface LockHandle {
-  writeFile: (data: string) => Promise<void>;
-  close: () => Promise<void>;
+  release: () => Promise<void>;
+}
+
+/** 拿到 fd 后尝试非阻塞排他锁；失败按「锁不可读」收口，交给调用方报可行动错误。 */
+export function lockFd(fd: number, lock: NativeLock | null = NATIVE_LOCK): boolean {
+  if (lock === null) {
+    throw new InstallError("INSTALL_LOCK_UNREADABLE", "fs-native-extensions is not loadable");
+  }
+  try {
+    return lock.tryLock(fd);
+  } catch (error) {
+    throw new InstallError("INSTALL_LOCK_UNREADABLE", `cannot lock install fd: ${String(error)}`);
+  }
 }
 
 /**
- * 读锁文件里写的属主 pid。
+ * 打开锁文件并尝试排他锁。
  *
- * 读不出数（文件没了、内容坏了）就返回 undefined。判「这把锁还归不归我」只认读到的 pid：
- * 读不到就当作不归我 —— 宁可留一把锁等人清，也不删别人可能正在持有的那一把。
+ * 锁文件只是句柄载体，互斥由内核维护：进程退出（含被杀）时 fd 关闭、锁随之释放，
+ * 因此不存在「陈旧锁由谁接管」的竞态；重复获取同一把锁只会得到 INSTALL_BUSY。
  */
-async function readLockOwner(lockPath: string): Promise<number | undefined> {
-  let text = "";
-  try {
-    text = await readFile(lockPath, "utf8");
-  } catch {
-    // 读不到（文件已被清、路径被占）就当没有属主：调用方据此不删锁，宁可留一把也不误删。
-  }
-  const pid = Math.trunc(Number(text.trim().split(WHITESPACE_RUNS)[0]));
-  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
-}
-
-/**
- * 判断锁文件是否还被活人持有。
- *
- * 读得出 pid 就按进程存活判（`process.kill(pid, 0)` 是存在性探测，不会杀进程；
- * EPERM 表示进程在但不可 signaling，也算活着）；读不出 pid（写到一半、或内容坏了）
- * 就按文件年龄判。这里宁可误报 BUSY 也不偷一把可能有人正持有的锁。
- */
-async function lockHeldByLivingProcess(lockPath: string): Promise<boolean> {
-  let text: string;
-  let modifiedAt: number;
-  try {
-    const [content, stats] = await Promise.all([readFile(lockPath, "utf8"), stat(lockPath)]);
-    text = content;
-    modifiedAt = stats.mtimeMs;
-  } catch {
-    return true;
-  }
-  const [pidText = ""] = text.trim().split(WHITESPACE_RUNS);
-  const pid = Math.trunc(Number(pidText));
-  // pid 先于时间戳：一次正常的 pip 安装要下载几百 MB，跑过一小时完全可能。
-  // 拿「锁写了一小时」去接管一把**活进程**持有的锁，等于让两个安装同时写同一个 venv。
-  if (Number.isSafeInteger(pid) && pid > 0) {
-    if (pid === process.pid) {
-      return true;
-    }
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (error) {
-      // EPERM 表示进程在、只是不可 signaling，算活着；ESRCH 才是「持有者不在了」。
-      // process.kill 的异常按 Node 文档就是 ErrnoException；这里只需要它的 code。
-      // oxlint-disable-next-line typescript/no-unsafe-type-assertion
-      return (error as NodeJS.ErrnoException).code === "EPERM";
-    }
-  }
-  // 读不出 pid（写到一半、或内容坏了）才退回按文件年龄判。
-  return Date.now() - modifiedAt < LOCK_GRACE_MS;
-}
-
 export async function acquireLock(
   lockPath: string,
-  openLock: (path: string, flags: string) => Promise<LockHandle> = open,
+  lock: NativeLock | null = NATIVE_LOCK,
 ): Promise<LockHandle> {
+  let handle: FileHandle;
   try {
-    return await openLock(lockPath, "wx");
-  } catch {
-    if (await lockHeldByLivingProcess(lockPath)) {
-      throw new InstallError("INSTALL_BUSY", `another install holds ${lockPath}`);
-    }
-    // 陈旧的锁（持有者已死、或写坏了太久）不该永久挡住安装：撤掉重占。
-    // 二次竞争失败（另一路同时来修）就如实报 BUSY。
-    await rm(lockPath, { force: true });
-    try {
-      return await openLock(lockPath, "wx");
-    } catch {
-      throw new InstallError("INSTALL_BUSY", `another install holds ${lockPath}`);
-    }
+    handle = await open(lockPath, "a+");
+  } catch (error) {
+    throw new InstallError(
+      "INSTALL_LOCK_UNREADABLE",
+      `cannot open install lock ${lockPath}: ${String(error)}`,
+    );
   }
-}
-
-/**
- * 关闭句柄并把锁交还。
- *
- * 两个细节都是必须的：
- * - close 抛错不能挡住清锁。句柄关不掉（已被关、EBADF）时那把锁会一直躺在 runtime 里，
- *   而锁里写的是**本进程**的 pid，于是本进程此后每一次安装都自撞 BUSY —— 比丢一个句柄贵得多。
- * - 删之前要确认锁仍归自己。持有期间锁可能被判陈旧而被清掉、被另一路重新写下它的 pid，
- *   这时删掉文件等于放行并发安装，所以只删写着自己 pid 的那一把。
- */
-export async function releaseLock(lockPath: string, handle: LockHandle): Promise<void> {
-  try {
+  if (!lockFd(handle.fd, lock)) {
     await handle.close();
-  } catch {
-    // 句柄关不掉不能挡住清锁：锁里写的是本进程 pid，留着它本进程此后每次安装都自撞 BUSY。
+    throw new InstallError("INSTALL_BUSY", `another install holds ${lockPath}`);
   }
-  if ((await readLockOwner(lockPath)) === process.pid) {
-    try {
-      await rm(lockPath, { force: true });
-    } catch {
-      // 删不掉（目录只读、被另一路占着）时留一把锁，好过把卸载/安装的原始错误盖掉。
-    }
-  }
+  return {
+    release: async () => {
+      try {
+        lock?.unlock(handle.fd);
+      } catch {
+        // 句柄已关闭或锁已释放：第二次 release 是空转，关闭句柄仍要走到。
+      }
+      await handle.close();
+    },
+  };
 }
 
 /** 本进程已经在锁下跑的工作层数（键是解析后的锁路径）。 */
@@ -325,22 +306,21 @@ async function ensureRuntimeDir(dataDir: string): Promise<string> {
  * 在安装锁下跑一段工作。
  *
  * 安装、卸载、卸载式清理共用同一把 `runtime/install.lock`：它们改的是同一批文件
- * （venv / state.json / browsers），并发进来就会互相踩。`openLock` 只为测试注入替身。
+ * （venv / state.json / browsers），并发进来就会互相踩。
  *
  * 同一进程可以重入：CLI 的卸载路径先取锁、再叫 `uninstallCapabilityPack`，而后者自己
- * 也要取同一把锁。没有这一层，`lockHeldByLivingProcess` 会对本进程的 pid 一律回答
- * 「活着」，于是自己的外层锁把自己挡住，卸载永远报 BUSY。
+ * 也要取同一把锁。OS 级锁按 fd 互斥，同一进程再开一个句柄同样拿不到，没有这层记账
+ * 就是自己挡住自己，卸载永远报 BUSY。
  */
 export async function withInstallLock<Result>(
   dataDir: string,
   work: () => Promise<Result>,
-  openLock: (path: string, flags: string) => Promise<LockHandle> = open,
 ): Promise<Result> {
   const runtimeDir = path.join(dataDir, "runtime");
   const lockPath = path.join(runtimeDir, "install.lock");
   const key = path.resolve(lockPath);
   const depth = heldLockDepths.get(key) ?? 0;
-  // 已经在锁下：只记层数，不再碰文件锁，也不重写属主。
+  // 已经在锁下：只记层数，不再开句柄、不再碰文件锁。
   if (depth > 0) {
     heldLockDepths.set(key, depth + 1);
     try {
@@ -350,14 +330,13 @@ export async function withInstallLock<Result>(
     }
   }
   await ensureRuntimeDir(dataDir);
-  const handle = await acquireLock(lockPath, openLock);
+  const handle = await acquireLock(lockPath);
   heldLockDepths.set(key, 1);
   try {
-    await handle.writeFile(`${process.pid} ${Date.now()}\n`);
     return await work();
   } finally {
     releaseLockDepth(key, 1);
-    await releaseLock(lockPath, handle);
+    await handle.release();
   }
 }
 
@@ -381,9 +360,23 @@ export interface PythonInstallResult {
  * 与联网走的是同一条校验；文件不在就是一条点名的失败，而不是退回联网。
  */
 async function offlineArchive(assets: string, url: string): Promise<Uint8Array> {
+  if (!URL.canParse(url)) {
+    throw new InstallError(
+      "INSTALL_OFFLINE_ASSETS",
+      `manifest archive URL is not parseable: ${url}`,
+    );
+  }
   const raw = path.basename(new URL(url).pathname);
   // 清单 URL 里 `+` 是 `%2B`；浏览器 / curl -O 落盘时用的是解码后的名字，两种都认。
-  const decoded = decodeURIComponent(raw);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    throw new InstallError(
+      "INSTALL_OFFLINE_ASSETS",
+      `manifest archive name has invalid percent-encoding: ${raw}`,
+    );
+  }
   const names = raw === decoded ? [raw] : [decoded, raw];
   const found = await Promise.all(
     names.map(async (name) => ({
@@ -465,8 +458,7 @@ export async function readRuntimeState(dataDir: string): Promise<Record<string, 
     // Node 的文件错误总是带 code 的 ErrnoException：ENOENT 是「第一次装」，
     // 其余（EACCES / EISDIR / 路径被占）都是「读不到已经装上的状态」——一律点名报损坏，
     // 不能因为错误类型没对上就把它当空态（那会把下一次合并里的 browser: ready 抹掉）。
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    if (errorCodeOf(error) === "ENOENT") {
       return { packs: {} };
     }
     throw new InstallError(
@@ -584,6 +576,7 @@ async function finishCoreInstall(
   paths: { venv: string; previousVenv: string; staging: string },
   restore: boolean,
 ): Promise<void> {
+  let restoreFailed = false;
   if (restore) {
     try {
       await rm(paths.venv, { recursive: true, force: true });
@@ -593,13 +586,17 @@ async function finishCoreInstall(
     try {
       await rename(paths.previousVenv, paths.venv);
     } catch {
-      // 还原失败时旧 venv 还留在 .tmp/venv-previous-*，调用方看到的原始错误说明进度。
+      // 还原失败：旧 venv 还留在 .tmp/venv-previous-*。那是用户原本可用的环境，
+      // 必须留着 —— 下面那段收尾清理会把它删掉，所以这一支要跳过。
+      restoreFailed = true;
     }
   }
-  try {
-    await rm(paths.previousVenv, { recursive: true, force: true });
-  } catch {
-    // 收尾清理尽力而为。
+  if (!restoreFailed) {
+    try {
+      await rm(paths.previousVenv, { recursive: true, force: true });
+    } catch {
+      // 收尾清理尽力而为。
+    }
   }
   try {
     await rm(paths.staging, { recursive: true, force: true });
@@ -697,6 +694,20 @@ export async function installCore(options: {
   });
 }
 
+/** 目录里是否有 Chromium 的可执行标记；安装后的验收与 status 的现量共用这一条判据。 */
+async function hasChromiumUnder(browsersPath: string): Promise<boolean> {
+  try {
+    const entries = await readdir(browsersPath, { recursive: true });
+    return entries.some((entry) => CHROMIUM_MARKERS.has(path.basename(entry)));
+  } catch {
+    return false;
+  }
+}
+
+async function chromiumInstalled(dataDir: string): Promise<boolean> {
+  return hasChromiumUnder(path.join(dataDir, "runtime", "browsers"));
+}
+
 /**
  * 安装完整 Chromium 到 dataDir/runtime/browsers。
  *
@@ -724,14 +735,7 @@ export async function installBrowser(options: {
         `chromium install failed: ${installed.stderr.slice(0, 400)}`,
       );
     }
-    let hasBrowser: boolean;
-    try {
-      const entries = await readdir(browsersPath, { recursive: true });
-      hasBrowser = entries.some((entry) => CHROMIUM_MARKERS.has(path.basename(entry)));
-    } catch {
-      hasBrowser = false;
-    }
-    if (!hasBrowser) {
+    if (!(await hasChromiumUnder(browsersPath))) {
       throw new InstallError(
         "INSTALL_BROWSER_FAILED",
         `no chromium executable found under ${browsersPath}`,
@@ -747,15 +751,6 @@ export async function installBrowser(options: {
   });
 }
 
-async function chromiumInstalled(dataDir: string): Promise<boolean> {
-  try {
-    const entries = await readdir(path.join(dataDir, "runtime", "browsers"), { recursive: true });
-    return entries.some((entry) => CHROMIUM_MARKERS.has(path.basename(entry)));
-  } catch {
-    return false;
-  }
-}
-
 /** state 标了 ready、文件却不在，就是 corrupt —— 这正是 repair 要修的那一档。 */
 function stateOf(marked: unknown, installed: boolean): PackState {
   if (marked !== "ready") {
@@ -768,7 +763,7 @@ function stateOf(marked: unknown, installed: boolean): PackState {
  * 六个能力包现在处于哪一档。
  *
  * `search` / `media` / `adaptive-redis` 都以 core 的 Python 环境为载体，因此跟随 core 的
- * 状态；`mcp` 在 B8 关闭前恒为 blocked。`installing` 由调用方给出（作业正在跑的那一包），
+ * 状态；`mcp` 与 core 共用同一 Python 环境，跟随 core 的状态。`installing` 由调用方给出（作业正在跑的那一包），
  * 文件态在安装完成前本来就还是旧的。
  *
  * @param dataDir - 数据目录
@@ -857,8 +852,8 @@ async function ensurePython(
 /**
  * 安装一个能力包。
  *
- * `browser` 先装 core 再装 Chromium；其余包以 core 的 Python 环境为载体。`mcp` 在 B8
- * 关闭前不安装。数据目录里的指纹库、下载与登录态全程不动。
+ * `browser` 先装 core 再装 Chromium；其余包以 core 的 Python 环境为载体，`mcp` 也一样。
+ * 数据目录里的指纹库、下载与登录态全程不动。
  *
  * @param pack - 能力包
  * @param options - 数据目录、包根、IO、取消信号与进度出口
@@ -925,13 +920,9 @@ export async function uninstallCapabilityPack(
   // CLI 的卸载路径已经在外层取过锁，这里靠 withInstallLock 的进程内重入才不会被自己挡住。
   await withInstallLock(options.dataDir, async () => {
     const runtimeDir = path.join(options.dataDir, "runtime");
-    if (pack === "browser") {
-      await rm(path.join(runtimeDir, "browsers"), { recursive: true, force: true });
-    }
-    if (pack !== "browser") {
-      await rm(path.join(runtimeDir, "venv"), { recursive: true, force: true });
-      await rm(path.join(runtimeDir, STATE_FILE), { force: true });
-    }
+    // browser 的安装面是 browsers/，其余包共用整份 venv。
+    const removedDir = pack === "browser" ? "browsers" : "venv";
+    await rm(path.join(runtimeDir, removedDir), { recursive: true, force: true });
     if (options.purge) {
       await Promise.all(
         ["", "-wal", "-shm"].map((suffix) =>
@@ -940,10 +931,8 @@ export async function uninstallCapabilityPack(
       );
       await rm(path.join(options.dataDir, "downloads"), { recursive: true, force: true });
     }
-    // core 系包的安装面就是整个 venv；文件与状态位都已删掉，没有别的包需要保留状态。
-    if (pack !== "browser") {
-      return;
-    }
+    // 只摘被卸的那一包，其余标记原样保留：core 卸载连带删掉 venv，但 browser 的
+    // chromium 与 browsersPath 还在盘上；整份删掉状态会让它显示 missing 并重下几百 MB。
     const state = await readRuntimeState(options.dataDir);
     if (!isPlainRecord(state["packs"])) {
       return;

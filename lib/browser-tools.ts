@@ -5,6 +5,7 @@ import type { ToolDefinition, ToolRunContext } from "@deepseek-ai/dsh-tools";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { capText } from "./output.ts";
 import { callSidecar, SidecarError } from "./sidecar.ts";
+import { callNumber } from "./tool-params.ts";
 import type { ToolDeps } from "./tools.ts";
 
 /** 宿主 attachment 服务的最小面；截图工具只调这一项。 */
@@ -73,6 +74,16 @@ function jsonRecordOf(value: unknown): Record<string, Json> | undefined {
   return converted !== null && typeof converted === "object" && !Array.isArray(converted)
     ? converted
     : undefined;
+}
+
+/**
+ * 单个动作 / 单次截图的超时，夹在本次调用的截止之内。
+ *
+ * 只许往下调：发一个比截止大的值，先到期的是 JS 这一侧的 SIDECAR_TIMEOUT，而超时按设计
+ * 会拆掉常驻进程重连 —— 于是一次点击或截图超时换成全部浏览器会话陪葬。
+ */
+function actionTimeoutMs(value: unknown, deadlineMs: number): number {
+  return callNumber(value, deadlineMs, deadlineMs);
 }
 
 /** 读会话当前页。 */
@@ -163,7 +174,7 @@ export function createSessionActTool(deps: ToolDeps): ToolDefinition {
       actions: { type: "json", required: true, description: "动作数组，按顺序执行。" },
       slowly: { type: "boolean", description: "每个动作之间等 100ms。" },
       maxActions: { type: "integer", description: "最多多少个动作，默认 20，上限 50。" },
-      timeoutMs: { type: "integer", description: "单个动作的超时（毫秒）。" },
+      timeoutMs: { type: "integer", description: "单个动作的超时（毫秒），不超过本次调用的超时。" },
     },
     output: {
       schema: {
@@ -194,7 +205,7 @@ export function createSessionActTool(deps: ToolDeps): ToolDefinition {
           actions: args["actions"],
           slowly: args["slowly"] === true,
           maxActions: args["maxActions"] ?? 20,
-          timeoutMs: args["timeoutMs"] ?? settings.timeoutMs,
+          timeoutMs: actionTimeoutMs(args["timeoutMs"], settings.timeoutMs),
         },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
       );
@@ -300,7 +311,7 @@ export function createScreenshotTool(deps: ToolDeps): ToolDefinition {
       fullPage: { type: "boolean", description: "截整页，默认 false。" },
       quality: { type: "integer", description: "JPEG 质量 1–100；PNG 不可用。" },
       selector: { type: "string", description: "只截这一个元素；与 fullPage 互斥。" },
-      timeoutMs: { type: "integer", description: "截图超时（毫秒）。" },
+      timeoutMs: { type: "integer", description: "截图超时（毫秒），不超过本次调用的超时。" },
     },
     output: {
       schema: {
@@ -341,7 +352,7 @@ export function createScreenshotTool(deps: ToolDeps): ToolDefinition {
           fullPage: args["fullPage"] === true,
           quality: args["quality"] ?? null,
           selector: args["selector"] ?? null,
-          timeoutMs: args["timeoutMs"] ?? settings.timeoutMs,
+          timeoutMs: actionTimeoutMs(args["timeoutMs"], settings.timeoutMs),
         },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
       );

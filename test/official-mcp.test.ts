@@ -26,8 +26,14 @@ function failure(options: Parameters<typeof officialMcpPlan>[0]): OfficialMcpErr
 describe("officialMcpPlan", () => {
   it("两项表态都给才生成：命令指向托管 venv 的 scrapling-mcp，args 为空", () => {
     const plan = officialMcpPlan(ENABLED);
-    // 托管 venv 由安装器建，而安装器只在 macOS arm64 上工作：那边就是 bin/scrapling-mcp。
-    expect(plan.command).toBe(path.join(DATA_DIR, "runtime", "venv", "bin", "scrapling-mcp"));
+    // 托管 venv 由安装器建，而安装器只在 macOS arm64 上工作；入口布局跟解释器同源：
+    // POSIX 在 bin/，Windows 在 Scripts/ 且可执行体带 .exe。
+    const venv = path.join(DATA_DIR, "runtime", "venv");
+    expect(plan.command).toBe(
+      process.platform === "win32"
+        ? path.join(venv, "Scripts", "scrapling-mcp.exe")
+        : path.join(venv, "bin", "scrapling-mcp"),
+    );
     expect(plan.args).toStrictEqual([]);
     expect(plan.serverName).toBe("scrapling");
     expect(plan.patch).toContain("- insert:");

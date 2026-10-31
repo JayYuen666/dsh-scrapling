@@ -50,7 +50,7 @@ export function decodeFrame(line: string): Record<string, unknown> {
   } catch (error) {
     throw new FrameError(
       FRAME_ERROR_KINDS.unparsableJson,
-      `frame is not valid JSON: ${line.slice(0, 120)}`,
+      `frame is not valid JSON (length=${String(line.length)})`,
       {
         cause: error,
       },
@@ -59,7 +59,7 @@ export function decodeFrame(line: string): Record<string, unknown> {
   if (!isRecord(parsed)) {
     throw new FrameError(
       FRAME_ERROR_KINDS.notAnObject,
-      `frame must be a JSON object: ${line.slice(0, 120)}`,
+      `frame must be a JSON object (length=${String(line.length)})`,
     );
   }
   return parsed;
@@ -98,6 +98,14 @@ export class FrameSplitter {
     while (newlineAt >= 0) {
       const line = this.#buffer.slice(0, newlineAt);
       this.#buffer = this.#buffer.slice(newlineAt + 1);
+      if (line.length > MAX_FRAME_BYTES) {
+        // 超长帧与换行落在同一个 chunk 时，只看残片会漏掉它：切行已经把它移出缓冲区。
+        this.#buffer = "";
+        throw new FrameError(
+          FRAME_ERROR_KINDS.frameTooLarge,
+          `a frame went over ${MAX_FRAME_BYTES} bytes`,
+        );
+      }
       if (line.trim().length > 0) {
         lines.push(line);
       }
@@ -127,7 +135,15 @@ export class FrameSplitter {
     this.#buffer = "";
     return rest.length > 0 ? [rest] : [];
   }
+
+  /** 丢弃缓冲区里的残片。调用方已经收摊时用，避免残片一直占着内存。 */
+  public clear(): void {
+    this.#buffer = "";
+  }
 }
+
+/** stop() 之后流再报错时的兜底监听：吞掉，不让 EventEmitter 把它变成未捕获异常。 */
+const swallowLateError = (): void => undefined;
 
 /**
  * 把一个 Readable 持续切成帧并回调。
@@ -163,50 +179,72 @@ export function pumpFrames(
     }
   };
 
-  const handle = (chunk: string | Buffer): void => {
-    // stop() 已经 off("data") 摘掉监听器，所以这里正常路径不会命中；留着是防
-    // 「onFrame 内部调 stop() 后，同一个 chunk 的后续帧仍被投递」。
-    /* v8 ignore next 3 */
-    if (state.stopped) {
-      return;
-    }
-    // setEncoding("utf8") 之后 data 事件给的永远是 string，Buffer 那一侧到不了；
-    // 保留判断是为了不依赖调用方一定先设了编码。
-    /* v8 ignore next 1 */
-    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  // `setEncoding("utf8")` 在挂监听器之前就由本函数设好（见下面 stream.setEncoding），所以
+  // 'data' 交来的只会是 string；stop() 又会把 data 监听器摘掉，停止后的流进不到这里。
+  const handle = (chunk: string): void => {
+    let frames: string[];
     try {
-      for (const line of splitter.push(text)) {
-        if (state.stopped) {
-          return;
-        }
-        onFrame(line);
-      }
+      frames = splitter.push(chunk);
     } catch (error) {
       report(error);
+      return;
+    }
+    for (const line of frames) {
+      if (state.stopped) {
+        return;
+      }
+      try {
+        onFrame(line);
+      } catch (error) {
+        // 单帧回调的异常只影响这一帧：它已经离开 splitter，不会重放；中断整个循环
+        // 会把同一个 chunk 里后面的帧一起静默丢掉（state.stopped 还是 false，泵照旧
+        // 活着），那种丢帧在消费方看来无从发现。
+        report(error);
+      }
     }
   };
 
+  const handleEnd = (): void => {
+    // flush() 只做 trim + 清空，没有会抛的路径，所以不套 try/catch：套一层永远进不去的
+    // catch 只会给覆盖率留一条假分支。加抛错路径时记得在这里补回 try/catch。
+    const frames = splitter.flush();
+    // 这里不再判 state.stopped：stop() 会把 handleEnd 一起摘掉（见下面 off("end")），
+    // 所以能进到这里的流一定还没停；多一个构造上不可达的守卫只会给覆盖率留假分支。
+    // flush() 最多吐一帧（缓冲区里不可能含换行：push 已经把完整的行都收走了）。
+    for (const line of frames) {
+      try {
+        onFrame(line);
+      } catch (error) {
+        report(error);
+      }
+    }
+  };
+  const handleError = (error: unknown): void => {
+    // stop() 会把本监听器摘掉并换成 swallowLateError，所以这里不会再看到 stopped 的流；
+    // 保留「只负责转交」这一条，避免多一条永远为假的早返回。
+    report(error);
+  };
+
+  // end 与 close 都收尾：流被 destroy()/对端进程被杀时 close 先到、end 不会触发，
+  // 只挂 end 会把已经到达的最后一帧残片丢掉。flush() 幂等，两个事件都到也只吐一次。
   stream.setEncoding("utf8");
   stream.on("data", handle);
-  stream.on("end", () => {
-    try {
-      for (const line of splitter.flush()) {
-        // stop() 之后连收尾的残帧也不再投递：调用方既然已经收摊，就不该再收到东西。
-        if (!state.stopped) {
-          onFrame(line);
-        }
-      }
-    } catch (error) {
-      report(error);
-    }
-  });
-  stream.on("error", (error: unknown) => {
-    report(error);
-  });
+  stream.on("end", handleEnd);
+  stream.on("close", handleEnd);
+  stream.on("error", handleError);
 
   return () => {
     state.stopped = true;
+    // 三个 handler 一起摘：只摘 data 时，end/error 仍会在 stop() 之后回调，违背
+    // 「调用后不再回调」的契约，也会一直持有 splitter 与回调闭包直到流销毁。
     stream.off("data", handle);
+    stream.off("end", handleEnd);
+    stream.off("close", handleEnd);
+    stream.off("error", handleError);
+    // EventEmitter 的 'error' 没有监听者时会变成未捕获异常：收摊之后流再报错
+    // （进程被杀、管道被拆）不能把宿主掀翻，所以留一个不带闭包的吞错监听。
+    stream.on("error", swallowLateError);
+    splitter.clear();
   };
 }
 
