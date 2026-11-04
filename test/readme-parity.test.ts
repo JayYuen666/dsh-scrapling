@@ -29,10 +29,13 @@ const HOST = "host.ts";
  * @returns 英文与中文正文
  */
 async function readPair(): Promise<{ en: string; zh: string }> {
-  // 逐个 await 而不是 Promise.all 后解构：解构的结果在 noUncheckedIndexedAccess 下是
-  // `string | undefined`，补一个 ?? 兜底等于给「文件没读到」编一个空文档的谎。
-  const en = await readFile(path.join(pkgDir, EN), "utf8");
-  const zh = await readFile(path.join(pkgDir, ZH), "utf8");
+  // 两份文件互不依赖，所以并行读。`Promise.all` 对数组字面量给出的就是定长元组
+  // `[string, string]`（实测：去掉 `as const` 也照样过 `tsc`），`noUncheckedIndexedAccess`
+  // 不参与——被索引的是元组常量位，不是 `string[]`。读不到就是抛错，不补 ?? 兜一份空文档。
+  const [en, zh] = await Promise.all([
+    readFile(path.join(pkgDir, EN), "utf8"),
+    readFile(path.join(pkgDir, ZH), "utf8"),
+  ]);
   return { en, zh };
 }
 
@@ -52,9 +55,20 @@ function configKeys(source: string): { all: readonly string[]; volatile: readonl
     throw new Error(`${HOST} 里找不到 Config 接口`);
   }
   const entries = Array.from(
-    body.matchAll(/^ {2}(?<key>[A-Za-z][A-Za-z0-9]*): (?<decl>.*)$/gmu),
+    body.matchAll(/^ {2}(?:readonly\s+)?(?<key>[A-Za-z][A-Za-z0-9]*)\??:\s*(?<decl>.*)$/gmu),
     (found) => [found.groups?.["key"] ?? "", found.groups?.["decl"] ?? ""] as const,
   );
+  // 自检：按行数一遍「看着像字段」的行，与解析到的条数比。正则一旦跟不上排版
+  // （就地换行的联合类型、更多缩进、新加的修饰符），字段会被静默丢掉 —— volatile 面
+  // 失真后，下游每一条卡片断言都跟着错，却一句提示都没有。
+  const declared = body
+    .split("\n")
+    .filter((line) => /^[ \t]+(?:readonly\s+)?[A-Za-z][A-Za-z0-9]*\??:/u.test(line)).length;
+  if (declared !== entries.length) {
+    throw new Error(
+      `${HOST} 的 Config 排版变了：按行数有 ${String(declared)} 个字段，这份解析只认到 ${String(entries.length)} 个`,
+    );
+  }
   return {
     all: entries.map(([key]) => key),
     volatile: entries.filter(([, decl]) => decl.includes("Volatile<")).map(([key]) => key),
@@ -152,10 +166,46 @@ function rowTokens(rows: readonly string[]): readonly string[] {
  * @returns 展开后的键；未知 token 原样保留，好让断言把它当多出来的项报出来
  */
 function expandFamilies(tokens: readonly string[], all: readonly string[]): readonly string[] {
-  return tokens.flatMap((token) =>
-    token.startsWith("*") ? all.filter((key) => key.endsWith(token.slice(1))) : [token],
-  );
+  return tokens.flatMap((token) => {
+    if (!token.startsWith("*")) {
+      return [token];
+    }
+    const expanded = all.filter((key) => key.endsWith(token.slice(1)));
+    // 一枚没匹配到任何键的族写法（多半是拼错的后缀）原样留着：展开成空表就会被这一族
+    // 静默吞掉，断言只剩一句笼统的「与 volatile 面不一致」。
+    return expanded.length > 0 ? expanded : [token];
+  });
 }
+
+/** 「空 baseUrl 时不猜绝对地址」那半句在两份里的写法。 */
+const EMPTY_BASE_URL = { en: "empty `baseUrl`", zh: "`baseUrl` 为空" } as const;
+/** 「adaptive 重定位只是线索」那半句在两份里的写法。 */
+const BEST_EFFORT = { en: "relocation is best-effort", zh: "重定位是尽力而为" } as const;
+
+describe("判据本身：读 Config 排版与族写法", () => {
+  it("readonly 与可选位同样算一个字段", () => {
+    const source =
+      "export interface Config {\n  readonly alpha?: Volatile<string>;\n  beta: number;\n}\n";
+    expect(configKeys(source)).toStrictEqual({ all: ["alpha", "beta"], volatile: ["alpha"] });
+  });
+
+  it("排版换了缩进时抛错，而不是静默少一个字段", () => {
+    // 主判据只认两格缩进；自检按任意缩进数一遍字段。两者对不上就是排版越过了这份解析的
+    // 形状 —— 让它在装配期点名，而不是把 volatile 面少一个键这件事交给下游断言去误报。
+    const source = "export interface Config {\n    alpha: Volatile<string>;\n}\n";
+    expect(() => {
+      configKeys(source);
+    }).toThrow(/排版变了/u);
+  });
+
+  it("族写法命中键时展开，没命中时原样留下", () => {
+    const all = ["fetchMaxOutputChars", "searchMaxOutputChars"];
+    expect(expandFamilies(["*MaxOutputChars"], all)).toStrictEqual(all);
+    // 拼错的后缀展开成空表就会被吞掉，留下一句看不出根因的「不一致」。
+    expect(expandFamilies(["*MaxOutputChar"], all)).toStrictEqual(["*MaxOutputChar"]);
+    expect(expandFamilies(["timeoutMs"], all)).toStrictEqual(["timeoutMs"]);
+  });
+});
 
 describe("中英文文档对等", () => {
   it("两份 README 互相链接", async () => {
@@ -178,14 +228,16 @@ describe("中英文文档对等", () => {
     const { en, zh } = await readPair();
     const { all } = configKeys(await readFile(path.join(pkgDir, HOST), "utf8"));
     expect(all.length, "配置键不该是空的").toBeGreaterThan(0);
-    // 只在英文侧出现的：中文读者按文档找不到这一项。
+    // 判据与「设置卡旋钮找得到」那条同一口径：`*MaxOutputChars` 这类族写法算「找得到」。
+    // 用裸 includes 时，一侧写族写法、另一侧逐字列名就会被判成落后，而落后的方向还是反的。
+    // 只在英文侧定位得到的：中文读者按文档找不到这一项。
     expect(
-      all.filter((key) => en.includes(key) && !zh.includes(key)),
+      all.filter((key) => discoverable(key, en) && !discoverable(key, zh)),
       `${ZH} 落后于 ${EN}`,
     ).toStrictEqual([]);
-    // 只在中文侧出现的：反过来，英文读者缺一份。
+    // 只在中文侧定位得到的：反过来，英文读者缺一份。
     expect(
-      all.filter((key) => zh.includes(key) && !en.includes(key)),
+      all.filter((key) => discoverable(key, zh) && !discoverable(key, en)),
       `${EN} 落后于 ${ZH}`,
     ).toStrictEqual([]);
   });
@@ -206,14 +258,12 @@ describe("中英文文档对等", () => {
 
   it("新工具的边界在两份里都写清楚", async () => {
     const { en, zh } = await readPair();
-    for (const [label, text] of [
-      [EN, en],
-      [ZH, zh],
-    ] as const) {
-      expect(text, `${label} 没写清 baseUrl 为空时的行为`).toContain("baseUrl");
-    }
-    expect(en).toContain("best-effort");
-    expect(zh).toContain("尽力而为");
+    // 判的是「那一层语义在不在」，不是标识符出现没出现：只 `toContain("baseUrl")` 时，
+    // 参数表里随便提一句 `baseUrl` 就能过，而「为空时返回什么」这句解释丢了没人知道。
+    expect(en, `${EN} 没写清 baseUrl 为空时的行为`).toContain(EMPTY_BASE_URL.en);
+    expect(zh, `${ZH} 没写清 baseUrl 为空时的行为`).toContain(EMPTY_BASE_URL.zh);
+    expect(en, `${EN} 没写清 adaptive 重定位只是线索`).toContain(BEST_EFFORT.en);
+    expect(zh, `${ZH} 没写清 adaptive 重定位只是线索`).toContain(BEST_EFFORT.zh);
   });
 
   it("发布范围写明 macOS arm64、安装器与 blocked 项", async () => {
@@ -261,22 +311,49 @@ describe("设置表与 schema 的 volatile 面对齐", () => {
       ).toStrictEqual([]);
       // 剩下没进部署表的，必须正好是 MCP 章节里单独文档化的那三枚。
       expect(
-        nonVolatile.filter((key) => !deployKeys.includes(key)),
+        // nonVolatile 跟着 `Config` 的声明序，右侧是字母序：今天恰好同序，字段换位就会
+        // 以「缺了部署级键」这种误导信息红。与上面几处一样比排序后的集合。
+        nonVolatile.filter((key) => !deployKeys.includes(key)).toSorted(),
         `${label} 的部署表缺了部署级键`,
       ).toStrictEqual(["integrationMode", "mcpPort", "officialMcpEnabled"]);
     }
   });
 });
 
+/**
+ * 工具数量到计数文案的映射：数量写死在这里，而不是从登记表算出来。
+ *
+ * 登记表换了数量而这张表没有那一档时，红话直接说出「缺的是文案表的一档」；有那一档但
+ * 文档没写，红话点名是哪份文档。两处分开才不用回头猜「哪几处该一起改」。
+ */
+const COUNT_PHRASES: Record<number, { en: string; zh: string }> = {
+  19: { en: "Nineteen tools", zh: "十九个工具" },
+};
+
+/**
+ * 取该数量对应的计数文案；表里没这一档时点名说出缺的是哪一档。
+ *
+ * @param count - 登记表长度
+ * @returns 两份 README 各自该写的计数文案
+ */
+function phrasesFor(count: number): { en: string; zh: string } {
+  const phrases = COUNT_PHRASES[count];
+  if (phrases === undefined) {
+    throw new Error(`登记表有 ${String(count)} 个工具，计数文案表里没有这一档`);
+  }
+  return phrases;
+}
+
 describe("文档里的工具计数跟着工具表走", () => {
   it("两份 README 与随包补丁注释都写现量", async () => {
     const { en, zh } = await readPair();
-    // 工具表增删工具时，这两句文案与补丁注释要一起改——这条断言就是那个提醒。
-    expect(TOOL_SPECS, "工具表变了就把这几处计数文案一起改").toHaveLength(19);
-    expect(en).toContain("Nineteen tools");
-    expect(zh).toContain("十九个工具");
+    const phrases = phrasesFor(TOOL_SPECS.length);
+    expect(en, `${EN} 缺少 ${phrases.en}`).toContain(phrases.en);
+    expect(zh, `${ZH} 缺少 ${phrases.zh}`).toContain(phrases.zh);
     const patch = await readFile(path.join(pkgDir, "cordis.patch.yml"), "utf8");
-    expect(patch).toContain(`# ${TOOL_SPECS.length} 个工具`);
+    expect(patch, "cordis.patch.yml 的工具计数没跟着登记表走").toContain(
+      `# ${String(TOOL_SPECS.length)} 个工具`,
+    );
   });
 });
 

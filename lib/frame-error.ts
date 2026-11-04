@@ -8,7 +8,7 @@
  * 调用侧从这里取，不再各自写字面量：字面量散开后，加一个分类或改一个取值就得靠人记得
  * 逐处对齐，漏掉的那处只会表现为「分支永远走不到」。类型从这份表派生，两边不可能走散。
  */
-export const FRAME_ERROR_KINDS = {
+const FRAME_ERROR_KIND_TABLE = {
   /** 不是合法 JSON（解析失败、序列化失败）。 */
   unparsableJson: "unparsable-json",
   /** 是合法 JSON 但不是对象。 */
@@ -16,6 +16,14 @@ export const FRAME_ERROR_KINDS = {
   /** 残帧超过长度上限：资源/限流一类，不是协议损坏。 */
   frameTooLarge: "frame-too-large",
 } as const;
+
+/**
+ * 上面那份表冻起来再交出去。
+ *
+ * `as const` 只给编译期只读：`jsonl.ts` 把它原样 re-export，任何导入方都能改属性，
+ * 改了之后 `FrameErrorKind` 仍允许旧值 —— 症状是「类型允许、运行时对不上」。
+ */
+export const FRAME_ERROR_KINDS = Object.freeze(FRAME_ERROR_KIND_TABLE);
 
 /** 帧处理失败的分类。 */
 export type FrameErrorKind = (typeof FRAME_ERROR_KINDS)[keyof typeof FRAME_ERROR_KINDS];

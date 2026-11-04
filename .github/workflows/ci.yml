@@ -7,9 +7,10 @@ on:
   workflow_dispatch: {}
   # 每周跑一次，抓的是**环境漂移**，不是依赖漂移：install 走 `--frozen-lockfile`，而
   # @deepseek-ai/* 那族在 pnpm-workspace.yaml 的 overrides 里钉死，所以上游发新版不会改变
-  # 这一跑装到的树。会浮动的是这几样：runner 镜像自身、`version: 12` 解析到的 pnpm 补丁版、
-  # `node-version` 与 `python-version` 解析到的补丁版，以及那段
-  # `pip install "scrapling[rag]>=0.5,<0.6"` 与其传递依赖。public 仓的标准 runner 免费。
+  # 这一跑装到的树。会浮动的是这几样：runner 镜像自身、`node-version` 与 `python-version`
+  # 解析到的补丁版，以及那段 `pip install "scrapling[rag]>=0.5,<0.6"` 与其传递依赖——pnpm
+  # 不在这份名单里，它钉在下面的 `env.PNPM_VERSION`，抬版本是一次可评审的 diff。public 仓的
+  # 标准 runner 免费。
   # 注意：public 仓 60 天无活动时，GitHub 会自动停用定时工作流——这不需要额外维护，
   # 但「上周没跑」不等于「上周全绿」，读结论时别把它当连续证据。
   schedule:
@@ -26,6 +27,13 @@ concurrency:
 # 门槛只需要读代码。写成白名单而不是省略：省略会拿到仓库默认权限，而默认可能是读写。
 permissions:
   contents: read
+# pnpm 取具体补丁版本而不是主版本 12：`version: 12` 让每次运行拿上游最新的 12.x，补丁差在安装树的
+# 解法上是可观察的行为差异（本族各仓 cordis.patch.yml 就记着 pnpm 某个小版本的 add 缺陷）。取值与
+# 伞根 packageManager 同源，也是各仓 lockfile 当期由之生成的那一枚。口径：九仓 CI 都在 workflow 级
+# env 里写这枚字面值；唯一例外是 dsh-lesson-loop，它的 package.json 自带 packageManager，由
+# pnpm/action-setup 自己读，再写 env 就成了两份真源。
+env:
+  PNPM_VERSION: 12.11.2
 jobs:
   gate:
     name: gate (${{ matrix.os }}, node ${{ matrix.node }})
@@ -61,9 +69,9 @@ jobs:
           # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
           # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 12
+          version: ${{ env.PNPM_VERSION }}
       # registry-url 留空：本仓 CI 不发布，装依赖走包自己的 .npmrc（@jayyuen66 指向公共 npm）。
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -173,8 +181,22 @@ jobs:
         if: always()
         # Windows 的默认 shell 是 pwsh，`test` 与 `$(...)` 都不存在；显式声明 bash 让这条
         # 判据在三个平台上是同一句话。
+        # 先打印再判，而不是只留一个退出码：这一步在 always() 下收尾，真红时「改了哪些文件」
+        # 是排查唯一需要的信息，否则得把整趟 job 的日志倒着读一遍。
         shell: bash
-        run: test -z "$(git status --porcelain --untracked-files=no)"
+        run: |
+          set -euo pipefail
+          # 赋值语句不传递命令的退出码：`git status` 自己失败（index 损坏、dubious ownership、
+          # 工作树异常）时变量落空串，这条判据反而在最该报错的时候判绿。
+          if ! changed="$(git status --porcelain --untracked-files=no)"; then
+            echo "::error::读不出 git status，无法判定门禁是否改写了被跟踪文件"
+            exit 1
+          fi
+          if [ -n "$changed" ]; then
+            echo "::error::门禁跑完改写了被跟踪的文件："
+            printf '%s\n' "$changed"
+            exit 1
+          fi
 
       # 运行页顶部的摘要：把结果留在这一页，不必点进每一步的日志里找。
       # 它必须排在 job 的最后一步：job.status 在执行到那一步时才求值，后面若还有判定步骤，
@@ -210,9 +232,9 @@ jobs:
           # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
           # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 12
+          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -241,7 +263,9 @@ jobs:
           set -euo pipefail
           tarball="$(find /tmp/pkg -name '*.tgz' -print -quit)"
           # dsh-tools 是 optional peer：npm 不会自动装 optional peer，但 host.js 在运行期
-          # 按值 import 它。探针必须按 tarball 声明的精确版本把它一并装上，才能验入口面。
+          # 按值 import 它。探针要显式补上它才验得到入口面。版本取 tarball 声明里那条 peer
+          # 范围（peerDependencies 的字面取值），由 npm 在窗口内解析出当下最新的一格——这一步
+          # 因此跟着 registry 的最新发布走，不是按精确钉版装。
           host_tools="$(node -e 'const p=require("./package.json"); process.stdout.write(p.peerDependencies["@deepseek-ai/dsh-tools"])')"
           mkdir -p /tmp/probe && cd /tmp/probe
           npm init -y >/dev/null
@@ -271,20 +295,43 @@ jobs:
           const patch = path.join(pkgDir, patchRel);
           if (!existsSync(patch)) throw new Error(`bundle patch 没随包发出：${patchRel}`);
           const text = readFileSync(patch, "utf8");
-          // 守卫要判的是「有没有一条条目按裸包名引用本包」，不是「有没有 id 行」也不是
-          // 「全文出现过这个串」：注释里的 `# - id:` 会让前者过，而 `.../settings` 子路径
-          // 条目天然包含完整包名会让后者过——两种情况下主入口都丢了，条目却照样注册不上。
-          const patchLines = text.split(/\r?\n/u);
-          const entries = [];
-          for (let i = 0; i < patchLines.length - 1; i += 1) {
-            const idHit = /^[ \t]*-[ \t]*id:[ \t]*(\S+)[ \t]*$/u.exec(patchLines[i]);
-            if (idHit === null) continue;
-            const nameHit = /^[ \t]*name:[ \t]*(?:"([^"]*)"|(\S+))[ \t]*$/u.exec(patchLines[i + 1]);
-            if (nameHit === null) continue;
-            entries.push([idHit[1], nameHit[1] ?? nameHit[2]]);
+          // 守卫判的是「有没有一条按裸包名引用本包的条目」。这里按缩进切成条目块，不是逐行
+          // 配对：在 id 与 name 之间插一行注释、把 name 写在 id 之前、或给 name 换成单引号，
+          // 都只是排版变化，而逐行紧邻匹配会把它们报成「引用丢了」——那是判据自己失效的假红，
+          // 不是产物缺陷。反向的一侧照样红：子路径条目不等于裸包名引用，缺 id 的条目不进候选面。
+          const unquote = (raw) => {
+            const s = raw.trim();
+            const code = s.charCodeAt(0);
+            if ((code === 34 || code === 39) && s.length > 1) {
+              const end = s.indexOf(s.charAt(0), 1);
+              if (end > 0) return s.slice(1, end);
+            }
+            return s;
+          };
+          const KEY = /^([A-Za-z_][\w.-]*):[ \t]*(.*)$/u;
+          const ITEM = /^([ \t]*)-[ \t]*(.*)$/u;
+          const blocks = [];
+          const lines = text.split(/\r?\n/u);
+          for (let i = 0; i < lines.length; i += 1) {
+            const start = ITEM.exec(lines[i]);
+            if (start === null) continue;
+            const entry = {};
+            const head = KEY.exec(start[2].trim());
+            if (head !== null) entry[head[1]] = unquote(head[2]);
+            for (let j = i + 1; j < lines.length; j += 1) {
+              const body = lines[j];
+              const trimmed = body.trim();
+              if (trimmed === "" || trimmed.startsWith("#")) continue;
+              const indent = /^[ \t]*/u.exec(body)[0].length;
+              if (indent <= start[1].length) break;
+              const kv = KEY.exec(trimmed);
+              if (kv !== null && !(kv[1] in entry)) entry[kv[1]] = unquote(kv[2]);
+            }
+            blocks.push(entry);
           }
-          if (entries.length === 0) throw new Error(`bundle patch 里没有 id/name 条目：${patchRel}`);
-          if (!entries.some(([, name]) => name === NAME)) throw new Error(`bundle patch 没有按裸包名引用 ${NAME} 的条目`);
+          const entries = blocks.filter((entry) => typeof entry.id === "string" && entry.id.length > 0);
+          if (entries.length === 0) throw new Error(`bundle patch 里没有带 id 的条目：${patchRel}`);
+          if (!entries.some((entry) => entry.name === NAME)) throw new Error(`bundle patch 没有按裸包名引用 ${NAME} 的条目`);
           // Python sidecar 必须随包：发布物里没有 py/ 的话，装得上、跑不了，而所有 JS 门禁全绿。
           const bridge = path.join(pkgDir, "py", "bridge.py");
           if (!existsSync(bridge)) throw new Error("py/bridge.py 没随包发出：sidecar 起不来");
@@ -306,9 +353,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 12
+          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -316,6 +363,44 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: 出货探针（pack → 干净目录安装 → 载入 → CLI 离线 status）
         run: node test/install-probe.mjs
+
+  # 出货那棵 Python 树此前在任何 job 里都没被装过：gate 三格装的是 range
+  # （`scrapling[rag]>=0.5,<0.6`），而插件真正拿去用的是 `py/runtime-requirements.txt`
+  # ——逐枚精确版本、每枚一个 sha256，由 lib/installer.ts 的托管 venv 路径消费。range 解析得开
+  # 不等于这 49 枚哈希闭包装得起来，所以这条腿判的是「出货的那棵树」而不是「现场解出来的一棵」。
+  # 它只能落在 macos：那些哈希对应的就是 macOS 轮子（实测 lxml==6.1.3 那枚哈希 =
+  # cp314-cp314-macosx_10_15_universal2.whl，greenlet 同理），放进 ubuntu / windows 两格会红在
+  # 「找不到匹配哈希的产物」上，那是平台事实而不是缺陷。装完还要真 import：`pip check` 只保证
+  # 依赖图自洽，导入名写错或某个 extra 不再带出 patchright 那一类，只有 import 认得出。
+  runtime-closure:
+    needs: gate
+    name: runtime closure (macos arm64)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: py/runtime-requirements.txt
+      - name: 按哈希装出货闭包
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/closure-venv
+          /tmp/closure-venv/bin/python -m pip install --upgrade pip
+          /tmp/closure-venv/bin/python -m pip install --require-hashes -r py/runtime-requirements.txt
+          /tmp/closure-venv/bin/python -m pip check
+      - name: 闭包里的关键导入面
+        # 这六个名字是被消费的那一面：设置卡的运行状态、浏览器路径与 MCP 装配各自依赖其中一枚。
+        # 名单与本文件上方 cache-dependency-path 指的那份文件同源，改包要同时改这里。
+        run: |-
+          set -euo pipefail
+          /tmp/closure-venv/bin/python -c 'import markdownify, mcp, patchright, playwright, redis, scrapling; print("closure imports ok")'
 
   # 来源证明是给「这次运行打出来的这份产物」出的第三方可验凭据，不是多一步验证：
   # 签在 PR 上，那张证明看起来属于本仓，指向的却是 PR 里 prepack 脚本产出的字节。

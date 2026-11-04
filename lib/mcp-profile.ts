@@ -21,10 +21,9 @@ import {
 } from "./mcp-contract.ts";
 import type { McpMode } from "./mcp-contract.ts";
 
-/** profile 文本的行分隔、URL 端口与版本行首引号。 */
+/** profile 文本的行分隔与 URL 端口（读不出端口时用它兜一次冒号匹配）。 */
 const LINE_BREAK = /\r\n|\n|\r/u;
 const URL_PORT = /:(?<port>\d+)/u;
-const LEADING_QUOTE = /^['"]/u;
 
 export type ProfileMode = McpMode;
 
@@ -162,7 +161,9 @@ function clientFindings(input: ProfileInspection): McpFinding[] {
       detail: `profile 没有 ${MCP_CLIENT_PACKAGE}：跑 ${clientInstallCommand()} 装上它`,
     });
   }
-  const pinned = input.clientVersion?.replace(LEADING_QUOTE, "");
+  // clientVersion 来自 JSON.parse 之后的 package.json，外层引号早被解析器吃掉，
+  // 这里不再剥引号：剥了一半反而会把带尾引号的值送去比对钉版表。
+  const pinned = input.clientVersion;
   if (pinned !== undefined && !MCP_CLIENT_PINS.includes(pinned)) {
     findings.push({
       code: "MCP_CLIENT_UNPINNED",
@@ -206,7 +207,7 @@ function modeFindings(input: ProfileInspection, scrapling: readonly ProfileEntry
     findings.push({
       code: "MCP_OFFICIAL_SWITCH_OFF",
       detail:
-        "留着官方 stdio 条目但 officialMcpEnabled=false：那 16 个工具不经本插件守卫，开关要明说",
+        "留着官方 stdio 条目但 officialMcpEnabled=false：官方 server 的工具不经本插件守卫，开关要明说",
     });
   }
   return findings;
@@ -264,11 +265,19 @@ export interface ProfileSnapshot {
  * 「看着像开」的写法和裸 `false` 一样都按未开启处理。把「未开启」判据放宽到任意非空值，会让宿主
  * 仍按 false 处理时 doctor 打绿——那比方红更贵。
  */
-const SWITCH_LINE = /^[\t ]*officialMcpEnabled:(?<value>[^\r\n]*)$/mu;
+const SWITCH_LINE = /^[\t ]*officialMcpEnabled:(?<value>[^\r\n]*)$/gmu;
 
-/** 取 `officialMcpEnabled` 的标量文本；同一份文本里出现多次时取第一条。 */
+/**
+ * 取 `officialMcpEnabled` 的标量文本；同一份文本里出现多次时取最后一条。
+ *
+ * YAML 的重复键按「后者生效」解析，宿主读到的就是那一条；取第一条会让 doctor 的判据与
+ * 宿主实际行为相反（前 false 后 true 时，doctor 说开关没开，而宿主已经把工具端出去了）。
+ */
 function switchScalar(text: string): string | undefined {
-  const raw = SWITCH_LINE.exec(text)?.groups?.["value"];
+  let raw: string | undefined;
+  for (const match of text.matchAll(SWITCH_LINE)) {
+    raw = match.groups?.["value"];
+  }
   const value = raw?.replace(TRAILING_COMMENT, "").trim();
   const quoted = value === undefined ? undefined : QUOTED_SCALAR.exec(value)?.groups;
   return quoted?.["double"] ?? quoted?.["single"] ?? value;
@@ -279,8 +288,25 @@ function isSwitchOn(text: string): boolean {
   return value === "true" || value === "True" || value === "TRUE";
 }
 
+/**
+ * 读一份 profile 文本。
+ *
+ * 只有 ENOENT 才是「这份文件不存在」；EACCES、EISDIR、EMFILE 这些读不到的原因不能压成
+ * 空串——空串在 doctor 眼里就是「profile 里什么都没写」，于是要么静默打绿、要么报一条
+ * 与事实无关的模式不匹配。其余错误原样上抛，由 CLI 的 reportFailure 收口成一句可读失败。
+ *
+ * @param file - 要读的文件
+ * @returns 文件正文；文件不存在时为空串
+ */
 async function readText(file: string): Promise<string> {
-  return readFile(file, "utf8").catch(() => "");
+  try {
+    return await readFile(file, "utf8");
+  } catch (error) {
+    if (isRecord(error) && error["code"] === "ENOENT") {
+      return "";
+    }
+    throw new Error(`读不出 ${file}：${String(error)}`, { cause: error });
+  }
 }
 
 /** 坏 JSON、空文本与非对象都归到 `{}`：让取值链自己落回 undefined，不必在调用点分叉。 */
@@ -307,8 +333,10 @@ function clientVersionOf(manifestText: string): string | undefined {
  * @returns patch 文本、客户端版本与官方开关；文件缺失即空值
  */
 export async function readProfileSnapshot(dir: string): Promise<ProfileSnapshot> {
-  const patchText = await readText(path.join(dir, "cordis.patch.yml"));
-  const manifestText = await readText(path.join(dir, "package.json"));
+  const [patchText, manifestText] = await Promise.all([
+    readText(path.join(dir, "cordis.patch.yml")),
+    readText(path.join(dir, "package.json")),
+  ]);
   return {
     patchText,
     clientVersion: clientVersionOf(manifestText),
@@ -362,6 +390,8 @@ export function nativeModePatch(): string {
   return [
     "# integrationMode=native：profile 里不留 scrapling 的 MCP 条目。",
     "# 留着条目时模型会同时看到原生工具与 mcp__scrapling__* 两套同名不同层的工具。",
+    `# 这份文本本身不删任何东西：profile 里若已有 name: '${MCP_CLIENT_PACKAGE}' 的条目，`,
+    "# 要手工删掉它再重启宿主，否则 `doctor --mode native` 会按事实报 MCP_MODE_ENTRY_MISMATCH。",
     "",
   ].join("\n");
 }

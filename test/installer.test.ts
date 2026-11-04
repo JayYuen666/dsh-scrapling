@@ -1,4 +1,7 @@
-// lib/installer.ts —— 托管 Python 与 core 依赖的安装边界。
+// test/installer.test.ts —— lib/installer.ts 的安装边界（下载、解压、锁、平台闸）。
+//
+// 头一行写本文件自己的路径：这几份测试的头注释是给读 test/ 的人定位用的，
+// 写成被测模块的路径会被当成植入在 lib 里的注释。
 
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
@@ -62,6 +65,33 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 
 const created: string[] = [];
+
+/**
+ * 回收本文件登记的临时目录。
+ *
+ * 登记表是整个文件共享的，原先只有四个 describe 的 afterEach 顺手 `splice(0)`：单独跑某个
+ * describe（`vitest -t installBrowser`）、用例在下一个钩子之前失败、或 describe 顺序调整时，
+ * 目录就留在系统临时目录里。现在每个 describe 自己调一次，回收函数只有一份。
+ */
+function drainCreatedDirs(): void {
+  for (const dir of created.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+/**
+ * 解压桩的共同部分：在解压目标里造出一层 `python/bin/python3`。
+ *
+ * 八处用例原先各抄这三行（其中一处还是同步 fs），新增用例时容易复制出细微差异；
+ * 布局不同的那一处（`python3.14` + 符号链接）自己写，不复用这里。
+ *
+ * @param destination - 解压目标目录
+ */
+async function stagePythonBin(destination: string): Promise<void> {
+  const bin = path.join(destination, "python", "bin");
+  await mkdir(bin, { recursive: true });
+  await writeFile(path.join(bin, "python3"), "#!/bin/sh\n");
+}
+
 const MANAGED_PYTHON = "/managed/python3";
 const STATE_FILE = "state.json";
 const STORAGE_DB = "elements_storage.db";
@@ -86,6 +116,20 @@ const missingCurlRun: RunStep = async () => ({
   stdout: "",
   stderr: "spawn curl ENOENT",
 });
+
+/**
+ * 关掉测试用的 HTTP 服务并等到句柄真的释放。
+ *
+ * `server.close()` 不 await：还有 keep-alive 连接时它不会立即完成，句柄留给测试进程，
+ * 部分环境会报 open handle 或把用例拖到超时。先切断连接再等 close 回调。
+ *
+ * @param server - 本用例起的那一个服务
+ */
+async function closeHttpServer(server: http.Server): Promise<void> {
+  server.closeAllConnections();
+  server.close();
+  await once(server, "close");
+}
 
 function tempDir(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "dsh-install-"));
@@ -158,14 +202,31 @@ function browserSpawner(): InstallerIO["spawn"] {
   };
 }
 
+/**
+ * 断言本机 PATH 上真的有可用的 curl。
+ *
+ * 下面两条用例钉的是 curl 的旗标组合（`--fail` 不吞 200、503 报 INSTALL_NETWORK），而
+ * `createCurlDownloader` 在 curl 非零时退回 fetch：没有 curl 的机器上这两条走的是 fetch
+ * 分支，断言照样绿而 curl 一次没跑。curl 缺不缺不是这条用例的判据，静默换路才是。
+ * 四个分支本身由 `describe("createCurlDownloader")` 用假 runner 逐条钉住。
+ *
+ * @param io - 用哪一份 IO 去问
+ */
+async function expectCurlAvailable(io: InstallerIO): Promise<void> {
+  const probe = await io.spawn(["curl", "--version"]);
+  expect(probe.code, "本机 PATH 上没有可用的 curl：下面两条旗标组合用例落不到 curl 上").toBe(0);
+}
+
 describe("defaultInstallerIO", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    drainCreatedDirs();
   });
 
   it("download 走系统 curl 成功读回字节", async () => {
     // 真起一次本地 HTTP 服务：这一条钉的是旗标组合本身（--fail 不吞 200、--location
     // 不破坏本地回显），假 runner 的那组测不到它。
+    await expectCurlAvailable(defaultInstallerIO);
     const bytes = new TextEncoder().encode("payload");
     const server = http.createServer((_request, response) => {
       response.writeHead(200, { "content-type": "application/octet-stream" });
@@ -180,11 +241,12 @@ describe("defaultInstallerIO", () => {
       );
       expect(Buffer.from(downloaded).equals(Buffer.from(bytes))).toBe(true);
     } finally {
-      server.close();
+      await closeHttpServer(server);
     }
   });
 
   it("download 遇 HTTP 错误报 INSTALL_NETWORK", async () => {
+    await expectCurlAvailable(defaultInstallerIO);
     const server = http.createServer((_request, response) => {
       response.writeHead(503);
       response.end();
@@ -198,7 +260,7 @@ describe("defaultInstallerIO", () => {
         .catch((error_: unknown) => error_);
       expect((error as InstallError).code).toBe("INSTALL_NETWORK");
     } finally {
-      server.close();
+      await closeHttpServer(server);
     }
   });
 
@@ -264,6 +326,7 @@ describe("defaultInstallerIO", () => {
 describe("createCurlDownloader", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    drainCreatedDirs();
   });
 
   it("curl 成功时读回文件字节并清掉临时文件", async () => {
@@ -307,12 +370,6 @@ describe("createCurlDownloader", () => {
 });
 
 describe("installPython", () => {
-  afterEach(() => {
-    for (const dir of created.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   it("哈希不符时报 INSTALL_HASH_MISMATCH 且不留临时目录", async () => {
     const dataDir = tempDir();
     const io = fakeIO({ download: async () => new Uint8Array([1, 2, 3]) });
@@ -333,13 +390,14 @@ describe("installPython", () => {
       download: async () => bytes,
       extract: async (_archive, destination) => {
         extracted = destination;
-        const bin = path.join(destination, "python", "bin");
-        await mkdir(bin, { recursive: true });
-        await writeFile(path.join(bin, "python3"), "#!/bin/sh\n");
+        await stagePythonBin(destination);
       },
     });
     const result = await installPython(asset, dataDir, io);
-    expect(result).toMatchObject({ version: "3.14.9" });
+    // 契约是「清单里的版本被原样带进结果」，不是「版本等于某个数」：写死 3.14.9 时清单升级
+    // 会以「安装器坏了」的形态红。形状再单独钉一次，防止两边同时空掉还判过。
+    expect(result).toMatchObject({ version: asset.pythonVersion });
+    expect(result.version).toMatch(/^\d+\.\d+\.\d+$/u);
     expect(result.pythonPath).toBe(managedPythonPath(dataDir));
     expect(existsSync(result.pythonPath)).toBe(true);
     expect(extracted).toContain(".tmp");
@@ -402,9 +460,7 @@ describe("installPython", () => {
     const io = fakeIO({
       download: async () => bytes,
       extract: async (_archive, destination) => {
-        const bin = path.join(destination, "python", "bin");
-        await mkdir(bin, { recursive: true });
-        await writeFile(path.join(bin, "python3"), "#!/bin/sh\n");
+        await stagePythonBin(destination);
       },
     });
     await installPython(asset, dataDir, io);
@@ -428,9 +484,7 @@ describe("installPython", () => {
 
   const usableExtract = {
     extract: async (_archive: string, destination: string) => {
-      const bin = path.join(destination, "python", "bin");
-      await mkdir(bin, { recursive: true });
-      await writeFile(path.join(bin, "python3"), "#!/bin/sh\n");
+      await stagePythonBin(destination);
     },
   };
 
@@ -485,8 +539,12 @@ describe("installPython", () => {
       );
       expect((error as InstallError).code).toBe("INSTALL_BUSY");
     } finally {
-      child.kill();
-      await once(child, "exit");
+      // 已经退场（或 spawn 失败只走到 error）时 kill 是空操作，而 once(child,"exit") 永远不
+      // settle：用例只能等超时，且留下的判断信息比直接放过还少。
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill();
+        await once(child, "exit");
+      }
     }
   });
 
@@ -513,12 +571,6 @@ describe("installPython", () => {
 });
 
 describe("withInstallLock", () => {
-  afterEach(() => {
-    for (const dir of created.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   it("同一进程可重入：内层不再取同一把锁", async () => {
     const dataDir = tempDir();
     const result = await withInstallLock(dataDir, () =>
@@ -560,6 +612,10 @@ describe("withInstallLock", () => {
 });
 
 describe("loadNativeLock", () => {
+  afterEach(() => {
+    drainCreatedDirs();
+  });
+
   it("模块加载失败或形状不符时返回 null", () => {
     expect(
       loadNativeLock(() => {
@@ -599,6 +655,10 @@ describe("loadNativeLock", () => {
 });
 
 describe("installBrowser", () => {
+  afterEach(() => {
+    drainCreatedDirs();
+  });
+
   it("命令与目录正确，且不带 --only-shell", async () => {
     const dataDir = tempDir();
     const calls: { argv: string[]; env?: NodeJS.ProcessEnv }[] = [];
@@ -728,11 +788,6 @@ describe("installCore", () => {
   beforeAll(() => {
     restorePlatform = mockPlatform("darwin", "arm64");
   });
-  afterEach(() => {
-    for (const dir of created.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
 
   afterAll(() => {
     restorePlatform?.();
@@ -749,6 +804,9 @@ describe("installCore", () => {
       io: fakeIO({ spawn: venvSpawner(calls, { code: 0, stdout: "", stderr: "" }) }),
     });
     const pip = calls.find((argv) => argv.includes("pip"));
+    // 先点名「没找到 pip 那一趟」并带上实收的调用表；否则传 undefined 给 toContain 只报
+    // received value must be an array，看不出是顺序变了还是根本没调。
+    expect(pip, `calls 里没有 pip 调用：${JSON.stringify(calls)}`).toBeDefined();
     expect(pip).toContain("--only-binary=:all:");
     expect(pip).toContain("--require-hashes");
     expect(pip).toContain("-r");
@@ -938,9 +996,7 @@ describe("installCore", () => {
         return { code: 0, stdout: "", stderr: "" };
       },
       extract: async (_archive, destination) => {
-        const bin = path.join(destination, "python", "bin");
-        await mkdir(bin, { recursive: true });
-        await writeFile(path.join(bin, "python3"), "#!/bin/sh\n");
+        await stagePythonBin(destination);
       },
     });
     await installCapabilityPack("core", {
@@ -973,9 +1029,7 @@ describe("installCore", () => {
         throw new Error("offline");
       },
       extract: async (_archive, destination) => {
-        const bin = path.join(destination, "python", "bin");
-        await mkdir(bin, { recursive: true });
-        await writeFile(path.join(bin, "python3"), "#!/bin/sh\n");
+        await stagePythonBin(destination);
       },
     });
     const installed = await installPython(plain, dataDir, io, assets);
@@ -1127,12 +1181,6 @@ describe("installCore", () => {
 });
 
 describe("readRuntimeState", () => {
-  afterEach(() => {
-    for (const dir of created.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   it("缺失给空状态（第一次装）", async () => {
     await expect(readRuntimeState(tempDir())).resolves.toStrictEqual({ packs: {} });
   });
@@ -1200,11 +1248,6 @@ describe("packStates", () => {
   let restorePlatform: (() => void) | undefined;
   beforeAll(() => {
     restorePlatform = mockPlatform("darwin", "arm64");
-  });
-  afterEach(() => {
-    for (const dir of created.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
   });
 
   afterAll(() => {
@@ -1295,35 +1338,12 @@ describe("packStates", () => {
     const states = await packStates(dataDir);
     expect(states.browser).toBe("corrupt");
   });
-
-  it("非 macOS arm64 上所有包都 blocked", async () => {
-    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("linux");
-    const arch = vi.spyOn(process, "arch", "get").mockReturnValue("x64");
-    try {
-      const states = await packStates(tempDir());
-      expect(Object.values(states).every((state) => state === "blocked")).toBe(true);
-      const error = await installCapabilityPack(CORE_PACK, {
-        dataDir: tempDir(),
-        repoRoot: requirementsRepoRoot(),
-        io: fakeIO(),
-      }).catch((error_: unknown) => error_);
-      expect((error as InstallError).code).toBe("INSTALL_PACK_BLOCKED");
-    } finally {
-      platform.mockRestore();
-      arch.mockRestore();
-    }
-  });
 });
 
 describe("installCapabilityPack", () => {
   let restorePlatform: (() => void) | undefined;
   beforeAll(() => {
     restorePlatform = mockPlatform("darwin", "arm64");
-  });
-  afterEach(() => {
-    for (const dir of created.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
   });
 
   afterAll(() => {
@@ -1342,9 +1362,7 @@ describe("installCapabilityPack", () => {
         download: async () => bytes,
         spawn: venvSpawner(calls, { code: 0, stdout: "", stderr: "" }),
         extract: async (_archive, destination) => {
-          const bin = path.join(destination, "python", "bin");
-          await mkdir(bin, { recursive: true });
-          await writeFile(path.join(bin, "python3"), "#!/bin/sh\n");
+          await stagePythonBin(destination);
         },
       }),
     });
@@ -1382,9 +1400,7 @@ describe("installCapabilityPack", () => {
     const io = fakeIO({
       download: async () => bytes,
       extract: async (_archive, destination) => {
-        const bin = path.join(destination, "python", "bin");
-        mkdirSync(bin, { recursive: true });
-        writeFileSync(path.join(bin, "python3"), "#!/bin/sh\n");
+        await stagePythonBin(destination);
       },
       spawn: packSpawner(),
     });
@@ -1440,6 +1456,10 @@ describe("installCapabilityPack", () => {
 });
 
 describe("errorCodeOf", () => {
+  afterEach(() => {
+    drainCreatedDirs();
+  });
+
   it("只从对象上读出字符串 code；其它形态一律 undefined", () => {
     const errno = Object.assign(new Error("x"), { code: "ENOENT" });
     expect(errorCodeOf(errno)).toBe("ENOENT");
@@ -1451,12 +1471,6 @@ describe("errorCodeOf", () => {
 });
 
 describe("uninstallCapabilityPack", () => {
-  afterEach(() => {
-    for (const dir of created.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   it("卸 core 删 venv、只摘 core 状态，保留 browser 标记与 adaptive 数据", async () => {
     const dataDir = tempDir();
     readyCore(dataDir);

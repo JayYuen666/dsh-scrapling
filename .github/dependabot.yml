@@ -4,14 +4,21 @@
 # 会把「换了哪个提交」变成一次可评审的 diff。
 #
 # 这里刻意**没有** npm 更新块：本仓依赖分三类，三类都不该由更新机器人改动。
-# 一是工具链与多数宿主依赖写成 catalog:，那条范围的真源在伞根的 pnpm-workspace.yaml；
-# 二是 31 枚写成字面版本的宿主依赖，本仓 pnpm-workspace.yaml 的 overrides 把它们钉死
-# （宿主族统一 0.2.1-rc.2 那条线），Dependabot 提的 PR 会被 overrides 解析回原版本，
-# 合进去也不改变安装树——留着只会造出「看起来升了、实际没升」的 PR；
-# 三是 8 枚既不在 catalog 也不在本仓 overrides 里的（ipaddr.js、react、@deepseek-ai/dsh
-# 与五枚未进本仓 overrides 的宿主包），它们的版本面确实会随机器人 PR 变动，但其中
-# ipaddr.js / react / @deepseek-ai/dsh 是本仓按需选的版本、宿主族那五枚要与伞根 overrides
-# 同步抬才算数，所以升版本仍只在伞根改真源、再投影下来。要升这些版本该改的是伞根。
+# 一是工具链与多数宿主依赖写成 catalog:，取值住在伞根的 pnpm-workspace.yaml，本仓这一份是投影
+# 下来的生成物；机器人改不到取值，改得到的只是 package.json 里那串引用写法。
+# 二是写成字面版本的宿主族（@deepseek-ai/*，含 @deepseek-ai/dsh 自己）：本仓 pnpm-workspace.yaml
+# 的 overrides 逐枚覆盖它们，机器人提的 PR 会被解析回 overrides 的取值，合进去也不改变安装树——
+# 留着只会造出「看起来升了、实际没升」的 PR。要抬这一族得在伞根改真源、再投影下来。
+# 三是既不走 catalog: 也不在本仓 overrides 里的第三方包，机器人对它们提的 PR 会真的换掉安装树：
+# 运行期用的是 @modelcontextprotocol/sdk（lib/mcp-server.ts 起 MCP server）、ipaddr.js
+# （lib/url-policy.ts 判地址）、fs-native-extensions（lib/installer.ts 取安装锁），
+# 编译期的是 react（卡片按包名段外部化，运行期由宿主提供实例）与 fast-check（属性测试）。
+# 这几枚的归属是「本仓自己按行改」：改完复跑 check；动到 Python 腿的那几枚还要复跑 check:py。
+#
+# 但「本仓不会出现 npm 机器人 PR」这句话**不由这个文件保证**：Dependabot security updates
+# 是仓库设置里独立开着的，不读本文件、也不需要 npm 配置块，仍会针对漏洞依赖提 PR；走 catalog:
+# 的那些它改到的是引用，第三类那几枚会真的换版本。要真正关掉它得去 Settings → Code security
+# 里处理 npm 那条 security updates，改这里的 yml 没有用。
 version: 2
 updates:
   - package-ecosystem: github-actions

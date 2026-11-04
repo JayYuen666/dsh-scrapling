@@ -62,8 +62,8 @@ def _resolve_url(page: Any, value: str) -> str:
         return value
 
 
-def _query_type(selector: str, query_type: str | None, use_xpath: bool) -> str:
-    """把旧的 ``useXpath`` 布尔值归一到 queryType。"""
+def _query_type(query_type: str | None, use_xpath: bool) -> str:
+    """把旧的 ``useXpath`` 布尔值归一到 queryType：显式 queryType 优先，其次 useXpath，最后 css。"""
     return query_type or ("xpath" if use_xpath else "css")
 
 
@@ -86,7 +86,7 @@ def query_nodes(
     """
     if not isinstance(selector, str) or not selector:
         raise ValueError("selector is required")
-    kind = _query_type(selector, query_type, use_xpath)
+    kind = _query_type(query_type, use_xpath)
     if kind == "css":
         return list(page.css(selector)), ""
     if kind == "xpath":

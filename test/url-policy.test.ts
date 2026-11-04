@@ -39,6 +39,9 @@ const PRIVATE = "private-address";
 /** 命中 scheme 判定时的原因码，出现多次故抽常量。 */
 const SCHEME = "scheme-not-allowed";
 
+/** IPv6 文档段（RFC 3849）：用来试「白名单里的 IPv6 条目」这一类不参与判定的前缀。 */
+const DOC_V6_CIDR = "2001:db8::/32";
+
 /** authority 歧义判定时的原因码，出现多次故抽常量。 */
 const AMBIGUOUS_AUTHORITY = "ambiguous-authority";
 
@@ -201,12 +204,16 @@ describe("地址判定", () => {
     expect(policy.isPublicAddress(`::ffff:${PUBLIC_V4}`)).toBe(true);
   });
 
-  it("nat64 里藏的回环地址必须拒（::ffff 之外的绕过手法）", () => {
+  it("nat64 里藏的非公网地址必须拒（::ffff 之外的绕过手法）", () => {
     const policy = defaultPolicy();
-    // 64:ff9b::/96 + 127.0.0.1
+    // /96：内嵌 IPv4 就是最后四个字节，这里是 127.0.0.1。
     expect(policy.isPublicAddress("64:ff9b::7f00:1")).toBe(false);
-    // 64:ff9b:1::/48（RFC 8215 本地段）+ 10.0.0.1
-    expect(policy.isPublicAddress("64:ff9b:1::a00:1")).toBe(false);
+    // /48（RFC 8215 本地段）按 RFC 6052 §2.2 取字节 6、7、9、10 —— 下标 8 的 u 字节恒为 0，
+    // 必须跳过。`64:ff9b:1::a00:1` 那一类写法在这档嵌的其实是 0.0.0.0（尾部四字节不参与 /48
+    // 的取法），两种读法都判拒，测不出位置。下面这一对是同一档前缀的正反两侧：内嵌私网判拒、
+    // 内嵌公网（8.8.8.8）放行；取字节的位置一挪，放行那半就红。
+    expect(policy.isPublicAddress("64:ff9b:1:a00:0:100::")).toBe(false);
+    expect(policy.isPublicAddress("64:ff9b:1:808:8:800::")).toBe(true);
   });
 
   it("nat64 里藏的公网地址放行", () => {
@@ -641,32 +648,37 @@ describe("自动识别合成解析器", () => {
 });
 
 /**
- * 建一个带着给定白名单、目标固定解析到私网的策略。
+ * 建一个带着给定白名单的策略，目标主机名解析到指定地址。
  *
  * @param ranges - 合成段白名单（CIDR 文本）
+ * @param targetAddress - 目标主机解析到的地址；缺省是一条**白名单之外**的私网地址
  * @returns 策略对象
  */
-function withRanges(ranges: readonly string[]): UrlPolicy {
+function withRanges(ranges: readonly string[], targetAddress = "10.0.0.1"): UrlPolicy {
   return createUrlPolicy({
     maxUrlLength: 2048,
-    // 目标必须是**控制域名之外**的另一个主机：把 10.0.0.1 放进控制集会让学出来的池
+    // 目标必须是**控制域名之外**的另一个主机：把目标地址放进控制集会让学出来的池
     // 横跨整个地址空间，测试就变成了在验证别的东西。
-    resolve: resolverFrom({ ...POOL, [TARGET_HOST]: ["10.0.0.1"] }),
+    resolve: resolverFrom({ ...POOL, [TARGET_HOST]: [targetAddress] }),
     syntheticRanges: ranges,
   });
 }
 
 describe("合成段白名单的解析容错", () => {
   it("写不成 CIDR 的项被丢掉，其余照常生效", async () => {
-    const policy = withRanges(["这不是一个 CIDR", "198.18.0.0/16"]);
-    const verdict = await policy.verify(TARGET_URL);
-    expect(reasonOf(verdict)).toBe(PRIVATE);
+    // 目标落在**有效那一条**里面：坏项若让整张表失效（或直接抛），这句就会红。
+    // 只对一条白名单之外的地址判拒，证的是「不崩溃」，不是「其余照常生效」。
+    const policy = withRanges(["这不是一个 CIDR", "10.20.0.0/16"], "10.20.30.40");
+    expect(allowedUrl(await policy.verify(TARGET_URL)).hostname).toBe(TARGET_HOST);
   });
 
   it("ipv6 的段被忽略（合成落点不会落在 IPv6 上）", async () => {
-    const policy = withRanges(["2001:db8::/32"]);
-    const verdict = await policy.verify(TARGET_URL);
-    expect(reasonOf(verdict)).toBe(PRIVATE);
+    // 两半各钉一条：IPv6 段本身不该把 IPv6 落点放宽（它不参与判定，落点仍是保留段→拒），
+    // 也不该因为它前面的位置就把同表里的 IPv4 条目一起丢掉。
+    const v6Only = withRanges([DOC_V6_CIDR], "2001:db8::5");
+    expect(reasonOf(await v6Only.verify(TARGET_URL))).toBe(PRIVATE);
+    const afterV6 = withRanges([DOC_V6_CIDR, "10.20.0.0/16"], "10.20.30.40");
+    expect(allowedUrl(await afterV6.verify(TARGET_URL)).hostname).toBe(TARGET_HOST);
   });
 
   it("白名单全是无效项时退化成维持最严，而不是崩溃", async () => {
@@ -676,22 +688,21 @@ describe("合成段白名单的解析容错", () => {
   });
 
   it("带主机位的 CIDR 按网络地址算，不把放行范围悄悄放大", async () => {
-    // 10.0.0.1/16 的意思是 10.0.0.0–10.0.255.255。原先按写出来的地址算，会变成
-    // 10.0.0.1–10.0.255.254，边界跟着部署方随手写的那个数字走。
-    const wide = createUrlPolicy({
-      maxUrlLength: 2048,
-      resolve: resolverFrom({ [HOST]: ["10.0.0.1"] }),
-      syntheticRanges: ["10.0.0.1/16"],
-    });
-    expect(allowedUrl(await wide.verify(`http://${HOST}/`)).hostname).toBe(HOST);
+    // 区间按网络地址算：`10.0.0.1/16` 的意思是 10.0.0.0–10.0.255.255。不对齐时它变成
+    // 10.0.0.1–10.1.0.0（按实现里那套 first + span - 1 实测），下界抬走头一个地址、上界
+    // 越出整段。所以两侧各取一条**只有按网络地址算才判对**的边界地址，光比「写出来的那个
+    // 地址」两种算法都放行，测不出这条判据。
+    const networkStart = withRanges(["10.0.0.1/16"], "10.0.0.0");
+    expect(allowedUrl(await networkStart.verify(TARGET_URL)).hostname).toBe(TARGET_HOST);
+    const pastNetwork = withRanges(["10.0.0.1/16"], "10.1.0.0");
+    expect(reasonOf(await pastNetwork.verify(TARGET_URL))).toBe(PRIVATE);
 
-    const inside = createUrlPolicy({
-      maxUrlLength: 2048,
-      resolve: resolverFrom({ [HOST]: ["10.0.1.1"] }),
-      syntheticRanges: ["10.1.2.3/24"],
-    });
-    // 10.1.1.1 在 10.1.2.0/24 之外，不该被放行。
-    expect(reasonOf(await inside.verify(`http://${HOST}/`))).toBe(PRIVATE);
+    // /24 那一档同理：`10.1.2.3/24` 的真实块是 10.1.2.0–10.1.2.255，不对齐是
+    // 10.1.2.3–10.1.3.2。
+    const blockStart = withRanges(["10.1.2.3/24"], "10.1.2.1");
+    expect(allowedUrl(await blockStart.verify(TARGET_URL)).hostname).toBe(TARGET_HOST);
+    const pastBlock = withRanges(["10.1.2.3/24"], "10.1.3.1");
+    expect(reasonOf(await pastBlock.verify(TARGET_URL))).toBe(PRIVATE);
   });
 
   it("控制域名里出现 IPv6 时不学池，避免拿 IPv6 地址去比 IPv4 区间", async () => {

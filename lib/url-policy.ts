@@ -402,8 +402,8 @@ function parseSyntheticRange(entry: string): SyntheticRange | null {
     return null;
   }
   // 区间按**网络地址**算，不按写出来的那个地址算：parseCIDR 原样返回 `10.1.2.3`，
-  // 于是 `10.1.2.3/24` 会被算成 10.1.2.3–10.1.3.254，比部署方写的范围大了一圈。
-  // 用户写 CIDR 的意思是那一段，边界就该是那一段。
+  // 于是 `10.1.2.3/24` 会被算成 10.1.2.3–10.1.3.2（照本函数那式 `first + span - 1` 算出的
+  // 终值），下界抬走块首、上界越出整段。用户写 CIDR 的意思是那一段，边界就该是那一段。
   const span = 2 ** (32 - bits);
   const first = Math.floor(ipv4ToLong(parsed) / span) * span;
   return { first, last: first + span - 1 };

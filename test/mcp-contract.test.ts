@@ -33,12 +33,16 @@ describe("客户端钉版", () => {
     );
   });
 
+  it("两条宿主线各自的同线版本都在放行名单内", () => {
+    expect(clientInstallCommand("0.2.1-rc.5")).toContain("@deepseek-ai/dsh-mcp-client@0.2.1-rc.5");
+  });
+
   it("next 标签在放行名单内", () => {
     expect(clientInstallCommand("next")).toContain("@deepseek-ai/dsh-mcp-client@next");
   });
 
   it("白名单之外的钉版在运行期也拒绝（JS 调用者没有联合类型保护）", () => {
-    expect(MCP_CLIENT_PINS).toStrictEqual([MCP_DEFAULT_CLIENT_PIN, "next"]);
+    expect(MCP_CLIENT_PINS).toStrictEqual([MCP_DEFAULT_CLIENT_PIN, "0.2.1-rc.5", "next"]);
     expect(() => clientInstallCommand("latest" as never)).toThrow(/unsupported MCP client pin/u);
   });
 });

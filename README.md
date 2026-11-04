@@ -76,7 +76,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 Remove with `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`. The package is on the public npm registry, so installation needs no credentials and no scoped-registry line.
 
 - **Requires Node.js `>= 22.18`.** This is an ESM-only package, and the build entry points (`build-client.ts`, `build-host.ts`, `build-cli.ts`) are executed by `node` directly; TypeScript type stripping is on by default from Node 22.18, so that is the floor that keeps `pnpm build` and `prepack` working on a declared-supported version.
-- **Requires host `dsh` at the `0.2.1-rc.3` / `0.2.2-alpha.2` line.** The requirement the host actually reads is `engines.dsh` (`^0.2.1-rc.3`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against the three most recently released host versions at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
+- **Requires host `dsh` at the `0.2.1-rc.5` or `0.2.2-alpha.3` line.** The requirement the host actually reads is `engines.dsh` (`^0.2.1-rc.5 || ^0.2.2-alpha.3`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against every released host version inside the window at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
 - **Requires Python 3.14+ with Scrapling installed** — named by `pythonBin`, or found by the fixed chain in `lib/runtime.ts` (managed runtime under `dataDir/runtime`, then the repository's `_env/.venv`, then `PATH`). In an installed package the `_env/.venv` leg does not exist, so after `setup --feature core --apply` the interpreter is that managed Python and otherwise the `python3` on your `PATH` (`python` on Windows); whichever one is chosen is logged at load time, and a missing Scrapling reports an error carrying the install line to copy.
 
 ```sh
@@ -105,7 +105,7 @@ dsh-scrapling setup --status
 ```
 
 - `core` installs managed Python 3.14.9, Scrapling 0.5 and its pinned wheels; `browser` adds the full Chromium build (not the headless shell).
-- `search`, `media`, `mcp` and `adaptive-redis` all ride on `core`'s venv: `mcp` brings the official `scrapling-mcp` server (the `mcp` package, 16 tools) that `official-mcp` mode needs, and `adaptive-redis` brings the `redis` client behind `adaptiveStorage: redis`. Every pack is installable; the settings card reports each as `ready`, `missing`, `corrupt` or `installing`.
+- `search`, `media`, `mcp` and `adaptive-redis` all ride on `core`'s venv: `mcp` brings the official `scrapling-mcp` server (the pinned `mcp` package; its tool set is the upstream's, not this plugin's) that `official-mcp` mode needs, and `adaptive-redis` brings the `redis` client behind `adaptiveStorage: redis`. Every pack is installable; the settings card reports each as `ready`, `missing`, `corrupt` or `installing`.
 - `--feature` is a dry run by default; `--apply` writes. `--repair` re-installs without touching user data, and `--uninstall <pack> [--purge]` removes runtime files; only `--purge` removes `elements_storage.db` and `downloads/`.
 - `--offline <dir>` installs with no network at all: `<dir>` must hold the Python archive named exactly as the manifest URL's last segment (browser and `curl -O` both keep `cpython-3.14.9+…-install_only.tar.gz`, and the percent-encoded spelling is accepted too) plus a `wheels/` directory with one wheel per pinned requirement - `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <dir>/wheels` produces it. The hash check on the Python archive is the same one the networked path runs, and pip is invoked with `--no-index`; a missing archive or wheelhouse fails as `INSTALL_OFFLINE_ASSETS` instead of silently going online.
 - `setup --status` prints one JSON document: `dataDir`, `profile`, `runtime`, `packs` and `state`. With `--profile <dir>` it reads that profile's `cordis.patch.yml` and resolves the interpreter from this package's `pythonBin` (the setting the host actually uses); without it, `profile.path` is `null`, a note says the profile was not read, and `runtime` falls back to the CLI's own chain (managed runtime → repo `_env/.venv` → PATH `python3`). Pass `--profile` whenever you compare the card's interpreter with what `--status` reports.
@@ -230,7 +230,8 @@ In `mcp` mode the server runs inside the plugin's own host process and calls the
 Connecting dsh needs `@deepseek-ai/dsh-mcp-client`, which this plugin deliberately does not depend on. Pin the build that matches the current host — npm `latest` is older than the host's own line and the host rejects the mismatch:
 
 ```bash
-dsh plugin --profile <name> add @deepseek-ai/dsh-mcp-client@0.2.1-rc.3
+dsh plugin --profile <name> add @deepseek-ai/dsh-mcp-client@0.2.2-alpha.3
+# host on the 0.2.1-rc.5 line: @deepseek-ai/dsh-mcp-client@0.2.1-rc.5
 ```
 
 Then add one entry to that profile's `cordis.patch.yml` — this is exactly what `dsh-scrapling setup --mode mcp` prints, so you can also let the CLI write it (drop `headers` when no token is configured):
@@ -263,7 +264,7 @@ dsh-scrapling setup --mode native --apply     # a file that deliberately contain
 dsh-scrapling doctor --mode mcp --profile <profileDir>
 ```
 
-`doctor` reads what the profile actually says - `cordis.patch.yml` plus that profile's `package.json` - and prints one line per problem: two entries under `serverName: scrapling`, this plugin's entry next to an official `stdio` one, entries that do not match the mode, an entry whose port disagrees with `--port`, a profile without `@deepseek-ai/dsh-mcp-client` or with it pinned to something other than `0.2.1-rc.3` / `next`, and an official entry while `officialMcpEnabled` is off. Exit `0` is "consistent", `1` names at least one problem, `2` is a bad argument. `integrationMode` itself is a plugin setting the CLI cannot read, so `--mode` is the claim being checked and has to match the deployment.
+`doctor` reads what the profile actually says - `cordis.patch.yml` plus that profile's `package.json` - and prints one line per problem: two entries under `serverName: scrapling`, this plugin's entry next to an official `stdio` one, entries that do not match the mode, an entry whose port disagrees with `--port`, a profile without `@deepseek-ai/dsh-mcp-client` or with it pinned to something other than `0.2.2-alpha.3` / `0.2.1-rc.5` / `next`, and an official entry while `officialMcpEnabled` is off. Exit `0` is "consistent", `1` names at least one problem, `2` is a bad argument. `integrationMode` itself is a plugin setting the CLI cannot read, so `--mode` is the claim being checked and has to match the deployment.
 
 `official-mcp` asks for two separate statements before it produces anything: `officialMcpEnabled: true` in the profile and `--accept-risk` on the command line; missing either one prints `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED` and writes nothing. The entry it generates starts `<dataDir>/runtime/venv/bin/scrapling-mcp`, so run `setup --feature mcp --apply` first - see [Runtime packs](#runtime-packs-macos-arm64). When that binary is missing, `setup` prints a line saying so.
 
@@ -297,7 +298,7 @@ Settings live on the **scrapling** card in the plugin detail page, grouped by pu
 | `syntheticDnsRanges` | string | `""` | Manual fallback for synthetic DNS: a comma-separated CIDR list of your proxy's fake-IP pool, for resolvers that mix synthetic and real answers. Invalid entries are dropped — a broken fallback degrades to "stay strict", not to a crash |
 | `proxyUrl` | string | `""` | Where fetches go out (`http://…` / `socks5://…`, optionally `user:pass@`). Empty = follow the environment; see [Proxies](#proxies). Masked on the card, never enters a tool schema |
 | `proxyBypass` | string | `""` | Host names that connect directly, mirroring `NO_PROXY`; `*` means the whole machine goes direct |
-| `nat64Prefixes` | string | `""` | Extra NAT64 prefixes (comma-separated CIDRs) for operator-specific networks; a declared prefix applies to every IPv6 address |
+| `nat64Prefixes` | string | `""` | Extra NAT64 prefixes (comma-separated `<IPv6 prefix>/<32\|40\|48\|56\|64\|96>`) for operator-specific networks. A declared prefix is consulted for every IPv6 answer and applies to the addresses inside it. A malformed entry makes the plugin **refuse to load** (`CONFIG_INVALID`), unlike `syntheticDnsRanges` below: dropping a prefix would let a private IPv4 embedded in IPv6 through as ordinary public IPv6 |
 
 **Deployment-only knobs** (not on the card; set them in the `config:` block of `cordis.patch.yml`):
 

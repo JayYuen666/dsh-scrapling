@@ -13,7 +13,13 @@ import type {
 } from "@deepseek-ai/dsh-typert-protocol";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { z } from "zod";
-import { RUNTIME_PACKS, RUNTIME_REMOTE_NAMESPACE } from "../lib/runtime-shape.ts";
+import {
+  JOB_STATUSES,
+  PACK_STATES,
+  REFUSED_STATUSES,
+  RUNTIME_PACKS,
+  RUNTIME_REMOTE_NAMESPACE,
+} from "../lib/runtime-shape.ts";
 import type {
   RuntimeActionResult,
   RuntimeCancelRequest,
@@ -47,7 +53,8 @@ const PACK_SCHEMA = z.object(
 
 const CANCEL_MESSAGE = "runtime cancel requires a jobId";
 const CANCEL_SCHEMA = z.object(
-  { jobId: z.string({ error: CANCEL_MESSAGE }).min(1, { error: CANCEL_MESSAGE }) },
+  // 先 trim 再判长度：`min(1)` 只挡空串，纯空白的 jobId 会带着空白上网关。
+  { jobId: z.string({ error: CANCEL_MESSAGE }).trim().min(1, { error: CANCEL_MESSAGE }) },
   { error: CANCEL_MESSAGE },
 );
 
@@ -71,8 +78,8 @@ const CANCEL_CODEC: TypertCodec<RuntimeCancelRequest> = {
   }),
 };
 
-const PACK_STATE_SCHEMA = z.enum(["ready", "missing", "corrupt", "installing", "blocked"]);
-const JOB_STATUS_SCHEMA = z.enum(["running", "stopping", "completed", "killed", "failed"]);
+const PACK_STATE_SCHEMA = z.enum(PACK_STATES);
+const JOB_STATUS_SCHEMA = z.enum(JOB_STATUSES);
 const RUNTIME_PACK_SCHEMA = z.enum(RUNTIME_PACKS);
 
 const JOB_VIEW_SCHEMA = z.object({
@@ -95,7 +102,7 @@ const STATUS_SCHEMA: z.ZodType<RuntimeStatusResult> = z.object({
 /** 动作读面的两支：启动成功带 jobId；拒绝带 error 与保留的状态码。
  *  状态码用 zod v4 的 `z.literal(数组)` 重载（core 侧落在同一份 PrimitiveSet，
  *  等价于逐值 union，但少三层 `z.literal(...)` 调用嵌套）。 */
-const REFUSED_STATUS_SCHEMA = z.literal([400, 404, 409, 500, 503]);
+const REFUSED_STATUS_SCHEMA = z.literal(REFUSED_STATUSES);
 const ACTION_SCHEMA: z.ZodType<RuntimeActionResult> = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(true), jobId: z.string() }),
   z.object({
@@ -105,44 +112,33 @@ const ACTION_SCHEMA: z.ZodType<RuntimeActionResult> = z.discriminatedUnion("ok",
   }),
 ]);
 
+/** 一个入参位的形状：四枚描述符里只有它不同。 */
+type DescriptorParameters = InvocationDescriptor["parameters"];
+
+/** 四个描述符共用的骨架：`id`、`service`、`namespace`、`invocation`、`result` 五件都同。 */
+function descriptorFor(method: string, parameters: DescriptorParameters): InvocationDescriptor {
+  return {
+    id: `${PACKAGE_NAME}#${NAMESPACE}/${method}`,
+    service: NAMESPACE,
+    namespace: NAMESPACE,
+    method,
+    invocation: { kind: "direct" },
+    parameters,
+    result: { mode: "src-json" },
+  };
+}
+
+/** 带请求件的那一枚入参：装与修共用 `PACK_CODEC`，取消用 `CANCEL_CODEC`。 */
+function requestParameter(codec: TypertCodec): DescriptorParameters {
+  return [{ name: "request", wire: "request", source: "json", codec }];
+}
+
 /** 宿主四个方法的客户端描述符；测试拿它与宿主侧 `remoteMethods()` 对质。 */
 export const RUNTIME_DESCRIPTORS: readonly InvocationDescriptor[] = [
-  {
-    id: `${PACKAGE_NAME}#${NAMESPACE}/status`,
-    service: NAMESPACE,
-    namespace: NAMESPACE,
-    method: "status",
-    invocation: { kind: "direct" },
-    parameters: [],
-    result: { mode: "src-json" },
-  },
-  {
-    id: `${PACKAGE_NAME}#${NAMESPACE}/installPack`,
-    service: NAMESPACE,
-    namespace: NAMESPACE,
-    method: "installPack",
-    invocation: { kind: "direct" },
-    parameters: [{ name: "request", wire: "request", source: "json", codec: PACK_CODEC }],
-    result: { mode: "src-json" },
-  },
-  {
-    id: `${PACKAGE_NAME}#${NAMESPACE}/repairPack`,
-    service: NAMESPACE,
-    namespace: NAMESPACE,
-    method: "repairPack",
-    invocation: { kind: "direct" },
-    parameters: [{ name: "request", wire: "request", source: "json", codec: PACK_CODEC }],
-    result: { mode: "src-json" },
-  },
-  {
-    id: `${PACKAGE_NAME}#${NAMESPACE}/cancelJob`,
-    service: NAMESPACE,
-    namespace: NAMESPACE,
-    method: "cancelJob",
-    invocation: { kind: "direct" },
-    parameters: [{ name: "request", wire: "request", source: "json", codec: CANCEL_CODEC }],
-    result: { mode: "src-json" },
-  },
+  descriptorFor("status", []),
+  descriptorFor("installPack", requestParameter(PACK_CODEC)),
+  descriptorFor("repairPack", requestParameter(PACK_CODEC)),
+  descriptorFor("cancelJob", requestParameter(CANCEL_CODEC)),
 ];
 
 export interface RemoteHost {
@@ -186,16 +182,32 @@ function isNamespace(value: unknown): value is RuntimeNamespace {
   );
 }
 
+/**
+ * 网关回包的形状判据。
+ *
+ * 只认「对象且带一个布尔 `ok` 位」：`ok` 缺席时后面那句 `result.error.code` 会在读属性上
+ * 抛 `Cannot read properties of undefined`，症状是一条没有协议含义的崩溃而不是「回包坏了」。
+ *
+ * @param value - 网关交回的任意值
+ * @returns 是否是这条协议的回包
+ */
+function isWireResult(value: unknown): value is RemoteResult<unknown> {
+  return isRecord(value) && typeof field(value, "ok") === "boolean";
+}
+
 async function unwrapWire<Value>(
-  call: Promise<
-    { ok: false; error: { code: string; message: string } } | { ok: true; value: unknown }
-  >,
+  call: Promise<RemoteResult<unknown>>,
   schema: z.ZodType<Value>,
 ): Promise<Value> {
   const result = await call;
+  if (!isWireResult(result)) {
+    throw new TypeError(`runtime remote returned a malformed envelope: ${JSON.stringify(result)}`);
+  }
   if (result.ok) {
     return parseOrThrow(schema, result.value);
   }
+  // 失败那一支只把码拼进文案：这张卡的唯一消费者是 `setFailure(String(error))`
+  // （src/settings-card.ts 的三处 catch），没有人按码分流，所以不再另立一枚错误类。
   throw new Error(`${result.error.code}: ${result.error.message}`);
 }
 

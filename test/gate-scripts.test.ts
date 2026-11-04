@@ -1,17 +1,19 @@
 // 门禁脚本 —— 符号链接调用仍要执行、import 时安静、纯函数按形状判红。
 //
-// 四个脚本都是 npm 脚本入口（py:which / face:py / deps:py / coverage:floor）。它们共同的
-// 失败形态是「静默退 0」：主模块判据写成 process.argv[1] 与 import.meta.filename 字符串
+// 这些脚本都是 npm 脚本入口（py:which / face:py / deps:py / coverage:floor / gate:eol）。它们
+// 共同的失败形态是「静默退 0」：主模块判据写成 process.argv[1] 与 import.meta.filename 字符串
 // 比较时，经符号链接调用会让 main 根本不跑，Node 照样 exit 0，门禁以为自己量过了。
 
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { symlink } from "node:fs/promises";
+import { readFile, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
+
+import oxfmtConfig from "../oxfmt.config.ts";
 
 const REPO = path.resolve(import.meta.dirname, "..");
 const WINDOWS = process.platform === "win32";
@@ -20,7 +22,8 @@ const PY_LAUNCHER = "py-launcher.mjs";
 const FACE_PY = "face-py.mjs";
 const DEPS_CHECK = "deps-check.mjs";
 const COVERAGE_FLOOR = "coverage-floor.mjs";
-const MODULES = [PY_LAUNCHER, FACE_PY, DEPS_CHECK, COVERAGE_FLOOR];
+const EOL_GATE = "eol-gate.mjs";
+const MODULES = [PY_LAUNCHER, FACE_PY, DEPS_CHECK, COVERAGE_FLOOR, EOL_GATE];
 const NEWLINE = String.fromCodePoint(10);
 
 const created: string[] = [];
@@ -84,13 +87,14 @@ describe("门禁脚本", () => {
     }
   });
 
-  it.runIf(!WINDOWS)("经符号链接调用时四个脚本仍然执行", async () => {
+  it.runIf(!WINDOWS)("经符号链接调用时每个门禁脚本仍然执行", async () => {
     const dir = tempDir();
     const cases = [
       { script: PY_LAUNCHER, args: ["--which"], marker: "[py]" },
       { script: FACE_PY, args: [], marker: "[face:py]" },
       { script: DEPS_CHECK, args: [], marker: "依赖检查解释器" },
       { script: COVERAGE_FLOOR, args: [], marker: "" },
+      { script: EOL_GATE, args: [], marker: "[eol-gate]" },
     ];
     const entries = await Promise.all(
       cases.map(async (item) => {
@@ -166,5 +170,103 @@ describe("门禁脚本", () => {
     const expression = ["mod.countPy(", JSON.stringify(dir), ")"].join("");
     const result = await evalModule(FACE_PY, jsonBody(expression));
     expect(JSON.parse(result.stdout.trim())).toBe(2);
+  });
+});
+
+describe("eol-gate 的判据面", () => {
+  // 这一组只喂合成回执，不读仓库：仓库那份的实跑由 `pnpm run gate:eol`（在 check 链里）承担。
+  // 判据不能拿 `.gitattributes` 解析出来的值当期望，所以这里的期望表是手抄的字面表。
+
+  const EOL_ROWS = [
+    "i/lf    w/lf    attr/text=auto eol=lf\thost.ts",
+    "i/crlf    w/crlf    attr/text=auto eol=lf\tlib/runtime.ts",
+    "i/mixed    w/lf    attr/-text\tpy/bridge.py",
+    "i/none    w/none    attr/-text\ticon.svg",
+    "读不出制表符的一行",
+  ];
+
+  it("check-attr 回执按行读成路径到行尾的表，读不出的行不算数", async () => {
+    const receipt = [
+      "host.ts: eol: lf",
+      "probe.bat: eol: crlf",
+      "probe.ps1: eol: unspecified",
+      "",
+      "坏行",
+    ].join("\n");
+    const result = await evalModule(
+      EOL_GATE,
+      jsonBody(["mod.parseCheckAttr(", JSON.stringify(receipt), ")"].join("")),
+    );
+    expect(JSON.parse(result.stdout.trim())).toStrictEqual({
+      "host.ts": "lf",
+      "probe.bat": "crlf",
+      "probe.ps1": "unspecified",
+    });
+  });
+
+  it("索引面只点源码类里非 LF 的那两行，二进制与 i/lf 不算", async () => {
+    const result = await evalModule(
+      EOL_GATE,
+      jsonBody(["mod.indexOffenders(", JSON.stringify(EOL_ROWS), ")"].join("")),
+    );
+    expect(JSON.parse(result.stdout.trim())).toStrictEqual([
+      "i/crlf lib/runtime.ts",
+      "i/mixed py/bridge.py",
+    ]);
+  });
+
+  it("字节判那一支只点带 CRLF 的源码，非源码后缀与纯 LF 不算", async () => {
+    const entries = [
+      { file: "src/a.ts", text: "x\r\n" },
+      { file: "py/b.py", text: "y\r\n" },
+      { file: "src/c.ts", text: "z\n" },
+      { file: "assets/d.png", text: "w\r\n" },
+    ];
+    const result = await evalModule(
+      EOL_GATE,
+      jsonBody(["mod.crlfSources(", JSON.stringify(entries), ")"].join("")),
+    );
+    expect(JSON.parse(result.stdout.trim())).toStrictEqual(["src/a.ts", "py/b.py"]);
+  });
+
+  it("规则字面表缺哪条就点名哪条", async () => {
+    const mainRule = "* text=auto eol=lf";
+    const intact = ["# 注释", mainRule, "*.bat text eol=crlf", "*.cmd text eol=crlf", ""].join(
+      "\n",
+    );
+    const flipped = intact.replace(mainRule, "* text=auto eol=crlf");
+    const intactResult = await evalModule(
+      EOL_GATE,
+      jsonBody(["mod.missingRules(", JSON.stringify(intact), ")"].join("")),
+    );
+    const flippedResult = await evalModule(
+      EOL_GATE,
+      jsonBody(["mod.missingRules(", JSON.stringify(flipped), ")"].join("")),
+    );
+    expect(JSON.parse(intactResult.stdout.trim())).toStrictEqual([]);
+    expect(JSON.parse(flippedResult.stdout.trim())).toStrictEqual([mainRule]);
+  });
+});
+
+describe("格式化工具的配置面", () => {
+  it("oxfmt.config.ts 的每个键都还在 oxfmt 自己的 schema 里", async () => {
+    // oxfmt 对认不出的键是静默忽略，而 `satisfies OxfmtConfig` 也拦不住改名（那个类型允许额外
+    // 属性：实测把 endOfLine 写成 endofLine 照常过 tsc）。所以键名要拿第三方发布的那份 schema
+    // 比一遍——改名与拼错红在这一句，而不是等 `fmt:check` 报一堆看不懂的意外差异。
+    const schemaPath = path.join(REPO, "node_modules", "oxfmt", "configuration_schema.json");
+    const schema = JSON.parse(await readFile(schemaPath, "utf8")) as {
+      properties?: Record<string, unknown>;
+    };
+    const known = Object.keys(schema.properties ?? {});
+    // 空集的 schema 会让「键都在里面」变成真空通过，先要求它确实读到过一张表。
+    expect(known.length).toBeGreaterThan(0);
+    const config = oxfmtConfig;
+    expect(Object.keys(config).toSorted()).toStrictEqual(["endOfLine", "ignorePatterns"]);
+    for (const key of Object.keys(config)) {
+      expect(known).toContain(key);
+    }
+    // 两条不变量的内容：键名对而值漂了，也要在这里红，而不是只红在格式检查上。
+    expect(config.endOfLine).toBe("lf");
+    expect(config.ignorePatterns).toContain("bin/**");
   });
 });

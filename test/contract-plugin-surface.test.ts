@@ -24,6 +24,13 @@ import { describe, expect, it } from "vitest";
 
 const REPO = path.resolve(import.meta.dirname, "..");
 
+/** 设置卡那两份客户端源码。 */
+const CLIENT_FILES = ["src/client-entry.ts", "src/settings-card.ts"];
+
+/** 客户端与宿主各自的 inject 声明锚点。 */
+const HOST_INJECT_MARKER = "export const inject =";
+const CLIENT_INJECT_MARKER = "const inject =";
+
 /**
  * cordis 自带的成员名：这些不需要声明注入。
  *
@@ -55,13 +62,14 @@ const CORDIS_BUILTINS = new Set([
 ]);
 
 /**
- * 摘掉注释与字符串，只留真正的代码用法。
+ * 消费 `index` 处那一处注释。
  *
  * 顺序要紧：先摘字符串再摘 `//` 行注释，否则 URL（``https://``）里的那个 `//` 会把整行
  * 吃掉，而那一行可能正好有真的 `ctx.xxx`。
  *
  * @param source - 源码
- * @returns 只剩代码的文本
+ * @param index - 注释开头的位置
+ * @returns 注释之后的下标，以及顶上它的替身文本（行注释留一个换行，块注释留一个空格）
  */
 function consumeComment(source: string, index: number): { at: number; text: string } {
   const isLine = source.startsWith("//", index);
@@ -99,6 +107,37 @@ function consumeQuoted(source: string, index: number): number {
 }
 
 /**
+ * 只摘注释，字符串原样留着。
+ *
+ * 给 `ctx.get("name")` 那一类判据用：名字就写在引号里，整段摘掉就读不到了；而注释里的那一行
+ * 必须摘 —— 判据的原则是「只取代码用法」，被注释掉的一行不算用法。
+ *
+ * @param source - 源码
+ * @returns 没有注释的文本
+ */
+function stripCommentsOnly(source: string): string {
+  const out: string[] = [];
+  let index = 0;
+  while (index < source.length) {
+    const char = source[index] ?? "";
+    const after = source[index + 1];
+    if (char === "/" && (after === "/" || after === "*")) {
+      const { at, text } = consumeComment(source, index);
+      out.push(text);
+      index = at;
+    } else if (char === '"' || char === "'" || char === "`") {
+      const end = consumeQuoted(source, index);
+      out.push(source.slice(index, end));
+      index = end;
+    } else {
+      out.push(char);
+      index += 1;
+    }
+  }
+  return out.join("");
+}
+
+/**
  * 只留代码：注释与字符串（含模板）整段摘掉。
  *
  * @param source - 源码
@@ -133,26 +172,41 @@ function stripCommentsAndStrings(source: string): string {
  * @param source - 源码
  * @param marker - 锚点前面的部分（如 `export const inject =`）
  * @returns 声明的服务名
- * @throws 找不到那个字面量
+ * @throws 锚点或方括号缺失、含展开写法，或一个名字都没读到
  */
 function listAfter(source: string, marker: string): string[] {
   const start = source.indexOf(marker);
-  const open = source.indexOf("[", start);
-  const close = source.indexOf("]", open);
-  if (start === -1 || open === -1 || close === -1) {
-    throw new Error(`源码里找不到 ${marker} [...] 这个数组字面量`);
+  if (start === -1) {
+    throw new Error(`源码里找不到 ${marker}`);
   }
-  return Array.from(
-    source.slice(open + 1, close).matchAll(/"(?<name>\w+)"/gu),
+  const open = source.indexOf("[", start);
+  if (open === -1) {
+    throw new Error(`${marker} 后面找不到数组的起始方括号`);
+  }
+  const close = source.indexOf("]", open);
+  if (close === -1) {
+    throw new Error(`${marker} 的数组字面量没有收尾的方括号`);
+  }
+  const body = source.slice(open + 1, close);
+  if (body.includes("...")) {
+    throw new Error(`${marker} 的数组里出现展开写法，交回的会是截断清单，本判据的读取要一起改`);
+  }
+  const names = Array.from(
+    body.matchAll(/["'`](?<name>\w+)["'`]/gu),
     (item) => item.groups?.["name"] ?? "",
   );
+  if (names.length === 0) {
+    // 空清单在这条门禁里与「声明全都没人用」逐字相同，不能当成正常结果交回去。
+    throw new Error(`${marker} 的数组字面量里一个名字都没读到`);
+  }
+  return names;
 }
 
 /**
- * 取一批源码里实际读到的 `ctx.<name>`（注释与字符串里的不算）。
+ * 把一个名字收进集合：空串与 cordis 自带的成员不算服务。
  *
- * @param sources - 源码文本
- * @returns 服务名集合
+ * @param into - 目标集合
+ * @param name - 读到的名字，可能是 undefined
  */
 function collect(into: Set<string>, name: string | undefined): void {
   if (name !== undefined && name !== "" && !CORDIS_BUILTINS.has(name)) {
@@ -173,8 +227,10 @@ function collect(into: Set<string>, name: string | undefined): void {
 function touchedServices(sources: readonly string[]): Set<string> {
   const out = new Set<string>();
   const dot = /#?\bctx\.(?<name>[a-zA-Z]\w*)/gu;
+  // 右侧必须就是 ctx：后面紧跟 `.` 或字母算别的表达式（`const { marker } = ctx.get("svc")`
+  // 里的 marker 不是服务名，收进来会让「少声明」报一个根本不存在的缺失服务）。
   const destructured =
-    /(?:const|let|var)\s*\{\s*(?<names>[^{}]*?)\s*\}\s*=\s*(?:this\.)?#?[\w.]*\bctx\b/gu;
+    /(?:const|let|var)\s*\{\s*(?<names>[^{}]*?)\s*\}\s*=\s*(?:this\.)?#?ctx(?![\w.])/gu;
   for (const source of sources) {
     const code = stripCommentsAndStrings(source);
     for (const match of code.matchAll(dot)) {
@@ -192,8 +248,11 @@ function touchedServices(sources: readonly string[]): Set<string> {
 /**
  * 取 `ctx.get("<name>")` 那一类可选读取。
  *
- * 可选服务按上游约定走 `ctx.get(name)`（拓扑无关的全局存储），**不该**写进 inject；这里从
- * 原文取，因为字符串里的名字正是判据本身。
+ * 可选服务按上游约定走 `ctx.get(name)`（拓扑无关的全局存储），**不该**写进 inject。名字写在
+ * 引号里，所以这一趟保留字符串；但注释必须摘 —— 原先直接在原文上匹配，与被本文件开头否掉的
+ * 「读注释里的说法」同一形状：被注释掉的一行 `// ctx.get("web")` 会被当成真实用法，于是
+ * 「多声明」那侧可以靠一句注释豁免掉一个其实没人读的 inject。剩下的已知缺口只有一种：日志
+ * 文案里原样写出 `ctx.get("x")` 这么一串。
  *
  * @param sources - 源码文本
  * @returns 可选服务名
@@ -201,7 +260,8 @@ function touchedServices(sources: readonly string[]): Set<string> {
 function optionalServices(sources: readonly string[]): Set<string> {
   const out = new Set<string>();
   for (const source of sources) {
-    for (const match of source.matchAll(/ctx\.get\(\s*"(?<name>\w+)"/gu)) {
+    const code = stripCommentsOnly(source);
+    for (const match of code.matchAll(/#?\bctx\.get\(\s*"(?<name>\w+)"/gu)) {
       collect(out, match.groups?.["name"]);
     }
   }
@@ -219,7 +279,6 @@ async function readAll(names: readonly string[]): Promise<string[]> {
 }
 
 /** Host 侧的全部实现文件（apply 与它交给的 lib）。 */
-/** Host 侧的全部实现文件（apply 与它交给的 lib）。 */
 const HOST_FILES = [
   "host.ts",
   "lib/sidecar.ts",
@@ -228,8 +287,6 @@ const HOST_FILES = [
   "lib/web-provider.ts",
   "lib/search-provider.ts",
 ];
-
-/** 上面那行重复声明的占位（下面清掉）。 */
 
 /**
  * 取 Host 侧的声明面与使用面。
@@ -243,11 +300,68 @@ async function hostSurface(): Promise<{
 }> {
   const sources = await readAll(HOST_FILES);
   return {
-    declared: new Set(listAfter(sources[0] ?? "", "export const inject =")),
+    declared: new Set(listAfter(sources[0] ?? "", HOST_INJECT_MARKER)),
     touched: touchedServices(sources),
     optional: optionalServices(sources),
   };
 }
+
+describe("判据本身：读代码，不读注释与文案", () => {
+  it("模板插值里没有 ctx 读服务：那条形状扫描器看不见，出现就要先改判据", async () => {
+    // stripCommentsAndStrings 把整段模板（含 `${...}`）当文案丢掉，所以插值里真读服务时
+    // 「少声明」会虚假通过。现量：本包源码里没有这种写法。有人写出来时这条要响，
+    // 而不是留一个静默的洞。
+    const files = [...HOST_FILES, ...CLIENT_FILES];
+    const offenders: string[] = [];
+    const sources = await readAll(files);
+    // 不带 g：带 g 的 test() 会留 lastIndex，八份文件里第二份起就可能漏判。
+    const interpolated = /\$\{[^}]*\bctx\.[a-zA-Z]/u;
+    for (const [name, text] of files.map((file, at) => [file, sources[at] ?? ""] as const)) {
+      if (interpolated.test(text)) {
+        offenders.push(name);
+      }
+    }
+    expect(
+      offenders,
+      `这些文件在模板插值里读服务，扫描器看不见：${offenders.join(", ")}`,
+    ).toStrictEqual([]);
+  });
+
+  it("注释里的 ctx.get 与 ctx.web 都不算用法", () => {
+    const source = ['// const web = ctx.get("web");', "/* ctx.jobs 在文档里 */"].join("\n");
+    expect([...optionalServices([source])]).toStrictEqual([]);
+    expect([...touchedServices([source])]).toStrictEqual([]);
+    const real = 'const remote = ctx.get("remote");\n// ctx.get("web");';
+    expect([...optionalServices([real])]).toStrictEqual(["remote"]);
+  });
+
+  it("解构的右侧不是 ctx 本身时不算服务", () => {
+    const source = [
+      "const { subprocess } = this.#ctx;",
+      'const { marker } = ctx.get("svc");',
+      "const { value } = header.config;",
+    ].join("\n");
+    expect([...touchedServices([source])]).toStrictEqual(["subprocess"]);
+  });
+
+  it("声明清单读不出来就抛，不交回一份看着正常的空名单", () => {
+    expect(() => {
+      listAfter("const nothingHere = 1;", CLIENT_INJECT_MARKER);
+    }).toThrow(/找不到 const inject =/u);
+    expect(() => {
+      listAfter("const inject = nothing;", CLIENT_INJECT_MARKER);
+    }).toThrow(/起始方括号/u);
+    expect(() => {
+      listAfter('const inject = [...baseInject, "tools"];', CLIENT_INJECT_MARKER);
+    }).toThrow(/展开写法/u);
+    expect(() => {
+      listAfter("const inject = [];", CLIENT_INJECT_MARKER);
+    }).toThrow(/一个名字都没读到/u);
+    expect(
+      listAfter('const inject = ["slots", "configForms"];', CLIENT_INJECT_MARKER),
+    ).toStrictEqual(["slots", "configForms"]);
+  });
+});
 
 describe("注入面：声明的服务与真正摸到的服务必须一致", () => {
   it("宿主侧少声明：摸到的每个服务都在 inject 里（漏了就是运行时抛）", async () => {
@@ -267,16 +381,20 @@ describe("注入面：声明的服务与真正摸到的服务必须一致", () =
   });
 
   it("客户端少声明：设置卡摸到的每个服务都在它的 inject 里", async () => {
-    const [entry = "", card = ""] = await readAll(["src/client-entry.ts", "src/settings-card.ts"]);
-    const declared = new Set(listAfter(entry, "const inject ="));
-    const missing = [...touchedServices([entry, card])].filter((name) => !declared.has(name));
+    const [entry = "", card = ""] = await readAll(CLIENT_FILES);
+    const declared = new Set(listAfter(entry, CLIENT_INJECT_MARKER));
+    const touched = touchedServices([entry, card]);
+    const missing = [...touched].filter((name) => !declared.has(name));
     expect(missing, `客户端少声明注入：${missing.join(", ")}`).toStrictEqual([]);
+    // 与宿主侧对称：缺这一句时，扫描器整体失灵会以「空集等于空集」虚假通过。
+    expect(touched.size, "客户端一个服务都没扫到，说明判据本身失效了").toBeGreaterThan(0);
   });
 
   it("客户端多声明：设置卡的 inject 里没有用不到的服务", async () => {
-    const [entry = "", card = ""] = await readAll(["src/client-entry.ts", "src/settings-card.ts"]);
-    const declared = new Set(listAfter(entry, "const inject ="));
+    const [entry = "", card = ""] = await readAll(CLIENT_FILES);
+    const declared = new Set(listAfter(entry, CLIENT_INJECT_MARKER));
     const touched = touchedServices([entry, card]);
+    expect(touched.size, "客户端一个服务都没扫到，说明判据本身失效了").toBeGreaterThan(0);
     const unused = [...declared].filter((name) => !touched.has(name));
     expect(unused, `客户端多声明注入：${unused.join(", ")}`).toStrictEqual([]);
   });

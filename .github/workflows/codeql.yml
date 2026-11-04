@@ -31,8 +31,9 @@ jobs:
     permissions:
       # 上传 SARIF 到 code scanning 面板所必需。
       security-events: write
-      # CodeQL 查询包要读 registry 上的 pack。
-      packages: read
+      # 不写 packages: read——本文件没有任何 packs / queries 输入，init 与 analyze 只用
+      # codeql-action 自带的默认套件。官方 code scanning 起始工作流把这枚权限标为
+      # 「required to fetch internal or private CodeQL packs」，本仓没有那一类 pack，它就是多给的。
       contents: read
     strategy:
       fail-fast: false
@@ -47,10 +48,19 @@ jobs:
           # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
           persist-credentials: false
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
         with:
           languages: ${{ matrix.language }}
+      # 来自 fork 的 pull_request 里 GITHUB_TOKEN 一律是只读的，job 上声明的
+      # `security-events: write` 会被降级。失败形态在钉住的那一版源码里可读：
+      # codeql-action v4.39.1 的 src/upload-lib.ts 收到 403 后先 core.warning、紧接着无条件
+      # throw，src/analyze-action.ts 的 catch 再 core.setFailed —— 也就是这一步会红，
+      # 不会「降级成告警」。所以这里对 fork PR 容错，让分析真的跑一遍（结果留在日志里），
+      # 同仓 PR / push / schedule 的分析失败仍判红。
+      # 整条 job 或整步跳过都不行：被跳过的必检在分支保护里记作通过，外部贡献的代码就变成
+      # 「未扫描即绿」，合并前盲区原样留着。
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+        uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
         with:
           category: /language:${{ matrix.language }}

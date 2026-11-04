@@ -31,6 +31,9 @@ export function encodeFrame(value: unknown): string {
   // JSON.stringify 对 undefined、函数、Symbol 不抛错而是返回 undefined：直接把它当
   // string 返回会在管道里写出字面量 "undefined" 或触发难以排查的写失败。序列化失败
   // 必须在这里就炸出来。
+  // 抑制只落在这一行而不是整个文件：这条规则是本仓清死分支的主要手段，文件级豁免会让
+  // 今后新增的真·永假分支一起没人管。
+  // oxlint-disable-next-line typescript/no-unnecessary-condition -- 声明是 string，运行时可 undefined
   if (encoded === undefined) {
     throw new FrameError(FRAME_ERROR_KINDS.unparsableJson, "frame is not JSON-serialisable");
   }
@@ -71,8 +74,10 @@ export function decodeFrame(line: string): Record<string, unknown> {
  * 与 Python 侧的 8 MiB **字节**上限数值相同但口径不同：同样的数值对 CJK 文本，这里的
  * 字符数对应更多字节，所以本侧的兜底比对端更宽 —— 它只需要拦住「对端只吐不带换行的
  * 内容、缓冲按到达速度一路增长」这条失控路径，精确的协议上限由按字节判的那一侧执行。
+ * 名字跟着本侧真正比较的单位写，不沿用对面的 BYTES：两侧同名同值却不同单位，读数会被
+ * 当成同一个口径比对。
  */
-const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+export const MAX_FRAME_CHARS = 8 * 1024 * 1024;
 
 /** 增量切帧器：喂进任意切片的文本，吐出完整的一行。 */
 export class FrameSplitter {
@@ -98,12 +103,12 @@ export class FrameSplitter {
     while (newlineAt >= 0) {
       const line = this.#buffer.slice(0, newlineAt);
       this.#buffer = this.#buffer.slice(newlineAt + 1);
-      if (line.length > MAX_FRAME_BYTES) {
+      if (line.length > MAX_FRAME_CHARS) {
         // 超长帧与换行落在同一个 chunk 时，只看残片会漏掉它：切行已经把它移出缓冲区。
         this.#buffer = "";
         throw new FrameError(
           FRAME_ERROR_KINDS.frameTooLarge,
-          `a frame went over ${MAX_FRAME_BYTES} bytes`,
+          `a frame went over ${MAX_FRAME_CHARS} characters`,
         );
       }
       if (line.trim().length > 0) {
@@ -111,13 +116,13 @@ export class FrameSplitter {
       }
       newlineAt = this.#buffer.indexOf("\n");
     }
-    if (this.#buffer.length > MAX_FRAME_BYTES) {
+    if (this.#buffer.length > MAX_FRAME_CHARS) {
       this.#buffer = "";
       // 长度超限按独立的分类抛，而不是「不是合法 JSON」：下游若按 kind 决定丢弃连接或
       // 重试，把限流一类当成对端协议损坏会走向完全相反的行动。
       throw new FrameError(
         FRAME_ERROR_KINDS.frameTooLarge,
-        `a frame went over ${MAX_FRAME_BYTES} bytes without a newline`,
+        `a frame went over ${MAX_FRAME_CHARS} characters without a newline`,
       );
     }
     return lines;

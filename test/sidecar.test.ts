@@ -11,7 +11,8 @@ import path from "node:path";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { Readable, Writable } from "node:stream";
-import { describe, expect, it } from "vitest";
+import type { Context } from "@deepseek-ai/cordis";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   createSidecar,
   PROTOCOL_VERSION,
@@ -68,18 +69,21 @@ interface FakeBehaviour {
   /** 在 spawn 之前卡住一段时间，用来把 dispose 挤进启动途中那个窗口。 */
   spawnDelayMs?: number;
   /**
-   * 进程结束后 done 晚多久兑现。用来把「旧代退出」排到新一代已经拉起来之后 ——
-   * 那正是旧代事件误拆新进程的时序。
+   * 这一代的 `done` 等这一位兑现之后才落地。用来把「旧代退出」显式排到测试观察到
+   * 新一代已经拉起来之后 —— 那正是旧代事件误拆新进程的时序，靠毫秒猜不稳。
    */
-  exitDelayMs?: number;
-  /** waitForExit 卡住一段时间，把新一代的 spawn 挤进旧代拆除的窗口里。 */
-  reapDelayMs?: number;
+  exitGate?: Promise<unknown>;
+  /** `waitForExit` 等这一位兑现才返回，把新一代的 spawn 挤进旧代拆除的窗口里。 */
+  reapGate?: Promise<unknown>;
 }
 
-const fakeCtx = (
-  behaviour: FakeBehaviour,
-  spawned: { count: number; last?: FakeHandle },
-): unknown => ({
+/** 每条用例记录「拉起过几代进程、最新那一代是哪枚 handle」的那只袋子。 */
+interface SpawnedHandle {
+  count: number;
+  last?: FakeHandle;
+}
+
+const fakeCtx = (behaviour: FakeBehaviour, spawned: SpawnedHandle): unknown => ({
   subprocess: {
     resolveExecutable: async (command: string): Promise<string> => {
       if (behaviour.spawnDelayMs !== undefined) {
@@ -141,8 +145,8 @@ const fakeCtx = (
         // 存进句柄而不是当场 await，.then 链会被 prefer-await-to-then 判掉。
         done: (async (): Promise<{ exitCode: number; signal: null }> => {
           await once(stdout, "end");
-          if (behaviour.exitDelayMs !== undefined) {
-            await delay(behaviour.exitDelayMs);
+          if (behaviour.exitGate !== undefined) {
+            await behaviour.exitGate;
           }
           if (behaviour.crashOnExit === true) {
             throw new Error("sidecar died");
@@ -156,8 +160,8 @@ const fakeCtx = (
           }
         },
         waitForExit: async (): Promise<boolean> => {
-          if (behaviour.reapDelayMs !== undefined) {
-            await delay(behaviour.reapDelayMs);
+          if (behaviour.reapGate !== undefined) {
+            await behaviour.reapGate;
           }
           if (behaviour.failExit === true) {
             throw new Error("cannot reap");
@@ -196,6 +200,35 @@ function options(overrides: Partial<SidecarOptions> = {}): SidecarOptions {
   };
 }
 
+/** 本文件里活到当前的客户端；用例自己 dispose 之外的兜底靠这张表。 */
+const live: SidecarClient[] = [];
+
+/** 收尾那条用例读的帧记录：由「不 dispose」那条上的客户端在 afterEach 里填。 */
+const drainedFrames: string[] = [];
+
+/**
+ * 建一个客户端并登记进 `live`。
+ *
+ * 用例结尾那句 `await client.dispose()` 只在自己没抛错时才跑到：断言一红，假 handle、
+ * 计时器与（那组真进程用例的）Python 子进程就留给后面的用例和 CI 的进程树。登记之后由
+ * 下面的 `afterEach` 兜住。`dispose()` 自己有 `#stopped` 判重，两处都调没有副作用，
+ * 所以用例内那句照旧保留 —— 有几条断言的就是「调完之后再调仍然安静」。
+ *
+ * @param runtime - 交给客户端的 runtime 上下文（这里是假 ctx 或真 ctx）
+ * @param config - 客户端配置
+ * @returns 已登记的客户端
+ */
+function makeClient(runtime: Context, config: SidecarOptions): SidecarClient {
+  const client = new SidecarClient(runtime, config);
+  live.push(client);
+  return client;
+}
+
+/** 把上一条用例遗留的客户端收干净：断言抛错时，用例自己那句 dispose 不会跑到。 */
+async function drainLive(): Promise<void> {
+  await Promise.all(live.splice(0).map((client) => client.dispose()));
+}
+
 describe("asText", () => {
   it("非空白字符串原样返回；空白串算取不到，落兜底", () => {
     expect(asText("boom", "fallback")).toBe("boom");
@@ -210,6 +243,19 @@ describe("asText", () => {
     expect(asText(1n, "fallback")).toBe("1");
     expect(asText({ message: "m" }, "fallback")).toBe("fallback");
     expect(asText(undefined, "fallback")).toBe("fallback");
+  });
+});
+
+describe("错误类的参数位（SidecarError）", () => {
+  it("只带 details 时不必给 cause 占位，两位也不会互相吞掉", () => {
+    // `ErrorOptions` 只有一个可选成员，`Record<string, unknown>` 赋得进去：两位一旦记反，
+    // 编译器不报错，details 会被当成 cause 静默吞掉。所以签名把 details 排在前，这里钉住。
+    const error = new SidecarError("ACTION_FAILED", "动作失败", { index: 2 });
+    expect(error.details).toStrictEqual({ index: 2 });
+    expect(error.cause).toBeUndefined();
+    const withCause = new SidecarError("ACTION_FAILED", "动作失败", { index: 3 }, { cause: "raw" });
+    expect(withCause.details).toStrictEqual({ index: 3 });
+    expect(withCause.cause).toBe("raw");
   });
 });
 
@@ -270,9 +316,11 @@ describe("parseCapabilities", () => {
 });
 
 describe("sidecar client 与假 runtime", () => {
+  afterEach(drainLive);
+
   it("握手后拿到能力，并把请求结果原样返回", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({ reply: okReply }, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ reply: okReply }, spawned) as never, options());
     const caps = await client.ensureStarted();
     expect(caps.scrapling).toBe(true);
     expect(client.alive).toBe(true);
@@ -283,8 +331,8 @@ describe("sidecar client 与假 runtime", () => {
 
   it("闸门交回归一串时，发往子进程的是归一串而不是入参", async () => {
     const sent: (string | undefined)[] = [];
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           reply: okReply,
@@ -307,8 +355,8 @@ describe("sidecar client 与假 runtime", () => {
 
   it("闸门交回与入参相同的串时沿用原串", async () => {
     const sent: (string | undefined)[] = [];
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           reply: okReply,
@@ -330,8 +378,8 @@ describe("sidecar client 与假 runtime", () => {
   it("crawl 的 sitemapUrl 与 feedUrl 同样过闸门，判否就不写管道", async () => {
     const seen: string[] = [];
     const sent: (Record<string, unknown> | undefined)[] = [];
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           reply: okReply,
@@ -369,8 +417,8 @@ describe("sidecar client 与假 runtime", () => {
     // 解析会把一个纯本地操作变成需要联网、还会被私网拦截的操作（F2）。
     const seen: string[] = [];
     const sent: (Record<string, unknown> | undefined)[] = [];
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           reply: okReply,
@@ -408,8 +456,8 @@ describe("sidecar client 与假 runtime", () => {
 
   it("select 帧上若另带 sitemapUrl/feedUrl，这两个仍要过闸门（J2）", async () => {
     // 只有顶层 url 是「基准」；其它 URL 字段一律是 sidecar 会真去请求的目标。
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx({ reply: okReply }, spawned) as never,
       options({
         urlGate: async (url: string): Promise<string> => {
@@ -429,8 +477,8 @@ describe("sidecar client 与假 runtime", () => {
 
   it("闸门归一化嵌套 URL 后，发往子进程的是归一串而不是入参", async () => {
     const sent: (Record<string, unknown> | undefined)[] = [];
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           reply: okReply,
@@ -455,16 +503,16 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("进程惰性拉起：只构造不发请求不会 spawn", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({}, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({}, spawned) as never, options());
     expect(spawned.count).toBe(0);
     expect(client.alive).toBe(false);
     await client.dispose();
   });
 
   it("重复 ensureStarted 只 spawn 一次", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({ reply: okReply }, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ reply: okReply }, spawned) as never, options());
     await client.ensureStarted();
     await client.ensureStarted();
     expect(spawned.count).toBe(1);
@@ -472,8 +520,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("对端回 ok:false 时把错误码、消息与 details 带出来", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           reply: (id) => ({
@@ -503,11 +551,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("对端不回应时按超时拆掉进程", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
-      fakeCtx({}, spawned) as never,
-      options({ requestTimeoutMs: 80 }),
-    );
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({}, spawned) as never, options({ requestTimeoutMs: 80 }));
     await client.ensureStarted();
     await expect(client.call("ping")).rejects.toThrow(/timed out/u);
     expect(client.alive).toBe(false);
@@ -516,8 +561,8 @@ describe("sidecar client 与假 runtime", () => {
 
   it("信号已中止时不发请求", async () => {
     const sent: string[] = [];
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           reply: okReply,
@@ -540,16 +585,20 @@ describe("sidecar client 与假 runtime", () => {
     ).rejects.toThrow(/aborted/u);
     // 一帧都不能写进管道：中止时进程正在被拆掉，写进去既不报错也不触发 error，只是静默丢弃。
     expect(sent).toStrictEqual([]);
-    // 也不能在 #pending 里留下一条已结清的条目 —— 那会一直占着 id，直到下一次 teardown。
-    const again = new SidecarClient(fakeCtx({ reply: okReply }, spawned) as never, options());
-    await expect(again.call("ping")).resolves.toStrictEqual({ pong: true });
+    // 「不在 #pending 里留下一条已结清的条目」在类外没有可读的面（`#pending` 是私有字段，
+    // 对外只有 capabilities 与 alive），所以这里判的是同一次中止之后**这只客户端**还能不能
+    // 重新起一代并把请求结清 —— 半拆的簿记（handle 没清、启动卡在中间态）在这里露出来。
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    // 还是那一代在服务：中止发生在写出之前，请求根本没进管道，进程自然不该被换掉。
+    // 换代会在这里露出来（半拆的簿记逼着重新拉起），所以这一位与上一句一起判「没留下
+    // 中间态」，而不是另起一只客户端去读它自己那张表。
+    expect(spawned.count).toBe(1);
     await client.dispose();
-    await again.dispose();
   });
 
   it("握手超时报错而不是永远挂着", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx({ ready: null, reply: okReply }, spawned) as never,
       options({ handshakeTimeoutMs: 80 }),
     );
@@ -558,8 +607,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("协议版本对不上时报错并拆掉进程", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         { ready: { event: "ready", protocol: 99, capabilities: {} }, reply: okReply },
         spawned,
@@ -571,8 +620,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("对端送来不可解析的帧时跳过它，后续请求照常", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           rawReply: (id) => (id === "h1" ? ["not json at all\n"] : undefined),
@@ -589,8 +638,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("对端送来没有 id 的帧时被忽略，而不是误配给在途请求", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           rawReply: (id) => (id === "h1" ? ['{"ok":true,"result":null}\n'] : undefined),
@@ -609,9 +658,9 @@ describe("sidecar client 与假 runtime", () => {
   it("事件回调抛错只记一条日志，不拆掉常驻进程", async () => {
     // 回调是调用方代码。让它的异常沿 pumpFrames 的 onError 走，就会被当成 sidecar 崩溃
     // 而 #teardown —— 一个回调 bug 不该带走同一进程上所有在途请求。
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const spawned: SpawnedHandle = { count: 0 };
     const lines: string[] = [];
-    const client = new SidecarClient(
+    const client = makeClient(
       fakeCtx(
         {
           rawReply: (id) => (id === "h1" ? ['{"event":"progress","done":1}\n'] : undefined),
@@ -638,16 +687,16 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("销毁一个从未启动的客户端不会抛", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({}, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({}, spawned) as never, options());
     await expect(client.dispose()).resolves.toBeUndefined();
     expect(spawned.count).toBe(0);
   });
 
   it("stderr 内容会被转发到日志回调", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const spawned: SpawnedHandle = { count: 0 };
     const lines: string[] = [];
-    const client = new SidecarClient(fakeCtx({ reply: okReply }, spawned) as never, {
+    const client = makeClient(fakeCtx({ reply: okReply }, spawned) as never, {
       ...options(),
       log: (line) => {
         lines.push(line);
@@ -667,7 +716,7 @@ describe("sidecar client 与假 runtime", () => {
 
   it("对端把 error 写成非对象时也报得出可读信息", async () => {
     const spawned = { count: 0 };
-    const client = new SidecarClient(
+    const client = makeClient(
       fakeCtx(
         { reply: (id) => ({ id, ok: false, error: "plain string failure" }) },
         spawned,
@@ -679,8 +728,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("capabilities 在握手前是 undefined，握手后是能力对象", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({ reply: okReply }, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ reply: okReply }, spawned) as never, options());
     expect(client.capabilities).toBeUndefined();
     await client.ensureStarted();
     expect(client.capabilities?.scrapling).toBe(true);
@@ -688,8 +737,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("响应里的未知 id 被忽略，不会误配给在途请求", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           rawReply: (id) =>
@@ -705,12 +754,41 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
-  it("调用途中才 abort 也能把请求作废", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
-      fakeCtx({}, spawned) as never,
-      options({ requestTimeoutMs: 5000 }),
+  it("并发请求按请求 id 各自兑现，载荷不会派给别的调用方", async () => {
+    const spawned: SpawnedHandle = { count: 0 };
+    // 请求 id 由客户端自己发号（h1、h2…），调用方事先不知道；所以用出站帧建一张
+    // 「id → 这一笔的 index」的表，回帧回显 id，最后按每个调用方拿到的 id 反查 index。
+    const indexById = new Map<string, unknown>();
+    const client = makeClient(
+      fakeCtx(
+        {
+          reply: (id) => ({ id, ok: true, result: { echo: id } }),
+          onFrame: (frame): void => {
+            // 只登记这八笔：客户端在握手前后自己写的帧不算在内。
+            if (frame.method === "ping") {
+              indexById.set(frame.id, frame.params?.["index"]);
+            }
+          },
+        },
+        spawned,
+      ) as never,
+      options(),
     );
+    const answers = await Promise.all(
+      Array.from({ length: 8 }, async (_unused, index) => client.call("ping", { index })),
+    );
+    // 只断 `toHaveLength(8)` 时，把响应派给错误的在途请求也照样过；这里要求每个调用方
+    // 反查回来的 index 正是自己那一个。id 若重复发号，`indexById.size` 先不够 8。
+    expect(indexById.size).toBe(8);
+    expect(answers.map((answer) => indexById.get((answer as { echo: string }).echo))).toStrictEqual(
+      [0, 1, 2, 3, 4, 5, 6, 7],
+    );
+    await client.dispose();
+  });
+
+  it("调用途中才 abort 也能把请求作废", async () => {
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({}, spawned) as never, options({ requestTimeoutMs: 5000 }));
     await client.ensureStarted();
     const controller = new AbortController();
     const pending = client.call("ping", {}, { signal: controller.signal });
@@ -723,8 +801,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("不设超时（timeoutMs: null）的请求被取消时，结算不依赖定时器", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx(
         {
           reply: (id: string, method: string) =>
@@ -744,9 +822,40 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
+  it("不设超时的请求靠回帧结算：清定时器那一步按判空走完", async () => {
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ reply: okReply }, spawned) as never, options());
+    await client.ensureStarted();
+    // 爬虫那类调用就走这一档（lib/tools.ts 的 timeoutMs: null）：条目没有定时器，
+    // #onFrame 里的 clearTimeout 分支是真实路径，不能被当成不可达。
+    await expect(client.call("ping", {}, { timeoutMs: null })).resolves.toStrictEqual({
+      pong: true,
+    });
+    expect(client.alive).toBe(true);
+    await client.dispose();
+  });
+
+  it("日志回调抛错既不掀翻 stderr 监听，也不让进程被拆", async () => {
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ reply: okReply }, spawned) as never, {
+      ...options(),
+      log: (): never => {
+        throw new Error("logger bug");
+      },
+    });
+    await client.ensureStarted();
+    // stderr 的 data 监听是裸监听：#log 不兜住这一抛就是未捕获异常。
+    spawned.last?.stderr.push("bridge: 一行诊断\n");
+    await delay(0);
+    // 回帧路径里也有 #log（坏帧与未知 id），一句打印的 bug 不该让进程收摊。
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    expect(client.alive).toBe(true);
+    await client.dispose();
+  });
+
   it("首个调用方在启动途中取消：不拆共享进程，后来的调用照常", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       // 把 spawn 前的解析拖慢，让取消落在「启动途中」而不是进入时已中止。
       fakeCtx(
         {
@@ -771,8 +880,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("取消一个请求不会拆掉常驻进程，也不会连累并行的其它请求", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       // slow 那个故意不回，等它被取消；ping 正常回，才看得出取消没有连累它。
       fakeCtx(
         {
@@ -800,8 +909,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("超时仍回收进程 —— 超时的含义是对端可能已经不响应了", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       // 不回任何帧：请求会一直挂着直到超时。
       fakeCtx({ reply: () => null }, spawned) as never,
       options({ requestTimeoutMs: 60 }),
@@ -813,8 +922,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("卸载正好落在启动途中时，刚出生的进程立刻被收掉，不留孤儿", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       // resolveExecutable 上卡 40ms，dispose 就在这 40ms 里跑完 —— 那时 #handle 还是空，
       // #teardown 拆不到任何东西。这条用例守的就是「别让这个进程活下来没人管」。
       fakeCtx({ spawnDelayMs: 40 }, spawned) as never,
@@ -827,16 +936,16 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("provider 没给出管道时明确报不可用", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({ noStdio: true }, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ noStdio: true }, spawned) as never, options());
     await expect(client.ensureStarted()).rejects.toThrow(/stdio/u);
     await client.dispose();
   });
 
   it("进程回收失败时只记日志，dispose 仍然正常返回", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const spawned: SpawnedHandle = { count: 0 };
     const lines: string[] = [];
-    const client = new SidecarClient(fakeCtx({ failExit: true }, spawned) as never, {
+    const client = makeClient(fakeCtx({ failExit: true }, spawned) as never, {
       ...options(),
       log: (line) => {
         lines.push(line);
@@ -848,8 +957,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("握手中途 dispose 会让握手失败而不是永远挂着", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({ ready: null }, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ ready: null }, spawned) as never, options());
     const starting = client.ensureStarted();
     // 等一拍，确保握手 waiter 已经挂上队列，再拆 —— 否则这条用例有时会退化成
     // 「dispose 先到、spawn 后到」，覆盖不到 waiter 被 reject 的那条路径。
@@ -859,8 +968,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("进程异常退出时按 crashed 拆掉并作废在途请求", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
       fakeCtx({ crashOnExit: true }, spawned) as never,
       options({ requestTimeoutMs: 5000 }),
     );
@@ -874,11 +983,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("stdout 管道报错时按 crashed 拆掉进程，少一个 error 监听就会掀翻宿主", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
-      fakeCtx({}, spawned) as never,
-      options({ requestTimeoutMs: 5000 }),
-    );
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({}, spawned) as never, options({ requestTimeoutMs: 5000 }));
     await client.ensureStarted();
     const pending = client.call("ping");
     await delay(20);
@@ -888,27 +994,36 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
-  it("stderr 管道报错同样被接住", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+  it("stderr 管道报错被接住并拆掉进程", async () => {
+    const spawned: SpawnedHandle = { count: 0 };
+    const logs: string[] = [];
+    const client = makeClient(
       fakeCtx({}, spawned) as never,
-      // 这里测的是 stderr 管道错误被接住，不是超时预算本身；100ms 足够让失败快速落地，
-      // 5000 会让用例实际等满 5s 的 SIDECAR_TIMEOUT。
-      options({ requestTimeoutMs: 100 }),
+      options({
+        log: (line): void => {
+          logs.push(line);
+        },
+      }),
     );
     await client.ensureStarted();
+    // 之后再发一次请求是测不到这条路径的：拆除已经把这一代换掉，新请求会另起一代，
+    // 它按自己的超时以 SIDECAR_TIMEOUT 落地，红绿都与 stderr 的 error 监听无关。
+    // 所以判据问在被拆的那一代身上：状态位与那句拆除日志。
     spawned.last?.stderr.emit("error", new Error("stderr pipe broke"));
     await delay(20);
-    await expect(client.call("ping")).rejects.toThrow(SidecarError);
+    expect(client.alive).toBe(false);
+    expect(
+      logs.some((line) => line.includes("stderr failed")),
+      `拆除日志里没有 stderr failed：${logs.join("\n")}`,
+    ).toBe(true);
+    // 监听少一个的话，上面那句 emit 直接变成未捕获异常（EventEmitter 对无监听 'error' 的
+    // 行为），这条用例连红带响。
     await client.dispose();
   });
 
   it("stdin 写端报错同样被接住", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
-      fakeCtx({}, spawned) as never,
-      options({ requestTimeoutMs: 5000 }),
-    );
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({}, spawned) as never, options({ requestTimeoutMs: 5000 }));
     await client.ensureStarted();
     const pending = client.call("ping");
     await delay(20);
@@ -918,17 +1033,20 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("旧代退出事件晚到时不拆掉新一代进程，也不作废新一代的在途请求", async () => {
-    // 时序：请求超时把第 1 代拆掉，而它的 done 被故意推迟兑现；拆除还卡在
-    // waitForExit 上时，下一个请求已经把第 2 代拉起来了。旧实现里那枚 done 回调
-    // 无条件 #teardown，于是晚到的「旧代已退出」会把第 2 代连同在途请求一起带走。
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    // 时序：请求超时把第 1 代拆掉，而它的 done 停在测试手里的门上；拆除还卡在
+    // waitForExit 上时，下一个请求把第 2 代拉起来。旧实现里那枚 done 回调无条件
+    // #teardown，于是晚到的「旧代已退出」会把第 2 代连同在途请求一起带走。
+    // 两道门都由测试兑现：窗口排在观察到的事件之后，不靠毫秒数猜。
+    const spawned: SpawnedHandle = { count: 0 };
     const lines: string[] = [];
-    const client = new SidecarClient(
+    const exit = Promise.withResolvers<boolean>();
+    const reap = Promise.withResolvers<boolean>();
+    const client = makeClient(
       fakeCtx(
         {
           reply: (id, method) => (method === "slow" ? null : okReply(id)),
-          exitDelayMs: 100,
-          reapDelayMs: 60,
+          exitGate: exit.promise,
+          reapGate: reap.promise,
         },
         spawned,
       ) as never,
@@ -942,50 +1060,74 @@ describe("sidecar client 与假 runtime", () => {
     await client.ensureStarted();
     const first = spawned.last!;
     await expect(client.call("slow")).rejects.toThrow(/timed out/u);
-    // 拆除正在 waitForExit 上等（reapDelayMs 还没到）—— 新一代就出生在这个窗口里。
-    await delay(10);
-    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    // 新一代就出生在旧代卡在 waitForExit 的那段窗口里。ping 自带宽裕预算：机器一忙时
+    // 它也不该被上面那档 30ms 打掉（那打掉的是一条与本时序无关的超时）。
+    await expect(client.call("ping", {}, { timeoutMs: 5000 })).resolves.toStrictEqual({
+      pong: true,
+    });
     expect(spawned.count).toBe(2);
     const second = spawned.last!;
     expect(second).not.toBe(first);
-    // 等第 1 代的 done 兑现（terminate 之后 exitDelayMs 才落地）。
-    await delay(150);
+    // 现在才放第 1 代退出。`first.done` 上客户端的处理器比这里的 await 先挂上，所以
+    // await 回来时那句 stale 判定已经写完日志（它同步跑在 #teardown 的入口）。
+    exit.resolve(true);
+    reap.resolve(true);
+    await first.done;
     expect(client.alive).toBe(true);
-    expect(lines.some((line) => line.includes("ignoring stale teardown"))).toBe(true);
-    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    expect(
+      lines.some((line) => line.includes("ignoring stale teardown")),
+      `日志里没有 stale teardown：${lines.join("\n")}`,
+    ).toBe(true);
+    await expect(client.call("ping", {}, { timeoutMs: 5000 })).resolves.toStrictEqual({
+      pong: true,
+    });
     await client.dispose();
   });
 
   it("旧代管道错误晚到时不拆掉新一代进程", async () => {
     // 管道 error 回调同样来自某一个具体进程：旧代已经退出之后，它的 stderr 错误
     // 才落地，不该据此拆掉后来才拉起来的新一代。
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
+    const spawned: SpawnedHandle = { count: 0 };
+    const lines: string[] = [];
+    const client = makeClient(
       fakeCtx(
         { reply: (id, method) => (method === "slow" ? null : okReply(id)) },
         spawned,
       ) as never,
-      options({ requestTimeoutMs: 20 }),
+      {
+        ...options({ requestTimeoutMs: 20 }),
+        log: (line) => {
+          lines.push(line);
+        },
+      },
     );
     await client.ensureStarted();
     const first = spawned.last!;
     await expect(client.call("slow")).rejects.toThrow(/timed out/u);
-    // 等第 1 代拆完，再拉第 2 代 —— 然后才让第 1 代的管道错误落地。
-    await delay(20);
-    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    // 超时处理器在作废请求之后就地清簿记（`#clearState` 跑在它自己任何 await 之前），
+    // 所以这里不必等：下一次调用出生的必然是新一代。
+    await expect(client.call("ping", {}, { timeoutMs: 5000 })).resolves.toStrictEqual({
+      pong: true,
+    });
     expect(spawned.count).toBe(2);
     first.stderr.emit("error", new Error("old stderr broke"));
-    await delay(20);
+    // 这条也不用等窗口：error 回调里的 #teardown 进门先判 origin，stale 那一句同步写出。
+    expect(
+      lines.some((line) => line.includes("ignoring stale teardown")),
+      `日志里没有 stale teardown：${lines.join("\n")}`,
+    ).toBe(true);
     expect(client.alive).toBe(true);
-    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    await expect(client.call("ping", {}, { timeoutMs: 5000 })).resolves.toStrictEqual({
+      pong: true,
+    });
     await client.dispose();
   });
 
   it("写管道已销毁时主动拆进程，并结清在途请求", async () => {
     // 已销毁的 Writable 上 write 会同步抛 ERR_STREAM_DESTROYED。这里测的是那之前的一道
     // 判据：先看 destroyed，就地拆进程 —— 在途条目都等不到回帧，只能自己回收。
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({}, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({}, spawned) as never, options());
     await client.ensureStarted();
     const gone = new Writable({
       write: (_chunk, _encoding, done) => {
@@ -1002,8 +1144,8 @@ describe("sidecar client 与假 runtime", () => {
   it("写管道同步抛错时同样收场，不把错误抛给调用方", async () => {
     // write 在管道刚断的那一瞬间会同步抛 EPIPE。让它冒出去的话，一次抓取的失败会变成
     // 调用栈上的一行原生异常，而 pending 条目没人回收。
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({}, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({}, spawned) as never, options());
     await client.ensureStarted();
     Object.assign(spawned.last!, {
       stdin: {
@@ -1018,11 +1160,8 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("销毁进程时在途请求被作废，而不是永远挂着", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(
-      fakeCtx({}, spawned) as never,
-      options({ requestTimeoutMs: 5000 }),
-    );
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({}, spawned) as never, options({ requestTimeoutMs: 5000 }));
     await client.ensureStarted();
     const pending = client.call("ping");
     // 等一拍让 call 真正把请求写出去并挂上 pending 表，再拆进程 ——
@@ -1033,15 +1172,15 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("createSidecar 工厂返回可用的客户端", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
+    const spawned: SpawnedHandle = { count: 0 };
     const client = createSidecar(fakeCtx({ reply: okReply }, spawned) as never, options());
     await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
     await client.dispose();
   });
 
   it("销毁后再用会拒绝", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({ reply: okReply }, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ reply: okReply }, spawned) as never, options());
     await client.ensureStarted();
     await client.dispose();
     await expect(client.call("ping")).rejects.toThrow(SidecarError);
@@ -1051,15 +1190,15 @@ describe("sidecar client 与假 runtime", () => {
   it("宽限期内进程没退就强杀，done 稍后以 reject 落地也不影响收场", async () => {
     // crashOnExit 让 done 在 stdout 结束后走 reject 分支：优雅路径里挂在 done 上的
     // 两个出口（resolve / reject）都必须执行到 —— 少一个就是没验证过的分支。
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({ crashOnExit: true }, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ crashOnExit: true }, spawned) as never, options());
     await client.ensureStarted();
     await expect(client.dispose()).resolves.toBeUndefined();
   });
 
   it("dispose 时写管道同步抛错（EPIPE）也走完收场", async () => {
-    const spawned: { count: number; last?: FakeHandle } = { count: 0 };
-    const client = new SidecarClient(fakeCtx({ reply: okReply }, spawned) as never, options());
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(fakeCtx({ reply: okReply }, spawned) as never, options());
     await client.ensureStarted();
     // 管道刚断的瞬间写帧会同步抛：dispose 必须吞掉它继续走等待/强杀，而不是把
     // 卸载流程本身炸掉。
@@ -1071,6 +1210,30 @@ describe("sidecar client 与假 runtime", () => {
       } as unknown as Writable,
     });
     await expect(client.dispose()).resolves.toBeUndefined();
+  });
+
+  it("用例不 dispose 的客户端由 afterEach 收干净", async () => {
+    const spawned: SpawnedHandle = { count: 0 };
+    const client = makeClient(
+      fakeCtx(
+        {
+          reply: okReply,
+          onFrame: (frame): void => {
+            drainedFrames.push(frame.method);
+          },
+        },
+        spawned,
+      ) as never,
+      options(),
+    );
+    await client.ensureStarted();
+    expect(spawned.count).toBe(1);
+    // 刻意不调 `client.dispose()` —— 收尾交给 afterEach，下一条用例读那份帧记录。
+  });
+
+  it("上一条遗留的客户端在收尾时收到了 shutdown 帧", () => {
+    // 这条断言读的是上一条之后的记录：没有 afterEach 那次 dispose，这一位就是空表。
+    expect(drainedFrames).toContain("shutdown");
   });
 });
 
@@ -1115,10 +1278,20 @@ const realCtx = {
 };
 
 describe("sidecar client 与真实 python 进程", () => {
+  afterEach(drainLive);
+
   const available = existsSync(LOCAL_PYTHON) && existsSync(BRIDGE);
 
+  // 这一组是 TS 侧与 py/bridge.py 的帧格式唯一真对接的地方。缺解释器或缺 bridge 文件时
+  // 上面那些 `runIf` 在报告里显式记成 skipped（不是假通过），但「八条 skipped」与「一条
+  // 都没跑」在一份绿报告里读起来一样 —— CI 上这组必须真跑到。CI 的 `gate` 作业把
+  // sidecar 解释器排在门禁之前备好，所以这条不会在没有解释器的作业里误红。
+  it.runIf(process.env["CI"] === "true")("在 CI 上这组真实进程用例不该被跳过", () => {
+    expect(available, `LOCAL_PYTHON=${LOCAL_PYTHON}；BRIDGE=${BRIDGE}`).toBe(true);
+  });
+
   it.runIf(available)("握手拿到的能力里 scrapling 为真", async () => {
-    const client = new SidecarClient(
+    const client = makeClient(
       realCtx as never,
       options({ pythonBin: LOCAL_PYTHON, requestTimeoutMs: 30_000 }),
     );
@@ -1128,7 +1301,7 @@ describe("sidecar client 与真实 python 进程", () => {
   });
 
   it.runIf(available)("握手如实上报 WebSocket 握手是否被守卫覆盖", async () => {
-    const client = new SidecarClient(
+    const client = makeClient(
       realCtx as never,
       options({ pythonBin: LOCAL_PYTHON, requestTimeoutMs: 30_000 }),
     );
@@ -1144,13 +1317,13 @@ describe("sidecar client 与真实 python 进程", () => {
   });
 
   it.runIf(available)("ping 往返", async () => {
-    const client = new SidecarClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
+    const client = makeClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
     await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
     await client.dispose();
   });
 
   it.runIf(available)("离线正文方法已从协议面下线（清洗只剩 to_payload 那一条口）", async () => {
-    const client = new SidecarClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
+    const client = makeClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
     await expect(client.call("extract", { html: "<body><h1>你好</h1></body>" })).rejects.toThrow(
       /unknown method/u,
     );
@@ -1158,7 +1331,7 @@ describe("sidecar client 与真实 python 进程", () => {
   });
 
   it.runIf(available)("结构化选择往返", async () => {
-    const client = new SidecarClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
+    const client = makeClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
     const result = (await client.call("select", {
       html: "<ul><li>A</li><li>B</li></ul>",
       selector: "li",
@@ -1169,17 +1342,20 @@ describe("sidecar client 与真实 python 进程", () => {
   });
 
   it.runIf(available)("未知方法回错而不是静默", async () => {
-    const client = new SidecarClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
+    const client = makeClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
     await expect(client.call("nope")).rejects.toThrow(/unknown method/u);
     await client.dispose();
   });
 
-  it.runIf(available)("并发请求 id 不串台", async () => {
-    const client = new SidecarClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
+  it.runIf(available)("八个并发请求经真实 bridge 都各自兑现", async () => {
+    const client = makeClient(realCtx as never, options({ pythonBin: LOCAL_PYTHON }));
     const answers = await Promise.all(
       Array.from({ length: 8 }, async (_unused, index) => client.call("ping", { index })),
     );
-    expect(answers).toHaveLength(8);
+    // id 路由本身不在这条上判：bridge 的 ping 忽略入参（py/adapters.py 的方法表就是
+    // `{"pong": True}`），八份载荷逐字相同，串不串台在这里读不出来。那条判据在假 runtime
+    // 那一组，由回显请求 id 的用例钉住。
+    expect(answers).toStrictEqual(Array.from({ length: 8 }, () => ({ pong: true })));
     await client.dispose();
   });
 
@@ -1197,7 +1373,7 @@ describe("sidecar client 与真实 python 进程", () => {
         },
       },
     };
-    const client = new SidecarClient(
+    const client = makeClient(
       ctx as never,
       options({ pythonBin: LOCAL_PYTHON, requestTimeoutMs: 30_000, graceMs: 5000 }),
     );

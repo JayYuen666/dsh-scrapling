@@ -304,7 +304,13 @@ export class SidecarClient {
   }
 
   #log(line: string): void {
-    this.#options.log?.(line);
+    try {
+      this.#options.log?.(line);
+    } catch {
+      // 日志回调是调用方的代码，它抛在这里有两个坏处：stderr 的 data 监听是裸监听，抛出
+      // 就是未捕获异常、掀翻宿主；而 #onFrame 里抛会被 pumpFrames 当成管道故障转交
+      // onError，触发 #teardown 把整个进程拆掉。一句打印的 bug 不该带走所有在途请求。
+    }
   }
 
   /** 放弃所有在途请求：进程没了，继续等下去没有意义。 */
@@ -341,8 +347,8 @@ export class SidecarClient {
       return;
     }
     this.#pending.delete(rawId);
-    // 每笔在途请求都挂了超时定时器，所以「没有定时器」这一侧到不了。
-    /* v8 ignore next 4 */
+    // timeoutMs 为 null 的请求（爬虫这类量级不定的任务）没有定时器，这一侧是真实路径，
+    // 判空不可省。
     if (entry.timer !== undefined) {
       clearTimeout(entry.timer);
       entry.timer = undefined;
@@ -361,9 +367,7 @@ export class SidecarClient {
         : "SIDECAR_REQUEST_FAILED";
     const details =
       isRecord(rawError) && isRecord(rawError["details"]) ? rawError["details"] : undefined;
-    entry.reject(
-      new SidecarError(code, asText(message, "unknown sidecar error"), undefined, details),
-    );
+    entry.reject(new SidecarError(code, asText(message, "unknown sidecar error"), details));
   }
 
   #onFrame(line: string): void {
@@ -414,13 +418,7 @@ export class SidecarClient {
       return;
     }
     this.#log(`[sidecar] teardown: ${reason}`);
-    this.#stopPump?.();
-    this.#stopPump = undefined;
-    const child = this.#handle;
-    this.#handle = undefined;
-    this.#capabilities = undefined;
-    this.#starting = undefined;
-    this.#rejectAll(new SidecarError(code, reason));
+    const child = this.#clearState(new SidecarError(code, reason));
     if (child === undefined) {
       return;
     }
@@ -430,6 +428,26 @@ export class SidecarClient {
     } catch (error) {
       this.#log(`[sidecar] terminate failed: ${String(error)}`);
     }
+  }
+
+  /**
+   * 清掉与「当前这一代进程」有关的全部簿记，并作废在途请求。
+   *
+   * 拆进程的两条路都走这里：`#teardown` 拆完还要 terminate，`dispose` 里进程已自行退出
+   * 那一支只清不拆。清理项只住一处，将来加一位共享状态不会只改一侧。
+   *
+   * @param error - 交给每个在途请求与待握手的调用方的错误
+   * @returns 被清掉的那一枚子进程句柄（没有进程时为 undefined）
+   */
+  #clearState(error: SidecarError): SubprocessHandle | undefined {
+    this.#stopPump?.();
+    this.#stopPump = undefined;
+    const child = this.#handle;
+    this.#handle = undefined;
+    this.#capabilities = undefined;
+    this.#starting = undefined;
+    this.#rejectAll(error);
+    return child;
   }
 
   /**
@@ -490,7 +508,7 @@ export class SidecarClient {
 
     const { stdin, stdout } = child;
     if (stdin === undefined || stdout === undefined) {
-      await this.#teardown("sidecar stdio pipes were not created", "SIDECAR_UNAVAILABLE");
+      await this.#teardown("sidecar stdio pipes were not created", "SIDECAR_UNAVAILABLE", child);
       throw new SidecarError("SIDECAR_UNAVAILABLE", "sidecar stdio pipes were not created");
     }
     // dispose() 可能正好落在 resolveExecutable 的 await 上跑完了：那时 #handle 还是空，
@@ -541,7 +559,7 @@ export class SidecarClient {
     const ready = await this.#waitForReady(this.#options.handshakeTimeoutMs);
     if (ready["protocol"] !== PROTOCOL_VERSION) {
       const seen = asText(ready["protocol"], "unknown");
-      await this.#teardown("protocol mismatch", "SIDECAR_PROTOCOL_MISMATCH");
+      await this.#teardown("protocol mismatch", "SIDECAR_PROTOCOL_MISMATCH", child);
       throw new SidecarError(
         "SIDECAR_PROTOCOL_MISMATCH",
         `sidecar speaks protocol ${seen}, host expects ${PROTOCOL_VERSION}`,
@@ -730,13 +748,8 @@ export class SidecarClient {
       const finished = await Promise.race([exited, grace]);
       clearTimeout(timer);
       if (finished) {
-        // 进程自己退了：补齐与 #teardown 相同的簿记，但不再对已死的进程 terminate。
-        this.#stopPump?.();
-        this.#stopPump = undefined;
-        this.#handle = undefined;
-        this.#capabilities = undefined;
-        this.#starting = undefined;
-        this.#rejectAll(new SidecarError("SIDECAR_CLOSED", "client disposed"));
+        // 进程自己退了：补齐与 #teardown 相同的簿记（同一个 #clearState），但不再对已死的进程 terminate。
+        this.#clearState(new SidecarError("SIDECAR_CLOSED", "client disposed"));
         return;
       }
     }
@@ -775,11 +788,11 @@ export function createSidecar(ctx: Context, options: SidecarOptions): SidecarCli
 export function sidecarErrorWithCode(
   code: SidecarErrorCode,
   message: string,
-  options?: ErrorOptions,
   details: Record<string, unknown> = {},
+  options?: ErrorOptions,
 ): SidecarError {
   const prefixed = message.startsWith(`${code}: `);
-  return new SidecarError(code, prefixed ? message : `${code}: ${message}`, options, details);
+  return new SidecarError(code, prefixed ? message : `${code}: ${message}`, details, options);
 }
 
 /**
@@ -804,7 +817,7 @@ export async function callSidecar(
     return await client.call(method, params, options);
   } catch (error) {
     if (error instanceof SidecarError) {
-      throw sidecarErrorWithCode(error.code, error.message, { cause: error }, error.details);
+      throw sidecarErrorWithCode(error.code, error.message, error.details, { cause: error });
     }
     throw error;
   }

@@ -3,8 +3,9 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { once } from "node:events";
 import http from "node:http";
-import type { ServerResponse } from "node:http";
+import type { ClientRequest, IncomingMessage, ServerResponse } from "node:http";
 import type { NetworkInterfaceInfo } from "node:os";
 import { Server } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -99,11 +100,6 @@ function imageTool(sink: McpImageSink): ToolDefinition {
   } as never);
 }
 
-async function expectMcpFailure(options: McpServerOptions): Promise<McpError> {
-  const thrown: unknown = await startMcpServer(options).catch((error_: unknown) => error_);
-  return thrown as McpError;
-}
-
 /** 让 listen 立刻回声一个非 EADDRINUSE 的绑定错误，用来判错误映射本身。 */
 function failedListen(this: Server): Server {
   setImmediate(() => {
@@ -131,7 +127,77 @@ const ENTRIES = mcpToolEntries([
 
 const started: McpServerHandle[] = [];
 
+/**
+ * `runEntry` 的 catch 用 `String(error)` 收两种抛出形状，两种都得真测。
+ *
+ * 抛出值取自用例参数而不是写成语句里的字面量：这条用例判的正是「非 Error 抛出」，
+ * 而 `throw "字符串"` 那种写法要么被 no-throw-literal 判红、要么靠禁用注释绕开 ——
+ * 绕开等于把这条分支又藏回去。
+ */
+const THROWN_SHAPES: readonly {
+  readonly label: string;
+  readonly value: unknown;
+}[] = [
+  { label: "Error", value: new Error("kaboom") },
+  { label: "非 Error", value: "kaboom-string" },
+];
+
+/**
+ * 要求一次启动失败，并把那条错误交给调用方按码断。
+ *
+ * 意外成功时**先登记再报**：否则服务器与端口留到后面的用例里，而红话只是「code 是
+ * undefined」一句，看不出真发生了什么事。抛出的形状不是 McpError 时同样点名，而不是
+ * 让 `expect(failure.code)` 去比一个 undefined。
+ *
+ * @param options - 交给 `startMcpServer` 的配置
+ * @returns 启动失败的 McpError
+ */
+async function expectMcpFailure(options: McpServerOptions): Promise<McpError> {
+  const outcome = await startMcpServer(options).then(
+    (handle): { started: McpServerHandle } => ({ started: handle }),
+    (error: unknown): { failure: unknown } => ({ failure: error }),
+  );
+  if ("started" in outcome) {
+    started.push(outcome.started);
+    throw new Error(
+      `startMcpServer 意外启动成功（端口 ${String(outcome.started.port)}），这条用例判的是失败路径`,
+    );
+  }
+  const failure = outcome.failure as Partial<McpError> | undefined;
+  if (typeof failure?.code !== "string") {
+    throw new TypeError(`startMcpServer 抛的不带 code：${String(outcome.failure)}`, {
+      cause: outcome.failure,
+    });
+  }
+  return failure as McpError;
+}
+
+/** 建好连接、还没关的 Client；用例自己关的会从这里摘掉。 */
+const openClients = new Set<Client>();
+
+/** 真的走过关闭流程的连接，收尾兜底是否动过手由它作证。 */
+const closedClients: Client[] = [];
+
+/** 上一条用例故意留下的连接，下一条用例据此检查兜底。 */
+const leftoverClients: Client[] = [];
+
+/**
+ * 关一只 Client 并把它摘出登记。
+ *
+ * @param client - 要关的连接
+ */
+async function closeClient(client: Client): Promise<void> {
+  openClients.delete(client);
+  closedClients.push(client);
+  await client.close();
+}
+
 async function closeAll(): Promise<void> {
+  // Client 先关：它还握着到服务端的 HTTP 会话，服务端先收摊会让关闭的回包拿不到，
+  // 用例之间就可能挂到全局超时。断言提前失败、没走到 closeClient 的连接也从这里收掉。
+  const leftover = [...openClients];
+  openClients.clear();
+  await Promise.all(leftover.map((client) => closeClient(client)));
   await Promise.all(started.splice(0).map((handle) => handle.close()));
 }
 
@@ -151,6 +217,7 @@ async function clientFor(port: number, token?: string): Promise<Client> {
     },
   );
   await client.connect(transport);
+  openClients.add(client);
   return client;
 }
 
@@ -178,39 +245,83 @@ const INITIALIZE_BODY = JSON.stringify({
 });
 
 /**
- * 用 node:http 发一次 POST。
+ * 响应有界的预算：服务端收下请求却不把响应写完时，宁可要一句点名端口的错，
+ * 也不要让 vitest 的全局超时来替这条用例解释失败原因。
+ */
+const RAW_POST_TIMEOUT_MS = 5000;
+
+/** 拆响应时 socket 会顺带让 request 也发一次 'error'；没人接就是宿主进程的未捕获异常。 */
+const swallowSocketError = (): void => undefined;
+
+/**
+ * 等到响应写完并取回状态码，超预算时按当前走到哪一步来拆，并报出端口。
+ *
+ * `events.once` 是官方那段「事件转 promise」：仓里不用手写 deferred，也不需要给
+ * `promise/avoid-new` 开豁免。它自带 'error' 分支 —— 超时时 destroy(err) 正是从这里
+ * 变成一次拒绝的；请求与响应两个方向都挂上，服务端只回头部不写完、或连接中途坏掉，
+ * 都不会让用例永远挂着。
+ *
+ * @param request - 已经 end() 的请求
+ * @param port - 只进报错文案，让失败的用例自己说出是哪一端没回话
+ * @param budgetMs - 响应预算，默认 `RAW_POST_TIMEOUT_MS`；判预算本身的那条用例会压小它
+ * @returns 响应状态码
+ */
+async function readStatus(
+  request: ClientRequest,
+  port: number,
+  budgetMs: number = RAW_POST_TIMEOUT_MS,
+): Promise<number> {
+  // 响应对象在 once() 落地那一刻才被登记（'response' 事件与这次登记之间没有 await，
+  // 定时器插不进来）。
+  const arrived = { response: undefined as IncomingMessage | undefined };
+  // once(request, "response") 一落地就把自己的 error 监听摘掉，之后 socket 上的错误
+  // 再无接收者：这条常驻的吞错监听让「拆响应」不会把 'error' 抛成未捕获异常（实测：
+  // vitest 会打一条 Uncaught Exception 并把整次运行判红）。
+  request.on("error", swallowSocketError);
+  const guard = setTimeout((): void => {
+    // 已经回头部时拆请求只会让响应端收到一句 'aborted'（实测）：那句不带端口，也看不出
+    // 是预算到点，判据会退化成「不知道谁把它掐了」。所以按当前走到哪一步来拆。
+    const failure = new Error(`端口 ${String(port)} 收下请求后没把响应写完`);
+    (arrived.response ?? request).destroy(failure);
+  }, budgetMs);
+  try {
+    const [response] = (await once(request, "response")) as [IncomingMessage];
+    arrived.response = response;
+    response.resume();
+    await once(response, "end");
+    return response.statusCode ?? 0;
+  } finally {
+    clearTimeout(guard);
+    request.off("error", swallowSocketError);
+  }
+}
+
+/**
+ * 用 node:http 发一次 POST，返回状态码。
  *
  * fetch 的 forbidden header 名单里包含 Host，伪造它必须走原始 http.request：被判的那条路
  * 恰好是「浏览器把攻击者域名解析到 127.0.0.1，Host/Origin 头留的是攻击者域名」。
+ *
+ * @param port - 服务端端口
+ * @param headers - 覆盖默认请求头的键（`host` / `origin` / `authorization` 一类）
+ * @returns 响应状态码
+ * @throws 连接失败，或在 `RAW_POST_TIMEOUT_MS` 内没等到响应写完
  */
 async function rawPost(port: number, headers: Record<string, string>): Promise<number> {
-  // node:http 的客户端只有事件回调，要拿到一个可 await 的「响应到了」只能自己 deferred；
-  // 而 fetch 的 forbidden header 名单里不能写 Host，这条判据要判的正是伪造的 Host。
-  // oxlint-disable-next-line promise/avoid-new, typescript/return-await
-  return await new Promise<number>((resolve, reject) => {
-    const request = http.request(
-      {
-        host: "127.0.0.1",
-        port,
-        path: "/mcp",
-        method: "POST",
-        headers: {
-          ...MCP_HEADERS,
-          "content-type": "application/json",
-          "content-length": Buffer.byteLength(INITIALIZE_BODY),
-          ...headers,
-        },
-      },
-      (response) => {
-        response.resume();
-        response.once("end", () => {
-          resolve(response.statusCode ?? 0);
-        });
-      },
-    );
-    request.once("error", reject);
-    request.end(INITIALIZE_BODY);
+  const request = http.request({
+    host: "127.0.0.1",
+    port,
+    path: "/mcp",
+    method: "POST",
+    headers: {
+      ...MCP_HEADERS,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(INITIALIZE_BODY),
+      ...headers,
+    },
   });
+  request.end(INITIALIZE_BODY);
+  return readStatus(request, port);
 }
 
 /**
@@ -220,29 +331,17 @@ async function rawPost(port: number, headers: Record<string, string>): Promise<n
  * 而正文大小在读到之前不可知。
  */
 async function rawPostChunked(port: number): Promise<number> {
-  // node:http 的客户端只有事件回调，要拿到一个可 await 的「响应到了」只能自己 deferred。
-  // oxlint-disable-next-line promise/avoid-new, typescript/return-await
-  return await new Promise<number>((resolve, reject) => {
-    const request = http.request(
-      {
-        host: "127.0.0.1",
-        port,
-        path: "/mcp",
-        method: "POST",
-        headers: { ...MCP_HEADERS, "content-type": "application/json" },
-      },
-      (response) => {
-        response.resume();
-        response.once("end", () => {
-          resolve(response.statusCode ?? 0);
-        });
-      },
-    );
-    request.once("error", reject);
-    // 分两次写且不带长度：node 会自己选 chunked。
-    request.write(INITIALIZE_BODY.slice(0, 20));
-    request.end(INITIALIZE_BODY.slice(20));
+  const request = http.request({
+    host: "127.0.0.1",
+    port,
+    path: "/mcp",
+    method: "POST",
+    headers: { ...MCP_HEADERS, "content-type": "application/json" },
   });
+  // 分两次写且不带长度：node 会自己选 chunked。
+  request.write(INITIALIZE_BODY.slice(0, 20));
+  request.end(INITIALIZE_BODY.slice(20));
+  return readStatus(request, port);
 }
 
 /**
@@ -504,8 +603,82 @@ describe("allowedEndpoints", () => {
   });
 });
 
+/** 判预算用的压缩档：只给「装死的对端」那两条用例，为的是秒级出结果。 */
+const SILENT_BUDGET_MS = 200;
+
+/** 一次「预算到点」的结局：报错原文与服务端实际绑到的端口。 */
+interface BudgetOutcome {
+  readonly message: string;
+  readonly port: number;
+}
+
+/**
+ * 起一台由 `handler` 决定行为的服务端，对它发一次 POST，等预算把它掐断。
+ *
+ * @param handler - 服务端对每个请求做什么（只回头部 / 一个响应字节都不写）
+ * @returns 拒绝原因的原文，外加那条消息本该点名的端口
+ */
+async function breakTheBudget(
+  handler: (incoming: IncomingMessage, response: ServerResponse) => void,
+): Promise<BudgetOutcome> {
+  const silent = http.createServer(handler);
+  silent.listen(0);
+  await once(silent, "listening");
+  const port = boundPort(silent.address());
+  try {
+    const request = http.request({ host: "127.0.0.1", port, path: "/mcp", method: "POST" });
+    request.end(INITIALIZE_BODY);
+    const failure = await readStatus(request, port, SILENT_BUDGET_MS).catch(
+      (error: unknown) => error,
+    );
+    return { message: String(failure), port };
+  } finally {
+    // 请求已被预算拆掉，连接随之结束，这里的 close 才等得到 'close'。
+    silent.close();
+    await once(silent, "close");
+  }
+}
+
+describe("原始请求的响应预算", () => {
+  it("服务端回了头部却永不 end 时，预算到点拆掉响应并点名端口", async () => {
+    const outcome = await breakTheBudget((_request, response) => {
+      response.writeHead(200);
+      response.flushHeaders();
+    });
+    expect(outcome.message).toContain("没把响应写完");
+    expect(outcome.message).toContain(String(outcome.port));
+  });
+
+  it("服务端一个响应字节都不写时，预算到点拆掉请求并点名端口", async () => {
+    const outcome = await breakTheBudget((incoming) => {
+      // 读干请求体、不写响应：客户端连 'response' 都等不到，等的是第一道 once。
+      incoming.resume();
+    });
+    expect(outcome.message).toContain("没把响应写完");
+    expect(outcome.message).toContain(String(outcome.port));
+  });
+});
+
 describe("startMcpServer", () => {
   afterEach(closeAll);
+
+  it("用例没关的连接仍在登记里（这条刻意不调 closeClient）", async () => {
+    const handle = await serve({ port: 0, entries: ENTRIES });
+    const client = await clientFor(handle.port);
+    // 留下一只没人关的连接给 afterEach 收：下一条用例判的就是它有没有真被关掉。
+    leftoverClients.push(client);
+    expect(openClients.has(client)).toBe(true);
+  });
+
+  it("上一条遗留的连接在收尾时被关掉", () => {
+    const [leaked] = leftoverClients;
+    // 先确认兜底有对象可判：上一条没留下连接时，这里要红而不是安静地比 undefined。
+    expect(leaked, "上一条用例没留下连接，这条判据就成了空转").toBeInstanceOf(Client);
+    // 按对象身份比，不按数量：数量会被同一批里其它连接的成功关闭顶掉。
+    expect(closedClients.some((client) => client === leaked)).toBe(true);
+    // 登记表也被清空：残留连接不该跟着下一条用例的连接一起留在表里。
+    expect(openClients.size).toBe(0);
+  });
 
   it("列出的工具来自同一份定义表，参数面不另起一套", async () => {
     const handle = await serve({ port: 0, entries: ENTRIES });
@@ -518,7 +691,7 @@ describe("startMcpServer", () => {
       properties: { query: { type: "string" } },
       required: ["query"],
     });
-    await client.close();
+    await closeClient(client);
   });
 
   it("调用走同一份执行面，参数原样到达", async () => {
@@ -528,7 +701,7 @@ describe("startMcpServer", () => {
     expect(result.isError).not.toBe(true);
     expect(JSON.stringify(result.content)).toContain("ok");
     expect(JSON.stringify(result.content)).toContain("hello");
-    await client.close();
+    await closeClient(client);
   });
 
   it("没有 arguments 的调用也落进同一张表，由工具自己判缺参", async () => {
@@ -536,7 +709,7 @@ describe("startMcpServer", () => {
     const client = await clientFor(handle.port);
     const result = await client.callTool({ name: "fetch" });
     expect(result.isError).toBe(true);
-    await client.close();
+    await closeClient(client);
   });
 
   it("参数不合法时回 isError，而不是把异常抛给客户端", async () => {
@@ -545,7 +718,7 @@ describe("startMcpServer", () => {
     const result = await client.callTool({ name: "fetch", arguments: {} });
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).toContain("query");
-    await client.close();
+    await closeClient(client);
   });
 
   it("名字不在表里时点名 unknown tool", async () => {
@@ -554,29 +727,32 @@ describe("startMcpServer", () => {
     const result = await client.callTool({ name: "nope", arguments: {} });
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).toContain("unknown tool: nope");
-    await client.close();
+    await closeClient(client);
   });
 
-  it("工具自己抛错时也落成 isError，不把异常抛进连接", async () => {
-    const rough: ToolDefinition = {
-      name: "scrapling_rough",
-      description: "抛非 Error",
-      parameters: {},
-      output: { schema: OUTPUT, render: () => [] },
-      execute: async () => {
-        throw new Error("kaboom");
-      },
-    };
-    const handle = await serve({
-      port: 0,
-      entries: mcpToolEntries([{ name: "scrapling_rough", definition: rough }]),
-    });
-    const client = await clientFor(handle.port);
-    const result = await client.callTool({ name: "rough", arguments: {} });
-    expect(result.isError).toBe(true);
-    expect(JSON.stringify(result.content)).toContain("kaboom");
-    await client.close();
-  });
+  it.each(THROWN_SHAPES)(
+    "工具自己抛 $label 时也落成 isError，不把异常抛进连接",
+    async ({ value }) => {
+      const rough: ToolDefinition = {
+        name: "scrapling_rough",
+        description: "execute 抛东西",
+        parameters: {},
+        output: { schema: OUTPUT, render: () => [] },
+        execute: async () => {
+          throw value;
+        },
+      };
+      const handle = await serve({
+        port: 0,
+        entries: mcpToolEntries([{ name: "scrapling_rough", definition: rough }]),
+      });
+      const client = await clientFor(handle.port);
+      const result = await client.callTool({ name: "rough", arguments: {} });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain("kaboom");
+      await closeClient(client);
+    },
+  );
 
   it("截图作为 image 内容交出去，字节来自本次调用的 sink", async () => {
     const sink = createMcpImageSink();
@@ -591,7 +767,7 @@ describe("startMcpServer", () => {
     expect(blocks[0]?.type).toBe("image");
     expect(blocks[0]?.mimeType).toBe("image/png");
     expect(Buffer.from(blocks[0]?.data ?? "", "base64")).toStrictEqual(Buffer.from([1, 2, 3]));
-    await client.close();
+    await closeClient(client);
   });
 
   it("设了 token 时，不带 Authorization 的请求 401，带了才列出工具", async () => {
@@ -601,7 +777,7 @@ describe("startMcpServer", () => {
     const authed = await clientFor(port, TOKEN);
     const listed = await authed.listTools();
     expect(listed.tools.map((tool) => tool.name)).toStrictEqual(["fetch"]);
-    await authed.close();
+    await closeClient(authed);
   });
 
   // DNS 重绑定/CSRF 的请求与本地请求长得一样，唯一的区别就在 Host / Origin 头里。
@@ -621,7 +797,9 @@ describe("startMcpServer", () => {
     await expect(rawPost(handle.port, { origin: "http://evil.example" })).resolves.toBe(403);
     await expect(
       rawPost(handle.port, { origin: `http://127.0.0.1:${String(handle.port)}` }),
-    ).resolves.not.toBe(403);
+      // 放行不等于「不是 403」：415 / 500 也是「不是 403」。initialize 走 JSON 应答，
+      // 本机 Origin 该拿到的是 200。
+    ).resolves.toBe(200);
   });
 
   it("非回环地址没有 token ⇒ 拒绝启动，不把工具表敞给局域网", async () => {
@@ -685,12 +863,24 @@ describe("startMcpServer", () => {
     const handle = await serve({ port: 0, entries: ENTRIES });
     const { port } = handle;
     const client = await clientFor(port);
-    await client.close();
+    await closeClient(client);
     await handle.close();
     const response = await fetch(`http://127.0.0.1:${String(port)}/mcp`).catch(
       (error_: unknown) => error_,
     );
     expect(response).toBeInstanceOf(TypeError);
+  });
+
+  it("判失败路径的 helper 自己撞上意外成功时，先登记再点名报错", async () => {
+    // 这条判的是 helper 的契约：意外成功时必须说出「意外启动成功」，而不是让调用方拿
+    // undefined 去比 code；那只 handle 还要登记进 started，否则端口一直占着，后面的用例
+    // 会在一个看不见的占用者上反复撞 MCP_PORT_IN_USE。
+    const before = started.length;
+    const failure = await expectMcpFailure({ port: 0, entries: ENTRIES }).catch(
+      (error: unknown) => error,
+    );
+    expect(String(failure)).toContain("意外启动成功");
+    expect(started).toHaveLength(before + 1);
   });
 
   it("端口被占时点名 MCP_PORT_IN_USE", async () => {

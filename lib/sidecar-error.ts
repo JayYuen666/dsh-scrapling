@@ -18,16 +18,20 @@ export class SidecarError extends Error {
   public readonly details: Record<string, unknown>;
 
   /**
+   * `details` 排在 `options` **之前**：两者都是可选的对象位，而只想带 details 的调用方
+   * 若要把 options 空着，就得写一枚 `undefined` 占位；占位与实参记反时，details 会被当成
+   * cause 静默吞掉（`ErrorOptions` 只有一个可选成员，类型面拦不住这种错位）。
+   *
    * @param code - 机器可读错误码
    * @param message - 人读信息
+   * @param details - Python 侧附带的机器可读细节（例如动作失败的下标）
    * @param options - 承载 `cause` 的选项包；原始异常放在 `options.cause` 里
-   * @param details - 可选的机器可读细节
    */
   public constructor(
     code: SidecarErrorCode,
     message: string,
-    options?: ErrorOptions,
     details: Record<string, unknown> = {},
+    options?: ErrorOptions,
   ) {
     super(message, options);
     this.name = "SidecarError";

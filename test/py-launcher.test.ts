@@ -19,6 +19,8 @@ const WINDOWS = process.platform === "win32";
 const VENV_DIR = WINDOWS ? "Scripts" : "bin";
 const VENV_EXE = WINDOWS ? "python.exe" : "python";
 const PATH_PYTHON = WINDOWS ? "python" : "python3";
+/** `--which` 那一行的前缀，启动器在 `whichLine` 里拼的是同一段话。 */
+const WHICH_PREFIX = "[py] 解释器：";
 
 const created: string[] = [];
 
@@ -60,7 +62,14 @@ async function run(args: string[]): Promise<RunResult> {
   child.stderr.on("data", (chunk: string) => {
     stderr += chunk;
   });
-  const [code] = (await once(child, "close")) as [number | null];
+  const [code, signal] = (await once(child, "close")) as [number | null, NodeJS.Signals | null];
+  if (signal !== null) {
+    // 折叠成 `status = 1` 会把「启动器自己被杀」与「它按预期退了 1」画成同一个读数，
+    // 而红话只能说出 1。这里直接抛，并把 stderr 带出来定位。注意这与下面那条「子进程被
+    // 信号结束时按 128+信号号退」的用例无关：那一条里收到信号的是 Python 子进程，启动器
+    // 自己带着映射后的 143 正常退出。
+    throw new Error(`py-launcher 被信号 ${signal} 终止：\n${stderr.slice(-2000)}`);
+  }
   return { status: code ?? 1, stdout, stderr };
 }
 
@@ -95,10 +104,20 @@ describe("py-launcher", () => {
 
   it("--which 与 --path 指向同一支", async () => {
     const root = venvRoot();
-    const withVenv = await run(["--which", `--root=${root}`]);
-    expect(withVenv.stdout).toContain(path.join(root, "_env", ".venv", VENV_DIR, VENV_EXE));
+    const venvPath = path.join(root, "_env", ".venv", VENV_DIR, VENV_EXE);
+    const [withVenv, asPath] = await Promise.all([
+      run(["--which", `--root=${root}`]),
+      run(["--path", `--root=${root}`]),
+    ]);
+    // 整行精确比对：`toContain` 下「同一行里既打出 venv 路径又打出 PATH 回落名」这种自相矛盾
+    // 的回答也判绿，而那正是这条用例要排除的形状。
+    expect(withVenv.stdout).toBe(`${WHICH_PREFIX}${venvPath}\n`);
+    // 标题说的那件事：--which 报的那一支与 --path 交出去的那一支是同一个字符串。
+    expect(withVenv.stdout.trim().slice(WHICH_PREFIX.length)).toBe(asPath.stdout.trim());
     const withoutVenv = await run(["--which", `--root=${tempDir()}`]);
-    expect(withoutVenv.stdout).toContain(`PATH 上的 ${PATH_PYTHON}`);
+    expect(withoutVenv.stdout).toBe(
+      `${WHICH_PREFIX}PATH 上的 ${PATH_PYTHON}（本仓没有 _env/.venv，在伞根跑 pnpm py:setup）\n`,
+    );
   });
 
   it("跑模式透传参数、环境与退出码", async () => {
@@ -115,7 +134,11 @@ describe("py-launcher", () => {
   });
 
   it("三处解析对同一棵树给出同一支", async () => {
+    // 期望值由独立写死的布局常量拼出（`VENV_DIR` / `VENV_EXE`），不从被测函数派生。
     expect(LOCAL_PYTHON).toBe(path.join(REPO, "_env", ".venv", VENV_DIR, VENV_EXE));
+    // 第一个实参是设置卡上的 `pythonBin`：空串表示「没表态」，才会接着看仓内 venv 与 PATH。
+    // 这一档成立的前提是 `_env/.venv` 已建好且可执行，由 `test/global-setup.ts` 兜住：解释器
+    // 不在位时整次运行点名拒掉，而不是让这条断言在干净检出上红成一句看不出成因的失败。
     expect(resolvePythonBin("", REPO)).toStrictEqual({ path: LOCAL_PYTHON, via: "_env/.venv" });
     const resolved = await run(["--path"]);
     expect(resolved.stdout.trim()).toBe(LOCAL_PYTHON);

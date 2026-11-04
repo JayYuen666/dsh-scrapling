@@ -27,8 +27,14 @@ import { installRuntimeRemote } from "./lib/runtime-remote.ts";
 import type { RuntimeJobs } from "./lib/runtime-remote.ts";
 import { defaultInstallerIO, installCapabilityPack } from "./lib/installer.ts";
 import { createUrlPolicy, redactUrlSecrets } from "./lib/url-policy.ts";
+import type { UrlPolicyOptions } from "./lib/url-policy.ts";
 import { createWebFetchProvider, PROVIDER_ID } from "./lib/web-provider.ts";
-import { createWebSearchProvider, SEARCH_PROVIDER_ID } from "./lib/search-provider.ts";
+import {
+  BRAVE_SEARCH_ENDPOINT,
+  createWebSearchProvider,
+  SEARCH_PROVIDER_ID,
+  SERPER_SEARCH_ENDPOINT,
+} from "./lib/search-provider.ts";
 import {
   createMcpImageSink,
   mcpSearchTool,
@@ -39,7 +45,7 @@ import type { McpServerHandle } from "./lib/mcp-server.ts";
 import { DEFAULT_MCP_PORT, MCP_MODES, MCP_TOKEN_ENV } from "./lib/mcp-contract.ts";
 import type { McpMode } from "./lib/mcp-contract.ts";
 import { officialMcpHint } from "./lib/official-mcp.ts";
-import type { SearchBackend } from "./lib/search-provider.ts";
+import type { SearchBackend } from "./lib/search-backends.ts";
 import { createAnswerer, profileRoute } from "./lib/answer.ts";
 import {
   createDownloadTool,
@@ -425,8 +431,8 @@ const configSchema = Schema.object({
   integrationMode: Schema.union([...MCP_MODES]).default("native"),
   // 端口要与 profile 里那条 dsh-mcp-client 的 URL 同值；改完必须重跑 setup，doctor 会查。
   mcpPort: Schema.natural().default(DEFAULT_MCP_PORT),
-  // 官方那 16 个工具含 browser_evaluate、不经本插件 guard，所以默认关，
-  // 且要 setup 的 --accept-risk 同一次表态才生成配置。
+  // 官方 server 的工具集（含 browser_evaluate 这类任意 JS）不经本插件的 guard，所以默认关，
+  // 且要 setup 的 --accept-risk 同一次表态才生成配置。条数不写在这里：它随上游版本漂。
   officialMcpEnabled: Schema.boolean().default(false),
   // 浏览器二进制路径：给装在非标准位置的企业镜像 / 便携版 Chromium 用的。
   browserExecutablePath: Schema.string().default(""),
@@ -648,7 +654,7 @@ export interface ToolSpec {
 }
 
 /**
- * 十九个工具的登记表。
+ * 全部工具的登记表。
  *
  * 顺序即注册顺序，也方便测试逐条对照。构造器直接挂在每一项上，而不是另开一张
  * 「名字 → 构造器」表：两张表只要有一处对不上，`apply` 就会拿不到构造器而跳过那条，
@@ -918,8 +924,6 @@ export function resolveDataDir(configured: string): string {
   return path.join(os.homedir(), ".dsh-scrapling");
 }
 
-/** 仓内解释器相对包根的路径；与根 `scripts/lib/py-env.mjs` 的 `VENV_REL` 同一套规则。 */
-
 /** 选中的解释器，以及它为什么被选中。 */
 export interface PythonChoice {
   /** 交给 `ctx.subprocess.resolveExecutable` 的那个名字或绝对路径。 */
@@ -933,7 +937,8 @@ export interface PythonChoice {
  *
  * 三条规则，按优先级：设置卡填了就用它；没填时**先看仓内 venv**（`py:setup` 建的那份；
  * POSIX 认可执行位，Windows 认文件是否存在——那边没有可执行位）；都没有才落 PATH 上的
- * 解释器（POSIX 是 `python3`，Windows 是 `python.exe`）。判据与根 `scripts/lib/py-env.mjs`
+ * 解释器（POSIX 是 `python3`，Windows 是 `python`，靠宿主 `resolveExecutable` 的 PATHEXT
+ * 展开取到 `python.exe`）。判据与根 `scripts/lib/py-env.mjs`
  * 的 `resolvePython` 逐条一致：两处答得不一样时，门禁判绿的解释器就不是插件真用的那个。
  *
  * @param configured - 设置卡上的 `pythonBin`；空白表示没表态
@@ -1132,7 +1137,7 @@ function startUnderCrawlController<Spec, Id>(jobs: CrawlJobsFace<Spec, Id>, spec
 export function crawlFailureDetail(error: unknown): string {
   if (error instanceof SidecarError) {
     // 幂等：Python 侧有时已把码拼进 message，再拼一次就是 `X: X: …`。
-    return sidecarErrorWithCode(error.code, error.message, { cause: error }, error.details).message;
+    return sidecarErrorWithCode(error.code, error.message, error.details, { cause: error }).message;
   }
   return String(error);
 }
@@ -1149,6 +1154,10 @@ export function crawlFailureDetail(error: unknown): string {
  * @param run - 作业主体
  * @returns 作业 id
  */
+// 返回 Promise 却是非 async 是刻意的：jobs.start 同步，而下面两处 Promise.resolve/reject
+// 要保证同步抛错也落成 rejection。改成 async 就得连带重写那三处 return —— 实测另报
+// unicorn/no-useless-promise-resolve-reject 三条与 typescript/return-await 一条。
+// oxlint-disable-next-line typescript/promise-function-async -- 返回 Promise 的非 async 包装是刻意的
 function startCrawlJob(
   ctx: Context,
   router: CrawlEventRouter,
@@ -1272,6 +1281,36 @@ function proxyOf(config: Config): string {
   return config.proxyUrl.get().trim();
 }
 
+/** 逗号串切成列表：去空白、丢空项。 */
+function commaList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+/**
+ * 把出站闸门那几项设置折成 `createUrlPolicy` 的入参。
+ *
+ * 逗号串一律按「切分 → 去空白 → 丢空项」处理，列表空时整条键不给：策略侧把缺席当作「用内建
+ * 默认」，交一个空数组会盖掉那个默认。这一层单独成函数，是因为合成段只作用于 DNS 解析结果，
+ * 闸门用 IP 字面量探不到它——透传是否成立只能在返回值上判。
+ *
+ * @param config - 已解析的设置
+ * @returns 交给 `createUrlPolicy` 的入参（不含 resolver）
+ */
+export function urlPolicyOptionsOf(config: Config): UrlPolicyOptions {
+  const nat64Prefixes = commaList(config.nat64Prefixes.get());
+  const allowHosts = commaList(config.allowedHosts.get());
+  const syntheticRanges = commaList(config.syntheticDnsRanges.get());
+  return {
+    maxUrlLength: config.maxUrlLength,
+    ...(nat64Prefixes.length > 0 ? { nat64Prefixes } : {}),
+    ...(allowHosts.length > 0 ? { allowHosts } : {}),
+    ...(syntheticRanges.length > 0 ? { syntheticRanges } : {}),
+  };
+}
+
 /**
  * Host 侧出站 URL 准入闸门：判否就地抛 `URL_BLOCKED`，请求根本不发出去。
  *
@@ -1286,29 +1325,9 @@ function proxyOf(config: Config): string {
  * @returns 闸门函数；判否时 reject，通过时交回归一后的 URL
  */
 export function createUrlGate(config: Config): (url: string) => Promise<string> {
-  const nat64Prefixes = config.nat64Prefixes
-    .get()
-    .split(",")
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-  const allowHosts = config.allowedHosts
-    .get()
-    .split(",")
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
   const policy = ((): ReturnType<typeof createUrlPolicy> => {
     try {
-      const syntheticRanges = config.syntheticDnsRanges
-        .get()
-        .split(",")
-        .map((item) => item.trim())
-        .filter((item) => item.length > 0);
-      return createUrlPolicy({
-        maxUrlLength: config.maxUrlLength,
-        ...(nat64Prefixes.length > 0 ? { nat64Prefixes } : {}),
-        ...(allowHosts.length > 0 ? { allowHosts } : {}),
-        ...(syntheticRanges.length > 0 ? { syntheticRanges } : {}),
-      });
+      return createUrlPolicy(urlPolicyOptionsOf(config));
     } catch (error) {
       // 方向是**拒绝加载**而不是「忽略这一条」：丢掉一个前缀 = 把它内嵌的私网 IPv4 当成
       // 普通公网 IPv6 放行，比「插件起不来」危险得多。把底层那条原始 Error 换成一句
@@ -1385,8 +1404,8 @@ function searchProviderOf(
     serperApiKey: config.serperApiKey.get(),
     apiEndpoint: config.tavilyApiEndpoint,
     bingEndpoint: config.bingEndpoint,
-    braveEndpoint: "https://api.search.brave.com/res/v1/web/search",
-    serperEndpoint: "https://google.serper.dev/search",
+    braveEndpoint: BRAVE_SEARCH_ENDPOINT,
+    serperEndpoint: SERPER_SEARCH_ENDPOINT,
     duckduckgoEndpoint: config.duckduckgoEndpoint,
     searxngEndpoint: config.searxngEndpoint.get(),
     publicFallback: config.searchPublicFallback.get(),
@@ -1601,17 +1620,6 @@ function makeSidecar(options: {
 }
 
 /**
- * 插件入口。
- *
- * 流程：建客户端 → 探测能力 → 按「开关 ∩ 能力」注册工具。
- *
- * 能力探测会真的拉起一个 Python 进程，所以 `apply` 是 async 的 ——
- * 官方也这么做（deepseek-harness 的 `packages/fs/tool-fs-search`）。
- *
- * @param ctx - 宿主上下文
- * @param config - 已由 schemastery 填满默认值的配置
- */
-/**
  * 作业后端不可用时把**怎么修**写出来。
  *
  * 这条路径上只少了 scrapling_crawl 一个工具，其余照常注册，所以它不是致命错误；
@@ -1655,10 +1663,12 @@ function warnSessionStateUnavailable(ctx: Context, plan: ToolPlan): void {
 }
 
 /**
- * 缺 scrapling 时把选中解释器一起点名。
+ * 没有可用的 Scrapling 面时，把选中的解释器与两种成因一起点名。
  *
- * 这条路径上工具全都不注册，而「解释器里没装」与「装了但 PATH 指错」在日志里长得一样，
- * 用户要的是那一行路径。
+ * 计划里这一档 reason 覆盖两态：握手没成功（解释器路径错、协议不合、超时、进程崩）与
+ * 解释器起来了但里面没装 Scrapling，planTools 把两者按同一档处理。所以这句不能只说后者：
+ * 只给一行 pip 安装命令，会把一个路径写错的部署支去装一个装不上的包。握手失败的准确成因
+ * 在更早那条「未能启动 Python sidecar」的 warn 里，这里把它指回去。
  *
  * @param ctx - 宿主上下文（只用于 logger）
  * @param plan - 本次注册计划
@@ -1669,8 +1679,9 @@ function warnScraplingMissing(ctx: Context, plan: ToolPlan, python: PythonChoice
     return;
   }
   ctx.logger.warn(
-    `[dsh-scrapling] 选中的解释器 ${python.path} 里没有可用的 Scrapling：` +
-      '装上它（pip install "scrapling[rag]>=0.5,<0.6"），或把 pythonBin 指向装了它的解释器。',
+    `[dsh-scrapling] 没有可用的 Scrapling 面（选中的解释器 ${python.path}）。两种成因：` +
+      '① 这个解释器里没装它 —— 装它（pip install "scrapling[rag]>=0.5,<0.6"）或把 pythonBin 指向装了它的解释器；' +
+      "② sidecar 压根没起来 —— 按上面那条「未能启动 Python sidecar」的成因修，装包不解决它。",
   );
 }
 
@@ -1755,11 +1766,15 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
   // 签名由截图工具的实际调用验证。
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion
   const attachments = ctx.get("attachments") as AttachmentSaver | undefined;
+  // 截图的落库处有两套：native 端用宿主那枚 attachment 服务，mcp 端由 startMcpSurface
+  // 自带 createMcpImageSink。因此「没有落库去处」只在 native 模式下成立；把宿主服务的在场
+  // 当成唯一判据，会让没有 attachment 库的 profile 切到 mcp 后连一只本来可用的截图工具都看不到。
+  const imageSinkReady = attachments !== undefined || config.integrationMode === "mcp";
   const plan = planTools(
     flags,
     capabilities,
     jobsReady,
-    attachments !== undefined,
+    imageSinkReady,
     config.sessionStateDir.trim().length > 0,
   );
   for (const item of plan.skipped) {

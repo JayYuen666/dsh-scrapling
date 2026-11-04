@@ -26,19 +26,35 @@ import type {
 const SELECT_TRUNCATION_HINT = "结果被截断：请减小 limit，或提高 maxContentChars 后再取。";
 
 /**
+ * 正文被截断时给模型的找回指引。
+ *
+ * 单一来源：`capText` 页脚里的恢复建议（tools.ts 以 `RECOVERY_HINT` 之名传入）与
+ * 渲染层在「只有 `truncated` 标记、没有页脚」时的回落提示都用这一句，两处不会各写一套说法。
+ */
+export const CONTENT_RECOVERY_HINT = "要拿被省略的部分，请用 cssSelector 收窄范围，或分多次抓取。";
+
+/** 对端报过截断、而本地封顶没再截时的回落页脚：先说事实，再给同一条出路。 */
+const CONTENT_TRUNCATION_HINT = `正文被截断：${CONTENT_RECOVERY_HINT}`;
+
+/**
  * 结果正文的尾巴：对端 notice 优先，其次截断提示；两者都没有就返回空串。
  *
  * 用 if 而不是嵌套三元：三元套三元在 lint 里是硬错误，而这里恰好是三个层级。
  *
  * @param notice - 对端给的人读说明
  * @param truncated - 结果是否被截断
+ * @param hint - 截断提示；缺省是按选择结果给的
  * @returns 追加到正文后的尾巴
  */
-function tailOf(notice: string | undefined, truncated: boolean): string {
+function tailOf(
+  notice: string | undefined,
+  truncated: boolean,
+  hint = SELECT_TRUNCATION_HINT,
+): string {
   if (notice !== undefined && notice.length > 0) {
     return notice;
   }
-  return truncated ? SELECT_TRUNCATION_HINT : "";
+  return truncated ? hint : "";
 }
 
 /** 一次封顶的结果。 */
@@ -54,10 +70,12 @@ export interface CappedText {
 /**
  * 预算非法（非有限数或不足 1）时的兜底。
  *
- * 与设置卡上各「输出上限」字段的默认值同一档。兜底而不是「不封顶」：本函数存在的理由就是
- * 别让超大正文整份进会话日志与模型上下文，预算坏了时静默放行等于把唯一的闸门拆掉。
+ * 兜底而不是「不封顶」：本函数存在的理由就是别让超大正文整份进会话日志与模型上下文，
+ * 预算坏了时静默放行等于把唯一的闸门拆掉。取值与设置卡上各「输出上限」字段的默认值
+ * 同一档，这一档由 test/settings-card.test.ts 的门禁核住（改了这里而没改 schema 默认值，
+ * 那条用例会点名两个数不一致）。
  */
-const FALLBACK_BUDGET_BYTES = 200_000;
+export const FALLBACK_BUDGET_BYTES = 200_000;
 
 /**
  * 把调用方给的预算归一成「至少 1 的整数」；非法值回落到兜底。
@@ -205,7 +223,10 @@ function renderFetch(value: FetchResult): string {
           .map(([key, item]) => `${key}: ${typeof item === "string" ? item : JSON.stringify(item)}`)
           .join("\n")}`;
   const withMetadata = `${body}${metadata}`;
-  return value.notice.length > 0 ? `${withMetadata}\n\n${value.notice}` : withMetadata;
+  // 对端的 `maxContentChars` 截断只体现在 `truncated` 这一位上（`toFetchResult` 交回的 notice
+  // 恒为空串），本地预算没再截时 notice 也是空串——只读 notice 就等于把这一份正文报成完整。
+  const tail = tailOf(value.notice, value.truncated, CONTENT_TRUNCATION_HINT);
+  return tail.length > 0 ? `${withMetadata}\n\n${tail}` : withMetadata;
 }
 
 /**
@@ -271,15 +292,17 @@ function networkLines(matches: readonly NetworkEntry[]): string[] {
 /**
  * 把浏览器抓取结果渲染成模型看的文本，末尾附上网络历史。
  *
+ * 网络历史单独再封顶：正文已按 `maxOutputBytes` 截过，而条目数与每条正文的上限都在
+ * 对端（`limit` / `body_chars`），叠起来的字节数与那份预算无关。不封这一段，工具回执
+ * 就能整段绕过输出上限，且没有任何说明。
+ *
  * @param value - 浏览器抓取载荷
+ * @param networkBudgetBytes - 网络历史那一段的字节预算（与正文同一档）
  * @returns 模型侧文本
  */
-function renderBrowser(value: BrowserResult | FetchResult): string {
+function renderBrowser(value: BrowserResult, networkBudgetBytes: number): string {
   const body = renderFetch(value);
-  // 不带网络历史的工具（render）其 schema 里没有这个字段，execute 也就不会产出它；
-  // capture 那一路上它一定是数组。这里只能断言一次：联合类型里 FetchResult 没有
-  // 这个键，但两个调用点传进来的对象都出自 createBrowserTool 的 execute。
-  const captured = (value as Partial<BrowserResult>).xhr;
+  const captured = value.xhr;
   if (captured === undefined) {
     return body;
   }
@@ -290,7 +313,13 @@ function renderBrowser(value: BrowserResult | FetchResult): string {
       "try scrapling_render with waitMs / waitSelector first, then capture again."
     );
   }
-  return `${body}\n\nCaptured XHR/fetch:\n${networkLines(captured).join("\n")}`;
+  const section = capText(
+    networkLines(captured).join("\n"),
+    networkBudgetBytes,
+    "网络历史整体被截断：完整的条目请用 scrapling_capture_xhr / scrapling_session_network 的 limit 与游标分页读。",
+  );
+  const footer = section.notice.length > 0 ? `\n\n${section.notice}` : "";
+  return `${body}\n\nCaptured XHR/fetch:\n${section.text}${footer}`;
 }
 
 /**
@@ -301,8 +330,8 @@ function renderBrowser(value: BrowserResult | FetchResult): string {
  */
 function renderAnswer(value: AnswerToolResult): string {
   const head = `Answer to "${value.url}" (HTTP ${value.statusCode}, via ${value.provider}/${value.model}):`;
-  const tail = value.notice.length > 0 ? `\n\n${value.notice}` : "";
-  return `${head}\n\n${value.answer}${tail}`;
+  const tail = tailOf(value.notice, value.truncated, CONTENT_TRUNCATION_HINT);
+  return `${head}\n\n${value.answer}${tail.length > 0 ? `\n\n${tail}` : ""}`;
 }
 
 export {

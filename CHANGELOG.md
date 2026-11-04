@@ -1,7 +1,40 @@
 # Changelog
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
-[语义化版本](https://semver.org/lang/zh-CN/)。最新版本在最上。
+[语义化版本](https://semver.org/lang/zh-CN/)。最新版本在最上。这里的偏离是刻意的：版本标题
+不写发布日期（各版发布时间以 npm registry 为准，`npm view <包名> time` 取得到），并按需增设
+标准六类之外的小节（本仓的 `Boundaries` 收各版本的验证范围与能力边界，即哪些平台/档位真跑过、
+哪些只到本地夹具为止）。
+
+## 0.1.7
+
+宿主支持窗口抬到 `0.2.1-rc.5 || 0.2.2-alpha.3`，MCP 客户端钉版、设置卡取值面与输出预算
+一起收口；构建与门禁补齐产物新鲜度、行尾与 lint 偏差三条判据，Python 侧补上有界关机。
+
+### Changed
+
+- **宿主与发布元数据**：devDependencies 全族抬到 `0.2.2-alpha.3`（cordis `4.0.6-alpha.2`、schemastery `3.18.6-alpha.2`）；`engines.dsh` 与 dsh 家族 peer 写 `^0.2.1-rc.5 || ^0.2.2-alpha.3`；MCP 客户端默认钉版改为 `0.2.2-alpha.3`，`doctor` 同时放行 rc 线的 `0.2.1-rc.5`；MCP server 自述版本同步 0.1.7。
+- **搜索后端**：名单收进 `lib/search-backends.ts` 单一定义（CLI 判配置与设置卡 enum 同源），Brave/Serper 端点与 `auto` 的分流提示一起显式化；`searxngEndpoint` 改为遮罩输入。
+- **输出预算**：浏览器抓取的网络历史单独封顶；正文被对端 `maxContentChars` 截断而本地未再截时也给出恢复指引，`scrapling_answer` 的截断落到同一条尾巴。
+- **会话参数**：`cookies` / `blockedDomains` 给了非数组时报 `ToolArgsError`；`sessionType=static` 时递进来的浏览器档旋钮直接报错，不再静默丢掉；网络历史的方法名与说明常量收成单一定义。
+- **运行环境与配置**：托管 runtime 只在 macOS arm64 尝试，其余平台报 `INSTALL_PACK_BLOCKED`；Windows 解释器名与根脚本统一为 `python`；`setup` / `doctor` 的 MCP 端口改为显式 `--port`；`nat64Prefixes` 非法时拒绝装载（`CONFIG_INVALID`），`stripInlineImages` 进卡；逗号串统一去空白，空列表不交空数组。
+- **构建与门禁**：`build-helpers.ts` 收拢三份构建脚本的入口判定、原子写与「宿主包被内联」断言；新增 `eol-gate.mjs`、`test/artifact-freshness.test.ts`、`test/build-helpers.test.ts`、`test/lint-deviations.test.ts`，`check` 串上 `gate:eol`；oxlint 的每处规则收窄逐条登记理由并由测试双向核对。
+- **Python 门禁**：ruff 开 RUF100（失效的 `noqa` 判红）；mypy 去掉全局 `ignore_missing_imports`，只对 `lxml` 与可选依赖 `redis` 逐模块放行；coverage 开分支统计，地板仍由 `coverage-floor.mjs` 施加。
+- **CI**：pnpm 钉到 `12.11.2`（与伞根 `packageManager` 同源）；工作树改写判据先打印再判红；产物探针按 tarball 声明的 peer 范围解析 `dsh-tools`。
+- **文档**：双语 README 与 DETAIL 对齐现量（49 个卡上取值、19 个工具、15 个开关、MCP 端口显式 `--port`、官方 MCP 工具集归上游）。
+
+### Fixed
+
+- **Python 关机**：`close-crawls` / `close-sessions` 放进有界线程（10 秒），超时只留日志；drain 超时时把队列里还排着的帧逐条点名，不再静默丢。
+- **协议与运行时**：`runtime-reader` 的 pack/job/拒绝码枚举改从 `runtime-shape.ts` 派生，四个 typert 描述符共用骨架；网关回包先判「对象且带布尔 `ok`」，坏形状报协议错误而不是读属性崩溃；空白 jobId 不再上网关。
+- **错误与路径**：`sidecarErrorWithCode` 把 `details` 排在 `options` 之前，避免把 details 当成 cause 静默吞掉；runtime manifest 的定位以实际文件所在目录为准，`repoPythonPath` 单独抽出。
+- **抽取**：`_query_type` 去掉不使用的 selector 参数，显式 `queryType` 优先于 `useXpath` 的语义写进函数本身。
+- **探针**：`_env` 六份脚本同步到当前 Scrapling 0.5 API，失败按「缺依赖 / 抓取失败 / 探针自身」分类并汇总，不再一条异常中断整份探针。
+
+### Added
+
+- `lib/search-backends.ts`、`eol-gate.mjs`、`test/artifact-freshness.test.ts`、`test/build-helpers.test.ts`、`test/lint-deviations.test.ts`。
+- `py/tests/test_bridge.py` 补爬虫 worker 收尾与关机边界的用例；`contract_probe.py` 跟随新 API。
 
 ## 0.1.6
 

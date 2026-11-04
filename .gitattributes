@@ -4,11 +4,21 @@
 # `text=auto` 保留按内容做的二进制探测，不会误伤二进制文件。
 #
 # 触发这条的是 Windows 检出（Git for Windows 的机器级 core.autocrlf=true 会把工作树换成
-# CRLF），CI 的 windows-latest 格与本地那份都算；门禁两侧（oxfmt 的 fmt:check、Python 的
-# ruff format --check）都按 LF 判，检出方式不该改变结论。
+# CRLF），CI 的 windows-latest 格与本地那份都算。两条腿的判据不一样：oxfmt 读配置里的
+# endOfLine，实测一份 CRLF 的 .ts 会被报 Format issues；ruff format 的 line-ending 默认 auto，
+# 按文件自身的第一处行尾走，实测同一份 CRLF 的 .py 回 "already formatted"。所以 Python 那一侧
+# 的 LF 只来自本文件，不来自 ruff 的配置——把它去掉，Python 腿照绿，翻转的只有 TS 腿。
 #
-# 依赖 CRLF 的 Windows 脚本单独豁免：`*` 规则会把它们静默改成 LF。
+# 依赖 CRLF 的 Windows 脚本单独豁免：上面那条 `*` 会把它们静默改成 LF。名单只列 cmd 系
+# （.bat / .cmd），cmd.exe 的 label 与 goto 对行尾确实敏感。
+#
+# `*.ps1` 不在这份名单里，也别顺手加回去：PowerShell 两种行尾都解析得了——本机第三方资产
+# `_env/.venv/bin/activate.ps1` 与 patchright 的 `install_webkit_wsl.ps1` 都是 LF，而它们就是
+# 给 Windows 用的。反过来说，一条 `eol=crlf` 会让带 `#!` 行的脚本在 macOS/Linux 上直接执行
+# 失败：实测一份 `#!/bin/sh` 写成 CRLF 的脚本被内核判成 `bad interpreter: /bin/sh^M`。
+#
+# 新增别的 Windows 专有文本（.vbs / .reg / .inf / .wxs / .msbuild 一类）时，必须同步在这里补
+# 豁免行——`*` 那条会静默把它们改成 LF，既不报错也不给提示。
 * text=auto eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf
-*.ps1 text eol=crlf

@@ -15,7 +15,7 @@
 // 运行期才提供的宿主包，其中一个在模块顶层按 import.meta.url 相对解析自身 package.json，
 // 搬进本包后那个相对路径就指到别处，import 直接抛 MODULE_NOT_FOUND。源码侧全绿、单测
 // 全绿、类型检查全绿，只有装出去才炸——所以门禁必须落在产物上。
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -28,10 +28,11 @@ const pkgDir = path.join(import.meta.dirname, "..");
 const PACKAGE_JSON = "package.json";
 
 /**
- * 只在注释与文档里禁的东西：写下来的时刻、列表序号、以及坏字节。
+ * 只在注释与文档里禁的东西：写下来的时刻、列表序号、以及坏字节。四条各管一样，多写一条
+ * 「看起来像规则」的行只会让人以为门禁还拦了别的形态。
  *
- * 年份一律拦，中英文两种写法都算 —— 指的是同一件事。列表序号只拦行首 `// ` 或 ` * ` 之后
- * 紧跟的有序列表标记，不拦句子里的数字：那类多半是代码引用。U+FFFD 替换字符一并拦：它是
+ * 年份一律拦，中英文两种写法都算 —— 指的是同一件事。列表序号只拦注释行首的有序列表标记
+ * （`// 1.`、` * 1.`、YAML 的 `# 1.`），不拦句子里的数字：那类多半是代码引用。U+FFFD 替换字符一并拦：它是
  * 编码坏掉的痕迹，已经在本仓咬到过几处注释，进包就是给用户看的乱码。
  *
  * 本文件自己也不举日期样例 —— 门禁扫的就是全部源码注释，在这里举例等于让自己红。
@@ -45,7 +46,6 @@ const FORBIDDEN_IN_COMMENTS: readonly RegExp[] = [
   /(?:19|20)\d{2}\s*年/u,
   /^\s*(?:\/\/|\*|#)\s+\d+[.、)]\s/u,
   /\uFFFD/u,
-  //u,
 ];
 
 /** `publishConfig` 里唯一允许出现的字段：可见性与源，都不是入口面。 */
@@ -82,10 +82,19 @@ interface Manifest {
 
 /** 一条 `files` 模式的两种形态。 */
 type PatternShape =
-  /** 目录或后缀模式：列该目录（可递归）下以 `extension` 结尾的文件。 */
+  /** 目录模式：列该目录（根之外递归）下以 `extension` 结尾的文件；空后缀表示整目录都要。 */
   | { readonly kind: "glob"; readonly dir: string; readonly extension: string }
-  /** 精确文件名：带点号又无通配的条目是**文件名**（`host.js`），不是后缀过滤。 */
+  /** 精确文件名：包根下确实是个文件的那一条（`host.js`）。 */
   | { readonly kind: "exact"; readonly file: string };
+
+/** 包根下这条路径确实是个目录时才算目录模式；读不到或不是目录都按精确文件名走。 */
+function isDirectoryEntry(entry: string): boolean {
+  try {
+    return statSync(path.join(pkgDir, entry)).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 把 `files` 的一条模式归类。本仓实际用到的只有三种写法：裸文件名、目录名、`dir/*.ext`。
@@ -98,32 +107,48 @@ type PatternShape =
  * @returns 该模式要列的目录与后缀过滤，或一个精确文件名
  */
 function shapeOf(entry: string): PatternShape {
-  const dot = entry.lastIndexOf(".");
   const star = entry.indexOf("*");
   if (star !== -1) {
+    // 后缀只在最后一个路径段里谈：`locale/*.json` 是 locale 目录下的 .json，而 `py/*` 没有
+    // 后缀（整目录都要）。拿整条的最后一个点算会把 `*` 自己当成后缀，覆盖集合当场空掉。
+    const segment = entry.slice(entry.lastIndexOf("/") + 1);
+    const dot = segment.indexOf(".");
+    const dir = entry.slice(0, star).replace(/\/$/u, "");
     return {
       kind: "glob",
-      dir: entry.slice(0, star).replace(/\/$/u, ""),
-      extension: entry.slice(dot),
+      dir: dir === "" ? "." : dir,
+      extension: dot === -1 ? "" : segment.slice(dot),
     };
   }
-  if (!entry.includes(".")) {
+  // 是不是目录按文件系统判，不按「名字里有没有点」：`docs.v2/` 这种目录名会被后者判成文件名，
+  // 于是整目录静默漏检，而漏检正是这道门禁最不能容忍的方向。
+  if (isDirectoryEntry(entry)) {
     return { kind: "glob", dir: entry, extension: "" };
   }
   return { kind: "exact", file: entry };
+}
+
+/** 列一个目录：包根之外递归，包根只取自己那一层（否则会把 node_modules 与 .git 整仓扫进来）。 */
+async function listDir(dir: string, entry: string): Promise<string[]> {
+  try {
+    return await readdir(path.join(pkgDir, dir), { recursive: dir !== "." });
+  } catch (error) {
+    throw new Error(`${PACKAGE_JSON} 的 files 条目 ${entry} 读不到目录`, { cause: error });
+  }
 }
 
 /**
  * 按 `files` 模式列出包内确实存在的文件（相对包根、`/` 分隔）。
  *
  * @param shape - 见 {@link shapeOf}
+ * @param entry - 该条 `files` 原文，只用于报错时点名
  * @returns 命中的文件清单
  */
-async function expand(shape: PatternShape): Promise<string[]> {
+async function expand(shape: PatternShape, entry: string): Promise<string[]> {
   if (shape.kind === "exact") {
     return existsSync(path.join(pkgDir, shape.file)) ? [shape.file] : [];
   }
-  const names = await readdir(path.join(pkgDir, shape.dir), { recursive: shape.dir !== "." });
+  const names = await listDir(shape.dir, entry);
   return names
     .map((name) => name.split(path.sep).join("/"))
     .filter((name) => shape.extension === "" || name.endsWith(shape.extension))
@@ -214,14 +239,24 @@ const ALWAYS_SHIPPED = [
  *
  * @returns manifest 本体与 `files` 展开后的集合（含发布器无条件附带的件）
  */
-async function readSurface(): Promise<{ manifest: Manifest; shipped: Set<string> }> {
+async function loadSurface(): Promise<{ manifest: Manifest; shipped: Set<string> }> {
   const manifest = JSON.parse(
     await readFile(path.join(pkgDir, PACKAGE_JSON), "utf8"),
   ) as unknown as Manifest;
-  const groups = await Promise.all((manifest.files ?? []).map((entry) => expand(shapeOf(entry))));
+  const groups = await Promise.all(
+    (manifest.files ?? []).map((entry) => expand(shapeOf(entry), entry)),
+  );
   const attached = ALWAYS_SHIPPED.filter((name) => existsSync(path.join(pkgDir, name)));
   return { manifest, shipped: new Set([...groups.flat(), ...attached]) };
 }
+
+/**
+ * 发布面快照：盘读一次、解析一次，各条断言共用同一份。
+ *
+ * 每条用例各调一次 `loadSurface()` 时，同一个 `package.json` 会被解析十几遍，而两遍之间
+ * 磁盘状态若变了（并跑的构建任务、`files` 改动），同一文件里的断言判的就不是同一份出货面。
+ */
+const surface = await loadSurface();
 
 /**
  * 递归收集该纳入注释门禁的源文件与文档（相对包根、`/` 分隔）。
@@ -253,18 +288,66 @@ async function collectSources(dir: string, prefix: string): Promise<string[]> {
 }
 
 /**
- * 取一段文本里属于注释或文档的行。文档（`.md`）整体算；代码只取注释行，免得把字符串
- * 字面量里的数据（日期夹具、示例路径）误判成注释噪音。
+ * 文档里的正文行：整篇都算，但代码块里的不算（那里的日期与路径是示例数据）。
+ *
+ * 围栏不配对时直接抛：那样一半的正文会被静默当成代码块跳过，门禁悄悄失效。
+ *
+ * @param lines - 文档按行切开的全文
+ * @returns 参与门禁的正文行（围栏行本身也留着，它不是内容）
+ */
+function mdProse(lines: readonly string[]): string[] {
+  const kept: string[] = [];
+  let inFence = false;
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      inFence = !inFence;
+      kept.push(line);
+    } else if (!inFence) {
+      kept.push(line);
+    }
+  }
+  if (inFence) {
+    throw new Error("文档里有没配对的代码围栏，注释门禁没法判断哪些是正文");
+  }
+  return kept;
+}
+
+/**
+ * 取一段文本里属于注释或文档的行。
+ *
+ * 代码按**区间**取：块注释从起始那对字符一路取到收尾那对字符为止，中间那些不带前导星的
+ * 正文行同样是注释 —— 只按行首字符判会整段漏掉，而日期恰恰常写在块注释中间。`.md` 整体算，
+ * 但代码块里的示例不算；`#` 那种行首只在 `.yml` 里才是注释（TypeScript 里那是私有字段）。
  *
  * @param file - 相对包根的文件名，用于决定判定口径
  * @param text - 文件全文
  * @returns 参与门禁的行
  */
 function commentLines(file: string, text: string): string[] {
+  const lines = text.split("\n");
   if (file.endsWith(".md")) {
-    return text.split("\n");
+    return mdProse(lines);
   }
-  return text.split("\n").filter((line) => /^\s*(?:\/\/|\/\*|\*|#)/u.test(line));
+  const kept: string[] = [];
+  let inBlock = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // 块注释按区间取：`/*` 与收尾那两个字符之间的每一行都是注释，中间那些不带前导星的
+    // 正文行也在内。只看行首字符会整段漏掉它们，而日期恰恰常写在块注释中间。
+    const keep =
+      inBlock ||
+      trimmed.startsWith("/*") ||
+      trimmed.startsWith("//") ||
+      /^\*\s/u.test(trimmed) ||
+      (file.endsWith(".yml") && trimmed.startsWith("#"));
+    if (keep) {
+      kept.push(line);
+    }
+    if (inBlock || trimmed.startsWith("/*")) {
+      inBlock = !trimmed.includes("*/");
+    }
+  }
+  return kept;
 }
 
 describe("entryFiles 认全 exports 的三种合法写法", () => {
@@ -302,9 +385,77 @@ describe("entryFiles 认全 exports 的三种合法写法", () => {
   });
 });
 
+describe("注释行的取法", () => {
+  it("块注释里不带前导星的正文行也参与", () => {
+    const text = ["/*", "下一份报告的时间线写在 2026 年那档", "*/"].join("\n");
+    expect(commentLines("a.ts", text)).toStrictEqual([
+      "/*",
+      "下一份报告的时间线写在 2026 年那档",
+      "*/",
+    ]);
+  });
+
+  it("行注释与续行都参与，普通代码行与字符串不参与", () => {
+    const text = [
+      "const x = 1; // 尾注不算（整行不是注释）",
+      "// 单独的注释行算",
+      " * 块注释的续行算",
+      'const s = "2026-01-01";',
+    ].join("\n");
+    expect(commentLines("a.ts", text)).toStrictEqual(["// 单独的注释行算", " * 块注释的续行算"]);
+  });
+
+  it("井号行只在 YAML 里算注释；TypeScript 里那是私有字段", () => {
+    expect(commentLines("a.yml", "# 说明")).toStrictEqual(["# 说明"]);
+    expect(commentLines("a.ts", "  #counter = 0;")).toStrictEqual([]);
+    // 拿到行之后还得真判：这条把「yml 的序号列表会被拦下来」走通到规则表本身，
+    // 而不是只证明行被取了出来。
+    expect(FORBIDDEN_IN_COMMENTS.some((rule) => rule.test("# 1. 步骤"))).toBe(true);
+  });
+
+  it("文档取正文、跳过代码块，围栏不配对时抛", () => {
+    const text = ["正文一行", "```", "2026-01-01 是示例数据", "```", "又一行正文"].join("\n");
+    expect(commentLines("README.md", text)).toStrictEqual(["正文一行", "```", "```", "又一行正文"]);
+    expect(() => {
+      commentLines("README.md", "正文\n```\n没收尾");
+    }).toThrow(/没配对的代码围栏/u);
+  });
+});
+
+describe("files 模式的归类", () => {
+  it("带通配的条目按目录与后缀切分；没有后缀就是整目录", () => {
+    expect(shapeOf("py/*")).toStrictEqual({ kind: "glob", dir: "py", extension: "" });
+    expect(shapeOf("locale/*.json")).toStrictEqual({
+      kind: "glob",
+      dir: "locale",
+      extension: ".json",
+    });
+    // 根级通配的 dir 归一成 "."：留空串会让 readdir 递归整仓，把 node_modules 也当成品。
+    expect(shapeOf("*.js")).toStrictEqual({ kind: "glob", dir: ".", extension: ".js" });
+  });
+
+  it("目录与文件的区分按文件系统判，不按名字里有没有点", () => {
+    expect(shapeOf("host.js")).toStrictEqual({ kind: "exact", file: "host.js" });
+    expect(shapeOf("docs")).toStrictEqual({ kind: "glob", dir: "docs", extension: "" });
+  });
+
+  it("包根那一层不递归：根级模式不会把依赖目录扫进覆盖集合", async () => {
+    const rootLevel = await expand(shapeOf("*.json"), "*.json");
+    // 递归会把 node_modules 与 dist 里的 .json 一起当成「包根上的根级文件」，覆盖集合当场失真。
+    expect(rootLevel.length, "包根上总该有 json 文件，否则这条是空转").toBeGreaterThan(0);
+    expect(rootLevel.filter((name) => name.includes("/"))).toStrictEqual([]);
+  });
+
+  it("读不到的目录点名报错，不静默交回空清单", async () => {
+    await expect(
+      expand({ kind: "glob", dir: "no-such-dir", extension: "" }, "no-such-dir/*"),
+    ).rejects.toThrow(/no-such-dir/u);
+  });
+});
+
 describe("发布形态", () => {
   it("files 覆盖运行模块、CLI 与运行时资产，bin 指向产物", async () => {
-    const pkg = JSON.parse(await readFile(path.join(pkgDir, PACKAGE_JSON), "utf8")) as Manifest;
+    const { manifest: pkg } = surface;
     const pyEntries = await readdir(path.join(pkgDir, "py"));
     const runtimePy = pyEntries
       .filter((name) => name.endsWith(".py"))
@@ -323,7 +474,7 @@ describe("发布形态", () => {
   });
 
   it("mcp server 自述的版本与包版本同值，SDK 是声明过的运行期依赖", async () => {
-    const pkg = JSON.parse(await readFile(path.join(pkgDir, PACKAGE_JSON), "utf8")) as Manifest;
+    const { manifest: pkg } = surface;
     expect(MCP_SERVER_NAME).toBe("scrapling");
     // 版本号写死在代码里，靠这条断言跟着 package.json 走：发布时忘了抬，红在这里而不是让客户
     // 连上一个自称旧版的 server。
@@ -333,7 +484,7 @@ describe("发布形态", () => {
   });
 
   it("files 覆盖全部入口目标（换个发布器也不会发出悬空入口）", async () => {
-    const { manifest, shipped } = await readSurface();
+    const { manifest, shipped } = surface;
     const targets = entryFiles(manifest);
     expect(targets.length, "入口面不该是空的").toBeGreaterThan(0);
     for (const target of targets) {
@@ -345,21 +496,21 @@ describe("发布形态", () => {
   });
 
   it("入口一律指向构建产物，源码目录不参与发布", async () => {
-    const { manifest } = await readSurface();
+    const { manifest } = surface;
     for (const target of entryFiles(manifest)) {
       expect(target.file, `${target.label} 不该指源码`).not.toMatch(/\.tsx?$/u);
     }
   });
 
   it("publishConfig 只留可见性与源，不留入口覆盖", async () => {
-    const { manifest } = await readSurface();
+    const { manifest } = surface;
     for (const key of Object.keys(manifest.publishConfig ?? {})) {
       expect(ALLOWED_PUBLISH_CONFIG.has(key), `publishConfig.${key} 会被 npm 忽略`).toBe(true);
     }
   });
 
   it("py/extraction.py 在 files 里", async () => {
-    const { manifest } = await readSurface();
+    const { manifest } = surface;
     expect(manifest.files).toContain("py/extraction.py");
   });
 });
@@ -375,7 +526,7 @@ describe("宿主依赖的版本形状（升级防线）", () => {
     // 情况下换掉编译用的宿主类型面。
     // 只判 dev 这一侧：它才是本包真正装下来的那一份。peer 记的是「运行期由宿主提供」，
     // 装什么版本由宿主决定，判据在下面那条。
-    const { manifest } = await readSurface();
+    const { manifest } = surface;
     // 过滤出违规项再一次性断言，而不是在循环里按条件 expect：失败时 diff 直接列出
     // 「哪个包钉成了什么」，比逐条抛错更好读。
     const ranged = Object.entries(manifest.devDependencies ?? {}).filter(
@@ -388,7 +539,7 @@ describe("宿主依赖的版本形状（升级防线）", () => {
     // 宿主类型面被这些包以 type-only 方式消费；同一次安装里出现两枚 dsh-session 的拷贝，
     // nominal 类型（品牌串、投影状态）会开始互相不认，而那不报编译错、只报运行期
     // 「认不出这个 callId」。同版本是让这件事不发生的最小条件。
-    const { manifest } = await readSurface();
+    const { manifest } = surface;
     const dshDev = Object.entries(manifest.devDependencies ?? {}).filter(([name]) =>
       name.startsWith(DSH_PREFIX),
     );
@@ -402,7 +553,7 @@ describe("宿主依赖的版本形状（升级防线）", () => {
     // peer 由宿主拿自己安装的那版去满足：钉成精确版本等于要求两者版本号完全相等，而滚动支持
     // 窗口本来就含三个版本。宿主侧只在 manifest 没有 engines.dsh 时才读 peer（app-boot 的
     // plugin-compatibility 里 engines.dsh 存在即独判），所以这一位是发布元数据的含义问题。
-    const { manifest } = await readSurface();
+    const { manifest } = surface;
     const bare = manifest.peerDependencies?.["@deepseek-ai/dsh"] ?? "";
     expect(bare, "裸 dsh 的 peer 缺失：支持窗口就失去基准了").toMatch(/^\^/u);
     const offPolicy = Object.entries(manifest.peerDependencies ?? {}).filter(
@@ -436,6 +587,14 @@ describe("注释与文档没有内部指涉", () => {
   });
 });
 
+/**
+ * 工具数量的独立锚点。
+ *
+ * 判据不得由被验的那张表派生，所以这里必须写死一个数；其余计数一律从 `TOOL_SPECS` 推。
+ * 改动登记表时这一位会红，红话里点名要跟着改的文案位置。
+ */
+const TOOL_COUNT_ANCHOR = 19;
+
 describe("构建产物可载入", () => {
   it("host.js 真的能 import（内联的宿主包会在模块顶层就炸）", async () => {
     const artifact = path.join(pkgDir, "host.js");
@@ -462,11 +621,11 @@ describe("构建产物可载入", () => {
 
   it("产物里的真实逻辑还能跑（压缩改形状时这条会红）", async () => {
     // 产物是压缩过的：标识符改名、注释剥掉。只断言「导出一个叫 apply 的函数」太弱，
-    // 压缩把内部逻辑改坏它照样绿。这里让**产物自己**跑一遍注册计划：十九个工具、两条
-    // 分支都要给出正确结果。任何依赖名字（constructor.name 之类）或模块级状态的压缩
+    // 压缩把内部逻辑改坏它照样绿。这里让**产物自己**跑一遍注册计划：登记表里的每个工具、
+    // 两条分支都要给出正确结果。任何依赖名字（constructor.name 之类）或模块级状态的压缩
     // 手法，都会在这里露出来，而不是等到装进 dsh 才发现。
     const artifact = (await import(pathToFileURL(path.join(pkgDir, "host.js")).href)) as {
-      TOOL_SPECS: readonly { name: string; flag: string }[];
+      TOOL_SPECS: readonly { name: string; flag: string; requires: string }[];
       planTools: (
         flags: Record<string, boolean>,
         capabilities: unknown,
@@ -488,19 +647,16 @@ describe("构建产物可载入", () => {
       browser: true,
       version: "0.5",
     };
-    expect(artifact.TOOL_SPECS).toHaveLength(19);
+    // 手写的只有这一处锚点：登记表换了数量，它要响，让人去核对 README 与设置卡文案。
+    expect(artifact.TOOL_SPECS).toHaveLength(TOOL_COUNT_ANCHOR);
     const { ready } = artifact.planTools(allOn, full, true, true, true);
-    // 有浏览器时十九个全注册；会话类各自独立，所以总数与工具数相等。
-    expect(ready).toHaveLength(19);
-    // 关掉浏览器的分支同样要成立，且恰好少掉那两个依赖浏览器的工具。写成差集而不是
-    // 写死个数：以后往登记表里加工具，这个断言仍然成立，而不会因为数字对不上而失败。
-    const BROWSER_TOOLS = new Set([
-      "scrapling_render",
-      "scrapling_capture_xhr",
-      "scrapling_session_read",
-      "scrapling_session_act",
-      "scrapling_screenshot",
-    ]);
+    // 全开且能力齐时，注册数等于登记表长度：这条是关系，不是第二个数字。
+    expect(ready).toHaveLength(artifact.TOOL_SPECS.length);
+    // 关掉浏览器的分支同样要成立。依赖浏览器的那组由登记表的 requires 字段问出来：抄一份
+    // 名单的话，以后加一只 requires 为 browser 的工具，这条断言会照样绿而漏掉它。
+    const browserTools = artifact.TOOL_SPECS.filter((spec) => spec.requires === "browser").map(
+      (spec) => spec.name,
+    );
     const { ready: withoutBrowser } = artifact.planTools(
       allOn,
       { ...full, browser: false },
@@ -508,7 +664,7 @@ describe("构建产物可载入", () => {
       true,
       true,
     );
-    expect(withoutBrowser).toStrictEqual(ready.filter((name) => !BROWSER_TOOLS.has(name)));
-    expect(BROWSER_TOOLS.has("scrapling_render")).toBe(true);
+    expect(browserTools, "登记表里没有依赖浏览器的工具，这条断言就成空转了").not.toHaveLength(0);
+    expect(withoutBrowser).toStrictEqual(ready.filter((name) => !browserTools.includes(name)));
   });
 });

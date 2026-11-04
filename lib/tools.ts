@@ -19,6 +19,7 @@ import { anySignal, drainCrawl } from "./crawl-support.ts";
 import type { CrawlJobStarter } from "./crawl-support.ts";
 import {
   capText,
+  CONTENT_RECOVERY_HINT as RECOVERY_HINT,
   networkLines,
   renderAnswer,
   renderBrowser,
@@ -32,6 +33,7 @@ import type { AnswerRequest, AnswerResult } from "./answer.ts";
 import { callSidecar, sidecarErrorWithCode } from "./sidecar.ts";
 import type { SidecarClient } from "./sidecar.ts";
 import {
+  arrayParam,
   BROWSER_REQUEST_PARAMS,
   callNumber,
   CRAWL_MODE_PARAMS,
@@ -39,7 +41,10 @@ import {
   NETWORK_ITEM,
   NETWORK_READ_PARAMS,
   networkReadParams,
+  METHOD_CAPTURE,
+  METHOD_SESSION_NETWORK,
   sessionOpenExtras,
+  assertOpenArgsFitSession,
   STATIC_REQUEST_PARAMS,
   WRITE_BODY_PARAMS,
 } from "./tool-params.ts";
@@ -384,9 +389,6 @@ function truncationOf(upstream: boolean, capped: CappedText): boolean {
 /** url 参数的说明，被多处参数表共用。 */
 const URL_PARAM_DESC = "要抓取的 HTTP(S) URL。";
 
-/** 被截断时告诉模型怎么把内容再拿回来。 */
-const RECOVERY_HINT = "要拿被省略的部分，请用 cssSelector 收窄范围，或分多次抓取。";
-
 /**
  * 把 sidecar 的会话开单回包归一成结构。
  *
@@ -687,6 +689,9 @@ function selectOutputPayload(
     includeAttributes: args["includeAttributes"] === true,
     // 调用值优先，缺省仍用部署的抽取结果上限：给模型一个「这一段我只要多少字」的旋钮，
     // 但不给时行为与旧载荷逐字一致。
+    // 单位在这里是错开的：这一位按**字符**截断（Python 侧 clip），settings.maxOutputBytes
+    // 按**字节**计（宿主侧 capText）。同一个数值对 CJK 内容意味着对端可以交出约 3 倍的字节量，
+    // 最终模型可见长度仍由字节那一档收口，所以这一位只决定「对端白攒多少」，不决定给出去多少。
     maxContentChars: callNumber(args["maxContentChars"], settings.maxOutputBytes),
   };
 }
@@ -855,7 +860,11 @@ const WRITE_PARAMS = {
 
 /** 会话抓取那一条帧的方法名。三处共用，写散了一次就查不出来。 */
 const METHOD_SESSION_FETCH = "session.fetch";
-const METHOD_SESSION_NETWORK = "session.network";
+
+/** 这次调用有没有带请求体（body / form / json 任一）。 */
+function hasFetchBody(args: Record<string, unknown>): boolean {
+  return args["body"] !== undefined || args["form"] !== undefined || args["json"] !== undefined;
+}
 
 /**
  * 这次静态抓取隐含的方法：显式 method 优先；给了 form/json/body 而没给 method 时按 POST。
@@ -866,11 +875,6 @@ const METHOD_SESSION_NETWORK = "session.network";
  * @param args - 工具入参
  * @returns 大写的请求方法
  */
-/** 这次调用有没有带请求体（body / form / json 任一）。 */
-function hasFetchBody(args: Record<string, unknown>): boolean {
-  return args["body"] !== undefined || args["form"] !== undefined || args["json"] !== undefined;
-}
-
 function impliedFetchMethod(args: Record<string, unknown>): string {
   const asked = args["method"];
   if (typeof asked === "string" && asked.length > 0) {
@@ -924,6 +928,38 @@ function fetchPayload(
       : {}),
     ...(args["includeMetadata"] === true ? { includeMetadata: true } : {}),
     deployment: { stripInlineImages: settings.stripInlineImages },
+  };
+}
+
+/**
+ * 抓取类工具共用的结果投影：卡片显示的字段都来自回包的 meta，缺项退回入参与占位值。
+ *
+ * scrapling_fetch / scrapling_render / scrapling_answer 三条工具的这段原先逐字重复三份，
+ * 加一个展示字段（例如 notice）时只会改到一处，三条工具卡就此分叉，所以收成这一个函数。
+ *
+ * @param args - 工具入参（title 与 url 的回退源）
+ * @param result - sidecar 归一后的结果，meta 上挂着投影要读的字段
+ * @returns 工具卡的展示载荷
+ */
+function fetchPresentation(
+  args: { url: string },
+  result: { meta?: unknown },
+): {
+  card: "web";
+  kind: "fetch";
+  title: string;
+  url: string;
+  statusCode: number;
+  truncated: boolean;
+} {
+  const meta = isRecord(result.meta) ? result.meta : {};
+  return {
+    card: "web",
+    kind: "fetch",
+    title: args.url,
+    url: typeof meta["url"] === "string" ? meta["url"] : args.url,
+    statusCode: typeof meta["statusCode"] === "number" ? meta["statusCode"] : 0,
+    truncated: meta["truncated"] === true,
   };
 }
 
@@ -1059,19 +1095,7 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
       };
     },
     presentCall: (args) => ({ card: "generic", title: args["url"], kind: "fetch" }),
-    presentResult: (args, result) => {
-      // 投影载荷挂在 result.meta 上（不是 output）；meta 缺席时退回占位值，
-      // 让 UI 至少还能显示这是一次抓取。
-      const meta = isRecord(result.meta) ? result.meta : {};
-      return {
-        card: "web",
-        kind: "fetch",
-        title: args["url"],
-        url: typeof meta["url"] === "string" ? meta["url"] : args["url"],
-        statusCode: typeof meta["statusCode"] === "number" ? meta["statusCode"] : 0,
-        truncated: meta["truncated"] === true,
-      };
-    },
+    presentResult: fetchPresentation,
   });
 }
 
@@ -1314,6 +1338,7 @@ export function createLocateTool(deps: ToolDeps): ToolDefinition {
           limit: args["limit"] ?? 200,
           includeAncestors: args["includeAncestors"] !== false,
           generateSelectors: args["generateSelectors"] !== false,
+          // 上限单位与 selectOutputPayload 那一处一致（字符截断与字节预算两套口径），说明写在那里。
           maxContentChars: callNumber(args["maxContentChars"], settings.maxOutputBytes),
         },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
@@ -1583,7 +1608,7 @@ function browserRequestParams(
       : {}),
     ...(typeof args["loadDom"] === "boolean" ? { loadDom: args["loadDom"] } : {}),
     ...(typeof args["googleSearch"] === "boolean" ? { googleSearch: args["googleSearch"] } : {}),
-    ...(Array.isArray(args["blockedDomains"]) ? { blockedDomains: args["blockedDomains"] } : {}),
+    ...arrayParam(args, "blockedDomains"),
     ...(typeof args["waitSelectorState"] === "string" && args["waitSelectorState"].length > 0
       ? { waitSelectorState: args["waitSelectorState"] }
       : {}),
@@ -1591,7 +1616,7 @@ function browserRequestParams(
     ...(sessionScoped
       ? {}
       : {
-          ...(Array.isArray(args["cookies"]) ? { cookies: args["cookies"] } : {}),
+          ...arrayParam(args, "cookies"),
           ...(typeof args["retries"] === "number" ? { retries: args["retries"] } : {}),
           ...(typeof args["retryDelay"] === "number" ? { retryDelay: args["retryDelay"] } : {}),
         }),
@@ -1616,7 +1641,7 @@ function sessionFetchExtras(
     ...(args["params"] === undefined ? {} : { params: args["params"] }),
     ...(args["form"] === undefined ? {} : { form: args["form"] }),
     ...(args["json"] === undefined ? {} : { json: args["json"] }),
-    ...(Array.isArray(args["cookies"]) ? { cookies: args["cookies"] } : {}),
+    ...arrayParam(args, "cookies"),
     // 静态会话不接受 timeoutMs，只认 timeoutSeconds；不给的话部署级那枚
     // requestTimeoutSeconds 对会话路径完全无效，每次都落回 Python 写死的 120 秒。
     timeoutSeconds: args["timeoutSeconds"] ?? settings.requestTimeoutSeconds,
@@ -1750,7 +1775,9 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
             : {}),
         },
       },
-      render: (_args, value) => [{ type: "text", text: renderBrowser(value) }],
+      render: (_args, value) => [
+        { type: "text", text: renderBrowser(value, settings.maxOutputBytes) },
+      ],
       presentationMeta: (_args, value) => ({
         url: value.url,
         statusCode: value.statusCode,
@@ -1780,17 +1807,7 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
       return result;
     },
     presentCall: (args) => ({ card: "generic", title: args["url"], kind: "fetch" }),
-    presentResult: (args, result) => {
-      const meta = isRecord(result.meta) ? result.meta : {};
-      return {
-        card: "web",
-        kind: "fetch",
-        title: args["url"],
-        url: typeof meta["url"] === "string" ? meta["url"] : args["url"],
-        statusCode: typeof meta["statusCode"] === "number" ? meta["statusCode"] : 0,
-        truncated: meta["truncated"] === true,
-      };
-    },
+    presentResult: fetchPresentation,
   });
 }
 
@@ -1844,7 +1861,7 @@ export function createCaptureXhrTool(deps: ToolDeps): ToolDefinition {
       "站点数据来自 JSON 接口而不是 DOM 时，用它找到那个接口，再对接口 URL 单独抓一次即可拿到原始数据。" +
       "默认只回摘要；要接口的响应体就打开 includeBody（单条上限由 maxBodyChars 定）。" +
       "要读一个**已开会话**攒下的历史（跨多次抓取与页面动作）时用 scrapling_session_network。",
-    method: "capture",
+    method: METHOD_CAPTURE,
     withXhr: true,
     extraParameters: NETWORK_READ_PARAMS,
   });
@@ -1971,17 +1988,7 @@ export function createAnswerTool(deps: ToolDeps): ToolDefinition {
       };
     },
     presentCall: (args) => ({ card: "generic", title: args["url"], kind: "fetch" }),
-    presentResult: (args, result) => {
-      const meta = isRecord(result.meta) ? result.meta : {};
-      return {
-        card: "web",
-        kind: "fetch",
-        title: args["url"],
-        url: typeof meta["url"] === "string" ? meta["url"] : args["url"],
-        statusCode: typeof meta["statusCode"] === "number" ? meta["statusCode"] : 0,
-        truncated: meta["truncated"] === true,
-      };
-    },
+    presentResult: fetchPresentation,
   });
 }
 
@@ -2099,6 +2106,7 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext): Promise<SessionOpenResult> {
+      assertOpenArgsFitSession(args);
       const raw = await callSidecar(
         sidecar,
         "session.open",
@@ -2462,7 +2470,18 @@ export function createSessionListTool(deps: ToolDeps): ToolDefinition {
             value.sessions.length === 0
               ? "no open sessions"
               : value.sessions
-                  .map((item) => `${item.sessionId} (${item.sessionType}) opened ${item.createdAt}`)
+                  .map((item) => {
+                    // description 承诺了「存活状态」，schema 也声明了 alive，只在结构化输出里
+                    // 带着而不渲进文本，模型读到的那一行就永远没有这一位。对端没给时不补值：
+                    // 编出来的 alive 会被读成一个事实。
+                    let state = "";
+                    if (item.alive === true) {
+                      state = " · alive";
+                    } else if (item.alive === false) {
+                      state = " · closed";
+                    }
+                    return `${item.sessionId} (${item.sessionType}) opened ${item.createdAt}${state}`;
+                  })
                   .join("\n"),
         },
       ],

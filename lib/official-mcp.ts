@@ -15,11 +15,23 @@ import {
 } from "./mcp-contract.ts";
 
 export interface OfficialMcpOptions {
-  /** 能力包所在的数据目录（官方 server 装在托管 venv 里）。 */
+  /**
+   * 能力包所在的数据目录（官方 server 装在托管 venv 里）。
+   *
+   * 必须是绝对路径：这一位拼出来的 `command:` 会写进 cordis 的 patch，而相对路径是按
+   * **宿主进程**的 cwd 解析的，跟生成它的那个 shell 的 cwd 不是同一个。CLI 侧在
+   * `defaultDataDir()` 里 `path.resolve` 过一次，宿主侧走 `resolveDataDir`。
+   */
   readonly dataDir: string;
   /** 部署配置里的 `officialMcpEnabled`。 */
   readonly enabled: boolean;
-  /** setup 这一次调用有没有带 `--accept-risk`。 */
+  /**
+   * setup 这一次调用有没有带 `--accept-risk`。
+   *
+   * 生成接入配置这件事只属于 setup 那条命令行：`--accept-risk` 是命令行列旗标，不是插件设置
+   * （见 `officialMcpHint`），宿主侧读的是 profile 里已有的条目、不会走这一层。所以新增任何
+   * 入口（doctor、宿主启动路径）时，这一位都必须接在真实的命令行表态上，而不是自己填 `true`。
+   */
   readonly acceptedRisk: boolean;
 }
 
@@ -107,9 +119,11 @@ function yamlScalar(value: string): string {
   return `"${value.replaceAll(YAML_UNSAFE, (char) => yamlEscape(char))}"`;
 }
 
+// 这里不写工具条数：那是官方 server 随版本变化的事实，而这段话是用户做 `--accept-risk` 表态
+// 时唯一的依据。要点的名字（`browser_evaluate`）留着——它是这条披露真正要警示的那一枚。
 const RISK =
-  "official-mcp 直连官方 scrapling-mcp：那 16 个工具不经本插件的 URL 守卫与会话闸门（含 browser_evaluate 的任意 JS），" +
-  "用的是它自己的会话与状态，本插件既不复用也不拦截。";
+  "official-mcp 直连官方 scrapling-mcp：它的全部工具不经本插件的 URL 守卫与会话闸门" +
+  "（钉住的 scrapling 版本里有 `browser_evaluate` 这类任意 JS 执行），用的是它自己的会话与状态，本插件既不复用也不拦截。";
 
 /**
  * 生成 dsh-mcp-client 的 stdio 接入配置。

@@ -15,6 +15,12 @@ on:
     - cron: "23 4 * * 1"
   push:
     branches: [main]
+# 组键按 ref 分：周度 cron 与 push / 手动触发落在同一 ref 上时，后一次取消前一次。
+# 这个工作流的产物是「对当前那棵树的扫描结论」，旧那次的结果没有留存价值；而它同时向
+# code scanning 与 OpenSSF 公共 API 发布，交错的两次会互相覆盖出不一致的数。
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
 # 工作流级全只读；两个写权限只挂在 analysis job 上。
 permissions: read-all
 jobs:
@@ -42,13 +48,15 @@ jobs:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: results.sarif
+      # artifact 只是 5 天的留存副本，价值低于上面那一步；排在它前面时一次 artifact 失败
+      # （配额、并发冲突、网络抖动）会让本轮扫描结果整条丢掉。
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: scorecard-sarif
           path: results.sarif
           retention-days: 5
-      - name: Upload to code-scanning
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
-        with:
-          sarif_file: results.sarif

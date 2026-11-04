@@ -15,7 +15,7 @@ import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { packStates } from "./installer.ts";
 import type { installCapabilityPack, InstallerIO } from "./installer.ts";
 import { resolveRuntime } from "./runtime.ts";
-import { RUNTIME_REMOTE_NAMESPACE, isRuntimePack } from "./runtime-shape.ts";
+import { RUNTIME_PACKS, RUNTIME_REMOTE_NAMESPACE, isRuntimePack } from "./runtime-shape.ts";
 import type {
   RuntimeActionResult,
   RuntimeJobStatus,
@@ -74,6 +74,20 @@ function outputOf(read: JobOutputRead): string {
 }
 
 /**
+ * 一条作业的输出尾部；读不出来时给空串。
+ *
+ * 输出环被回收或读数异常都不改变「这条作业还在」的事实，所以这里的失败不能升级成
+ * 「整份作业视图没有」。
+ */
+function outputTextOf(jobs: RuntimeJobs, id: JobId): string {
+  try {
+    return outputOf(jobs.readAt(id, 0));
+  } catch {
+    return "";
+  }
+}
+
+/**
  * 设置卡「运行环境」的宿主读面。
  *
  * 服务在构造时注册（cordis Service 的契约），随所属 fiber 卸载自动撤；调用方拿实例没有用处。
@@ -93,18 +107,22 @@ export class ScraplingRuntimeService extends TypertRemoteService {
     if (this.job === null || jobs === undefined) {
       return null;
     }
+    const tracked = this.job;
+    let status: RuntimeJobStatus;
     try {
-      const view = jobs.get(this.job.id);
-      return {
-        id: String(this.job.id),
-        pack: this.job.pack,
-        status: view.status,
-        output: outputOf(jobs.readAt(this.job.id, 0)),
-      };
+      ({ status } = jobs.get(tracked.id));
     } catch {
       // 注册表不认这条了（被重载或已收走）：卡片按“没有作业”处理，不把旧读数当现状。
       return null;
     }
+    // 输出与状态分开读：`readAt` 失败（输出环被回收、读数异常）改变不了「有一个作业在跑」
+    // 这个事实。合在一个 try 里会让整份视图退回 null，于是正在装的环境被显示成没在装。
+    return {
+      id: String(tracked.id),
+      pack: tracked.pack,
+      status,
+      output: outputTextOf(jobs, tracked.id),
+    };
   }
 
   /**
@@ -167,21 +185,34 @@ export class ScraplingRuntimeService extends TypertRemoteService {
     const record = isRecord(request) ? request : undefined;
     const raw = record === undefined ? undefined : field(record, "pack");
     if (!isRuntimePack(raw)) {
-      return refused(400, "pack must be one of core|browser|search|media|adaptive-redis|mcp");
+      return refused(400, `pack must be one of ${RUNTIME_PACKS.join("|")}`);
     }
     const jobs = this.deps.jobsOf();
     if (jobs === undefined) {
       return refused(503, "this profile has no jobs backend; run the CLI instead");
     }
-    let running: TrackedJob | null;
+    // 互斥不能只认实例内那一条：插件重载或服务重建后拿到的是新实例（`this.job` 为 null），
+    // 而上一次安装可能还在跑；按 kind 向注册表要一次现状，判断才不受实例生命周期影响。
+    // `installer` 的 `install.lock` 只保证不双写，挡不住用户白等一个注定 `INSTALL_BUSY` 的作业。
+    let busy: string | undefined;
     try {
-      running = this.liveJob(jobs);
+      const mine = this.liveJob(jobs);
+      if (mine === null) {
+        const foreign = jobs
+          .list()
+          .find((view) => view.kind === RUNTIME_JOB_KIND && isLive(view.status));
+        if (foreign !== undefined) {
+          busy = String(foreign.id);
+        }
+      } else {
+        busy = String(mine.id);
+      }
     } catch (error) {
       // 读不到上一次安装的状态就不能放行：它可能还在跑，放行等于双写。
       return refused(500, `cannot read the last install job: ${String(error)}`);
     }
-    if (running !== null) {
-      return refused(409, `another install is running: ${String(running.id)}`);
+    if (busy !== undefined) {
+      return refused(409, `another install is running: ${busy}`);
     }
     const pack = raw;
     const controller = new AbortController();
@@ -204,9 +235,16 @@ export class ScraplingRuntimeService extends TypertRemoteService {
             });
             return { status: "completed" };
           } catch (error) {
-            return controller.signal.aborted
-              ? { status: "killed", detail: "cancelled from settings card" }
-              : { status: "failed", detail: String(error) };
+            const { aborted } = controller.signal;
+            const detail = aborted ? "cancelled from settings card" : String(error);
+            // 原因必须落到作业输出里：作业视图只透出 status 与 output，`JobOutcome.detail`
+            // 到不了卡片 —— 否则界面只看得见一个停在 "installing browser" 的 failed。
+            try {
+              job.append(`${aborted ? "CANCELLED" : "FAILED"}: ${detail}\n`, { channel: "log" });
+            } catch {
+              // 输出环已经不认这次写入：原因进不了界面，但作业的终态照旧交回注册表。
+            }
+            return aborted ? { status: "killed", detail } : { status: "failed", detail };
           }
         })();
         return {
@@ -226,6 +264,9 @@ export class ScraplingRuntimeService extends TypertRemoteService {
         detach();
       }
     } catch (error) {
+      // `start` 可能在调用过 `run` 之后才失败（登记环节出问题），那时装包已经在后台跑，
+      // 而 `this.job` 还没写上——不摘掉它，第二次安装就会与它同时写同一份 venv/state.json。
+      controller.abort();
       return refused(500, String(error));
     }
     this.job = { id, pack };
@@ -238,19 +279,26 @@ export class ScraplingRuntimeService extends TypertRemoteService {
     if (typeof raw !== "string" || raw.length === 0) {
       return refused(400, "cancel requires a jobId");
     }
-    if (this.job === null || String(this.job.id) !== raw) {
+    const tracked = this.job;
+    if (tracked === null || String(tracked.id) !== raw) {
       return refused(404, `unknown jobId: ${raw}`);
     }
     const jobs = this.deps.jobsOf();
     if (jobs === undefined) {
       return refused(503, "this profile has no jobs backend");
     }
+    if (!jobs.list().some((view) => String(view.id) === raw)) {
+      // 注册表已经把这条收走（`remove()` 或服务销毁）。本包对「缺席」的口径是自愈信号，
+      // 不是一次取消失败：报 404 并忘掉它，下一次安装才不会被一条已不存在的作业挡住。
+      this.job = null;
+      return refused(404, `unknown jobId: ${raw}`);
+    }
     try {
-      jobs.kill(this.job.id, undefined, "cancelled from settings card");
+      jobs.kill(tracked.id, undefined, "cancelled from settings card");
     } catch (error) {
       return refused(500, String(error));
     }
-    return { ok: true, jobId: String(this.job.id) };
+    return { ok: true, jobId: String(tracked.id) };
   }
 }
 

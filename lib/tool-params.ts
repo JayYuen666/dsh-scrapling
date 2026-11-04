@@ -1,3 +1,5 @@
+import { ToolArgsError } from "@deepseek-ai/dsh-tools";
+
 /**
  * 本次调用的数值参数：调用值优先，缺省用部署值；给了 cap 就只压上限。
  *
@@ -19,6 +21,17 @@ export function callNumber(
 
 /** `mainContentOnly` 在三处工具参数表里共用同一句说明。 */
 export const MAIN_CONTENT_ONLY_DESC = "只保留 body 内容，默认 true。";
+
+/** `retryDelay` 在静态与浏览器两张参数表里同义，说明只写一处。 */
+export const RETRY_DELAY_DESC = "重试间隔秒，默认 1。";
+
+/** `includeMetadata` 在两张表里回传的是同一份元数据。 */
+export const INCLUDE_METADATA_DESC =
+  "回传安全响应元数据（contentType / encoding / reason / redirects / method），默认 false。";
+
+/** 读网络历史的两个方法名；`networkReadParams` 与各调用点共用，写散了一次就查不出来。 */
+export const METHOD_CAPTURE = "capture";
+export const METHOD_SESSION_NETWORK = "session.network";
 
 /** 网络历史条目的条目 schema。 */
 export const NETWORK_ITEM = {
@@ -52,7 +65,7 @@ export function networkReadParams(
   method: string,
   args: Record<string, unknown>,
 ): Record<string, unknown> {
-  if (method !== "capture" && method !== "session.network") {
+  if (method !== METHOD_CAPTURE && method !== METHOD_SESSION_NETWORK) {
     return {};
   }
   return {
@@ -104,22 +117,97 @@ export const NETWORK_READ_PARAMS = {
 } as const;
 
 /**
+ * 数组参数的一枚展开件：没给就不出现在载荷里，给了但不是数组就报参数错误。
+ *
+ * `cookies` / `blockedDomains` 声明的是 `json`，任何 JSON 值都过得了宿主那道形状校验。
+ * 按 `Array.isArray` 判「给了才带」时，`{name, value}` 或字符串走的是「没给」那支，于是
+ * 会话按无 cookie 开场且没有任何回执；Python 侧的 `_cookie_list` 本来会报
+ * `cookies must be an array or null`，但值在这里就被丢了，那条错永远到不了模型眼前。
+ *
+ * 空数组照旧原样发下去：发与不发在 Python 侧不是一回事，这里不做超出报错之外的取舍。
+ *
+ * @param args - 工具入参
+ * @param key - 要读的那一枚数组参数
+ * @returns 要并进载荷的键（没给时是空对象）
+ * @throws ToolArgsError - 给了但不是数组
+ */
+export function arrayParam(args: Record<string, unknown>, key: string): Record<string, unknown> {
+  const value: unknown = args[key];
+  if (value === undefined) {
+    return {};
+  }
+  if (!Array.isArray(value)) {
+    throw new ToolArgsError([`${key} must be an array`]);
+  }
+  return { [key]: value };
+}
+
+/** static 会话（curl_cffi 的 `FetcherSession`）在开场时一个都不读的那几枚键：只有
+ *  `impersonate` 与超时进得去。见 `py/adapters.py` 的 `_make_session` static 分支。 */
+export const STATIC_UNUSED_OPEN_KEYS = [
+  "headless",
+  "solveCloudflare",
+  "hideCanvas",
+  "blockWebrtc",
+  "allowWebgl",
+  "recordNetwork",
+  "useragent",
+  "locale",
+  "timezoneId",
+  "cookies",
+  "disableResources",
+  "loadDom",
+  "blockedDomains",
+  "googleSearch",
+  "retries",
+  "retryDelay",
+  "maxPages",
+] as const;
+
+/**
+ * static 会话开场只读 `impersonate` 与超时，递过来的浏览器档旋钮在这里报参数错误，
+ * 而不是静默丢掉后让调用方以为开关生效了。
+ *
+ * 判据是「调用方真的给了」（`undefined` 以外都算给过），不是「载荷里有这一位」——
+ * `scrapling_session_open` 每次开场都把 `headless` / `solveCloudflare` 连同部署默认值
+ * 写进载荷，按后者判会让每一次 static 开场都失败。
+ *
+ * 同一类「键归另一种会话」的抱怨已经在 `session.fetch` 那一帧存在（`py/adapters.py`
+ * 的 `only applies to static sessions` 那一段），这条只是把开场那一帧补齐。
+ *
+ * @param args - 工具入参
+ * @throws ToolArgsError - 开了 static 却给了只有浏览器档才生效的键
+ */
+export function assertOpenArgsFitSession(args: Record<string, unknown>): void {
+  if (args["sessionType"] !== "static") {
+    return;
+  }
+  const unused = STATIC_UNUSED_OPEN_KEYS.filter((key) => args[key] !== undefined);
+  if (unused.length > 0) {
+    throw new ToolArgsError([
+      `sessionType=static ignores: ${unused.join(", ")} — 要这些行为请开 stealth 会话`,
+    ]);
+  }
+}
+
+/**
  * 组装会话构造期的扩展参数。
  *
  * @param args - 工具入参
  * @returns 给了才出现的键
+ * @throws ToolArgsError - `cookies` / `blockedDomains` 给了但不是数组
  */
 export function sessionOpenExtras(args: Record<string, unknown>): Record<string, unknown> {
   return {
     ...(typeof args["sessionId"] === "string" && args["sessionId"].length > 0
       ? { sessionId: args["sessionId"] }
       : {}),
-    ...(Array.isArray(args["cookies"]) ? { cookies: args["cookies"] } : {}),
+    ...arrayParam(args, "cookies"),
     ...(typeof args["disableResources"] === "boolean"
       ? { disableResources: args["disableResources"] }
       : {}),
     ...(typeof args["loadDom"] === "boolean" ? { loadDom: args["loadDom"] } : {}),
-    ...(Array.isArray(args["blockedDomains"]) ? { blockedDomains: args["blockedDomains"] } : {}),
+    ...arrayParam(args, "blockedDomains"),
     ...(typeof args["googleSearch"] === "boolean" ? { googleSearch: args["googleSearch"] } : {}),
     ...(typeof args["retries"] === "number" ? { retries: args["retries"] } : {}),
     ...(typeof args["retryDelay"] === "number" ? { retryDelay: args["retryDelay"] } : {}),
@@ -134,16 +222,12 @@ export const STATIC_REQUEST_PARAMS = {
     type: "string",
     description: "响应头没有 charset 时使用的回退编码名，例如 latin-1。",
   },
-  retryDelay: { type: "integer", description: "重试间隔秒，默认 1。" },
+  retryDelay: { type: "integer", description: RETRY_DELAY_DESC },
   stealthyHeaders: {
     type: "boolean",
     description: "是否给静态请求补浏览器头，默认 true。",
   },
-  includeMetadata: {
-    type: "boolean",
-    description:
-      "回传安全响应元数据（contentType / encoding / reason / redirects / method），默认 false。",
-  },
+  includeMetadata: { type: "boolean", description: INCLUDE_METADATA_DESC },
 } as const;
 
 /**
@@ -190,12 +274,8 @@ export const BROWSER_REQUEST_PARAMS = {
     description: "是否注入 Google referer，默认 true。",
   },
   retries: { type: "integer", description: "会话构造期重试次数，默认 3。" },
-  retryDelay: { type: "integer", description: "重试间隔秒，默认 1。" },
-  includeMetadata: {
-    type: "boolean",
-    description:
-      "回传安全响应元数据（contentType / encoding / reason / redirects / method），默认 false。",
-  },
+  retryDelay: { type: "integer", description: RETRY_DELAY_DESC },
+  includeMetadata: { type: "boolean", description: INCLUDE_METADATA_DESC },
 } as const;
 
 /** `scrapling_crawl` 的 sitemap/feed 模式参数；放这里让工具函数本体保持在行数门内。 */

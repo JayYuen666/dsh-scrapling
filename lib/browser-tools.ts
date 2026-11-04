@@ -19,6 +19,14 @@ export interface AttachmentSaver {
 
 const RECOVERY_HINT = "要拿被省略的部分，请用 cssSelector 收窄范围，或分多次读取。";
 
+/**
+ * 标准 base64 的形态：四位一组，尾部允许一枚或两枚 `=`。
+ *
+ * 判形态而不是只判「能解出字节」：`Buffer.from(str, "base64")` 会跳过字母表以外的字符，
+ * 于是带 `data:` 前缀或被截断的串也能解出一点东西，而解出来的是半张图。
+ */
+const BASE64_SHAPE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+
 function textOf(raw: unknown, field: string): string {
   if (!isRecord(raw) || typeof raw[field] !== "string") {
     throw new SidecarError(
@@ -360,7 +368,20 @@ export function createScreenshotTool(deps: ToolDeps): ToolDefinition {
       if (mediaType !== "image/png" && mediaType !== "image/jpeg") {
         throw new SidecarError("SIDECAR_REQUEST_FAILED", `unexpected media type: ${mediaType}`);
       }
-      const data = Buffer.from(textOf(raw, "base64"), "base64");
+      const encoded = textOf(raw, "base64");
+      // `Buffer.from(str, "base64")` 对非法输入是宽容的：不在字母表里的字符被跳过，于是
+      // 半帧、带 `data:` 前缀或已被截断的串会解出一小段的图，然后照样落库成一张坏图。
+      // 这条路径的正文来自自家 sidecar 的 b64encode，形态不合就说明回包已经不是这张图；
+      // 判形态也顺手排除了「解出零字节」那一档（空串与纯 `=` 都不合形）。
+      // 解码后的字节上限不在这一层：落库处是宿主的 attachment 服务，容量与清理归它，
+      // 模型从这一枚工具看到的只有引用。
+      if (encoded.length === 0 || !BASE64_SHAPE.test(encoded)) {
+        throw new SidecarError(
+          "SIDECAR_REQUEST_FAILED",
+          "screenshot payload is not a well-formed base64 string",
+        );
+      }
+      const data = Buffer.from(encoded, "base64");
       const attachment = jsonOf(
         await attachments.saveImage({
           data: new Uint8Array(data),

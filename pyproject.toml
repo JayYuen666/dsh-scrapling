@@ -33,8 +33,8 @@ select = [
   "B", # bugbear：闭包捕获循环变量（B023）就在这一类里，实测抓到过真缺陷
   "SIM", # flake8-simplify： suppress 之类
   "RET", # flake8-return：return 前的多余赋值
-  "BLE001", # 裸 except Exception —— 本仓库刻意保留带理由的既有抑制，开这条等于把它们一起判死
-  "PLW0603", # global 语句 —— 同理，抑制标记里写着「为什么可以」
+  "BLE001", # 裸 except Exception —— 开着它，配合下面 RUF100：既有抑制都带理由，理由不再成立时标记本身判红
+  "PLW0603", # global 语句 —— 同上；这一档的抑制标记里写着「为什么可以」
   "S", # flake8-bandit：安全类（含 S603 子进程调用）
   "N802", # 函数命名 —— BaseHTTPRequestHandler 的 do_GET 约定
   "E402", # 模块级 import 不在文件头 —— bridge.py 为避开循环依赖而内联导入
@@ -56,9 +56,9 @@ max-complexity = 28
 # 收益为负 —— 原先那批 `# noqa: ANN401` 因此改成普通注释，理由留在原地但不占着抑制标记。
 
 [tool.mypy]
-ignore_missing_imports = true
-# 严格档：未注解的函数体也要查，失效的 type: ignore 与未注解 def 都判红；
-# 第三方缺 stubs 时仍按 Any 处理（Playwright 对象是运行时形状）。
+# 严格档：未注解的函数体也要查，失效的 type: ignore 与未注解 def 都判红。
+# 解析不到的导入按下面的 [[tool.mypy.overrides]] 逐模块放行，不开全局开关：
+# 全局 ignore_missing_imports 会把同级模块拼错（`import adapters` 打成 `adapterss`）也吞成 Any。
 python_version = "3.14"
 # 未注解的函数体也要查；失效的 type: ignore 与未注解 def 都判红。
 check_untyped_defs = true
@@ -66,6 +66,10 @@ disallow_untyped_defs = true
 warn_unused_ignores = true
 
 [tool.coverage.run]
+# 分支也计入：本项目的风险面恰恰在错误/降级分支（SCRAPLING_MISSING、半帧与超时、Windows
+# 路径分叉），只按行统计时未走到的 except/else 不会拉低读数。开启后现量最低的那份是
+# py/bridge.py 与 py/extraction.py（81%），仍高于 coverage:floor 的地板，所以地板值不动。
+branch = true
 # 只量随包发布的源文件 + 测试脚本本身；__pycache__ 与 _env 一概不进。
 source = ["py"]
 parallel = true
@@ -73,5 +77,18 @@ parallel = true
 sigterm = true
 
 [tool.coverage.report]
+# 这一档不设 fail_under：地板由 package.json 的 coverage:floor 那条腿施加（它同时用
+# --omit="py/tests/*" 把分母收在随包发布的源文件上），cov:py 是「看缺口在哪」的报表面，
+# 不该因为一次探查就判红。两处地板取值不一致时由 coverage-floor.mjs 判红，不靠人记。
 show_missing = true
 skip_covered = false
+
+# 只对确实没有类型桩的第三方按模块放行：全局 ignore_missing_imports 会把 py/ 里拼错的、
+# 被删掉的或改了名的一等公民导入（`import adapters` 这类同级模块）一起吞成 Any，
+# 而那正是类型门禁该抓的东西。实测 14 份源文件里只有两处需要这一条 —— scrapling、
+# playwright、curl_cffi 都自带 py.typed，mypy 直接解析得开，把它们列进来只是死配置；
+# `lxml` 没有桩；`redis` 是 adaptive-redis 能力包的运行期依赖，dev 环境不装它
+# （CI 只装 scrapling[rag] 与 requirements-dev），缺它时 py/redis_storage.py 的按需导入按 Any 处理。
+[[tool.mypy.overrides]]
+module = ["lxml.*", "redis", "redis.*"]
+ignore_missing_imports = true

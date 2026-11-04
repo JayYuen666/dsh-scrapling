@@ -3964,6 +3964,21 @@ def _run_crawl_happy_path(crawl: Any) -> None:
         check("压过的那页带 truncated 标记", shrunk[0].get("truncated") is True, repr(shrunk[0].get("truncated")))
         check("原页不被就地改动", len(huge_pages[0]["markdown"]) == len(oversized), str(len(huge_pages[0]["markdown"])))
 
+        # feed / shopify 的行没有 markdown 键，走的是另一条降级分支，所以单独钉一条：
+        # 只压 pages 那一支的话，超长字段所在的那一帧会原样出去并顶过切帧线。
+        huge_row = {"title": "T", "body": oversized}
+        shrunk_rows, _ = crawl._take_pages([huge_row], 0)
+        row_bytes = len(json.dumps(shrunk_rows[0], ensure_ascii=False).encode("utf-8"))
+        check(
+            "超大行也压到回包预算内",
+            len(shrunk_rows) == 1 and row_bytes <= crawl.MAX_STATUS_BYTES,
+            f"{row_bytes} vs {crawl.MAX_STATUS_BYTES}",
+        )
+        row_flag = shrunk_rows[0].get("truncated")
+        check("压过的行带 truncated 标记", row_flag is True, repr(row_flag))
+        check("压行只动最长那一串", shrunk_rows[0]["title"] == "T", repr(shrunk_rows[0]["title"]))
+        check("原行不被就地改动", len(huge_row["body"]) == len(oversized), str(len(huge_row["body"])))
+
         # 报告 §2.7：单页超预算时不能把已经收下的前几页一起丢掉。调用方按回包条数推进
         # since，丢页会让那些页下一轮重发、更后面的页永远轮不到（more=false 时直接跳过）。
         marker_pages = [
@@ -5058,6 +5073,29 @@ def run_proxy() -> None:
                 check(f"NAT64 {note} 判拒", not guard.is_public_address(host), host)
             finally:
                 guard.configure(nat64_prefixes=())
+
+        # 非法与不支持的前缀必须可见：静默丢掉会让运营方以为「私网 IPv4 已被 NAT64 复判
+        # 保护」，而实际那一段仍按公网放行。两类各给一条日志，且被拒的项不进表。
+        nat64_log = io.StringIO()
+        with contextlib.redirect_stderr(nat64_log):
+            guard.configure(nat64_prefixes=("not-a-prefix", "10.0.0.0/8"))
+        nat64_logged = nat64_log.getvalue()
+        check(
+            "非法 NAT64 前缀点名忽略并留下日志",
+            "ignoring an invalid extra NAT64 prefix" in nat64_logged,
+            nat64_logged[:160],
+        )
+        check(
+            "不支持的前缀点名时给出可用档位",
+            "ignoring an unsupported extra NAT64 prefix" in nat64_logged and "/96" in nat64_logged,
+            nat64_logged[:200],
+        )
+        check(
+            "被拒的两项都不进 NAT64 表",
+            len(guard._nat64_tables()) == 2,
+            str(len(guard._nat64_tables())),
+        )
+        guard.configure(nat64_prefixes=())
     finally:
         for key, value in saved.items():
             if value is None:

@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import { createWebFetchProvider, PROVIDER_ID, toBodyKind } from "../lib/web-provider.ts";
+import type { WebProviderDeps } from "../lib/web-provider.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
 
@@ -20,7 +21,57 @@ function stubSidecar(): SidecarClient {
   });
 }
 
-const DEPS = { sidecar: stubSidecar(), maxOutputBytes: 4000, timeoutMs: 30_000 };
+/**
+ * 一份用例依赖：sidecar 与两个预算值每次都是新的。
+ *
+ * 原先这是模块级共享的 `const DEPS`，而 `available` 那组用 `Object.defineProperty` 反复改写
+ * 同一枚 sidecar 的 `alive` / `capabilities`：用例一重排、加 `.concurrent`，或中途有一条红在
+ * 改状态之后（恢复语句就跑不到），下一条读到的就是上一位的残留状态。
+ *
+ * @param overrides - 要替换的位（通常只换 sidecar）
+ * @returns 供 `createWebFetchProvider` 用的依赖
+ */
+function makeDeps(overrides: Partial<WebProviderDeps> = {}): WebProviderDeps {
+  return { sidecar: stubSidecar(), maxOutputBytes: 4000, timeoutMs: 30_000, ...overrides };
+}
+
+/** 握手后的能力表：`scrapling` 那一档可按用例需要改。 */
+function capabilities(scrapling = true): Record<string, unknown> {
+  return {
+    scrapling,
+    static: true,
+    extract: true,
+    browser: false,
+    version: "0.5",
+  };
+}
+
+/**
+ * 造一台「握过手 / 没握手」可控的 sidecar。
+ *
+ * `alive` 与 `capabilities` 在 `SidecarClient` 上是只读 getter，只能按实例覆盖；
+ * 覆盖动作留在这个工厂里，用例就不再直接改共享对象。
+ *
+ * @param options - 活不活、能力表、以及 `call` 要不要被记账
+ * @returns 可用的 sidecar 替身
+ */
+function fakeSidecar(
+  options: {
+    alive?: boolean;
+    caps?: Record<string, unknown> | undefined;
+    call?: (method: string, params: unknown, opts?: Record<string, unknown>) => Promise<unknown>;
+  } = {},
+): SidecarClient {
+  const client = stubSidecar();
+  Object.defineProperties(client, {
+    alive: { value: options.alive ?? false, configurable: true },
+    capabilities: { value: options.caps, configurable: true },
+  });
+  if (options.call !== undefined) {
+    Object.assign(client, { call: options.call });
+  }
+  return client;
+}
 
 describe("toBodyKind", () => {
   it("html 保持 html，markdown 与 text 都降级成 text", () => {
@@ -32,30 +83,40 @@ describe("toBodyKind", () => {
 });
 
 describe("available", () => {
-  it("sidecar 没起来时不可用", () => {
-    expect(createWebFetchProvider(DEPS).available()).toBe(false);
+  it("sidecar 没起来时不可用，而且不发任何请求", () => {
+    // available() 是同步的：实现里若偷偷 call 一次 sidecar，那个 Promise 会被丢掉，
+    // 只看布尔值的断言一位都测不到。所以替身把每一次 call 记下来并直接抛。
+    const requested: string[] = [];
+    const sidecar = fakeSidecar({
+      alive: false,
+      call: (method): Promise<unknown> => {
+        requested.push(method);
+        throw new Error("available() 不该发请求");
+      },
+    });
+    expect(createWebFetchProvider(makeDeps({ sidecar })).available()).toBe(false);
+    expect(requested).toStrictEqual([]);
   });
 
   it("handshake 过且有 scrapling 才可用", () => {
-    const provider = createWebFetchProvider(DEPS);
-    Object.defineProperty(DEPS.sidecar, "alive", { value: true, configurable: true });
-    Object.defineProperty(DEPS.sidecar, "capabilities", {
-      value: {
-        scrapling: true,
-        static: true,
-        extract: true,
-        browser: false,
-        version: "0.5",
-      },
-      configurable: true,
-    });
-    expect(provider.available()).toBe(true);
+    const sidecar = fakeSidecar({ alive: true, caps: capabilities(true) });
+    expect(createWebFetchProvider(makeDeps({ sidecar })).available()).toBe(true);
+  });
+
+  it("活着但能力表说没有 scrapling 时不可用", () => {
+    // 这一档与「没起来」是两条不同的路径：握手成功、scrapling 没装上，
+    // 实现里那句 `capabilities?.scrapling === true` 一旦退化就会被这里抓到。
+    const noScrapling = fakeSidecar({ alive: true, caps: capabilities(false) });
+    const noCapabilities = fakeSidecar({ alive: true });
+    expect(createWebFetchProvider(makeDeps({ sidecar: noScrapling })).available()).toBe(false);
+    expect(createWebFetchProvider(makeDeps({ sidecar: noCapabilities })).available()).toBe(false);
   });
 
   it("有 scrapling 但 sidecar 已死时不可用", () => {
-    Object.defineProperty(DEPS.sidecar, "alive", { value: false, configurable: true });
-    expect(createWebFetchProvider(DEPS).available()).toBe(false);
-    Object.defineProperty(DEPS.sidecar, "alive", { value: true, configurable: true });
+    const sidecar = fakeSidecar({ alive: true, caps: capabilities(true) });
+    expect(createWebFetchProvider(makeDeps({ sidecar })).available()).toBe(true);
+    Object.defineProperty(sidecar, "alive", { value: false, configurable: true });
+    expect(createWebFetchProvider(makeDeps({ sidecar })).available()).toBe(false);
   });
 });
 
@@ -70,7 +131,7 @@ describe("fetch", () => {
         truncated: false,
       }),
     });
-    const result = await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({
+    const result = await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({
       url: "https://example.test/start",
     });
     expect(result.url).toBe("https://example.test/final");
@@ -89,8 +150,24 @@ describe("fetch", () => {
         truncated: false,
       }),
     });
-    const result = await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+    const result = await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
     expect(result.truncated).toBe(true);
+  });
+
+  it("sidecar 自己标了截断、正文没超预算时也透传 truncated", async () => {
+    // 实现是 `payload.truncated === true || capped.truncated` 两半并列：只测后半段时，
+    // 前半段（sidecar 已裁过、本层不必再裁）被整段丢掉也不会红。
+    const client = fakeSidecar({
+      call: async (): Promise<unknown> => ({
+        url: "u",
+        status: 200,
+        content: "短正文",
+        truncated: true,
+      }),
+    });
+    const result = await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
+    expect(result.truncated).toBe(true);
+    expect(result.body.content).toBe("短正文");
   });
 
   it("超预算时正文真的被裁到预算以内，不只是标一个 truncated", async () => {
@@ -105,8 +182,10 @@ describe("fetch", () => {
         truncated: false,
       }),
     });
-    const result = await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
-    expect(Buffer.byteLength(result.body.content, "utf8")).toBeLessThanOrEqual(DEPS.maxOutputBytes);
+    const result = await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
+    expect(Buffer.byteLength(result.body.content, "utf8")).toBeLessThanOrEqual(
+      makeDeps().maxOutputBytes,
+    );
     expect(result.body.content.length).toBeLessThan(9000);
   });
 
@@ -122,9 +201,11 @@ describe("fetch", () => {
         truncated: false,
       }),
     });
-    const result = await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+    const result = await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
     expect(result.truncated).toBe(true);
-    expect(Buffer.byteLength(result.body.content, "utf8")).toBeLessThanOrEqual(DEPS.maxOutputBytes);
+    expect(Buffer.byteLength(result.body.content, "utf8")).toBeLessThanOrEqual(
+      makeDeps().maxOutputBytes,
+    );
   });
 
   it("回包不是对象时抛错，而不是补成一张空白的成功页", async () => {
@@ -134,7 +215,7 @@ describe("fetch", () => {
     Object.assign(client, { call: async (): Promise<unknown> => "not an object" });
     let caught: (Error & { code?: string }) | undefined;
     try {
-      await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+      await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
     } catch (error) {
       caught = error as Error & { code?: string };
     }
@@ -149,7 +230,7 @@ describe("fetch", () => {
     Object.assign(client, { call: async (): Promise<unknown> => undefined });
     let caught: (Error & { code?: string }) | undefined;
     try {
-      await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+      await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
     } catch (error) {
       caught = error as Error & { code?: string };
     }
@@ -168,7 +249,7 @@ describe("fetch", () => {
     Object.assign(client, { call: async (): Promise<unknown> => cyclic });
     let caught: (Error & { code?: string }) | undefined;
     try {
-      await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+      await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
     } catch (error) {
       caught = error as Error & { code?: string };
     }
@@ -183,23 +264,98 @@ describe("fetch", () => {
       call: async (): Promise<unknown> => ({ url: "u" }),
     });
     await expect(
-      createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" }),
+      createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" }),
     ).rejects.toThrow(/malformed/u);
   });
 
-  it("给了 signal 时会一并透传给 sidecar", async () => {
+  it.each([
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["0", 0],
+    ["负数", -1],
+    ["600", 600],
+    ["小数", 200.5],
+  ])("status 是 %s 时按回包坏了处理，不让它进模型看到的标题行", async (_label, status) => {
     const client = stubSidecar();
-    const seen: { hasSignal: boolean }[] = [];
     Object.assign(client, {
-      call: async (_m: string, _p: unknown, opts?: { signal?: AbortSignal }): Promise<unknown> => {
-        seen.push({ hasSignal: opts?.signal !== undefined });
+      call: async (): Promise<unknown> => ({ url: "http://a.test/", status, content: "body" }),
+    });
+    let caught: (Error & { code?: string }) | undefined;
+    try {
+      await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
+    } catch (error) {
+      caught = error as Error & { code?: string };
+    }
+    expect(caught?.code).toBe("SCRAPLING_FETCH_FAILED");
+    expect(caught?.message).toContain("malformed");
+  });
+
+  it("url 是空串时同样判坏了：宿主那张卡会没有标题", async () => {
+    const client = stubSidecar();
+    Object.assign(client, {
+      call: async (): Promise<unknown> => ({ url: "", status: 200, content: "body" }),
+    });
+    await expect(
+      createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" }),
+    ).rejects.toThrow(/malformed/u);
+  });
+
+  it("sidecar 的原始错误挂在 cause 上：code 是 provider 的，机器可读的那一枚不能只活在文案里", async () => {
+    const client = stubSidecar();
+    Object.assign(client, {
+      call: async (): Promise<never> => {
+        throw new SidecarError("URL_BLOCKED", "blocked by the url policy");
+      },
+    });
+    let caught: (Error & { code?: string; cause?: unknown }) | undefined;
+    try {
+      await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
+    } catch (error) {
+      caught = error as Error & { code?: string; cause?: unknown };
+    }
+    expect(caught?.code).toBe("SCRAPLING_FETCH_FAILED");
+    expect(caught?.message).toContain("URL_BLOCKED");
+    const cause = caught?.cause;
+    expect(cause).toBeInstanceOf(SidecarError);
+    expect((cause as SidecarError).code).toBe("URL_BLOCKED");
+  });
+
+  it("给了 signal 时会一并透传给 sidecar", async () => {
+    const deps = makeDeps();
+    const seen: { hasSignal: boolean }[] = [];
+    const client = fakeSidecar({
+      call: async (_m: string, _p: unknown, opts?: Record<string, unknown>): Promise<unknown> => {
+        seen.push({ hasSignal: (opts?.["signal"] as AbortSignal | undefined) !== undefined });
         return { url: "u", status: 200, content: "x", truncated: false };
       },
     });
-    const provider = createWebFetchProvider({ ...DEPS, sidecar: client });
+    const provider = createWebFetchProvider({ ...deps, sidecar: client });
     await provider.fetch({ url: "u" }, new AbortController().signal);
     await provider.fetch({ url: "u" });
     expect(seen).toStrictEqual([{ hasSignal: true }, { hasSignal: false }]);
+  });
+
+  it("输出的字节预算与协同超时按 deps 透传，不写死也不漏传", async () => {
+    // 这两个值一边决定 sidecar 侧裁到多少字符，一边决定协议层的超时；漏传或写死都会
+    // 让「设置卡拧了旋钮」在这条路径上没有效果，而回包形状照旧、看不出异常。
+    const deps = makeDeps();
+    const sent: { params: unknown; opts: unknown }[] = [];
+    const client = fakeSidecar({
+      call: async (
+        _method: string,
+        params: unknown,
+        opts?: Record<string, unknown>,
+      ): Promise<unknown> => {
+        sent.push({ params, opts });
+        return { url: "u", status: 200, content: "x", truncated: false };
+      },
+    });
+    await createWebFetchProvider({ ...deps, sidecar: client }).fetch({ url: "https://a.test/" });
+    expect(sent).toHaveLength(1);
+    const record = sent[0] as { params: Record<string, unknown>; opts: Record<string, unknown> };
+    expect(record.params["url"]).toBe("https://a.test/");
+    expect(record.params["maxContentChars"]).toBe(deps.maxOutputBytes);
+    expect(record.opts["timeoutMs"]).toBe(deps.timeoutMs);
   });
 
   it("sidecar 抛错时包成带 code 的 WebError，并把 sidecar 的码带进消息", async () => {
@@ -209,7 +365,7 @@ describe("fetch", () => {
         throw new SidecarError("URL_BLOCKED", "blocked by the host gate");
       },
     });
-    const provider = createWebFetchProvider({ ...DEPS, sidecar: client });
+    const provider = createWebFetchProvider(makeDeps({ sidecar: client }));
     // WebError 的签名是 (message, code)。这里必须断 code 而不是只看类型 —— 参数写反时
     // 照样是 WebError 实例，但 code 会变成一整段错误文本，按码路由的调用方就废了。
     let caught: (Error & { code?: string }) | undefined;
@@ -243,13 +399,16 @@ describe("fetch", () => {
     });
     let caught: (Error & { code?: string }) | undefined;
     try {
-      await createWebFetchProvider({ ...DEPS, sidecar: client }).fetch({ url: "u" });
+      await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
     } catch (error) {
       caught = error as Error & { code?: string };
     }
     expect(caught).toBeInstanceOf(Error);
     expect(caught?.constructor.name).toBe("WebError");
-    expect(caught?.message).toBe("Error: socket hang up");
+    // 判的是这条意图：没有码时不许拼出以「: 」起头的空前缀。整段比对 `String(error)`
+    // 的拼法（含类名）会把实现换成更干净的 `error.message` 时也判红，那是误报。
+    expect(caught?.message).not.toMatch(/^\s*:/u);
+    expect(caught?.message).toContain("socket hang up");
   });
 
   it("调用方取消时原样抛出，不被包成一次抓取失败", async () => {
@@ -262,7 +421,7 @@ describe("fetch", () => {
         throw new SidecarError("SIDECAR_ABORTED", "aborted");
       },
     });
-    const provider = createWebFetchProvider({ ...DEPS, sidecar: client });
+    const provider = createWebFetchProvider(makeDeps({ sidecar: client }));
     let caught: unknown;
     try {
       await provider.fetch({ url: "u" }, controller.signal);
@@ -277,6 +436,6 @@ describe("fetch", () => {
 describe("provider id", () => {
   it("固定为 scrapling（部署配置要按这个名字写）", () => {
     expect(PROVIDER_ID).toBe("scrapling");
-    expect(createWebFetchProvider(DEPS).id).toBe("scrapling");
+    expect(createWebFetchProvider(makeDeps()).id).toBe("scrapling");
   });
 });

@@ -52,7 +52,8 @@ const RUNTIME_MANIFEST_SCHEMA: z.ZodType<RuntimeManifest> = z.object({
 });
 
 // 这个模块同时被源码（lib/）、host.js（包根）与 CLI 产物（bin/）载入，`..` 不是固定的包根。
-// 以 runtime-manifest.json 实际所在的那一级为准；右侧只在打包产物里成立，源码态恒走左侧。
+// 以 runtime-manifest.json 实际所在的那一级为准：打包产物里 manifest 就在 import.meta.dirname
+// 这一级（左侧），源码态的 lib/ 里没有它，只能回到上一级（右侧）。
 // publish-manifest.test.ts 直接 import host.js，负责钉住打包态那一侧真的读得到 manifest。
 /* v8 ignore next 1 */
 const packageRoot = existsSync(path.join(import.meta.dirname, "runtime-manifest.json"))
@@ -111,8 +112,19 @@ function executable(file: string): boolean {
   }
 }
 
-/** 仓内 venv 的解释器：POSIX 在 `bin/python`，Windows 在 `Scripts/python.exe`。 */
-function repoPythonPath(repoRoot: string): string {
+/**
+ * 仓内 venv 的解释器：POSIX 在 `bin/python`，Windows 在 `Scripts/python.exe`。
+ *
+ * 这份布局导出给测试侧复用（`test/python-bin.ts` 的 `LOCAL_PYTHON` 由它算），门禁量的解释器
+ * 与插件真拉起的那支因此同源，而不是两处各写一遍再靠断言对齐。`py-launcher.mjs` 里还留着
+ * 同样的一段拼接，它不并入这里：那份是仓内 CLI，不在发布面上，发出去的 host 产物不能依赖
+ * 一个不随包的文件。两边不一致由 `test/py-launcher.test.ts` 拿 `--root` 对同一棵树各算一次
+ * 来判红。
+ *
+ * @param repoRoot - 包根
+ * @returns 仓内 venv 解释器的路径（不保证存在）
+ */
+export function repoPythonPath(repoRoot: string): string {
   return process.platform === "win32"
     ? path.join(repoRoot, "_env", ".venv", "Scripts", "python.exe")
     : path.join(repoRoot, "_env", ".venv", "bin", "python");
@@ -124,14 +136,13 @@ function repoPythonPath(repoRoot: string): string {
  * 顺序固定：显式配置 → 托管 runtime → 仓内 `_env/.venv` → PATH。托管 runtime 只在
  * macOS arm64 有已验证资产，其他平台不猜路径。
  *
- * @param options - 配置、数据目录、包根与环境
+ * @param options - 配置、数据目录与包根
  * @returns 选中的解释器
  */
 export function resolveRuntime(options: {
   pythonBin: string;
   dataDir: string;
   repoRoot: string;
-  env?: NodeJS.ProcessEnv;
 }): RuntimeResolution {
   const explicit = options.pythonBin.trim();
   if (explicit.length > 0) {

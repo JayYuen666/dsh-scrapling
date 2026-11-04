@@ -17,6 +17,11 @@ const DISCOVER = "search.discover";
 const API_ENDPOINT = "https://api.tavily.test/search";
 const BING_ENDPOINT = "https://bing.test/search";
 
+/** 三把后端 key 的替身值：既配上、又要求只下发自家那一把，值只在这里写一次。 */
+const BRAVE_KEY = "brave-key";
+const SERPER_KEY = "serper-key";
+const TAVILY_KEY = "tavily-key";
+
 /** 假 sidecar 的一次调用记录。 */
 interface SidecarCall {
   readonly method: string;
@@ -93,6 +98,8 @@ function deps(over?: Partial<SearchProviderDeps>): SearchProviderDeps {
     renderTopN: 2,
     maxOutputBytes: 100_000,
     timeoutMs: 30_000,
+    // 闸门是必填依赖：默认给一枚全放行的，用例要判否时用 blockList/passGate 覆盖。
+    urlGate: async (url: string): Promise<string | undefined> => url,
     ...over,
   };
 }
@@ -141,24 +148,27 @@ describe("search provider 可用性", () => {
 
   it("sidecar 没握手或没有 scrapling 能力时不可用，且不发任何网络请求", () => {
     const calls: SidecarCall[] = [];
-    const sidecar = makeSidecar({ calls });
-    expect(createWebSearchProvider(deps({ sidecar })).available()).toBe(true);
+    const readySidecar = makeSidecar({ calls });
+    const ready = createWebSearchProvider(deps({ sidecar: readySidecar }));
+    expect(ready.available()).toBe(true);
     expect(calls).toStrictEqual([]);
 
-    const dead = {
-      alive: false,
-      capabilities: DEFAULT_CAPS,
-      call: async (): Promise<unknown> => ({}),
-    } as unknown as SidecarClient;
+    // 三条「不可用」路径各配一只会记账的假 sidecar：标题里那句「不发任何网络请求」只有
+    // 在账本上才判得出来。内联假件里那个永远 resolve、又不记账的 call 判不了这件事。
+    const deadCalls: SidecarCall[] = [];
+    const dead = Object.assign(makeSidecar({ calls: deadCalls }), { alive: false });
     expect(createWebSearchProvider(deps({ sidecar: dead })).available()).toBe(false);
-    const noCap = {
-      alive: true,
-      capabilities: undefined,
-      call: async (): Promise<unknown> => ({}),
-    } as unknown as SidecarClient;
-    expect(createWebSearchProvider(deps({ sidecar: noCap })).available()).toBe(false);
-    const browserOnly = makeSidecar({ capabilities: { browser: true } });
+    expect(deadCalls).toStrictEqual([]);
+
+    const noCapsCalls: SidecarCall[] = [];
+    const noCaps = Object.assign(makeSidecar({ calls: noCapsCalls }), { capabilities: undefined });
+    expect(createWebSearchProvider(deps({ sidecar: noCaps })).available()).toBe(false);
+    expect(noCapsCalls).toStrictEqual([]);
+
+    const browserOnlyCalls: SidecarCall[] = [];
+    const browserOnly = makeSidecar({ capabilities: { browser: true }, calls: browserOnlyCalls });
     expect(createWebSearchProvider(deps({ sidecar: browserOnly })).available()).toBe(false);
+    expect(browserOnlyCalls).toStrictEqual([]);
   });
 
   it("auto 没有任何发现路径时不可用 —— 公共引擎不是默认路径（spec D10）", () => {
@@ -236,22 +246,37 @@ describe("search provider 检索与渲染", () => {
   });
 
   it("每条后端只把自家 key 递给 sidecar", async () => {
-    const tavilyKey = "tavily-key";
     const cases = [
-      { backend: "brave", key: "brave-key", over: { braveApiKey: "brave-key" } },
-      { backend: "serper", key: "serper-key", over: { serperApiKey: "serper-key" } },
-      { backend: "tavily", key: tavilyKey, over: { apiKey: tavilyKey } },
+      { backend: "brave", key: BRAVE_KEY, over: { braveApiKey: BRAVE_KEY } },
+      { backend: "serper", key: SERPER_KEY, over: { serperApiKey: SERPER_KEY } },
+      { backend: "tavily", key: TAVILY_KEY, over: { apiKey: TAVILY_KEY } },
     ] as const;
-    await Promise.all(
+    // 三把 key 每次都一起配上（`apiKey` 一律给 tavily 那把，另两把走各自字段），所以
+    // 「把别家 key 也下发」是看得见的。`toMatchObject({ apiKey })` 只看那一位，漏在
+    // params 别处的另一把 key 它看不见，因此这里比整张回执表。
+    const outcomes = await Promise.all(
       cases.map(async (item) => {
         const calls: SidecarCall[] = [];
         const sidecar = makeSidecar({ calls });
-        await createWebSearchProvider(
-          deps({ sidecar, backend: item.backend, apiKey: tavilyKey, renderTopN: 0, ...item.over }),
-        ).search({ query: "q" });
-        expect(calls[0]?.params).toMatchObject({ backend: item.backend, apiKey: item.key });
+        const provider = createWebSearchProvider(
+          deps({ sidecar, backend: item.backend, apiKey: TAVILY_KEY, renderTopN: 0, ...item.over }),
+        );
+        await provider.search({ query: "q" });
+        const serialized = JSON.stringify(calls[0]?.params);
+        return {
+          backend: item.backend,
+          apiKey: calls[0]?.params["apiKey"],
+          leaked: cases
+            .filter((other) => other.backend !== item.backend && serialized.includes(other.key))
+            .map((other) => other.backend),
+        };
       }),
     );
+    expect(outcomes).toStrictEqual([
+      { backend: "brave", apiKey: BRAVE_KEY, leaked: [] },
+      { backend: "serper", apiKey: SERPER_KEY, leaked: [] },
+      { backend: "tavily", apiKey: TAVILY_KEY, leaked: [] },
+    ]);
   });
 
   it("没有浏览器时退回静态抓取，仍是 markdown 抽取", async () => {
@@ -325,6 +350,63 @@ describe("search provider 检索与渲染", () => {
     expect(error.message).toContain("URL gate");
   });
 
+  it("丢弃原因分开点名：被闸门判否的与拼不成绝对 URL 的各算各的", async () => {
+    // 压成一句「全部被闸门拒绝」会把后端回了垃圾值也带去查安全策略。
+    const sidecar = makeSidecar({
+      discovery: { backend: "mojeek", hits: [{ url: "/relative-only" }, { url: PAGE_A }] },
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(
+        deps({ sidecar, renderTopN: 0, urlGate: blockList([PAGE_A]) }),
+      ).search({ query: "q" }),
+    );
+    expect(error.message).toContain("1 rejected by the URL gate");
+    expect(error.message).toContain("1 were not usable URLs");
+  });
+
+  it("相对 URL 按回包里那个后端自己的端点归一", async () => {
+    const sidecar = makeSidecar({
+      discovery: { backend: "searxng", hits: [{ url: "/results/1" }] },
+    });
+    const result = await createWebSearchProvider(
+      deps({ sidecar, renderTopN: 0, searxngEndpoint: "https://search.test" }),
+    ).search({ query: "q" });
+    expect(result.sources[0]?.url).toBe("https://search.test/results/1");
+  });
+
+  it("brave / serper / duckduckgo 的相对 URL 也各按自己的端点归一", async () => {
+    const results = await Promise.all(
+      [
+        { backend: "brave", base: "https://brave.test", key: "braveEndpoint" },
+        { backend: "serper", base: "https://serper.test", key: "serperEndpoint" },
+        { backend: "duckduckgo", base: "https://ddg.test", key: "duckduckgoEndpoint" },
+      ].map(async (item) => {
+        const sidecar = makeSidecar({
+          discovery: { backend: item.backend, hits: [{ url: "/r/1" }] },
+        });
+        const result = await createWebSearchProvider(
+          deps({ sidecar, renderTopN: 0, [item.key]: item.base }),
+        ).search({ query: "q" });
+        return result.sources[0]?.url;
+      }),
+    );
+    expect(results).toStrictEqual([
+      "https://brave.test/r/1",
+      "https://serper.test/r/1",
+      "https://ddg.test/r/1",
+    ]);
+  });
+
+  it("后端名不认识时相对 URL 宁可丢掉，也不拼到另一台主机上", async () => {
+    const sidecar = makeSidecar({
+      discovery: { backend: "mojeek", hits: [{ url: "/results/1" }, { url: PAGE_A }] },
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({
+      query: "q",
+    });
+    expect(result.sources.map((source) => source.url)).toStrictEqual([PAGE_A]);
+  });
+
   it("闸门归一过的地址，sources 与真正去抓的都是那一个", async () => {
     const normalized = "https://a.test/normalized";
     const calls: SidecarCall[] = [];
@@ -394,14 +476,18 @@ describe("search provider 检索与渲染", () => {
 describe("search provider 错误与取消", () => {
   it("tavily 没配 key 时 SEARCH_AUTH 原样透出，不静默换后端", async () => {
     const key = "super-secret-key-123";
+    const calls: SidecarCall[] = [];
     const sidecar = makeSidecar({
+      calls,
       onDiscover: () => Promise.reject(new SidecarError("SEARCH_AUTH", "tavily needs an API key")),
     });
     const error = await failureOf(() =>
-      createWebSearchProvider(deps({ sidecar, backend: "tavily", renderTopN: 0 })).search({
-        query: "q",
-      }),
+      createWebSearchProvider(
+        deps({ sidecar, backend: "tavily", apiKey: key, renderTopN: 0 }),
+      ).search({ query: "q" }),
     );
+    // 先证明这枚 key 真进了链路：不传 apiKey 时「不回显 key」是一句永远成立的空断言。
+    expect(calls[0]?.params["apiKey"]).toBe(key);
     expect(error.code).toBe("SEARCH_AUTH");
     expect(error.message).not.toContain(key);
   });
@@ -458,21 +544,33 @@ describe("search provider 错误与取消", () => {
     expect(result.sources[0]).toStrictEqual({ url: PAGE_A });
   });
 
-  it("sidecar 抓取回的不是对象、或 content 非字符串时整次搜索报错", async () => {
-    const notObject = makeSidecar({
-      hits: [{ url: PAGE_A }],
-      onFetch: () => Promise.resolve("not-an-object"),
-    });
-    const badContent = makeSidecar({
-      hits: [{ url: PAGE_A }],
-      onFetch: () => Promise.resolve({ content: 12_345, status: 200 }),
-    });
-    await expect(
-      createWebSearchProvider(deps({ sidecar: notObject, renderTopN: 1 })).search({ query: "q" }),
-    ).rejects.toThrow(/no body/u);
-    await expect(
-      createWebSearchProvider(deps({ sidecar: badContent, renderTopN: 1 })).search({ query: "q" }),
-    ).rejects.toThrow(/no body/u);
+  it("三种「读不到正文」的形态各报各的成因，并且整次搜索以通用失败码收", async () => {
+    // 用 failureOf 而不是 rejects.toThrow(/…/)：后者只看消息，错误码回归成别的值它照样绿，
+    // 与本文件其它失败用例的判法不一致。
+    const cases = [
+      { reply: "not-an-object", cause: "the fetch reply was not an object" },
+      { reply: { content: 12_345, status: 200 }, cause: "without a text body" },
+      { reply: { content: "", status: 200 }, cause: "came back with no body" },
+    ] as const;
+    const outcomes = await Promise.all(
+      cases.map(async (item) => {
+        const sidecar = makeSidecar({
+          hits: [{ url: PAGE_A }],
+          onFetch: () => Promise.resolve(item.reply),
+        });
+        const provider = createWebSearchProvider(deps({ sidecar, renderTopN: 1 }));
+        const error = await failureOf(() => provider.search({ query: "q" }));
+        return {
+          code: error.code ?? "",
+          // 命中就把该档成因原样交回，没命中就把整条消息交回：红话里直接能看出是哪档含糊了。
+          cause: error.message.includes(item.cause) ? item.cause : `未点名成因：${error.message}`,
+        };
+      }),
+    );
+    // 逐档比一张表：红话会指出是哪一档的成因或错误码不对，而不是三条里任一条含糊失败。
+    expect(outcomes).toStrictEqual(
+      cases.map((item) => ({ code: SEARCH_FAILED, cause: item.cause })),
+    );
   });
 
   it("URL 全被安全闸门拦下时报错，原因里点名 URL_BLOCKED", async () => {
@@ -489,10 +587,13 @@ describe("search provider 错误与取消", () => {
 
   it("发现阶段被取消时原样抛出", async () => {
     const controller = new AbortController();
+    // 桩的文案刻意不含 "aborted"：那样「消息里含 aborted」就不再是判据。真正要钉的是
+    // 抛出来的就是同一枚错误对象 —— 实现按 signal.aborted 决定不归包，不是按文案。
+    const failure = new Error("pipe gone during discover");
     const sidecar = makeSidecar({
       onDiscover: () => {
         controller.abort();
-        return Promise.reject(new Error("The operation was aborted"));
+        return Promise.reject(failure);
       },
     });
     const error = await failureOf(() =>
@@ -501,17 +602,18 @@ describe("search provider 错误与取消", () => {
         controller.signal,
       ),
     );
+    expect(error).toBe(failure);
     expect(error.code).toBeUndefined();
-    expect(error.message).toContain("aborted");
   });
 
   it("抓取途中被取消时，取消原样抛出而不是被包成搜索失败", async () => {
     const controller = new AbortController();
+    const failure = new Error("pipe gone during fetch");
     const sidecar = makeSidecar({
       hits: [{ url: PAGE_A }],
       onFetch: () => {
         controller.abort();
-        return Promise.reject(new Error("this call was aborted"));
+        return Promise.reject(failure);
       },
     });
     const error = await failureOf(() =>
@@ -520,8 +622,9 @@ describe("search provider 错误与取消", () => {
         controller.signal,
       ),
     );
+    // 同一枚对象：包一层就变成另一个 Error，code 也会带上通用失败码。
+    expect(error).toBe(failure);
     expect(error.code).toBeUndefined();
-    expect(error.message).toContain("aborted");
   });
 
   it("signal 同时透给发现层与 sidecar 抓取", async () => {

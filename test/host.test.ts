@@ -29,6 +29,7 @@ import {
   crawlFailureDetail,
   createCrawlEventRouter,
   createUrlGate,
+  urlPolicyOptionsOf,
   guidanceFor,
   inject,
   name,
@@ -180,9 +181,6 @@ interface PromptRecord {
   text: string | ((context: { scope?: object; toolSet?: ToolSetFace }) => string);
 }
 
-/** 假 systemPrompt 收到的段。 */
-const SECTIONS: PromptRecord[] = [];
-
 /** 步骤准入的读面（官方 `ResolvedToolSet.view` 的结构投影）。 */
 interface ToolSetFace {
   readonly view: (scope: object | undefined) => Map<string, unknown>;
@@ -194,10 +192,13 @@ interface ToolSetFace {
  * apply 会注册一段用量指引，所以每个跑 apply 的用例都得给它挂上这个面 —— 缺了它，症状不是
  * 「指引段没注册」而是整个 apply 抛，那会把一堆无关用例一起带走，报错还不指向真正的原因。
  *
+ * `into` 每次调用新建一份：默认值若是模块级共享数组，跑 apply 的用例就会互相往里面塞段，
+ * `at(-1)` 取到的可能是别的用例注册的。要读收到什么的用例自己传一个进来。
+ *
  * @param into - 收到的段推进这里
  * @returns 可直接挂进假 ctx 的对象
  */
-function promptStub(into: PromptRecord[] = SECTIONS): unknown {
+function promptStub(into: PromptRecord[] = []): unknown {
   return {
     getSectionOrder: (): number => 2100,
     section: (section: PromptRecord): (() => void) => {
@@ -457,7 +458,7 @@ describe("工具注册计划", () => {
     ]);
   });
 
-  it("缺浏览器时不注册四个浏览器类工具，会话与爬虫照常", () => {
+  it("缺浏览器时不注册依赖浏览器的那几只工具，会话与爬虫照常", () => {
     // 依赖 browser 的现在是 render / capture_xhr / session_read / session_act / screenshot；
     // 下载只依赖 scrapling，所以浏览器缺失时照常注册。
     const caps: SidecarCapabilities = { ...FULL_CAPS, browser: false };
@@ -581,7 +582,7 @@ describe("每个工具的输出预算各走各的旋钮", () => {
 });
 
 describe("system prompt 指引段", () => {
-  it("全开且工具都在时九段指引都在，只开一条时就只剩一条", () => {
+  it("全开且工具都在时每一段指引都在，只开一条时就只剩一条", () => {
     // 判据是**行数与开关数一一对应**，而不是逐行文本内容：指引写的是给人读的话，措辞会变，
     // 而「关掉一个工具就少一段」这个不变式不会变。
     expect(guidanceFor(ALL_ON, EVERYWHERE).split("\n")).toHaveLength(Object.keys(ALL_ON).length);
@@ -613,7 +614,7 @@ describe("system prompt 指引段", () => {
     // 注册那一刻算好的死字符串 —— 否则设置卡关掉工具，指引不会跟着消失；③ 那段文本问的是
     // ctx.tools.get(名字, 装配 scope)，而不是我们自己攒的注册表；④ ctx.effect 的工厂被宿主
     // 调用过，disposer 真的产出（上游规则「注册即 effect」要求回收路径被验证）。
-    SECTIONS.length = 0;
+    const sections: PromptRecord[] = [];
     const factories: (() => unknown)[] = [];
     const tools = toolsStub();
     const ctx = {
@@ -632,7 +633,7 @@ describe("system prompt 指引段", () => {
         debug: (): void => undefined,
       },
       settings: settingsStub(),
-      systemPrompt: promptStub(),
+      systemPrompt: promptStub(sections),
       tools: tools.face,
       effect: (factory: () => unknown): void => {
         factories.push(factory);
@@ -653,7 +654,7 @@ describe("system prompt 指引段", () => {
     for (const factory of factories) {
       factory();
     }
-    const section = SECTIONS.at(-1);
+    const section = sections.at(-1);
     expect(section?.name).toBe("scrapling-usage");
     expect(section?.text).toBeTypeOf("function");
     const read = (): string => (typeof section?.text === "function" ? section.text({}) : "");
@@ -984,167 +985,173 @@ describe("apply", () => {
     ).resolves.toBe("0");
   });
 
-  it.runIf(HAS_LOCAL_PYTHON)("真的拉起 sidecar 时能走通握手与注册计划", async () => {
-    const python = LOCAL_PYTHON;
-    const warnings: string[] = [];
-    const infos: string[] = [];
-    const disposers: (() => unknown)[] = [];
-    const settingsRegistrations: string[] = [];
-    const registered: string[] = [];
-    const jobsStub = {
-      // 这条验的是「全能力时 19 个工具全注册」，所以作业后端要报可用；
-      // 探测作业（kind='probe'）照实回一个 id。
-      start: (): string => "probe-job",
-      // 本包起作业时自己挂 controller（见 startUnderCrawlController）。
-      attachController: (): (() => void) => (): void => undefined,
-    };
-    const ctx = {
-      get: (service: string): unknown => (service === "jobs" ? jobsStub : undefined),
-      subprocess: {
-        // 官方实现会校验可执行文件存在（SubprocessExecutableNotFoundError），这里照做：
-        // 否则会拿一个不存在的解释器去 spawn，而 ENOENT 是异步事件，try/catch 抓不到。
-        resolveExecutable: async (command: string): Promise<string> => {
-          if (!existsSync(command)) {
-            throw new Error(`executable not found: ${command}`);
-          }
-          return command;
+  it.runIf(HAS_LOCAL_PYTHON)(
+    "真的拉起 sidecar 时能走通握手与注册计划",
+    async () => {
+      const python = LOCAL_PYTHON;
+      const warnings: string[] = [];
+      const infos: string[] = [];
+      const disposers: (() => unknown)[] = [];
+      const settingsRegistrations: string[] = [];
+      const registered: string[] = [];
+      const jobsStub = {
+        // 这条验的是「全能力时 19 个工具全注册」，所以作业后端要报可用；本用例不发起作业，
+        // 这一支只是把 id 回掉，不代表 apply 里存在什么探测作业。
+        start: (): string => CRAWL_JOB_ID,
+        // 本包起作业时自己挂 controller（见 startUnderCrawlController）。
+        attachController: (): (() => void) => (): void => undefined,
+      };
+      const ctx = {
+        get: (service: string): unknown => (service === "jobs" ? jobsStub : undefined),
+        subprocess: {
+          // 官方实现会校验可执行文件存在（SubprocessExecutableNotFoundError），这里照做：
+          // 否则会拿一个不存在的解释器去 spawn，而 ENOENT 是异步事件，try/catch 抓不到。
+          resolveExecutable: async (command: string): Promise<string> => {
+            if (!existsSync(command)) {
+              throw new Error(`executable not found: ${command}`);
+            }
+            return command;
+          },
+          spawn: (spec: { argv: string[]; cwd: string; env?: Record<string, string> }) => {
+            const child = spawn(spec.argv[0] ?? "", spec.argv.slice(1), {
+              cwd: spec.cwd,
+              env: { ...process.env, ...spec.env },
+              stdio: ["pipe", "pipe", "pipe"],
+            });
+            return {
+              stdin: child.stdin,
+              stdout: child.stdout,
+              stderr: child.stderr,
+              done: (async (): Promise<{ exitCode: number | null; signal: null }> => {
+                const args = await once(child, "close");
+                return { exitCode: args[0] as number | null, signal: null };
+              })(),
+              terminate: (): void => {
+                child.kill("SIGTERM");
+              },
+              waitForExit: async (): Promise<boolean> => true,
+            };
+          },
         },
-        spawn: (spec: { argv: string[]; cwd: string; env?: Record<string, string> }) => {
-          const child = spawn(spec.argv[0] ?? "", spec.argv.slice(1), {
-            cwd: spec.cwd,
-            env: { ...process.env, ...spec.env },
-            stdio: ["pipe", "pipe", "pipe"],
-          });
-          return {
-            stdin: child.stdin,
-            stdout: child.stdout,
-            stderr: child.stderr,
-            done: (async (): Promise<{ exitCode: number | null; signal: null }> => {
-              const args = await once(child, "close");
-              return { exitCode: args[0] as number | null, signal: null };
-            })(),
-            terminate: (): void => {
-              child.kill("SIGTERM");
-            },
-            waitForExit: async (): Promise<boolean> => true,
-          };
+        logger: {
+          info: (line: string): void => {
+            infos.push(line);
+          },
+          warn: (line: string): void => {
+            warnings.push(line);
+          },
+          debug: (): void => undefined,
         },
-      },
-      logger: {
-        info: (line: string): void => {
-          infos.push(line);
+        // 只记名字，不真的进注册表 —— 这里验的是「apply 打算注册哪些」。
+        tools: {
+          register: (definition: { name: string }): (() => void) => {
+            registered.push(definition.name);
+            return (): void => undefined;
+          },
         },
-        warn: (line: string): void => {
-          warnings.push(line);
+        // ctx.effect 收的是**工厂**：宿主会调用它拿到真正的 disposer 再登记。
+        // 早先这里把工厂直接当 disposer 存下，于是真正的清理函数一次都没跑过 ——
+        // 断言「disposers 有 2 条」照样通过，回收路径却完全没被验证。
+        settings: settingsStub(settingsRegistrations),
+        systemPrompt: promptStub(),
+        effect: (factory: () => () => unknown): void => {
+          disposers.push(factory());
         },
-        debug: (): void => undefined,
-      },
-      // 只记名字，不真的进注册表 —— 这里验的是「apply 打算注册哪些」。
-      tools: {
-        register: (definition: { name: string }): (() => void) => {
-          registered.push(definition.name);
-          return (): void => undefined;
-        },
-      },
-      // ctx.effect 收的是**工厂**：宿主会调用它拿到真正的 disposer 再登记。
-      // 早先这里把工厂直接当 disposer 存下，于是真正的清理函数一次都没跑过 ——
-      // 断言「disposers 有 2 条」照样通过，回收路径却完全没被验证。
-      settings: settingsStub(settingsRegistrations),
-      systemPrompt: promptStub(),
-      effect: (factory: () => () => unknown): void => {
-        disposers.push(factory());
-      },
-    } as unknown as never;
+      } as unknown as never;
 
-    // 先探一次能力：注册结果依赖环境里到底有没有浏览器，断言要跟着环境走，
-    // 而不是把「这台机器装了什么」写死进期望值。
-    const probe = new SidecarClient(ctx, {
-      pythonBin: python,
-      bridgePath: path.resolve(import.meta.dirname, "../py/bridge.py"),
-      cwd: os.tmpdir(),
-      handshakeTimeoutMs: 30_000,
-      requestTimeoutMs: 30_000,
-      graceMs: 5000,
-    });
-    const caps = await probe.ensureStarted();
-    await probe.dispose();
-
-    // 这一格不验 provider 注册（那条由「接管 ctx.web 的两个接缝」那组负责），而夹具里
-    // 也没有 ctx.web 面，所以把默认开着的两个 provider 显式关掉，免得 apply 在半路抛。
-    await apply(
-      ctx,
-      makeConfig({ pythonBin: python, provideWebFetch: false, provideWebSearch: false }),
-    );
-    // 握手成功后必然打出注册计划这一行。
-    expect(infos.some((line) => line.includes("注册"))).toBe(true);
-    // 真正注册上去的 =「静态四条」+「会话五条」+「爬虫一条」+「问答一条」+（浏览器可用时的两条）。
-    // 这里 makeConfig 没配 sessionStateDir，登录态存取两只按设计不注册（F4/F11）。
-    const sessionTools = [
-      "scrapling_session_open",
-      "scrapling_session_fetch",
-      "scrapling_session_network",
-      "scrapling_session_list",
-      "scrapling_session_close",
-    ];
-    const expected = caps.browser
-      ? [
-          "scrapling_fetch",
-          "scrapling_extract",
-          "scrapling_locate",
-          "scrapling_links",
-          "scrapling_render",
-          "scrapling_capture_xhr",
-          ...sessionTools,
-          "scrapling_crawl",
-          "scrapling_answer",
-          "scrapling_session_read",
-        ]
-      : [
-          "scrapling_fetch",
-          "scrapling_extract",
-          "scrapling_locate",
-          "scrapling_links",
-          ...sessionTools,
-          "scrapling_crawl",
-          "scrapling_answer",
-        ];
-    expect(registered).toStrictEqual(expected);
-
-    // 再跑一次「全部关掉」：ready 为空时日志要落到 (none) 分支。
-    infos.length = 0;
-    registered.length = 0;
-    await apply(
-      ctx,
-      makeConfig({
+      // 先探一次能力：注册结果依赖环境里到底有没有浏览器，断言要跟着环境走，
+      // 而不是把「这台机器装了什么」写死进期望值。
+      const probe = new SidecarClient(ctx, {
         pythonBin: python,
-        provideWebFetch: false,
-        provideWebSearch: false,
-        fetchEnabled: false,
-        extractEnabled: false,
-        locateEnabled: false,
-        linksEnabled: false,
-        renderEnabled: false,
-        captureXhrEnabled: false,
-        networkEnabled: false,
-        sessionEnabled: false,
-        sessionStateEnabled: false,
-        crawlEnabled: false,
-        answerEnabled: false,
-        sessionReadEnabled: false,
-        sessionActionsEnabled: false,
-        downloadEnabled: false,
-        screenshotEnabled: false,
-      }),
-    );
-    expect(infos.some((line) => line.includes("(none)"))).toBe(true);
-    expect(registered).toStrictEqual([]);
-    // 两次 apply，每次登记三个 disposer：「这一页由自带卡片编辑」的页面策略、sidecar 回收，
-    // 以及 system prompt 指引段 —— 注册就是 effect，回收路径也要被数到。
-    expect(disposers).toHaveLength(6);
-    expect(settingsRegistrations).toStrictEqual(["false", "false"]);
-    // 卸载插件要能回收进程 —— disposer 把 promise 交回来，宿主会 await 它。
-    await Promise.all(disposers.map((disposer) => disposer()));
-  });
+        bridgePath: path.resolve(import.meta.dirname, "../py/bridge.py"),
+        cwd: os.tmpdir(),
+        handshakeTimeoutMs: 30_000,
+        requestTimeoutMs: 30_000,
+        graceMs: 5000,
+      });
+      const caps = await probe.ensureStarted();
+      await probe.dispose();
+
+      // 这一格不验 provider 注册（那条由「接管 ctx.web 的两个接缝」那组负责），而夹具里
+      // 也没有 ctx.web 面，所以把默认开着的两个 provider 显式关掉，免得 apply 在半路抛。
+      await apply(
+        ctx,
+        makeConfig({ pythonBin: python, provideWebFetch: false, provideWebSearch: false }),
+      );
+      // 握手成功后必然打出注册计划这一行。
+      expect(infos.some((line) => line.includes("注册"))).toBe(true);
+      // 真正注册上去的 =「静态四条」+「会话五条」+「爬虫一条」+「问答一条」+（浏览器可用时的两条）。
+      // 这里 makeConfig 没配 sessionStateDir，登录态存取两只按设计不注册（F4/F11）。
+      const sessionTools = [
+        "scrapling_session_open",
+        "scrapling_session_fetch",
+        "scrapling_session_network",
+        "scrapling_session_list",
+        "scrapling_session_close",
+      ];
+      const expected = caps.browser
+        ? [
+            "scrapling_fetch",
+            "scrapling_extract",
+            "scrapling_locate",
+            "scrapling_links",
+            "scrapling_render",
+            "scrapling_capture_xhr",
+            ...sessionTools,
+            "scrapling_crawl",
+            "scrapling_answer",
+            "scrapling_session_read",
+          ]
+        : [
+            "scrapling_fetch",
+            "scrapling_extract",
+            "scrapling_locate",
+            "scrapling_links",
+            ...sessionTools,
+            "scrapling_crawl",
+            "scrapling_answer",
+          ];
+      expect(registered).toStrictEqual(expected);
+
+      // 再跑一次「全部关掉」：ready 为空时日志要落到 (none) 分支。
+      infos.length = 0;
+      registered.length = 0;
+      await apply(
+        ctx,
+        makeConfig({
+          pythonBin: python,
+          provideWebFetch: false,
+          provideWebSearch: false,
+          fetchEnabled: false,
+          extractEnabled: false,
+          locateEnabled: false,
+          linksEnabled: false,
+          renderEnabled: false,
+          captureXhrEnabled: false,
+          networkEnabled: false,
+          sessionEnabled: false,
+          sessionStateEnabled: false,
+          crawlEnabled: false,
+          answerEnabled: false,
+          sessionReadEnabled: false,
+          sessionActionsEnabled: false,
+          downloadEnabled: false,
+          screenshotEnabled: false,
+        }),
+      );
+      expect(infos.some((line) => line.includes("(none)"))).toBe(true);
+      expect(registered).toStrictEqual([]);
+      // 两次 apply，每次登记三个 disposer：「这一页由自带卡片编辑」的页面策略、sidecar 回收，
+      // 以及 system prompt 指引段 —— 注册就是 effect，回收路径也要被数到。
+      expect(disposers).toHaveLength(6);
+      expect(settingsRegistrations).toStrictEqual(["false", "false"]);
+      // 卸载插件要能回收进程 —— disposer 把 promise 交回来，宿主会 await 它。
+      await Promise.all(disposers.map((disposer) => disposer()));
+      // 单条超时高于这一格内部的握手 + 请求预算（各 30s）：先到期的必须是那两句点名的报错，
+      // 不是 vitest 一句不说所在的层的「test timed out」。
+    },
+    90_000,
+  );
 });
 
 /**
@@ -1225,7 +1232,7 @@ const CRAWL_SETTINGS = {
   // 这件事悄悄当成前提。
   allowWriteMethods: false,
   stripInlineImages: true,
-  downloadDir: "/tmp/scrapling-downloads",
+  downloadDir: path.join(os.tmpdir(), "scrapling-downloads"),
   downloadMaxBytes: 10_000_000,
 } satisfies ToolSettings;
 
@@ -1295,21 +1302,15 @@ function createCrawlToolDeps(sink: {
 }
 
 describe("apply 的爬虫作业接线", () => {
-  it.runIf(HAS_LOCAL_PYTHON)("crawl 开关打开时会注册爬虫工具，并起一个 ctx.jobs 作业", async () => {
+  it.runIf(HAS_LOCAL_PYTHON)("sidecar 起不来时 apply 一个 ctx.jobs 作业都不开", async () => {
     const python = LOCAL_PYTHON;
-    const appended: string[] = [];
-    const progressed: string[] = [];
-    let spec:
-      | { run?: (job: unknown) => { cancel: () => void; done: Promise<unknown> } }
-      | undefined;
+    const started: unknown[] = [];
+    // apply 不起任何「能力探测作业」：`probeJobsReady` 只做两次 typeof 检查（host.ts），
+    // 所以这里不必按 kind 分流，登记到的每一笔都算。
     const jobsStub = {
-      // 只记真实作业：`scrapling` 在 apply 时先起一个 kind='probe' 的空作业探测后端，
-      // 那是能力探测，不是被测的接线。夹具据此分流，否则 spec 会被探测覆盖。
       attachController: (): (() => void) => (): void => undefined,
-      start: (received: { kind?: string }): string => {
-        if (received.kind !== "probe") {
-          spec = received as typeof spec;
-        }
+      start: (received: unknown): string => {
+        started.push(received);
         return CRAWL_JOB_ID;
       },
     };
@@ -1338,11 +1339,17 @@ describe("apply 的爬虫作业接线", () => {
       ctx,
       makeConfig({ pythonBin: python, crawlEnabled: true, failFastOnMissingPython: false }),
     );
-    // failFastOnMissingPython=false 时 sidecar 起不来（spawn 被拒）crawl 工具照样注册 ——
-    // 它只是返回作业 id，真正的抓取发生在作业里，所以「探不到 python」不该影响工具面。
-    expect(spec).toBeUndefined();
+    // failFastOnMissingPython=false：spawn 被拒 → 没有可用 sidecar → 作业一个都不该开。
+    // 「sidecar 真起来时 apply 会注册 crawl 工具并起作业」那半由下面 makeJobHarness 那组用例驱动
+    // （真站点 + 真解释器），本用例只钉这一侧的收口。
+    expect(started).toStrictEqual([]);
+  });
 
-    // 直接驱动作业主体：这段代码在 apply 里通过 startJob 闭包挂到 ctx.jobs 上。
+  it("爬虫作业主体把输出与进度写进宿主给的作业句柄", async () => {
+    const appended: string[] = [];
+    const progressed: string[] = [];
+    // 这里直接驱动 createCrawlTool 的作业主体（apply 把它挂在 startJob 闭包里交给 ctx.jobs），
+    // 用的是自造的句柄替身，与 apply 的注册路径无关。
     const crawlDeps = createCrawlToolDeps({
       appended,
       progressed,
@@ -1366,11 +1373,10 @@ describe("apply 的爬虫作业接线", () => {
 });
 
 /**
- * 等作业输出环里出现某个标记，最多等 timeoutMs。
+ * 等一条判据变真，每 50 毫秒问一次，预算用完就不再追问。
  *
- * @param output - 输出环的替身
- * @param marker - 要等到的标记
- * @param timeoutMs - 上限
+ * @param check - 判据；返回真即结束
+ * @param remaining - 剩余预算（毫秒）
  */
 async function waitFor(check: () => boolean, remaining = 10_000): Promise<void> {
   if (check() || remaining <= 0) {
@@ -1435,16 +1441,11 @@ describe("apply 到爬虫作业的完整链路", () => {
     const jobsStub = {
       attachController: (): (() => void) => (): void => undefined,
       start: (spec: {
-        kind?: string;
         run: (job: { append: (text: string) => void; updateProgress: (line: string) => void }) => {
           cancel: () => void;
           done: Promise<unknown>;
         };
       }): string => {
-        // 能力探测那个空作业不跑、也不写输出环（见上面第一处夹具的同一说明）。
-        if (spec.kind === "probe") {
-          return "probe-job";
-        }
         const job = {
           append: (text: string): void => {
             output.push(text);
@@ -1681,10 +1682,16 @@ function makeJobHarness({ withoutJobs = false }: { withoutJobs?: boolean } = {})
  *
  * @returns 起始 URL 与关闭函数
  */
-async function startStallingSite(): Promise<{ base: string; close: () => Promise<void> }> {
+async function startStallingSite(): Promise<{
+  base: string;
+  requests: () => number;
+  close: () => Promise<void>;
+}> {
   const sockets = new Set<Socket>();
+  let served = 0;
   const server = createServer((_req, res) => {
-    // 故意什么都不写：连接保持着，响应永远不来。
+    // 故意什么都不写：连接保持着，响应永远不来。计数只记「请求真的到了」。
+    served += 1;
     void res;
   });
   server.on("connection", (socket: Socket) => {
@@ -1700,6 +1707,7 @@ async function startStallingSite(): Promise<{ base: string; close: () => Promise
   const port = typeof address === "object" && address !== null ? address.port : 0;
   return {
     base: `http://127.0.0.1:${port}/`,
+    requests: (): number => served,
     close: async (): Promise<void> => {
       for (const socket of sockets) {
         socket.destroy();
@@ -1784,7 +1792,10 @@ describe("爬虫作业的取消与失败", () => {
       );
       await waitFor(() => harness.hooks !== undefined);
       expect(harness.hooks).toBeDefined();
-      await sleep(500);
+      // 等到请求真的落到那台站点上再取消：原先这里是 sleep(500)，拿墙钟猜「爬虫跑起来了」，
+      // 慢机或高负载上取消可能打在 sidecar 调用发出之前。
+      await waitFor(() => stalling.requests() > 0, 30_000);
+      expect(stalling.requests()).toBeGreaterThan(0);
       harness.hooks?.cancel();
       const outcome = (await harness.hooks?.done) as { status: string };
       // 信号传对了的话，取消会让 sidecar 调用中止、作业主体抛错，最终落成 killed。
@@ -1934,22 +1945,26 @@ describe("出站 URL 闸门（Host 侧 SSRF 防线）", () => {
     await expect(gate(`http://93.184.216.34/${"a".repeat(64)}`)).rejects.toMatchObject(blocked);
   });
 
-  it("打开合成段放行时，字面量仍走严格判定", async () => {
-    // 这一条覆盖的是配置项真的传进了策略：用 IP 字面量当探针，它不查 DNS，
-    // 于是既能走到那处分支，又不会把用例绑到真实解析上。
-    const relaxed = createUrlGate(makeConfig({ allowSyntheticDns: true }));
-    await expect(relaxed("http://93.184.216.34/x")).resolves.toContain("93.184.216.34");
-    // 放宽只针对解析结果：回环字面量拿不到它。
-    await expect(relaxed(LOOPBACK_URL)).rejects.toMatchObject(blocked);
-  });
-
-  it("合成段白名单非空时才传给策略，空值不传", async () => {
-    // 这条覆盖的是配置真的透传下去了：IP 字面量当探针，它不查 DNS，于是既能走到那处分支，
-    // 又不会把用例绑到真实解析上。
-    const relaxed = createUrlGate(makeConfig({ syntheticDnsRanges: "198.18.0.0/16" }));
-    await expect(relaxed("http://93.184.216.34/x")).resolves.toContain("93.184.216.34");
-    // 放宽只针对解析结果：回环字面量拿不到它。
-    await expect(relaxed(LOOPBACK_URL)).rejects.toMatchObject(blocked);
+  it("合成段按「空列表不给键」折进策略入参，段本身的行为不在这一层判", () => {
+    // 闸门这一层探不到 `syntheticDnsRanges`：它只改 DNS 答案的判定，而 IP 字面量明确不走那条路
+    // （lib/url-policy.ts 的 literal 分支）。原先两条用例都拿字面量当探针，公网字面量本来就
+    // 放行、回环本来就判否，实现一个字没读也照样绿；其中一条还传了 Config 里根本没有的
+    // `allowSyntheticDns`，被夹具静默丢掉。段本身的行为由 test/url-policy.test.ts 用假 resolver 覆盖。
+    expect(urlPolicyOptionsOf(makeConfig({}))).toStrictEqual({ maxUrlLength: 2048 });
+    expect(
+      urlPolicyOptionsOf(
+        makeConfig({
+          syntheticDnsRanges: "198.18.0.0/16, ,100.64.0.0/10",
+          nat64Prefixes: " 64:ff9b::/96 ",
+          allowedHosts: "localhost,",
+        }),
+      ),
+    ).toStrictEqual({
+      maxUrlLength: 2048,
+      nat64Prefixes: ["64:ff9b::/96"],
+      allowHosts: ["localhost"],
+      syntheticRanges: ["198.18.0.0/16", "100.64.0.0/10"],
+    });
   });
 
   it("判否时 message 带人话原因（模型要能据此改写目标）", async () => {

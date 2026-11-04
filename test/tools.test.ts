@@ -13,7 +13,14 @@ import { describe, expect, it } from "vitest";
 import { ToolArgsError } from "@deepseek-ai/dsh-tools";
 import { pageToText, rowToText } from "../lib/crawl-output.ts";
 import { anySignal, drainCrawl } from "../lib/crawl-support.ts";
-import { capText } from "../lib/output.ts";
+import {
+  capText,
+  CONTENT_RECOVERY_HINT,
+  FALLBACK_BUDGET_BYTES,
+  renderAnswer,
+  renderBrowser,
+  renderFetch,
+} from "../lib/output.ts";
 import { CRAWL_MODE_PARAMS } from "../lib/tool-params.ts";
 import {
   createAnswerTool,
@@ -52,6 +59,14 @@ const listenerCountOf = (signal: AbortSignal): number =>
 const REPO = path.resolve(import.meta.dirname, "..");
 const BRIDGE = path.join(REPO, "py", "bridge.py");
 
+/**
+ * 真起 sidecar 的那几格共用的单条超时：高于它们各自的握手 + 请求预算之和（30s + 90s）。
+ *
+ * 单条超时低于内部预算时，先到期的是 vitest 那句「test timed out」——它不说超时发生在哪一层；
+ * 而握手与请求各自的那句报错会点名是哪一步、等了多久。
+ */
+const REAL_SIDECAR_TIMEOUT_MS = 150_000;
+
 /** 测试里反复用到的示例 XHR 接口 URL。 */
 const SAMPLE_API = "https://api.test/items";
 
@@ -69,15 +84,6 @@ const ALREADY_PREFIXED = "BAD_ARGS: too many pages";
 /** 跟随重定向之后的最终地址：结果卡片用它，而不是调用参数里那个。 */
 const FINAL_URL = "http://final.test/";
 
-/**
- * 假的起作业回调：立刻跑一次主体并返回固定 id。
- *
- * 这样测试能同步验证作业主体干了什么，而不必真的去挂 `ctx.jobs`。
- *
- * @param label - 作业标签
- * @param run - 作业主体
- * @returns 固定作业 id
- */
 /** 空 sink：测试里不关心输出内容，只关心爬虫有没有被驱动起来。 */
 const NULL_SINK: CrawlSink = {
   append: () => {
@@ -95,12 +101,11 @@ const NULL_SINK: CrawlSink = {
  * 同步跑一次主体再返回固定 id —— 这样测试能直接验证作业主体干了什么，
  * 而不必真的去挂 `ctx.jobs`。
  *
- * @param label - 作业标签
+ * @param _label - 作业标签（本替身不用它，签名要跟上 `CrawlJobStarter`）
  * @param run - 作业主体
  * @returns 固定作业 id
  */
-async function fakeJobStarter(label: string, run: CrawlJobRunner): Promise<string> {
-  void label;
+async function fakeJobStarter(_label: string, run: CrawlJobRunner): Promise<string> {
   await run(NULL_SINK);
   return "job-1";
 }
@@ -202,24 +207,43 @@ function fakeSidecar(result: unknown): {
       graceMs: 10,
     },
   );
-  const original = client.call.bind(client);
   Object.assign(client, {
     call: async (method: string, params: unknown): Promise<unknown> => {
       calls.push({ method, params });
       return result;
     },
   });
-  void original;
   return { client, calls };
 }
 
-/** UTF-16 高代理区下界。 */
+/**
+ * 造一台浏览器可用的假 sidecar。
+ *
+ * `scrapling_session_open` 的 `sessionType` 可选值跟着 `capabilities.browser` 走；不声明
+ * 时宿主的形状校验会先把 stealth 拒掉，请求走不到载荷组装那一步。
+ *
+ * @param result - 每次调用要回的那份载荷
+ * @returns 假 sidecar
+ */
+function fakeBrowserSidecar(result: unknown): {
+  client: SidecarClient;
+  calls: { method: string; params: unknown }[];
+} {
+  const fake = fakeSidecar(result);
+  Object.defineProperty(fake.client, "capabilities", {
+    value: { scrapling: true, static: true, extract: true, browser: true, writeMethods: false },
+    configurable: true,
+  });
+  return fake;
+}
+
+/** UTF-16 高代理区下界（0xD800）。 */
 const HIGH_SURROGATE_START = 55_296;
-/** UTF-16 高代理区上界。 */
-const HIGH_SURROGATE_END = 57_343;
-/** UTF-16 低代理区下界。 */
+/** UTF-16 高代理区上界（0xDBFF）；再往上一档就是低代理区。 */
+const HIGH_SURROGATE_END = 56_319;
+/** UTF-16 低代理区下界（0xDC00）。 */
 const LOW_SURROGATE_START = 56_320;
-/** UTF-16 低代理区上界。 */
+/** UTF-16 低代理区上界（0xDFFF）。 */
 const LOW_SURROGATE_END = 57_343;
 
 /**
@@ -272,8 +296,26 @@ function sessionTypeParam(browser: boolean): { enum?: string[]; description?: st
 /** 测试里统一用的假作业 id（`scrapling-<hex>` 形态的一枚具体样本）。 */
 const SAMPLE_JOB_ID = "scrapling-1";
 
-/** 假 sidecar 的短名包装：多处用到，且不捕获任何外层变量，故放模块级。 */
-const deps = (result: unknown): ReturnType<typeof fakeSidecar> => fakeSidecar(result);
+describe("代理区判定的上下界（截断那条用例的判据本身）", () => {
+  // 那两条区间只是 `截断点不会留下孤立代理码元` 的工具；工具自己错了不会让那条用例红
+  // （它对两半都要求 false），所以区间边界要单独钉住。
+  it("高代理区止于 0xDBFF，低代理区从 0xDC00 起", () => {
+    expect(isHighSurrogate(HIGH_SURROGATE_START)).toBe(true);
+    expect(isHighSurrogate(HIGH_SURROGATE_END)).toBe(true);
+    expect(isHighSurrogate(LOW_SURROGATE_START)).toBe(false);
+    expect(isLowSurrogate(LOW_SURROGATE_START)).toBe(true);
+    expect(isLowSurrogate(LOW_SURROGATE_END)).toBe(true);
+    expect(isLowSurrogate(HIGH_SURROGATE_END)).toBe(false);
+  });
+
+  it("两半都不覆盖代理区之外的码元", () => {
+    // 55_295 / 57_344 是两半各自紧外侧的那一档，128_512 是 😀 的真实码点。
+    for (const code of [0, 65, 55_295, 57_344, 128_512]) {
+      expect(isHighSurrogate(code), `高代理区判到了 ${String(code)}`).toBe(false);
+      expect(isLowSurrogate(code), `低代理区判到了 ${String(code)}`).toBe(false);
+    }
+  });
+});
 
 describe("capText", () => {
   it("未超预算时原样返回且没有页脚", () => {
@@ -288,11 +330,20 @@ describe("capText", () => {
   it("非有限或不足 1 的预算回落到安全兜底，而不是静默关闭截断", () => {
     // 本函数存在的理由就是别让超大正文整份进上下文；预算坏掉时只有两条出路——
     // 兜底预算或显式报错。静默放行等于把闸门拆掉。
-    const body = "x".repeat(400_000);
+    // 预算取实现导出的那一枚而不是字面量：实现合法地换档时这条不该误红。
+    const head = "〔头部标记〕";
+    const tail = "〔尾部标记〕";
+    const body = `${head}${"x".repeat(400_000)}${tail}`;
     for (const budget of [Number.NaN, 0, 0.5]) {
       const result = capText(body, budget, "再取一次");
       expect(result.truncated).toBe(true);
-      expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(200_000);
+      const kept = Buffer.byteLength(result.text, "utf8");
+      // 上界只证明闸门还关着；下界与首尾两枚标记才证明兜底之后仍然留着头尾两段。
+      // 只断上界时，退化成「返回空串」的 capText 照样全绿。
+      expect(kept).toBeLessThanOrEqual(FALLBACK_BUDGET_BYTES);
+      expect(kept).toBeGreaterThan(FALLBACK_BUDGET_BYTES / 2);
+      expect(result.text).toContain(head);
+      expect(result.text).toContain(tail);
     }
   });
 
@@ -311,8 +362,10 @@ describe("capText", () => {
     expect(result.notice).toContain("cssSelector");
   });
 
-  it("截断点不会留下孤立高代理", () => {
-    // 全是代理对的正文：每个码元 4 字节，正好压在中点最容易切出孤立项。
+  it("截断点不会留下孤立代理码元", () => {
+    // 全是代理对的正文：每个码元 4 字节，正好压在中点最容易切出孤立项。头尾两段都参与
+    // 保留，所以留下孤立项的位置有两处（头的末尾切进对里、尾的开头从对的中段起），
+    // 判据对两半都要求 false。
     const body = "😀".repeat(200);
     const result = capText(body, 101, "x");
     const units = Array.from(result.text, (char) => char.codePointAt(0) ?? 0);
@@ -326,6 +379,107 @@ describe("capText", () => {
     const result = capText("x".repeat(1000), 100, "");
     expect(result.truncated).toBe(true);
     expect(result.notice.length).toBeGreaterThan(0);
+  });
+});
+
+const fetchOf = (truncated: boolean, notice: string): Parameters<typeof renderFetch>[0] => ({
+  url: SAMPLE_URL,
+  statusCode: 200,
+  extractionType: "markdown",
+  content: "正文",
+  truncated,
+  notice,
+});
+
+const answerOf = (truncated: boolean, notice: string): Parameters<typeof renderAnswer>[0] => ({
+  url: SAMPLE_URL,
+  statusCode: 200,
+  extractionType: "markdown",
+  answer: "结论",
+  rendered: false,
+  provider: "brave",
+  model: "some-model",
+  truncated,
+  notice,
+});
+
+const browserOf = (entries: number, withXhr = true): Parameters<typeof renderBrowser>[0] => ({
+  url: SAMPLE_URL,
+  statusCode: 200,
+  extractionType: "markdown",
+  content: "正文",
+  truncated: false,
+  notice: "",
+  ...(withXhr
+    ? {
+        xhr: Array.from({ length: entries }, (_unused, index) => ({
+          id: index,
+          url: `${SAMPLE_URL}/api/${String(index)}`,
+          status: 200,
+          bytes: 12,
+          method: "GET",
+          resourceType: "fetch",
+          body: "x".repeat(120),
+        })),
+      }
+    : {}),
+});
+
+describe("正文截断标记的渲染", () => {
+  it("fetch 只有 truncated 标记、没有页脚时也告诉模型正文不完整", () => {
+    // Python 侧按 maxContentChars 截过时 notice 恒为空串（toFetchResult 写死 ""），
+    // 只读 notice 就等于把这份正文报成完整。
+    const text = renderFetch(fetchOf(true, ""));
+    expect(text).toContain("正文被截断：");
+    expect(text).toContain(CONTENT_RECOVERY_HINT);
+  });
+
+  it("fetch 的 notice 在场时以 notice 为准，不重复给回落提示", () => {
+    const text = renderFetch(fetchOf(true, "body 截断：省了 12 字节"));
+    expect(text).toContain("body 截断：省了 12 字节");
+    expect(text).not.toContain("正文被截断：");
+  });
+
+  it("fetch 没截断就不加任何尾巴", () => {
+    const text = renderFetch(fetchOf(false, ""));
+    expect(text.endsWith("正文")).toBe(true);
+  });
+
+  it("answer 只有 truncated 标记时也补一条截断说明", () => {
+    const text = renderAnswer(answerOf(true, ""));
+    expect(text).toContain("正文被截断：");
+    expect(text).toContain(CONTENT_RECOVERY_HINT);
+  });
+
+  it("answer 的 notice 与截断标记同时在场时只留 notice", () => {
+    const text = renderAnswer(answerOf(true, "对端的说明"));
+    expect(text).toContain("对端的说明");
+    expect(text).not.toContain("正文被截断：");
+  });
+
+  it("answer 没截断就不加尾巴", () => {
+    expect(renderAnswer(answerOf(false, "")).endsWith("结论")).toBe(true);
+  });
+});
+
+describe("网络历史的封顶", () => {
+  it("条目再多也把网络段压在预算内，并留下被截断的说明", () => {
+    // 判据不取自实现：条数放大百倍，回执字节数与渲染出的条目数都不许跟着涨。
+    const many = renderBrowser(browserOf(2000), 500);
+    const bytes = Buffer.byteLength(many, "utf8");
+    expect(bytes).toBeLessThanOrEqual(1024);
+    expect((many.match(/- \[id /gu) ?? []).length).toBeLessThan(40);
+    expect(many).toContain("网络历史整体被截断");
+  });
+
+  it("网络段在预算内时不加页脚", () => {
+    const text = renderBrowser(browserOf(1), 8192);
+    expect(text).toContain("Captured XHR/fetch:");
+    expect(text).not.toContain("网络历史整体被截断");
+  });
+
+  it("schema 里没有 xhr 的工具只回正文", () => {
+    expect(renderBrowser(browserOf(0, false), 500).endsWith("正文")).toBe(true);
   });
 });
 
@@ -1817,91 +1971,101 @@ async function startSpaServer(): Promise<{ base: string; close: () => Promise<vo
 describe("scrapling_render 与真实 sidecar", () => {
   const available = existsSync(LOCAL_PYTHON) && existsSync(BRIDGE);
 
-  it.runIf(available)("渲染出 JS 执行后才出现的内容（内置 web_fetch 拿不到的那部分）", async () => {
-    const spa = await startSpaServer();
-    const client = new SidecarClient(realCtx() as never, {
-      pythonBin: LOCAL_PYTHON,
-      bridgePath: BRIDGE,
-      cwd: REPO,
-      handshakeTimeoutMs: 30_000,
-      requestTimeoutMs: 90_000,
-      graceMs: 5000,
-      // 守卫默认拒绝回环地址；本地测试服务器就在 127.0.0.1，必须显式放行。
-      env: { DSH_SCRAPLING_ALLOWED_HOSTS: "127.0.0.1,localhost" },
-    });
-    try {
-      const caps = await client.ensureStarted();
-      if (!caps.browser) {
-        return;
-      }
-      const tool = createRenderTool({
-        sidecar: client,
-        settings: { ...SETTINGS, timeoutMs: 90_000 },
-        startCrawlJob: fakeJobStarter,
-        answer: fakeAnswer,
+  it.runIf(available)(
+    "渲染出 JS 执行后才出现的内容（内置 web_fetch 拿不到的那部分）",
+    async (ctx) => {
+      const spa = await startSpaServer();
+      const client = new SidecarClient(realCtx() as never, {
+        pythonBin: LOCAL_PYTHON,
+        bridgePath: BRIDGE,
+        cwd: REPO,
+        handshakeTimeoutMs: 30_000,
+        requestTimeoutMs: 90_000,
+        graceMs: 5000,
+        // 守卫默认拒绝回环地址；本地测试服务器就在 127.0.0.1，必须显式放行。
+        env: { DSH_SCRAPLING_ALLOWED_HOSTS: "127.0.0.1,localhost" },
       });
-      const exec = { signal: new AbortController().signal } as never;
-      const result = (await tool.execute({ url: spa.base, networkIdle: true }, exec)) as {
-        content: string;
-        statusCode: number;
-      };
-      expect(result.statusCode).toBe(200);
-      expect(result.content).toContain("Server Price");
-      expect(result.content).toContain("ABC-1");
-      // 加载占位不该还在 —— 说明拿到的是渲染后的 DOM 而不是壳。
-      expect(result.content).not.toContain("LOADING_PLACEHOLDER");
-    } finally {
-      await client.dispose();
-      await spa.close();
-    }
-  });
+      try {
+        const caps = await client.ensureStarted();
+        if (!caps.browser) {
+          // 没有浏览器二进制时这条要显式记成 skipped。裸 `return` 会让报告里它是「通过」，
+          // 而它一位都没断 —— 覆盖率与 CI 都看不出这段没跑到。
+          ctx.skip();
+        }
+        const tool = createRenderTool({
+          sidecar: client,
+          settings: { ...SETTINGS, timeoutMs: 90_000 },
+          startCrawlJob: fakeJobStarter,
+          answer: fakeAnswer,
+        });
+        const exec = { signal: new AbortController().signal } as never;
+        const result = (await tool.execute({ url: spa.base, networkIdle: true }, exec)) as {
+          content: string;
+          statusCode: number;
+        };
+        expect(result.statusCode).toBe(200);
+        expect(result.content).toContain("Server Price");
+        expect(result.content).toContain("ABC-1");
+        // 加载占位不该还在 —— 说明拿到的是渲染后的 DOM 而不是壳。
+        expect(result.content).not.toContain("LOADING_PLACEHOLDER");
+      } finally {
+        await client.dispose();
+        await spa.close();
+      }
+    },
+    REAL_SIDECAR_TIMEOUT_MS,
+  );
 });
 
 describe("scrapling_fetch 与真实 sidecar", () => {
   const available = existsSync(LOCAL_PYTHON) && existsSync(BRIDGE);
 
-  it.runIf(available)("抽取一段 HTML 并按选择器取出结构化内容", async () => {
-    const client = new SidecarClient(realCtx() as never, {
-      pythonBin: LOCAL_PYTHON,
-      bridgePath: BRIDGE,
-      cwd: REPO,
-      handshakeTimeoutMs: 30_000,
-      requestTimeoutMs: 30_000,
-      graceMs: 5000,
-    });
-    const fetchTool = createFetchTool({
-      sidecar: client,
-      settings: SETTINGS,
-      startCrawlJob: fakeJobStarter,
-      answer: fakeAnswer,
-    });
-    const exec = { signal: new AbortController().signal } as never;
-    const html = "<html><body><ul><li>alpha</li><li>beta</li></ul></body></html>";
-
-    const extractTool = createExtractTool({
-      sidecar: client,
-      settings: SETTINGS,
-      startCrawlJob: fakeJobStarter,
-      answer: fakeAnswer,
-    });
-    try {
-      const selected = (await extractTool.execute({ html, selector: "li" }, exec)) as {
-        count: number;
-        matches: { text: string }[];
-      };
-      expect(selected.count).toBe(2);
-      expect(selected.matches.map((item) => item.text)).toStrictEqual(["alpha", "beta"]);
-
-      // fetch 走的是网络，这里钉的是「闸门在 Python 侧真生效」：回环地址要在读到任何字节之前
-      // 被点名拒掉。原先写成 toBeTypeOf("string") —— 成功与失败两分支都是 string，把整道闸门
-      // 删掉也照样绿。dispose 挪进 finally：断言一抛就跳过它，实测会留下一个活着的 bridge.py。
-      await expect(fetchTool.execute({ url: LOOPBACK_UNREACHABLE }, exec)).rejects.toMatchObject({
-        code: "URL_BLOCKED",
+  it.runIf(available)(
+    "抽取一段 HTML 并按选择器取出结构化内容",
+    async () => {
+      const client = new SidecarClient(realCtx() as never, {
+        pythonBin: LOCAL_PYTHON,
+        bridgePath: BRIDGE,
+        cwd: REPO,
+        handshakeTimeoutMs: 30_000,
+        requestTimeoutMs: 30_000,
+        graceMs: 5000,
       });
-    } finally {
-      await client.dispose();
-    }
-  });
+      const fetchTool = createFetchTool({
+        sidecar: client,
+        settings: SETTINGS,
+        startCrawlJob: fakeJobStarter,
+        answer: fakeAnswer,
+      });
+      const exec = { signal: new AbortController().signal } as never;
+      const html = "<html><body><ul><li>alpha</li><li>beta</li></ul></body></html>";
+
+      const extractTool = createExtractTool({
+        sidecar: client,
+        settings: SETTINGS,
+        startCrawlJob: fakeJobStarter,
+        answer: fakeAnswer,
+      });
+      try {
+        const selected = (await extractTool.execute({ html, selector: "li" }, exec)) as {
+          count: number;
+          matches: { text: string }[];
+        };
+        expect(selected.count).toBe(2);
+        expect(selected.matches.map((item) => item.text)).toStrictEqual(["alpha", "beta"]);
+
+        // fetch 走的是网络，这里钉的是「闸门在 Python 侧真生效」：回环地址要在读到任何字节之前
+        // 被点名拒掉。原先写成 toBeTypeOf("string") —— 成功与失败两分支都是 string，把整道闸门
+        // 删掉也照样绿。dispose 挪进 finally：断言一抛就跳过它，实测会留下一个活着的 bridge.py。
+        await expect(fetchTool.execute({ url: LOOPBACK_UNREACHABLE }, exec)).rejects.toMatchObject({
+          code: "URL_BLOCKED",
+        });
+      } finally {
+        await client.dispose();
+      }
+    },
+    REAL_SIDECAR_TIMEOUT_MS,
+  );
 });
 
 describe("scrapling_render", () => {
@@ -3129,16 +3293,18 @@ describe("会话工具", () => {
   });
 
   it("open 把构造期扩展参数上线，缺省时不发", async () => {
-    const fake = fakeSidecar({ sessionId: "s1", sessionType: "stealth", createdAt: "T" });
+    const fake = fakeBrowserSidecar({ sessionId: "s1", sessionType: "stealth", createdAt: "T" });
     const tool = createSessionOpenTool({
       sidecar: fake.client,
       settings: SETTINGS,
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
     });
+    // 用 stealth 而不是 static：`py/adapters.py` 的 static 分支只读 `impersonate` 与超时，
+    // 这一组键在 static 上会被 open 那一帧直接拒掉（见下一条用例）。
     await tool.execute(
       {
-        sessionType: "static",
+        sessionType: "stealth",
         sessionId: "s9",
         cookies: [{ name: "a", value: "b" }],
         disableResources: true,
@@ -3163,7 +3329,7 @@ describe("会话工具", () => {
       maxPages: 2,
     });
 
-    await tool.execute({ sessionType: "static" }, sessionExec());
+    await tool.execute({ sessionType: "stealth" }, sessionExec());
     for (const key of [
       "sessionId",
       "cookies",
@@ -3177,6 +3343,100 @@ describe("会话工具", () => {
     ]) {
       expect(fake.calls[1]?.params).not.toHaveProperty(key);
     }
+  });
+
+  it("open 在 static 会话上把浏览器档的键报回，而不是静默丢掉", async () => {
+    // `py/adapters.py` 的 `_make_session` static 分支只读 impersonate / timeoutSeconds，
+    // 所以这些旋钮送过去不会有任何效果；按 Array.isArray / ?? 的老写法它们连一条错误都没有。
+    const fake = fakeSidecar({ sessionId: "s1", sessionType: "static", createdAt: "T" });
+    const tool = createSessionOpenTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(
+      tool.execute(
+        {
+          sessionType: "static",
+          headless: false,
+          retries: 2,
+          cookies: [{ name: "a", value: "b" }],
+        },
+        sessionExec(),
+      ),
+    ).rejects.toThrow(/headless, cookies, retries/u);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("open 的 static 闸门只认调用方给过的键", async () => {
+    // 载荷里每帧都带 headless / solveCloudflare（execute 补的部署默认值）；判据只能看
+    // 入参，否则每次 static 开场都会失败。
+    const fake = fakeSidecar({ sessionId: "s1", sessionType: "static", createdAt: "T" });
+    const tool = createSessionOpenTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute(
+      { sessionType: "static", impersonate: "firefox", sessionId: "s9" },
+      sessionExec(),
+    );
+    expect(fake.calls[0]?.params).toMatchObject({
+      sessionType: "static",
+      impersonate: "firefox",
+      sessionId: "s9",
+      headless: SETTINGS.headless,
+    });
+  });
+
+  it.each([
+    ["cookies", "not-an-array"],
+    ["blockedDomains", "ads.test"],
+  ])("open 的 %s 给成非数组时报参数错误", async (key, value) => {
+    const fake = fakeBrowserSidecar({ sessionId: "s1", sessionType: "stealth", createdAt: "T" });
+    const tool = createSessionOpenTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(
+      tool.execute({ sessionType: "stealth", [key]: value }, sessionExec()),
+    ).rejects.toThrow(new RegExp(`${key} must be an array`, "u"));
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("会话抓取与 render 对非数组 cookies 同样报参数错误", async () => {
+    const fetchFake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "b", truncated: false });
+    const fetchTool = createSessionFetchTool({
+      sidecar: fetchFake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(
+      fetchTool.execute({ sessionId: "s1", url: SAMPLE_URL, cookies: { a: "b" } }, sessionExec()),
+    ).rejects.toThrow(/cookies must be an array/u);
+    expect(fetchFake.calls).toHaveLength(0);
+
+    const renderFake = fakeSidecar({
+      url: SAMPLE_URL,
+      status: 200,
+      content: "b",
+      truncated: false,
+    });
+    const renderTool = createRenderTool({
+      sidecar: renderFake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(
+      renderTool.execute({ url: SAMPLE_URL, cookies: "a=b" }, sessionExec()),
+    ).rejects.toThrow(/cookies must be an array/u);
+    expect(renderFake.calls).toHaveLength(0);
   });
 
   it("open 缺 sessionId 时报可读错误", async () => {
@@ -3437,7 +3697,7 @@ describe("会话工具", () => {
     expect(JSON.stringify(tool.output.render({}, result))).toContain("no open sessions");
   });
 
-  it("list 回包是数字（而非数组）时给空列表", async () => {
+  it("list 回包不是数组（这里给的是字符串）时给空列表", async () => {
     const fake = fakeSidecar("nope");
     const tool = createSessionListTool({
       sidecar: fake.client,
@@ -3863,6 +4123,59 @@ describe("浏览器会话读/动作/媒体工具", () => {
       title: "s1",
       kind: "fetch",
     });
+  });
+
+  it("screenshot 拒掉不合形的 base64，不把半张图落库", async () => {
+    // `Buffer.from(str, "base64")` 会跳过字母表以外的字符：带 `data:` 前缀或被截断的串
+    // 照样解得出一点字节，于是坏图被存下来、工具还回一句「截图已保存」。
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      mediaType: "image/png",
+      base64: "data:image/png;base64,iVBORw0KGgo=",
+      width: 2,
+      height: 3,
+    });
+    let saved = 0;
+    const tool = createScreenshotTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+      attachments: {
+        saveImage: async () => {
+          saved += 1;
+          return { attachmentId: "a" };
+        },
+      },
+    });
+    await expect(tool.execute({ sessionId: "s1" }, exec)).rejects.toMatchObject({
+      code: "SIDECAR_REQUEST_FAILED",
+    });
+    expect(saved).toBe(0);
+
+    const empty = fakeSidecar({
+      url: SAMPLE_URL,
+      mediaType: "image/png",
+      base64: "",
+      width: 2,
+      height: 3,
+    });
+    const emptyTool = createScreenshotTool({
+      sidecar: empty.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+      attachments: {
+        saveImage: async () => {
+          saved += 1;
+          return { attachmentId: "a" };
+        },
+      },
+    });
+    await expect(emptyTool.execute({ sessionId: "s1" }, exec)).rejects.toMatchObject({
+      code: "SIDECAR_REQUEST_FAILED",
+    });
+    expect(saved).toBe(0);
   });
 
   it("screenshot 把字节交给 attachment 并渲染图片块", async () => {
@@ -4329,7 +4642,7 @@ describe("结果侧投影（结果行读的就是这几个键）", () => {
    */
   it("extract 投影出 count；session_open 投影出会话 id 与类型", async () => {
     const extract = createExtractTool({
-      sidecar: deps({ count: 2, truncated: false, matches: [] }).client,
+      sidecar: fakeSidecar({ count: 2, truncated: false, matches: [] }).client,
       settings: SETTINGS,
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
@@ -4339,7 +4652,7 @@ describe("结果侧投影（结果行读的就是这几个键）", () => {
     ).toStrictEqual({ count: 2 });
 
     const open = createSessionOpenTool({
-      sidecar: deps({ sessionId: "s1", sessionType: "static", createdAt: "t" }).client,
+      sidecar: fakeSidecar({ sessionId: "s1", sessionType: "static", createdAt: "t" }).client,
       settings: SETTINGS,
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
@@ -4354,7 +4667,7 @@ describe("结果侧投影（结果行读的就是这几个键）", () => {
 
   it("session_list 投影出条数；crawl 投影出作业 id", async () => {
     const list = createSessionListTool({
-      sidecar: deps({ sessions: [] }).client,
+      sidecar: fakeSidecar({ sessions: [] }).client,
       settings: SETTINGS,
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
@@ -4372,7 +4685,7 @@ describe("结果侧投影（结果行读的就是这几个键）", () => {
     ).toStrictEqual({ count: 2 });
 
     const crawl = createCrawlTool({
-      sidecar: deps({ crawlId: "c1" }).client,
+      sidecar: fakeSidecar({ crawlId: "c1" }).client,
       settings: SETTINGS,
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
@@ -4380,6 +4693,35 @@ describe("结果侧投影（结果行读的就是这几个键）", () => {
     expect(
       crawl.output.presentationMeta?.({}, { jobId: SAMPLE_JOB_ID, url: SAMPLE_URL, maxPages: 2 }),
     ).toStrictEqual({ jobId: SAMPLE_JOB_ID });
+  });
+
+  it("session_list 的文本行带出对端给明的存活状态，没给时不补值", async () => {
+    const list = createSessionListTool({
+      sidecar: fakeSidecar({ sessions: [] }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    // 一行会话条目：alive 可缺，缺时渲染不该替对端编一个判断。
+    const rendered = (row: {
+      sessionId: string;
+      sessionType: string;
+      createdAt: string;
+      alive?: boolean;
+    }): string => {
+      const blocks = list.output.render({}, { sessions: [row] });
+      return blocks[0]?.type === "text" ? blocks[0].text : "";
+    };
+    expect(rendered({ sessionId: "s1", sessionType: "static", createdAt: "t", alive: true })).toBe(
+      "s1 (static) opened t · alive",
+    );
+    expect(rendered({ sessionId: "s2", sessionType: "static", createdAt: "t", alive: false })).toBe(
+      "s2 (static) opened t · closed",
+    );
+    // 对端没给 alive：文本里不能凭空出现alive/closed 这类判断（同 sessionRowOf 的取舍）。
+    expect(rendered({ sessionId: "s3", sessionType: "static", createdAt: "t" })).toBe(
+      "s3 (static) opened t",
+    );
   });
 });
 
@@ -4700,16 +5042,6 @@ describe("爬虫报错的传播", () => {
 });
 
 /**
- * 造一个只需依赖 sidecar 的工具依赖包。
- *
- * @param result - 假 sidecar 的回包
- * @returns 假 sidecar 与它收到的帧
- */
-function fakeDeps(result: unknown): ReturnType<typeof fakeSidecar> {
-  return fakeSidecar(result);
-}
-
-/**
  * 造一个 call 必然抛错的 fetch 工具。
  *
  * @param error - 假 sidecar 要抛出的错误
@@ -4732,7 +5064,7 @@ function throwingFetchTool(error: unknown): ReturnType<typeof createFetchTool> {
 
 describe("结果投影补全（J4：schema 里声明的面必须在文本里看得见）", () => {
   it("select 命中里带 html 时渲染出来，includeHtml 不再是个空操作", () => {
-    const fake = fakeDeps({});
+    const fake = fakeSidecar({});
     const tool = createExtractTool({
       sidecar: fake.client,
       settings: SETTINGS,
@@ -4751,7 +5083,7 @@ describe("结果投影补全（J4：schema 里声明的面必须在文本里看�
   });
 
   it("select 的 rows 面：空表说 no rows，有表逐行 JSON", () => {
-    const fake = fakeDeps({});
+    const fake = fakeSidecar({});
     const tool = createExtractTool({
       sidecar: fake.client,
       settings: SETTINGS,
@@ -4781,7 +5113,7 @@ describe("结果投影补全（J4：schema 里声明的面必须在文本里看�
   });
 
   it("locate 渲染 attributes / 完整选择器 / 祖先链，截断时给提示", () => {
-    const fake = fakeDeps({});
+    const fake = fakeSidecar({});
     const tool = createLocateTool({
       sidecar: fake.client,
       settings: SETTINGS,
@@ -4818,7 +5150,7 @@ describe("结果投影补全（J4：schema 里声明的面必须在文本里看�
   });
 
   it("links 截断时给提示，不再静默少一半", () => {
-    const fake = fakeDeps({});
+    const fake = fakeSidecar({});
     const tool = createLinksTool({
       sidecar: fake.client,
       settings: SETTINGS,
@@ -4838,7 +5170,7 @@ describe("结果投影补全（J4：schema 里声明的面必须在文本里看�
   });
 
   it("capture_xhr 抓到 0 条时给一行可操作提示，而不是只给正文", () => {
-    const fake = fakeDeps({});
+    const fake = fakeSidecar({});
     const tool = createCaptureXhrTool({
       sidecar: fake.client,
       settings: SETTINGS,
@@ -4861,7 +5193,7 @@ describe("结果投影补全（J4：schema 里声明的面必须在文本里看�
   });
 
   it("session_network 渲染 id 与 includeHeaders 时的 headers", () => {
-    const fake = fakeDeps({});
+    const fake = fakeSidecar({});
     const tool = createSessionNetworkTool({
       sidecar: fake.client,
       settings: SETTINGS,

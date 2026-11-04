@@ -90,7 +90,7 @@ export interface McpServerHandle {
 }
 
 /** MCP server 自述的版本；由 test/publish-manifest.test.ts 钉成 package.json 同值。 */
-export const MCP_SERVER_VERSION = "0.1.6";
+export const MCP_SERVER_VERSION = "0.1.7";
 
 const RAW_PREFIX = "scrapling_";
 
@@ -332,7 +332,7 @@ async function runEntry(
 ): Promise<{ content: McpContent[]; isError?: boolean }> {
   const params = args ?? {};
   try {
-    // 十九个工具只读 exec 上的 signal（native 的单测同样只给这一位），MCP 请求的取消信号
+    // 每个工具只读 exec 上的 signal（native 的单测同样只给这一位），MCP 请求的取消信号
     // 就落在这一位上。ToolRunContext 的其余成员是宿主的调用身份，这一侧没有对应事实可填。
     // oxlint-disable-next-line typescript/no-unsafe-type-assertion
     const exec = { signal } as ToolRunContext;

@@ -105,6 +105,10 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 # 所以正常情况下的深度约等于 MAX_INFLIGHT；超过它说明调用方在以远超并发的速率灌帧，
 # 继续收就是纯粹的内存增长。判否让调用方自己退避。
 MAX_QUEUE_DEPTH = MAX_INFLIGHT * 4
+# 关机时每一路 close（爬虫、会话）的最长等待秒数。取 10 秒：浏览器会话的退出要给
+# Chromium 进程留收尾时间，而 sidecar 自己已经不再服务任何请求，等更久只是把
+# 「有界关机」变回无界。
+SHUTDOWN_CLOSE_TIMEOUT = 10.0
 
 _WRITE_LOCK = threading.Lock()
 _SLOTS = threading.Semaphore(MAX_INFLIGHT)
@@ -300,6 +304,21 @@ def _ensure_worker(count: int) -> None:
             worker.start()
 
 
+def _run_bounded(label: str, action: Callable[[], None], timeout: float) -> None:
+    """在后台线程里跑一次关闭并等它有界完成。
+
+    `close_all_crawls()` / `close_all_sessions()` 自己没有超时：它们要等 handler 释放
+    持有的锁，而那时 drain 已经放弃等待，关机就会从「有界」变成等一个不确定的对端。
+    超时后不重跑也不硬等——进程马上要退，这些资源由 OS 收；留一行日志是为了让宿主侧
+    读得出「这一轮是超时收的场」而不是「关干净了」。
+    """
+    worker = threading.Thread(target=action, daemon=True, name=f"bridge-{label}")
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        log(f"shutdown: {label} still running after {timeout}s; leaving it to process exit")
+
+
 def _shutdown_crawls() -> None:
     """退出前叫停全部爬虫，并给它们的线程一点收尾时间。
 
@@ -307,12 +326,16 @@ def _shutdown_crawls() -> None:
     不读这一路了，帧落进管道就是没人认领的字节。所以爬虫要在会话之前关：蜘蛛自己也要用
     浏览器，先把会话抽走只会让它在下一次请求里抛。
     """
-    try:
-        import crawl
 
-        crawl.close_all_crawls()
-    except Exception as error:  # noqa: BLE001 —— 关不掉也不能拖住关机
-        log(f"failed to stop crawls: {type(error).__name__}: {error}")
+    def close() -> None:
+        try:
+            import crawl
+
+            crawl.close_all_crawls()
+        except Exception as error:  # noqa: BLE001 —— 关不掉也不能拖住关机
+            log(f"failed to stop crawls: {type(error).__name__}: {error}")
+
+    _run_bounded("close-crawls", close, SHUTDOWN_CLOSE_TIMEOUT)
 
 
 def _shutdown_sessions() -> None:
@@ -320,12 +343,16 @@ def _shutdown_sessions() -> None:
 
     浏览器会话是独立进程：sidecar 自己退了、Chromium 还活着，就成了没人管的孤儿。
     """
-    try:
-        import adapters
 
-        adapters.close_all_sessions()
-    except Exception as error:  # noqa: BLE001 —— 关不掉也不能拖住关机
-        log(f"failed to close sessions: {type(error).__name__}: {error}")
+    def close() -> None:
+        try:
+            import adapters
+
+            adapters.close_all_sessions()
+        except Exception as error:  # noqa: BLE001 —— 关不掉也不能拖住关机
+            log(f"failed to close sessions: {type(error).__name__}: {error}")
+
+    _run_bounded("close-sessions", close, SHUTDOWN_CLOSE_TIMEOUT)
 
 
 def _drain_before_exit(timeout: float = 5.0) -> None:
@@ -333,20 +360,30 @@ def _drain_before_exit(timeout: float = 5.0) -> None:
 
     收到 shutdown 就直接 return 的话，队列里已排队的请求会被静默丢掉 —— Host 侧看到的
     是「没等到响应」而不是「被关机打断」。所以这里有界地等一下：等空了就走，等不到就
-    记一行日志再走，不无限期拖住关机。
+    把还排着的帧逐条点名再走，不无限期拖住关机。
+
+    点名只覆盖队列里的帧：已经出队、正在 handler 里跑的请求没有一处集中的登记面，要命名
+    它们就得在 worker 的热路径上加簿记，这比一条关机日志不值。那一路的后果由
+    `_shutdown_crawls` / `_shutdown_sessions` 的有界关闭兜住（宿主侧等的是帧，不是关闭）。
 
     :param timeout - 最长等待秒数
     """
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
         with _QUEUE_LOCK:
-            pending = bool(_QUEUE)
+            pending = list(_QUEUE)
         with _WORKERS_LOCK:
             busy = any(item.is_alive() for item in _WORKERS)
         if not pending and not busy:
             return
+        if time.monotonic() >= deadline:
+            ids = [str(item.get("id", "(无 id)")) for item in pending]
+            log(
+                f"shutdown: giving up after {timeout}s — {len(ids)} 帧仍在队列里未应答 "
+                f"ids={','.join(ids) if ids else '(空)'}"
+            )
+            return
         time.sleep(0.02)
-    log("shutdown: giving up on in-flight requests")
 
 
 def read_loop() -> int:

@@ -10,7 +10,8 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Config as configSchema } from "../host.ts";
-import { RUNTIME_PACKS, packLabelKey, packStateKey } from "../lib/runtime-shape.ts";
+import { FALLBACK_BUDGET_BYTES } from "../lib/output.ts";
+import { PACK_STATES, RUNTIME_PACKS, packLabelKey, packStateKey } from "../lib/runtime-shape.ts";
 import {
   BUNDLE_PACKAGE_NAME,
   LOCALE_NS,
@@ -58,6 +59,23 @@ const VOLATILE_KEYS: readonly string[] = Object.entries(PROPERTIES)
   .filter(([, property]) => property.meta?.volatile === true)
   .map(([key]) => key);
 
+/** 键在某语言字典里缺位或文案为空串时，收成 `语言/键` 便于点名；全齐时为空数组。 */
+function missingLabels(
+  dicts: ReturnType<typeof localeDictionaries>,
+  keys: readonly string[],
+): string[] {
+  const out: string[] = [];
+  for (const [lang, table] of Object.entries(dicts)) {
+    for (const key of keys) {
+      const text = table[key];
+      if (text === undefined || text === "") {
+        out.push(`${lang}/${key}`);
+      }
+    }
+  }
+  return out;
+}
+
 /** 按键取字段。 */
 function fieldOf(key: string): FieldSpec {
   const field = SETTINGS_FIELDS.find((candidate) => candidate.key === key);
@@ -77,7 +95,12 @@ function fakeDocument(present: boolean): DocumentFace & {
   return {
     appended,
     removed,
-    querySelector: () => (present ? { id: "already" } : null),
+    querySelector: (selector: string): unknown => {
+      // 「已经在文档里」有两种来源：测试预先摆一枚（present），或本卡自己刚注入过 ——
+      // 后一种才是 installStyle 幂等分支真正要判的那一档（产品侧靠真 DOM 的 querySelector）。
+      const id = selector.replace(/^#/u, "");
+      return appended.find((tag) => tag.id === id) ?? (present ? { id: "already" } : null);
+    },
     createElement: () => {
       const tag: StyleTag = {
         id: "",
@@ -97,6 +120,14 @@ function fakeDocument(present: boolean): DocumentFace & {
 }
 
 describe("字段表与 schema 同解", () => {
+  it("对账拿到的 schema 不是空表，字段表里每个键都在 schema 上有名", () => {
+    // 先判数据源在位：`configSchema.dict` 换名或换形状时，上面那次强转不是报错就是给一个
+    // 空对象，而集合比对那时只会说一句笼统的「不一致」。
+    expect(Object.keys(PROPERTIES).length).toBeGreaterThan(0);
+    expect(VOLATILE_KEYS.length).toBeGreaterThan(0);
+    expect(SETTINGS_FIELD_KEYS.filter((key) => !(key in PROPERTIES))).toStrictEqual([]);
+  });
+
   it("键集合与 host.ts 里 volatile 的字段完全一致", () => {
     expect(SETTINGS_FIELD_KEYS.toSorted()).toStrictEqual(VOLATILE_KEYS.toSorted());
   });
@@ -109,10 +140,23 @@ describe("字段表与 schema 同解", () => {
   });
 
   it("每个字段的默认值都等于 schema 里的默认值", () => {
+    // 红话把两侧都写出来：只给字段表那一侧时，「schema 没有 default 这一位」与「两边值
+    // 不一样」看着是同一句话。
     const wrong = SETTINGS_FIELDS.filter(
       (field) => PROPERTIES[field.key]?.meta?.default !== field.fallback,
-    ).map((field) => `${field.key}=${String(field.fallback)}`);
+    ).map(
+      (field) =>
+        `${field.key}: 卡片 ${String(field.fallback)} / schema ${String(PROPERTIES[field.key]?.meta?.default)}`,
+    );
     expect(wrong).toStrictEqual([]);
+  });
+
+  it("capText 的兜底预算与三枚输出上限的默认值同一档", () => {
+    // lib/output.ts 的兜底是第三份声明：schema 默认值、卡片 fallback 之外，预算非法时用的
+    // 就是它。注释说「同一档」，这里就把这句话变成可复跑的判据。
+    for (const key of ["fetchMaxOutputChars", "extractMaxOutputChars", "renderMaxOutputChars"]) {
+      expect(PROPERTIES[key]?.meta?.default).toBe(FALLBACK_BUDGET_BYTES);
+    }
   });
 
   it("枚举字段的取值非空，且默认值就在其中", () => {
@@ -148,15 +192,19 @@ describe("locale 字典", () => {
     expect(Object.keys(dicts.zh).toSorted()).toStrictEqual(Object.keys(dicts.en).toSorted());
   });
 
-  it("六个能力包的名称与五种状态都配了中英文案", () => {
-    for (const pack of RUNTIME_PACKS) {
-      expect(dicts.zh[packLabelKey(pack)]).not.toBe("");
-      expect(dicts.en[packLabelKey(pack)]).not.toBe("");
-    }
-    for (const state of ["ready", "missing", "corrupt", "installing", "blocked"] as const) {
-      expect(dicts.zh[packStateKey(state)]).not.toBe("");
-      expect(dicts.en[packStateKey(state)]).not.toBe("");
-    }
+  it("每个能力包的名称与每种包状态都配了中英文案", () => {
+    // 判据是「键在位且非空」：只写 `.not.toBe("")` 时缺键拿到 undefined 照样通过，门禁对着
+    // 真正缺文案的那一档恒绿（变异实测：给 PACK_STATES 加一个没配译名的状态，旧写法不红）。
+    //
+    // 状态清单取自 lib/runtime-shape.ts 的运行时值域：加一个状态而没配译名，这条会点名是哪一个，
+    // 而不是等卡片把 `runtime.state.<新值>` 原样露在界面上。
+    const labels = [
+      ...RUNTIME_PACKS.map((pack) => packLabelKey(pack)),
+      ...PACK_STATES.map((state) => packStateKey(state)),
+    ];
+    // 先证明这条有的判：值域一旦被清空，下面的 missingLabels 就只是在判一张空表。
+    expect(labels.length).toBeGreaterThan(0);
+    expect(missingLabels(dicts, labels)).toStrictEqual([]);
   });
 
   it("每个字段与每个分组都有 label / hint / title / note 四个键", () => {
@@ -243,6 +291,20 @@ describe("controlType", () => {
   it("不是凭据字段的，显示开关不影响它", () => {
     expect(controlType(plain, true)).toBe("text");
     expect(controlType(plain, false)).toBe("text");
+  });
+
+  it("说明里承诺遮罩的字段，控件必须真遮罩", () => {
+    // 反方向不要求：三枚 API key 的说明只讲「必填 / 留空」，不必重复一句「会遮罩」。
+    // 但说明写了遮罩而字段没标 secret 时，用户在卡上看见的仍是明文，而这一位没有任何
+    // 别的判据会红 —— 卡片文案与控件形态之间唯一的连线就是这条。
+    const promised = SETTINGS_FIELDS.filter(
+      (field) => field.hint.zh.includes("遮罩") || field.hint.en.includes("Masked"),
+    );
+    expect(promised.length).toBeGreaterThanOrEqual(2);
+    for (const field of promised) {
+      expect(field.secret, `${field.key} 的说明写了遮罩却没标 secret`).toBe(true);
+      expect(controlType(field, false), `${field.key} 没走密码控件`).toBe("password");
+    }
   });
 });
 
@@ -406,7 +468,22 @@ describe("样式挂载", () => {
     expect(doc.appended).toHaveLength(1);
     expect(doc.appended[0]?.id).toBe("dsh-scrapling-settings-css");
     dispose();
-    expect(doc.removed).toHaveLength(1);
+    // 判「摘掉的就是刚注入的那一枚」，不判长度：假 document 里每个 tag 的 remove 都只把
+    // 自己 push 进 removed，无论 dispose 关的是谁，长度都是 1。
+    expect(doc.removed).toStrictEqual([doc.appended[0]]);
+  });
+
+  it("同一 id 注入两次只留一段：摘除函数也不该把第二段的活抢过来", () => {
+    // 这就是 installStyle 注释里「重复调用是空操作」那一支：第二次得从文档里认回第一段，
+    // 而不是再叠一份 CSS 规则。
+    const doc = fakeDocument(false);
+    const first = installStyles(doc);
+    const second = installStyles(doc);
+    expect(doc.appended).toHaveLength(1);
+    second();
+    expect(doc.removed).toStrictEqual([]);
+    first();
+    expect(doc.removed).toStrictEqual([doc.appended[0]]);
   });
 
   it("已经在文档里就跳过，不重复注入，摘除函数也不该动别人的东西", () => {
@@ -426,8 +503,10 @@ describe("样式挂载", () => {
 });
 
 describe("browserDocument", () => {
+  // `Reflect.deleteProperty` 是删掉而不是还原：环境本身提供 document 时（happy-dom 那类
+  // 渲染用例就在同一个 worker 里跑），它会被永久摘走。stubGlobal 记下原值、unstubAllGlobals
+  // 负责放回，这才叫还原。
   afterEach(() => {
-    Reflect.deleteProperty(globalThis, "document");
     vi.unstubAllGlobals();
   });
 
@@ -437,24 +516,24 @@ describe("browserDocument", () => {
 
   it("有 document 时交出它", () => {
     const doc = fakeDocument(false);
-    Reflect.set(globalThis, "document", doc);
+    vi.stubGlobal("document", doc);
     expect(browserDocument()).toBe(doc);
   });
 
   it("像个对象但缺方法的不算 document", () => {
-    Reflect.set(globalThis, "document", { querySelector: () => null });
+    vi.stubGlobal("document", { querySelector: () => null });
     expect(browserDocument()).toBeUndefined();
-    Reflect.set(globalThis, "document", null);
+    vi.stubGlobal("document", null);
     expect(browserDocument()).toBeUndefined();
   });
 
   it("head 不是可用对象的不算 document —— 否则 installStyles 会在 doc.head 上炸掉", () => {
     const partial = fakeDocument(false) as { head?: unknown };
-    Reflect.set(globalThis, "document", { ...partial, head: undefined });
+    vi.stubGlobal("document", { ...partial, head: undefined });
     expect(browserDocument()).toBeUndefined();
-    Reflect.set(globalThis, "document", { ...partial, head: "not-an-object" });
+    vi.stubGlobal("document", { ...partial, head: "not-an-object" });
     expect(browserDocument()).toBeUndefined();
-    Reflect.set(globalThis, "document", { ...partial, head: { append: "not-a-function" } });
+    vi.stubGlobal("document", { ...partial, head: { append: "not-a-function" } });
     expect(browserDocument()).toBeUndefined();
   });
 });

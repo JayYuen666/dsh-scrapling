@@ -18,6 +18,7 @@
 //
 // 允许表里每一项都要写明理由 —— 那是「这段不对称是故意的」唯一的记录处。
 
+import type { Context } from "@deepseek-ai/cordis";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { SidecarClient } from "../lib/sidecar.ts";
@@ -128,13 +129,7 @@ interface ParamSpec {
   enum?: unknown[];
 }
 
-/**
- * 由声明的 schema 造一份入参。
- *
- * @param name - 参数名
- * @param spec - 声明形状
- * @returns 一个合法值
- */
+/** 类型 → 兜底样例值：`sampleValue` 在按名字和枚举都取不到值时落到这张表上。 */
 const BY_TYPE: Record<string, unknown> = {
   boolean: true,
   integer: 5,
@@ -220,7 +215,10 @@ function recordingSidecar(replies: Record<string, unknown>): {
           throw new Error("本用例不拉起真进程");
         },
       },
-    } as unknown as never,
+      // 构造器只把 ctx 存下来，而下面 `Object.assign` 把唯一的读点 `call` 整个换掉，
+      // 所以这份桩只带 subprocess。断到构造参数的真实类型而不是 `never`：参数换类型时
+      // 这里要红，`never` 则什么都接。
+    } as unknown as Context,
     {
       pythonBin: "python3",
       bridgePath: BRIDGE,
@@ -301,13 +299,21 @@ const REPLIES: Record<string, unknown> = {
  *
  * @returns 工具名到观测结果的映射
  */
-async function driveTools(): Promise<Record<string, ToolObservation>> {
+async function driveAllTools(): Promise<Record<string, ToolObservation>> {
   const out: Record<string, ToolObservation> = {};
   // 每个工具各自挂一份记录用的 sidecar，彼此没有共享状态，可以并发跑；顺序无所谓，
   // 断言读的是「工具名 -> 观测」这张表。
   await Promise.all(
     TOOL_SPECS.map(async (spec) => {
       const { client, calls } = recordingSidecar(REPLIES);
+      // `scrapling_session_open` 的 `sessionType` 可选值跟着 `capabilities.browser` 走；
+      // 不声明就只剩 static，而下面要把满参数面发给它（见那处的 sessionType 覆盖）。
+      if (spec.name === "scrapling_session_open") {
+        Object.defineProperty(client, "capabilities", {
+          value: { scrapling: true, static: true, extract: true, browser: true },
+          configurable: true,
+        });
+      }
       const definition = spec.build({
         sidecar: client,
         settings: SETTINGS,
@@ -347,8 +353,22 @@ async function driveTools(): Promise<Record<string, ToolObservation>> {
       ) {
         args["method"] = "POST";
       }
+      // 满参数面在 `scrapling_session_open` 上只有走 stealth 才合法：`py/adapters.py` 的
+      // `_make_session` static 分支只读 impersonate 与超时，其余浏览器旋钮现在由开场那道
+      // 闸门报参数错误（静默丢掉正是本包在消灭的那类故障）。static 那一档的读取由
+      // `READ_VARIANTS` 的 static 分支单独覆盖，两边的键表都是并集，不靠这一帧证明。
+      if (spec.name === "scrapling_session_open") {
+        args["sessionType"] = "stealth";
+      }
+      // 执行面这一位是宿主自己的类型，本桩只喂 `signal`（被测工具读的就这一位），
+      // 因此断到「execute 第二个参数到底是什么」而不是 `as never`：后者连参数类型改名都
+      // 不会报，等于把签名漂移咽进桩里。宿主那个类型另有数个必填成员，它们的语义本桩
+      // 不认领 —— 要真按那个类型逐成员写，就得凭猜填行为，那比一处注明的双断言更坏。
+      const execCtx = {
+        signal: new AbortController().signal,
+      } as unknown as Parameters<typeof definition.execute>[1];
       try {
-        await definition.execute(args, { signal: new AbortController().signal } as never);
+        await definition.execute(args, execCtx);
       } catch {
         // 回包与某个工具对不上时本用例仍只看**发出去的帧**；结果侧的形状问题由
         // tools.test.ts 那套按工具逐条钉的用例负责。
@@ -377,6 +397,7 @@ async function driveTools(): Promise<Record<string, ToolObservation>> {
     renderTopN: 0,
     maxOutputBytes: 4000,
     timeoutMs: 30_000,
+    urlGate: async (url: string): Promise<string | undefined> => url,
   }).search({ query: "probe" });
   out["web_search provider"] = { calls: search.calls, declared: [] };
   return out;
@@ -417,6 +438,20 @@ async function buildPythonSide(): Promise<PythonSide> {
 async function pythonSide(): Promise<PythonSide> {
   side ??= buildPythonSide();
   return side;
+}
+
+// 驱动结果缓存一份：五条用例读的是同一份「工具 -> 观测」，跑五遍等于把整批工具重复驱动
+// 五遍，而两遍之间任何一处不一致都会让某一组断言读到另一个产物（与 `pythonSide` 同一理由）。
+let driven: Promise<Record<string, ToolObservation>> | undefined;
+
+/**
+ * 取本次运行驱动出来的观测（只驱动一次）。
+ *
+ * @returns 工具名到观测结果的映射
+ */
+async function driveTools(): Promise<Record<string, ToolObservation>> {
+  driven ??= driveAllTools();
+  return driven;
 }
 
 /** 起探针那一条用例的时间预算：默认那 20s 恰好压在探针的实际耗时上，runner 慢一点就越线。 */
@@ -495,11 +530,10 @@ function unreadKeys(
 }
 
 /**
- * 对端读了、本侧从不发的键，以及已经接线却仍躺在豁免表里的条目。
+ * 按 sidecar 方法聚合「本侧发出去的键」。
  *
  * @param observations - 工具观测
- * @param reads - 对端读取表
- * @returns 两个列表：新增的死分支与过期的豁免
+ * @returns 方法名到该方法收过的键集；一个方法收过哪些键，只能按方法问
  */
 function sentKeysByMethod(observations: Record<string, ToolObservation>): Map<string, Set<string>> {
   const sentByMethod = new Map<string, Set<string>>();
@@ -515,6 +549,15 @@ function sentKeysByMethod(observations: Record<string, ToolObservation>): Map<st
   return sentByMethod;
 }
 
+/**
+ * 对端读了、本侧从不发的键，以及已经接线却仍躺在豁免表里的条目。
+ *
+ * 两条判定口径不同：`unreachable` 问全网线，`stale` 问该方法（理由写在函数体里）。
+ *
+ * @param observations - 工具观测
+ * @param reads - 对端读取表
+ * @returns 两个列表：新增的死分支与过期的豁免
+ */
 function deadReads(
   observations: Record<string, ToolObservation>,
   reads: Map<string, Set<string>>,
@@ -525,15 +568,25 @@ function deadReads(
   const stale: string[] = [];
   for (const [method, read] of reads) {
     const excused = excusedFor(KNOWN_UNREACHABLE, method);
+    const sentHere = sentByMethod.get(method) ?? new Set<string>();
     for (const key of read) {
+      // 两条判定的口径**故意**不同，这里把理由写死而不是留给下一个人猜：
+      // - unreachable 问「全网线上有没有任何一个调用点发过它」。把这一半也改成按方法判
+      //   （本轮实测过）会一次点出 37 项，其中绝大多数是会话构造期的旋钮 —— Python 侧
+      //   一个构造函数被多个方法共用，于是 render / capture / session.fetch 都「读」
+      //   locale、allowWebgl、waitSelector 这类键，而它们按设计只在 session.open 那一帧
+      //   发；另有 locate 读 useXpath 这种「上游接受一个本调用点不发的可选入参」。
+      //   这些都不是死分支，per-method 在这张表上没有分辨力。
+      // - stale 反过来必须按方法判：豁免是针对某个方法写的，别的调用点把同名键发给别的
+      //   方法，不能让这条豁免看起来已经接线。
+      // 「某个方法的帧上真该带哪些键」这类按方法的契约，由下面那条 session.open 的逐键
+      // 断言按具体形状钉住，而不是靠这张表泛判。
       if (wire.has(key)) {
-        // 豁免是针对**这个方法**的：别的工具把同名键发给别的方法，不能让这条豁免
-        // 看起来已经接线。
-        if (excused.has(key) && (sentByMethod.get(method)?.has(key) ?? false)) {
+        if (excused.has(key) && sentHere.has(key)) {
           stale.push(`${method} 的 ${key} 已上网线，仍留在豁免表里`);
         }
       } else if (!excused.has(key)) {
-        unreachable.push(`${method} 读了 ${key}，本侧从不发`);
+        unreachable.push(`${method} 读了 ${key}，全网线一次都没发过`);
       }
     }
   }
@@ -587,7 +640,13 @@ describe("两侧对表：线路上的键必须一一对得上", () => {
     "本侧发出的每个键，对端那侧真读（否则就是「拧了没反应」）",
     async () => {
       const { reads } = await pythonSide();
-      expect(unreadKeys(await driveTools(), reads)).toStrictEqual([]);
+      const observations = await driveTools();
+      // 驱动退化保护：工具一帧都没发时，下面这句会真空通过（同一条守卫在「方法都在
+      // METHODS 表里」与「声明给模型的参数」那两条里也有，三组断言同一口径）。
+      expect(
+        keysOf(Object.values(observations).flatMap((item) => item.calls)).size,
+      ).toBeGreaterThan(0);
+      expect(unreadKeys(observations, reads)).toStrictEqual([]);
     },
     PROBE_TIMEOUT_MS,
   );

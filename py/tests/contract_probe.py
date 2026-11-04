@@ -39,6 +39,7 @@ import inspect
 import json
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager, suppress
 from dataclasses import fields
 from pathlib import Path
@@ -368,6 +369,10 @@ def drive() -> None:
     adapters.render(_full_args(_browser_args()))
     adapters.fetch(_full_args({"timeoutSeconds": 30.0, "retries": 2, "headers": {"A": "b"}}))
     adapters.fetch(_full_args({"method": "POST", "body": {"k": "v"}, "cookies": {"c": "1"}}))
+    # 四个动词都要驱动：STATIC_LEVEL 里列了 put/delete，只走 get/post 时那两站的键映射
+    # 漂移没人判（adapters 按 getattr(Fetcher, method.lower()) 分发）。
+    adapters.fetch(_full_args({"method": "PUT", "body": {"k": "v"}}))
+    adapters.fetch(_full_args({"method": "DELETE", "body": {"k": "v"}}))
     with _spawn_as("capture.open", "capture.fetch"):
         adapters.capture(
             _full_args(
@@ -654,6 +659,22 @@ READ_VARIANTS: dict[str, list[dict[str, Any]]] = {
 }
 
 
+# crawl.run 的 worker 是 daemon 线程，失败路径要经过 _emit_event；给它收摊的等待上限。
+# 取秒级而不是无限：等不到就不还原发射器（宁可留空函数），也不能让一帧迟到的事件写进 stdout。
+CRAWL_WORKER_JOIN_TIMEOUT = 5
+
+
+def _drain_crawl_workers() -> bool:
+    """等读取面里 ``crawl.run`` 起过的 daemon worker 收摊。
+
+    :returns: 是否已经确认没有 worker 在跑（true 时才可以把真实的事件发射器换回去）
+    """
+    workers = [thread for thread in threading.enumerate() if thread.name.startswith("crawl-")]
+    for worker in workers:
+        worker.join(timeout=CRAWL_WORKER_JOIN_TIMEOUT)
+    return all(not worker.is_alive() for worker in workers)
+
+
 def reads_by_method() -> dict[str, list[str]]:
     """逐个方法真跑一遍（含各分支），记下 Python 侧实际读取的键。
 
@@ -705,7 +726,12 @@ def reads_by_method() -> dict[str, list[str]]:
         return out
     finally:
         crawl._make_spider = spider_maker
-        crawl._emit_event = emit
+        # 事件发射器只在确认没有 worker 在跑时才还原：本探针的 stdout 只给那一行结论
+        # （test/probe.ts 是 JSON.parse(整个 stdout)），一帧迟到的 crawlError 落在还原之后
+        # 就会让「探针坏了」冒充「上游变了」。等不干净时保留这个吞帧替身——后面没人再需要
+        # 真事件帧，进程马上就退。
+        if _drain_crawl_workers():
+            crawl._emit_event = emit
         adapters.close_all_sessions()
         _restore(originals)
         adapters.close_all_sessions()
@@ -764,7 +790,13 @@ def _launch_args(site: str) -> list[str]:
     except Exception:  # noqa: BLE001 —— 造不出来本身就是结论，由调用侧按空表判
         return []
     try:
-        return list(session._browser_options.get("args", []))
+        # 私有面本身也是被盯的对象：上游把 _browser_options 改名或换成非 dict 时，这里按
+        # 「拿不到启动参数」收进空表，由 _stealth_check 用结构化缺失报出来。docstring 承诺的
+        # 就是「造不出来给空表」，而 traceback 冒到 check()/facts() 会让 stdout 一个字节都没有。
+        options = getattr(session, "_browser_options", None)
+        if not isinstance(options, dict):
+            return []
+        return list(options.get("args", []))
     finally:
         _close_quietly(session)
 
@@ -856,6 +888,16 @@ def check() -> dict[str, Any]:
                         "honorableAtOpen": sorted(set(silent) & _typed_keys("StealthSession")),
                     }
                 )
+        else:
+            # 三张表都没登记的调用点等于「探针没问过上游」：静默跳过会让 adapters 新增引擎调用点时
+            # 这张表与代码一起漂移而门照样绿。报成违规，逼新调用点先归类。
+            violations.append(
+                {
+                    "site": site,
+                    "keys": sorted(keys),
+                    "expected": "unmapped-call-site（不在 STATIC_LEVEL / SESSION_LEVEL / FETCH_LEVEL_SITES 里）",
+                }
+            )
 
     return {
         "checked": checked,
@@ -888,9 +930,9 @@ def facts() -> dict[str, Any]:
     markdown = inspect.signature(Response.markdown)
     return {
         "fetcherVerbs": sorted(name for name in ("get", "post", "put", "delete", "fetch") if hasattr(Fetcher, name)),
-        "selectorCssParams": list(css.parameters),
+        "selectorCssParams": sorted(str(name) for name in css.parameters),
         "selectorCssDefaultPercentage": css.parameters["percentage"].default,
-        "responseMarkdownParams": list(markdown.parameters),
+        "responseMarkdownParams": sorted(str(name) for name in markdown.parameters),
         "convertorPrivates": [
             name
             for name in ("_strip_noise_tags", "_sanitize_for_ai", "_extract_content", "_convert_to_markdown")
@@ -903,6 +945,9 @@ def facts() -> dict[str, Any]:
         "stealthArgCount": len(_launch_args("browser.render")),
         "stealthArgsTotal": len(STEALTH_ARGS),
         "defaultArgsTotal": len(DEFAULT_ARGS),
+        # 两表今天的交集为 0，相加与并集同值；哪天上游让某枚 flag 同时出现在两表里，
+        # 相加就会超过最终启动参数的条数，所以这里把并集单独报出来。
+        "defaultStealthUnionTotal": len(set(DEFAULT_ARGS) | set(STEALTH_ARGS)),
         "spiderDefaults": {
             "robots_txt_obey": Spider.robots_txt_obey,
             "autothrottle_enabled": Spider.autothrottle_enabled,

@@ -1,9 +1,13 @@
 # dsh-scrapling：Scrapling 网页抓取插件（bundle）。
-# 19 个工具（scrapling_fetch / scrapling_extract / scrapling_render /
-# scrapling_capture_xhr / scrapling_session_* / scrapling_crawl / scrapling_answer），
+# 19 个工具（名单以 `host.ts` 的 `TOOL_SPECS` 与 `src/client-entry.ts` 的 `ROW_TOOLS` 为准，
+# 两侧名字一致由 `test/client.test.ts` 判红；这个计数本身由 `test/readme-parity.test.ts` 跟着
+# 登记表核对，所以这里不逐枚列举，也删不掉——注释不必成为第二份清单）。
 # 后端是常驻 Python 进程，经 ctx.subprocess 的 stdin/stdout
 # 跑 JSON-lines 协议（stdout 走协议、stderr 走日志）。
-# 每个工具一个 Config .volatile() 开关；关闭时连 systemPrompt 指引段也不注册。
+# 开关粒度是一类工具一枚、不是每个工具一枚：同族工具共用一个 `Config` 的 .volatile()
+# 布尔（`TOOL_SPECS` 里各条的 `flag` 就是归属），关闭时连 systemPrompt 指引段也不注册。
+# 工具级开关只是 volatile 字段里的一类：`pythonBin`、超时与输出预算一类同样可热改，
+# 部署级字段（`integrationMode` / `mcpPort` / `allowWriteMethods` 等）不在其中，改完要重启。
 # 浏览器未就绪时不注册依赖浏览器的工具，并在设置卡给出安装指引。
 # 安全不变量：page_action / page_setup / selector_config / proxy 绝不进模型
 # schema —— 浏览器侧的 SSRF 守卫由 Python 侧自己注册，不接受模型传入的回调。

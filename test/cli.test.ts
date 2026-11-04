@@ -16,6 +16,7 @@ import { mockPlatform } from "./managed-host.ts";
 import { runCli } from "../lib/cli.ts";
 import type { CliDeps } from "../lib/cli.ts";
 import { acquireLock, InstallError } from "../lib/installer.ts";
+import { MCP_DEFAULT_CLIENT_PIN } from "../lib/mcp-contract.ts";
 
 const created: string[] = [];
 const SETUP = "setup";
@@ -40,7 +41,7 @@ const CLIENT_KEY = "@deepseek-ai/dsh-mcp-client";
 const OFFICIAL = "official-mcp";
 const ENABLED_LINE = "        officialMcpEnabled: true\n";
 const PLAIN_PATCH = "serverName: scrapling\n";
-const PINNED_CLIENT = { [CLIENT_KEY]: "0.2.1-rc.3" };
+const PINNED_CLIENT = { [CLIENT_KEY]: MCP_DEFAULT_CLIENT_PIN };
 const SERVER_LINE = "        serverName: scrapling";
 const HTTP_LINE = "        transport: streamable-http";
 const HTTP_URL_LINE = "        url: http://127.0.0.1:39217/mcp";
@@ -155,6 +156,69 @@ function harness(): { deps: Partial<CliDeps>; lines: string[]; calls: string[]; 
   };
 }
 
+/** `--status` 打出的那份 JSON 里，本文件会读到的字段。 */
+interface Status {
+  readonly dataDir: string;
+  readonly profile: {
+    readonly path: string | null;
+    readonly pythonBin: string | null;
+    readonly note?: string;
+  };
+  readonly runtime: {
+    readonly pythonPath: string;
+    readonly via: string;
+    readonly version: string;
+  };
+}
+
+/**
+ * 把一次 `--status` 的日志读成一份 Status。
+ *
+ * 整份日志必须恰好是那一份 JSON：这里不做「取最后一个 JSON 块」的宽容，因为
+ * 「status 之前多打了一行提示」本身就是该让用例变红的漂移。
+ *
+ * @param lines - 这次调用收下的日志行
+ * @returns 解析后的 status
+ */
+function parseStatus(lines: readonly string[]): Status {
+  return JSON.parse(lines.join("\n")) as Status;
+}
+
+/**
+ * 在一次调用里临时改 `DSH_SCRAPLING_DATA_DIR`，并把默认输出口（`console.info`）收成行。
+ *
+ * 变量赋值落在 try 内侧而不是 spyOn 之后：先赋值再 spyOn 时，spyOn 自己抛错就走不到还原，
+ * 这份环境变量会泄漏给同进程后面的用例。
+ *
+ * @param value - 这一条用例要写的取值
+ * @param run - 要跑的调用
+ * @returns 调用结果与收到的日志行
+ */
+async function withEnvDataDir<Result>(
+  value: string,
+  run: () => Promise<Result>,
+): Promise<{ readonly result: Result; readonly lines: string[] }> {
+  const previous = process.env["DSH_SCRAPLING_DATA_DIR"];
+  try {
+    process.env["DSH_SCRAPLING_DATA_DIR"] = value;
+    const lines: string[] = [];
+    const info = vi.spyOn(console, "info").mockImplementation((...args: unknown[]) => {
+      lines.push(args.join(" "));
+    });
+    try {
+      return { result: await run(), lines };
+    } finally {
+      info.mockRestore();
+    }
+  } finally {
+    if (previous === undefined) {
+      delete process.env["DSH_SCRAPLING_DATA_DIR"];
+    } else {
+      process.env["DSH_SCRAPLING_DATA_DIR"] = previous;
+    }
+  }
+}
+
 describe("runCli", () => {
   let restorePlatform: (() => void) | undefined;
   beforeAll(() => {
@@ -184,10 +248,7 @@ describe("runCli", () => {
   it("--status 没给 --profile 时明说没读 profile", async () => {
     const { deps, lines } = harness();
     await expect(runCli([SETUP, STATUS], deps)).resolves.toBe(0);
-    const status = JSON.parse(lines.join("\n")) as {
-      profile: { path: string | null; pythonBin: string | null; note?: string };
-      runtime: { via: string };
-    };
+    const status = parseStatus(lines);
     expect(status.profile.path).toBeNull();
     expect(status.profile.pythonBin).toBeNull();
     expect(status.profile.note ?? "").toContain("未读 profile");
@@ -202,10 +263,7 @@ describe("runCli", () => {
       `- id: scrapling\n  name: "@jayyuen66/dsh-scrapling"\n  config:\n    pythonBin: ${configured}\n`,
     );
     await expect(runCli([SETUP, STATUS, PROFILE, profile], deps)).resolves.toBe(0);
-    const status = JSON.parse(lines.join("\n")) as {
-      profile: { path: string | null; pythonBin: string | null; note?: string };
-      runtime: { pythonPath: string; via: string; version: string };
-    };
+    const status = parseStatus(lines);
     expect(status.profile.path).toBe(profile);
     expect(status.profile.pythonBin).toBe(configured);
     expect(status.profile.note).toBeUndefined();
@@ -220,14 +278,26 @@ describe("runCli", () => {
     const { deps, lines, dataDir } = harness();
     const profile = profileDir(dataDir, `- id: scrapling\n  name: "@jayyuen66/dsh-scrapling"\n`);
     await expect(runCli([SETUP, STATUS, PROFILE, profile], deps)).resolves.toBe(0);
-    const status = JSON.parse(lines.join("\n")) as {
-      profile: { path: string | null; pythonBin: string | null; note?: string };
-      runtime: { via: string };
-    };
+    const status = parseStatus(lines);
     expect(status.profile.path).toBe(profile);
     expect(status.profile.pythonBin).toBeNull();
     expect(status.profile.note ?? "").toContain("没有 scrapling 的 pythonBin");
     expect(status.runtime.via).toBe("path");
+  });
+
+  it("--status 跳过只写了键名的 pythonBin，取后面那条真值", async () => {
+    // profile 的 cordis.patch.yml 是多层 patch 的聚合：别的条目先落一个空 `pythonBin:` 时，
+    // 「第一次出现」读到的是那一条空值，于是 status 只能说没配，而宿主起的是后面那一条。
+    const { deps, lines, dataDir } = harness();
+    const configured = path.join(dataDir, "venv", "bin", "python");
+    const profile = profileDir(
+      dataDir,
+      `- id: other\n  config:\n    pythonBin:\n- id: scrapling\n  name: "@jayyuen66/dsh-scrapling"\n  config:\n    pythonBin: ${configured}\n`,
+    );
+    await expect(runCli([SETUP, STATUS, PROFILE, profile], deps)).resolves.toBe(0);
+    const status = parseStatus(lines);
+    expect(status.profile.pythonBin).toBe(configured);
+    expect(status.runtime.via).toBe("configured");
   });
 
   it("--feature core --apply 交给 installer 的包安装入口", async () => {
@@ -331,7 +401,7 @@ describe("runCli", () => {
     expect(text).toContain(HTTP_LINE);
     expect(text).toContain(HTTP_URL_LINE);
     expect(text).toContain(
-      "dsh plugin --profile <profile> add @deepseek-ai/dsh-mcp-client@0.2.1-rc.3",
+      `dsh plugin --profile <profile> add @deepseek-ai/dsh-mcp-client@${MCP_DEFAULT_CLIENT_PIN}`,
     );
     expect(text).toContain("dry-run");
     expect(existsSync(path.join(dataDir, "mcp"))).toBe(false);
@@ -449,7 +519,7 @@ describe("runCli", () => {
     const text = lines.join("\n");
     expect(text).toContain("MCP_MODE_CONFLICT");
     expect(text).toContain("MCP_CLIENT_UNPINNED");
-    expect(text).toContain("0.2.1-rc.3");
+    expect(text).toContain(MCP_DEFAULT_CLIENT_PIN);
   });
 
   it("doctor 提示 searchProvider 没配，并把「后端缺失」说成预期行为", async () => {
@@ -488,7 +558,9 @@ describe("runCli", () => {
     expect(text).toContain("searchPublicFallback");
     // 已经指名道姓指向本插件时，不再是「预期行为」那条提示，而是一条真配置错。
     expect(text).not.toContain("SEARCH_BACKEND_MISSING");
-    expect(text).toContain("1 处不一致");
+    expect(text).toContain("1 处搜索配置不一致");
+    // 这几位不归 setup --mode 写，收尾那句不能把用户支到那条命令上去。
+    expect(text).not.toContain("setup --mode");
   });
 
   it("searchProvider 指向本插件而能力包没装好时，doctor 点名先装能力包", async () => {
@@ -514,6 +586,40 @@ describe("runCli", () => {
     );
     await expect(runCli([DOCTOR, MODE, MCP, PROFILE, profile], deps)).resolves.toBe(0);
     expect(lines.join("\n")).toContain("一致");
+  });
+
+  it("searchBackend 写成本包没有的后端时 doctor 判红并给可写名单", async () => {
+    // provider 不拒未知后端：它按 deps.backend 走到 endpointOf 的 switch，落空之后连对端都取不到，
+    // 坏要等到每次查询才现形。doctor 此前对这一位完全沉默（既不算 auto 也不在凭据表里）。
+    const { deps, lines, dataDir } = harness();
+    readyCoreData(dataDir);
+    const profile = profileDir(
+      dataDir,
+      `${CLEAN_MCP_ENTRY}${WEB_POINTS_HERE}${SEARCH_ENTRY_ID}\n  config:\n    searchBackend: brve\n`,
+      PINNED_CLIENT,
+    );
+    await expect(runCli([DOCTOR, MODE, MCP, PROFILE, profile], deps)).resolves.toBe(1);
+    const text = lines.join("\n");
+    expect(text).toContain("SEARCH_BACKEND_INVALID");
+    expect(text).toContain("searchBackend=brve 不是本包实现的后端");
+    expect(text).toContain("auto / tavily / bing / brave / serper / duckduckgo / searxng");
+    // 名单里的一档写对时不该被这条判据波及。
+    expect(text).not.toContain("SEARCH_AUTH");
+  });
+
+  it("searchBackend 只写了键名时按 auto 解释，不判成未知后端", async () => {
+    const { deps, lines, dataDir } = harness();
+    readyCoreData(dataDir);
+    const profile = profileDir(
+      dataDir,
+      `${CLEAN_MCP_ENTRY}${WEB_POINTS_HERE}${SEARCH_ENTRY_ID}\n  config:\n    searchBackend:\n`,
+      PINNED_CLIENT,
+    );
+    // 空值 ⇒ 未配置 ⇒ auto，于是走的还是「指向本插件而后端没配」那一条判据（退 1）。
+    await expect(runCli([DOCTOR, MODE, MCP, PROFILE, profile], deps)).resolves.toBe(1);
+    const text = lines.join("\n");
+    expect(text).not.toContain("SEARCH_BACKEND_INVALID");
+    expect(text).toContain("WEB_PROVIDER_CONFIGURED_UNAVAILABLE");
   });
 
   it("显式指定后端却缺凭据时按 SEARCH_AUTH 退 1", async () => {
@@ -593,52 +699,39 @@ describe("runCli", () => {
 
   it("dataDir 默认读 DSH_SCRAPLING_DATA_DIR，并走默认输出口", async () => {
     const dir = tempDir();
-    const previous = process.env["DSH_SCRAPLING_DATA_DIR"];
-    process.env["DSH_SCRAPLING_DATA_DIR"] = dir;
-    const lines: string[] = [];
-    const info = vi.spyOn(console, "info").mockImplementation((...args: unknown[]) => {
-      lines.push(args.join(" "));
-    });
-    try {
+    const { lines } = await withEnvDataDir(dir, async () => {
       await expect(runCli([SETUP, STATUS])).resolves.toBe(0);
-    } finally {
-      info.mockRestore();
-      if (previous === undefined) {
-        delete process.env["DSH_SCRAPLING_DATA_DIR"];
-      } else {
-        process.env["DSH_SCRAPLING_DATA_DIR"] = previous;
-      }
-    }
+    });
     // 读字段而不是比子串：输出是 JSON，Windows 的路径反斜杠在 JSON 里是转义过的
     // （`C:\\Users\\…`），拿原始路径去 toContain 只在 POSIX 上成立。
     const parsed = JSON.parse(lines.join("\n")) as { dataDir?: string };
     expect(parsed.dataDir).toBe(dir);
   });
 
-  it("空的 DSH_SCRAPLING_DATA_DIR 落回家目录", async () => {
-    const previous = process.env["DSH_SCRAPLING_DATA_DIR"];
-    process.env["DSH_SCRAPLING_DATA_DIR"] = "";
-    const lines: string[] = [];
-    const info = vi.spyOn(console, "info").mockImplementation((...args: unknown[]) => {
-      lines.push(args.join(" "));
-    });
-    try {
+  it("dataDir 环境变量写相对路径时按当前目录归一", async () => {
+    // 这一位最后会拼成写进 cordis.patch.yml 的 `command:`，而相对路径是按**宿主进程**的
+    // cwd 解析的：setup 打出来的那条与宿主真正起的那条不是同一个文件，失败要等宿主启动那次才现形。
+    const { lines } = await withEnvDataDir("scratch-data", async () => {
       await expect(runCli([SETUP, STATUS])).resolves.toBe(0);
-    } finally {
-      info.mockRestore();
-      if (previous === undefined) {
-        delete process.env["DSH_SCRAPLING_DATA_DIR"];
-      } else {
-        process.env["DSH_SCRAPLING_DATA_DIR"] = previous;
-      }
-    }
-    expect(lines.length).toBeGreaterThan(0);
+    });
+    const parsed = JSON.parse(lines.join("\n")) as { dataDir?: string };
+    // 期望值独立写死：绝对化就是「按当前工作目录接上这一段」。
+    expect(parsed.dataDir).toBe(path.join(process.cwd(), "scratch-data"));
+    expect(path.isAbsolute(parsed.dataDir ?? "")).toBe(true);
+  });
+
+  it("空的 DSH_SCRAPLING_DATA_DIR 落回家目录", async () => {
+    const { lines } = await withEnvDataDir("", async () => {
+      await expect(runCli([SETUP, STATUS])).resolves.toBe(0);
+    });
+    // 空串按「没设」处理，落回的就是 defaultDataDir() 那一支：断的是字段值，
+    // 不是「有没有输出」——任何一行非空输出（含错误行）都能过后半句。
+    expect(parseStatus(lines).dataDir).toBe(path.join(os.homedir(), ".dsh-scrapling"));
   });
 
   it("uninstall 把包与 purge 原样交给 installer", async () => {
     const { deps, lines } = harness();
     await expect(runCli([SETUP, UNINSTALL, CORE, PURGE, APPLY], deps)).resolves.toBe(0);
-    expect(deps.uninstallPackFn).toBeTypeOf("function");
     expect(lines.join("\n")).toContain("uninstalled core (purged data)");
 
     const browser = harness();

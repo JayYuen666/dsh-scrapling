@@ -2,13 +2,13 @@
 
 import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
-import { setImmediate } from "node:timers/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   decodeFrame,
   encodeFrame,
   FRAME_ERROR_KINDS,
   FrameSplitter,
+  MAX_FRAME_CHARS,
   pumpFrames,
 } from "../lib/jsonl.ts";
 import { FrameError } from "../lib/frame-error.ts";
@@ -23,9 +23,20 @@ function collectErrors(sink: unknown[]): (error: unknown) => void {
   };
 }
 
-/** 让出一个事件循环回合，等事件回调里同步排的活干完。 */
-async function tick(): Promise<void> {
-  await setImmediate();
+/**
+ * 记下转交过来的错误、然后再抛一次的 onError 替身。
+ *
+ * 「onError 自己抛了也不往上抛」这条得先证明转交**发生了**，再证明第二次抛被吃掉 ——
+ * 只断言流安静收尾时，实现把异常整个吞掉也算通过。
+ *
+ * @param sink - 收账的数组
+ * @returns 可直接交给 `pumpFrames` 的 onError
+ */
+function recordThenThrow(sink: unknown[]): (error: unknown) => void {
+  return (error: unknown): void => {
+    sink.push(error);
+    throw new Error("second");
+  };
 }
 
 /** 反复出现的样例帧，抽成常量免得重复字面量。 */
@@ -33,15 +44,17 @@ const FRAME_A = '{"a":1}';
 const FRAME_B = '{"b":2}';
 
 /**
- * 把若干片段当成一条字节流喂给切帧器，收齐所有帧。
+ * 把若干片段喂给切帧器，收齐所有帧。
  *
+ * 片段可以是文本，也可以是 `Buffer`：`pumpFrames` 在挂监听之前先 `setEncoding("utf8")`，
+ * 所以字节案由 Node 的解码器收口，跨片段的半个多字节字符正是走这条路（见下面那条用例）。
  * 用 `finished(stream)` 而不是 `new Promise` 包 `end` 事件：前者是官方封装，也不会
  * 触发本仓对 `new Promise` 的那条规则。
  *
- * @param chunks - 任意切片的文本
+ * @param chunks - 任意切片的文本或字节
  * @returns 收到的帧序列
  */
-async function collect(chunks: string[]): Promise<string[]> {
+async function collect(chunks: readonly (string | Buffer)[]): Promise<string[]> {
   const stream = Readable.from(chunks);
   const seen: string[] = [];
   pumpFrames(stream, (line) => {
@@ -85,6 +98,19 @@ describe("encodeFrame", () => {
     // undefined 当字符串交给管道，写出的是字面量 "undefined"，对端解析成标量后按
     // 「不是对象」丢掉 —— 症状是一帧凭空消失，而不是一条能定位的报错。
     expect(kindOf(() => encodeFrame(undefined))).toBe(FRAME_ERROR_KINDS.unparsableJson);
+  });
+});
+
+describe("帧错误分类表（FRAME_ERROR_KINDS）", () => {
+  it("这份表在运行时也不可改写：类型派生与实际取值不会分叉", () => {
+    // `as const` 只给编译期只读；`jsonl.ts` 把它原样 re-export，任何导入方都能改属性，
+    // 改了之后 FrameErrorKind 仍允许旧值 —— 症状是「类型允许、运行时对不上」。
+    expect(Object.isFrozen(FRAME_ERROR_KINDS)).toBe(true);
+    const mutable = FRAME_ERROR_KINDS as { unparsableJson: string };
+    expect(() => {
+      mutable.unparsableJson = "mutated";
+    }).toThrow(TypeError);
+    expect(FRAME_ERROR_KINDS.unparsableJson).toBe("unparsable-json");
   });
 });
 
@@ -148,6 +174,30 @@ describe("pumpFrames", () => {
     ]);
   });
 
+  it("数据不在挂监听的那一 tick 里吐出（回调里引用 stop 靠的就是这一点）", () => {
+    // 两处用例在回调闭包里调用 `stop()`，而 `stop` 是 `const`：不炸只可能因为 `Readable.from`
+    // 的 data 落在 pumpFrames 返回之后。这个假设现在由本条钉住 —— 哪天实现改成同步吐缓冲，
+    // 这里会以一条对得上的断言红，而不是在别处抛 `Cannot access 'stop' before initialization`。
+    const seen: string[] = [];
+    let stop: () => void = noop;
+    stop = pumpFrames(Readable.from([`${FRAME_A}\n`]), (line) => {
+      seen.push(line);
+      stop();
+    });
+    expect(seen).toStrictEqual([]);
+  });
+
+  it("多字节字符被切在两个 Buffer 片段之间时仍然解出一帧", async () => {
+    // 正文里的中文按 UTF-8 是三字节；`setEncoding("utf8")` 之前把字节切成两半，
+    // 解码器要把半个字符留到下一段。走 `Readable.from(string[])` 一辈子碰不到这条路径。
+    const bytes = Buffer.from(`${FRAME_A}\n{"note":"中"}\n`, "utf8");
+    const cut = bytes.indexOf(Buffer.from("中", "utf8")) + 1;
+    await expect(collect([bytes.subarray(0, cut), bytes.subarray(cut)])).resolves.toStrictEqual([
+      FRAME_A,
+      '{"note":"中"}',
+    ]);
+  });
+
   it("流被 close 而没有 end 时，残留的最后一帧仍被投递", async () => {
     const seen: string[] = [];
     const stream = new Readable({ read: noop });
@@ -204,7 +254,12 @@ describe("pumpFrames", () => {
     stream.emit("data", `${FRAME_A}\n`);
     stream.emit("end");
     expect(() => stream.emit("error", new Error("late pipe broke"))).not.toThrow();
-    await tick();
+    // 「没收到回调」是断言缺失，等一 tick 并不能证明什么；能证明的是 stop() 把三个监听器
+    // 都摘了（这是它承诺的机制），然后再读两位收集器。
+    await vi.waitFor(() => {
+      expect(stream.listenerCount("data")).toBe(0);
+      expect(stream.listenerCount("end")).toBe(0);
+    });
     expect(frames).toStrictEqual([]);
     expect(errors).toStrictEqual([]);
   });
@@ -224,10 +279,11 @@ describe("pumpFrames", () => {
       collectErrors(errors),
     );
     await finished(stream);
-    await tick();
     // 帧已经被 splitter 消费掉，不会重放：让异常中断循环等于静默丢掉后面那帧。
+    await vi.waitFor(() => {
+      expect(errors).toHaveLength(1);
+    });
     expect(delivered).toStrictEqual([FRAME_A, FRAME_B]);
-    expect(errors).toHaveLength(1);
     expect(String(errors[0])).toContain("first frame blew up");
   });
 
@@ -242,10 +298,12 @@ describe("pumpFrames", () => {
       },
       collectErrors(errors),
     );
-    // 只喂不带换行的一大段：切帧器攒到 8 MiB 字符上限就抛 frame-too-large，泵必须把它
+    // 只喂不带换行的一大段：切帧器攒到字符上限就抛 frame-too-large，泵必须把它
     // 交给 onError（从 data 监听器里抛出去就是宿主进程的未捕获异常）。
-    stream.emit("data", "x".repeat(8 * 1024 * 1024 + 1));
-    await tick();
+    stream.emit("data", "x".repeat(MAX_FRAME_CHARS + 1));
+    await vi.waitFor(() => {
+      expect(errors).toHaveLength(1);
+    });
     expect(frames).toStrictEqual([]);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toBeInstanceOf(FrameError);
@@ -258,17 +316,17 @@ describe("frame splitter 上限", () => {
     // 限流/长度一类与「JSON 解析失败」要采取的行动相反：下游按 kind 决定丢连接或重试时，
     // 两者混成一个分类会把限流误判成对端坏了。
     const splitter = new FrameSplitter();
+    // 上限从实现导出，测试直接构造「比上限多一个字符」：用循环逼近阈值等于把
+    // `MAX_FRAME_CHARS` 又抄了一遍，改档时这条会悄悄失效。
     const kind = kindOf(() => {
-      for (let index = 0; index < 200; index += 1) {
-        splitter.push("x".repeat(64 * 1024));
-      }
+      splitter.push("x".repeat(MAX_FRAME_CHARS + 1));
     });
     expect(kind).toBe(FRAME_ERROR_KINDS.frameTooLarge);
   });
 
   it("超长帧与换行落在同一个 chunk 里同样判超限（只看残片会漏掉）", () => {
     const splitter = new FrameSplitter();
-    expect(kindOf(() => splitter.push(`${"x".repeat(8 * 1024 * 1024 + 1)}\n`))).toBe(
+    expect(kindOf(() => splitter.push(`${"x".repeat(MAX_FRAME_CHARS + 1)}\n`))).toBe(
       FRAME_ERROR_KINDS.frameTooLarge,
     );
     // 超限后缓冲被清空，后续正常帧不粘上半截坏内容。
@@ -277,13 +335,9 @@ describe("frame splitter 上限", () => {
 
   it("超限后缓冲被丢弃，下一帧正常，不会永远卡在坏状态里", () => {
     const splitter = new FrameSplitter();
-    expect(
-      kindOf(() => {
-        for (let index = 0; index < 200; index += 1) {
-          splitter.push("x".repeat(64 * 1024));
-        }
-      }),
-    ).toBe(FRAME_ERROR_KINDS.frameTooLarge);
+    expect(kindOf(() => splitter.push("x".repeat(MAX_FRAME_CHARS + 1)))).toBe(
+      FRAME_ERROR_KINDS.frameTooLarge,
+    );
     expect(splitter.push(`${FRAME_B}\n`)).toStrictEqual([FRAME_B]);
   });
 });
@@ -294,8 +348,9 @@ describe("pumpFrames 的错误通道", () => {
     const stream = new Readable({ read: noop });
     pumpFrames(stream, noop, collectErrors(seen));
     stream.emit("error", new Error("pipe broke"));
-    await tick();
-    expect(seen).toHaveLength(1);
+    await vi.waitFor(() => {
+      expect(seen).toHaveLength(1);
+    });
     expect(String(seen[0])).toContain("pipe broke");
   });
 
@@ -310,8 +365,9 @@ describe("pumpFrames 的错误通道", () => {
       collectErrors(seen),
     );
     await finished(stream);
-    await tick();
-    expect(seen).toHaveLength(1);
+    await vi.waitFor(() => {
+      expect(seen).toHaveLength(1);
+    });
     expect(String(seen[0])).toContain("consumer blew up");
   });
 
@@ -328,23 +384,28 @@ describe("pumpFrames 的错误通道", () => {
       collectErrors(seen),
     );
     await finished(stream);
-    await tick();
-    expect(seen).toHaveLength(1);
+    await vi.waitFor(() => {
+      expect(seen).toHaveLength(1);
+    });
     expect(String(seen[0])).toContain("flush consumer blew up");
   });
 
   it("onError 自己抛了也不会再往上抛 —— 此时已经在事件回调的栈上", async () => {
     const stream = Readable.from([`${FRAME_A}\n`]);
+    const forwarded: unknown[] = [];
     pumpFrames(
       stream,
       () => {
         throw new Error("first");
       },
-      () => {
-        throw new Error("second");
-      },
+      // 先记账再抛：这条判的是「转交发生了、接收方又炸了也没冒出去」。
+      recordThenThrow(forwarded),
     );
     await expect(finished(stream)).resolves.toBeUndefined();
+    await vi.waitFor(() => {
+      expect(forwarded).toHaveLength(1);
+    });
+    expect(String(forwarded[0])).toContain("first");
   });
 
   it("不给 onError 时错误被安静丢弃，默认参数让旧调用点继续成立", async () => {

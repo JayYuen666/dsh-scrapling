@@ -10,8 +10,9 @@
 //   form 可给）。所以设置卡的 form 由本文件从 `ctx.configForms` 取 —— 见 apply()。
 // · **ctx 只认它自己声明过的那些服务。** cordis 的上下文代理对没进 `inject` 的名字直接
 //   抛 `cannot get property "<name>" without inject`（@deepseek-ai/cordis 里
-//   `ReflectService.handler.get`），而这个抛出发生在 `ctx.effect` 的函数体里时只会被记进
-//   logger，界面上看不出任何异常。所以
+//   `ReflectService.handler.get`）。这个抛出落在 `ctx.effect` 的函数体里时会穿出 `apply()`
+//   （`Fiber._execute` → `composeError` → `handleError` 以 `throw reason` 收尾），界面上
+//   看不出异常的原因是注册根本没发生，而不是错误被谁吞了。所以
 //   `ctx.locale` / `ctx.configForms` 必须写进下面的 inject 清单 —— 少写一个，症状就是
 //   整张设置卡与全部结果行一起静默消失。六个同类插件与官方的
 //   dsh-experimental-client-ui-voice-input 都声明 `["slots", "configForms", "locale"]`。
@@ -270,7 +271,10 @@ export function readArgs(args: ArgsFace | undefined): Record<string, unknown> {
   const values: Record<string, unknown> = {};
   for (const key of ARG_KEYS) {
     const asText = args.text(key);
-    const asValue = asText ?? args.value(key);
+    // 空串不算「text() 命中」：数值参数在这一路里给回什么形态不是本包的契约，而一旦给回
+    // 空串，`??` 会短路掉 `value()`，行上那一格就永久空白 —— 参数明明在场。真实的空串入参
+    // 走 `value()` 拿到的仍是同一个空串，两种情况都不丢信息。
+    const asValue = asText === undefined || asText.length === 0 ? args.value(key) : asText;
     if (asValue !== undefined) {
       values[key] = asValue;
     }

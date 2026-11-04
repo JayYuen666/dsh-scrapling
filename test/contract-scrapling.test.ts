@@ -35,6 +35,12 @@ type KeyIndex = Map<string, Set<string>>;
 function indexKeys(calls: ProbeCall[]): KeyIndex {
   const out: KeyIndex = new Map();
   for (const call of calls) {
+    // 后写覆盖前写会把「某一次少发了键」这件事藏起来：断言于是只对最后一次记录成立。
+    // 今天 drive() 每个站点只记一次，这道判空是防探针以后复用站点名（多跑一轮、
+    // capture 借用会话站点那一类）。
+    if (out.has(call.site)) {
+      throw new Error(`探针把站点 ${call.site} 记录了多次，这份索引会掩盖前一次发出的键`);
+    }
     out.set(call.site, new Set(call.keys));
   }
   return out;
@@ -42,7 +48,42 @@ function indexKeys(calls: ProbeCall[]): KeyIndex {
 
 // 一次探针跑全程共用：两次都要拉起解释器、import scrapling 并真造会话，而两拨读到的
 // 必须是同一份上游状态 —— 分两次跑，中途装/换了什么就会让两组断言互相矛盾。
-const report: ProbeReport = await runProbe();
+//
+// 失败时必须与「契约被破坏」分得开：探针起不来（缺解释器、解释器不可执行、非零退出、
+// 输出不是 JSON、超时被杀）会在这里抛，收集期就崩，三条 describe 的用例一起变成同一句
+// 基建错误。包一层点名原因的话，红话自己说清是哪一类——基建坏了不该被读成上游改了契约。
+// 挂死那一支由 `runProbe` 自己的看门狗收（它超时后杀掉子进程并点名预算），所以这里不必
+// 再挪进 beforeAll：那会让下面的 `const { facts } = report` 在装配期读到还没值的报告。
+const report: ProbeReport = await runProbe().catch((error: unknown) => {
+  throw new Error(`Scrapling 契约探针跑不起来（基建故障，不是契约被破坏）：${String(error)}`, {
+    cause: error,
+  });
+});
+
+/** indexKeys 自证用例的夹具站点名：刻意不与探针里的任何站点重名。 */
+const FIXTURE_OPEN = "fixture.open";
+const FIXTURE_FETCH = "fixture.fetch";
+
+describe("indexKeys：站点重复记录就抛，不后写覆盖前写", () => {
+  // 夹具用探针里不存在的站点名（`FIXTURE_*`）：这条判的是 indexKeys 自己的形状，不是上游事实。
+  it("同一站点记两次时点名抛出", () => {
+    expect(() => {
+      indexKeys([
+        { site: FIXTURE_OPEN, keys: ["impersonate", "timeout"] },
+        { site: FIXTURE_OPEN, keys: ["timeout"] },
+      ]);
+    }).toThrow(/记录了多次/u);
+  });
+
+  it("每个站点各记一次时按站点给出键集合", () => {
+    const index = indexKeys([
+      { site: FIXTURE_OPEN, keys: ["impersonate", "timeout"] },
+      { site: FIXTURE_FETCH, keys: ["headless"] },
+    ]);
+    expect([...index.keys()].toSorted()).toStrictEqual([FIXTURE_FETCH, FIXTURE_OPEN]);
+    expect(index.get(FIXTURE_OPEN)).toStrictEqual(new Set(["impersonate", "timeout"]));
+  });
+});
 
 /** 会话开场两侧都要点到的站点名。 */
 const SESSION_OPEN_SITES = ["session.open.static", "session.open.stealth"];
@@ -56,6 +97,8 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
     for (const wanted of [
       "static.get",
       "static.post",
+      "static.put",
+      "static.delete",
       "browser.render",
       "capture.open",
       "capture.fetch",
@@ -78,22 +121,29 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
       "capture.fetch": 9,
       "session.open.stealth": 10,
       "session.open.static": 2,
-      "session.fetch.stealth": 9,
-      "session.fetch.static": 4,
       "static.get": 4,
       "static.post": 4,
+      // PUT / DELETE 走的是同一张 DataRequestParams 面：实测各 5 键。
+      "static.put": 4,
+      "static.delete": 4,
     };
     for (const [site, floor] of Object.entries(FLOORS)) {
       expect(report.checked[site], `${site} 抓到的键太少`).toBeGreaterThanOrEqual(floor);
     }
-    // 会话 fetch 那两处反过来只能落在 fetch 层的字段面里：涨过上限就是有人又把构造期才生效的
-    // 设置往 fetch 层塞（`silentAtSessionFetch` 抓的是同一类漂移，这里先给一道量级闸）。
-    const CEILINGS: Record<string, number> = {
-      "session.fetch.static": 6,
-      "session.fetch.stealth": 14,
+    // 会话 fetch 那两处发的键数**是我们自己的属性**：上游多认一个字段不会让我们多发一键，
+    // 数字变了只能是本仓改了发出去的 kwargs。所以这里钉等号，不留下限与上限之间那段余量 ——
+    // 余量存在时「又把构造期才生效的设置往 fetch 层塞」要涨过余量才看得见（旧的 14 对实测 9
+    // 就是这种只剩文档作用的闸）。`silentAtSessionFetch` 判的是同一类漂移的另一面：键在不在
+    // fetch 层被读到；这条判的是「发出去的键数有没有变」，两者都要。
+    const FETCH_SITE_KEYS: Record<string, number> = {
+      "session.fetch.static": 4,
+      "session.fetch.stealth": 9,
     };
-    for (const [site, ceiling] of Object.entries(CEILINGS)) {
-      expect(report.checked[site], `${site} 又混进了会话级键`).toBeLessThanOrEqual(ceiling);
+    for (const [site, sent] of Object.entries(FETCH_SITE_KEYS)) {
+      expect(
+        report.checked[site],
+        `${site} 发出的键数不再是 ${String(sent)} 条（现为 ${String(report.checked[site])}）：会话级设置又回到 fetch 层，或 fetch 层少发了键`,
+      ).toBe(sent);
     }
   });
 
@@ -164,8 +214,10 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
     // block_webrtc / hide_canvas / allow_webgl=false 各自还会再加几条，所以是「至少」。
     // 「整套反检测有没有被冲掉」由上一条断言逐条比对负责，这里只钉量级。
     expect(report.facts.stealthArgsTotal).toBeGreaterThanOrEqual(40);
+    // 判据取探针报出的并集，而不是把两张表的长度相加：今天交集为 0（相加 65 ＝ 并集 65），
+    // 哪天一枚 flag 同时出现在两表里，相加就会超过最终启动参数的条数而误红。
     expect(report.facts.stealthArgCount).toBeGreaterThanOrEqual(
-      report.facts.defaultArgsTotal + report.facts.stealthArgsTotal,
+      report.facts.defaultStealthUnionTotal,
     );
   });
 });
@@ -182,13 +234,15 @@ describe("上游事实钉桩：本仓代码直接依赖的形状", () => {
   it("自愈选择器的开关还是那四个参数", () => {
     // select() 只传 adaptive/auto_save，靠 identifier 默认取选择器本身：identifier 一旦
     // 变成必填，自愈就静默失效。
+    // 名单由探针排序后交出（与本文件其它 facts 同一口径）：本仓全按关键字调用，
+    // 上游调整形参位置不该读成契约被破坏。
     expect(facts.selectorCssParams).toStrictEqual([
-      "self",
-      "selector",
-      "identifier",
       "adaptive",
       "auto_save",
+      "identifier",
       "percentage",
+      "selector",
+      "self",
     ]);
     expect(facts.selectorCssDefaultPercentage).toBe(40);
   });
@@ -202,9 +256,9 @@ describe("上游事实钉桩：本仓代码直接依赖的形状", () => {
       "_convert_to_markdown",
     ]);
     expect(facts.responseMarkdownParams).toStrictEqual([
-      "self",
       "css_selector",
       "main_content_only",
+      "self",
     ]);
   });
 

@@ -2,62 +2,68 @@
 autoInstallPeers: false
 catalog:
   "@e18e/eslint-plugin": 0.8.1
-  "@jayyuen66/dsh-plugin-shared": 0.2.2
+  "@jayyuen66/dsh-plugin-shared": 0.2.3
   "@types/node": 26.6.6
   "@types/react": 19.3.0
   "@types/react-dom": 19.3.0
   "@vitest/coverage-v8": 5.0.5
   eslint-plugin-regexp: 3.3.2
-  "eslint-plugin-sonarjs": 4.2.2
+  eslint-plugin-sonarjs: 4.2.2
   eslint-plugin-zod: 5.2.2
   happy-dom: 21.0.4
   oxfmt: 0.75.0
   oxlint: 1.90.0
-  "oxlint-tsgolint": 7.0.2005
+  oxlint-tsgolint: 7.0.2005
   rolldown: 1.2.15
   typescript: 7.0.2
   vite: 8.3.5
   vitest: 5.0.5
   zod: 4.6.7
 overrides:
-  "@deepseek-ai/cordis": 4.0.6-alpha.1
-  "@deepseek-ai/cordis-plugin-include": 1.0.11-alpha.1
-  "@deepseek-ai/cordis-plugin-loader": 1.0.7-alpha.1
-  "@deepseek-ai/cordis-plugin-timer": 1.1.8-alpha.1
-  "@deepseek-ai/cosmokit": 1.8.7-alpha.1
-  "@deepseek-ai/dsh": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-api-remotes": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-locale": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-store": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-ui-chat": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-ui-conversation": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-ui-layout": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-ui-plugin-manager": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-ui-primitives": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-ui-renderer": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-ui-settings": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-ui-slots": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-client-ui-tool": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-host-webserver": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-http-proxy": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-jobs": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-jobs-local": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-output-retention": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-package-manifest": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-ptc-runtime": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-sandbox": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-scope": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-session": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-settings": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-shell": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-subprocess": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-system-prompt": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-tool-executor-native": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-tools": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-typert-protocol": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-user-approval": 0.2.2-alpha.2
-  "@deepseek-ai/dsh-web": 0.2.2-alpha.2
-  "@deepseek-ai/schemastery": 3.18.6-alpha.1
+  "@deepseek-ai/cordis": 4.0.6-alpha.2
+  "@deepseek-ai/cordis-plugin-include": 1.0.11-alpha.2
+  "@deepseek-ai/cordis-plugin-loader": 1.0.7-alpha.2
+  "@deepseek-ai/cordis-plugin-timer": 1.1.8-alpha.2
+  "@deepseek-ai/cosmokit": 1.8.7-alpha.2
+  "@deepseek-ai/dsh": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-api-remotes": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-locale": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-store": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-ui-chat": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-ui-conversation": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-ui-layout": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-ui-plugin-manager": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-ui-primitives": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-ui-renderer": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-ui-settings": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-ui-slots": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-client-ui-tool": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-host-webserver": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-http-proxy": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-jobs": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-jobs-local": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-output-retention": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-package-manifest": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-ptc-runtime": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-sandbox": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-scope": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-session": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-settings": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-shell": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-subprocess": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-system-prompt": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-tool-executor-native": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-tools": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-typert-protocol": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-user-approval": 0.2.2-alpha.3
+  "@deepseek-ai/dsh-web": 0.2.2-alpha.3
+  "@deepseek-ai/schemastery": 3.18.6-alpha.2
+# 本地策略，根不下发也不改写（投影只动 catalog / overrides 两个映射）。
+# 空映射就是「谁都不许跑安装脚本」：pnpm 12 认这个键（`pnpm config get allowBuilds` 在本仓
+# 读出 `{}`），而本仓的依赖图里没有一枚包带 install/postinstall 脚本（扫 node_modules/.pnpm 的
+# manifest 现量 0 处），rolldown / oxlint / oxfmt 走的都是各自平台的预编译产物。所以这里不是
+# 「漏了要放行的包」；哪天真有包需要跑脚本，安装会红在 ERR_PNPM_IGNORED_BUILDS，那时往这张表里
+# 加它的名字，而不是把整张表打开。
 allowBuilds: {}
 # 发布冷却刻意为 0：内部 @jayyuen66/* 与宿主族 rc 包必须发布后即时可装；第三方新版的供应链
 # 缓冲由 catalog 与 overrides 的精确钉版承担，不靠时间窗。

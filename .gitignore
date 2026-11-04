@@ -1,7 +1,10 @@
 node_modules/
-client.js
-.toolchain/
-host.js
+# 锚定到仓库根：不写前导 `/` 时 `client.js` 这种模式会匹配任意层级的同名文件，
+# 于是将来 `test/fixtures/` 或 `py/` 下真需要一个叫 client.js / host.js 的文件时，
+# 它会被静默忽略 —— `git add` 不报错、文件不在版本里、别人的检出里少一份夹具。
+/client.js
+/.toolchain/
+/host.js
 coverage/
 # 覆盖率数据文件：cov:py 的聚合结果，以及 py/ 下子进程留下的那一份。
 # 不忽略的话每次跑完覆盖率都多出几个未跟踪文件，还容易被误提交。
@@ -14,8 +17,9 @@ coverage/
 # 用户机器上；一旦有测试或探针以仓库根为 cwd 跑 select(adaptive=True)，SQLite 就会在
 # 这里建库 —— 那是运行时状态，不是源码，而且会把用户的选择器指纹误提交出去。
 elements_storage.db
-elements_storage.db-wal
-elements_storage.db-shm
+# 后缀那一段按变体收：WAL 之外还有 rollback journal（`-journal`）与 checkpoint 期留下的
+# `-mj` 等形态，逐枚列后缀的那写法会漏掉没用到的那一种。
+elements_storage.db-*
 
 # Python 字节码缓存（构建产物）
 py/__pycache__/
@@ -23,6 +27,11 @@ __pycache__/
 
 # 探针脚本用的虚拟环境：404MB，机器本地状态，不入库
 _env/.venv/
+# 手工建的根级虚拟环境（`python -m venv .venv` / `venv`）同样不该入库：几百 MB 的目录
+# 以未跟踪状态出现在 `git status` 里，还容易被 `git add -A` 一并带走。锚定到根，
+# 免得这条规则把某个真需要入库的嵌套 `.venv` 挡掉。
+/.venv/
+/venv/
 
 # 本地环境文件：机器相关、常带密钥，只放行模板
 .env

@@ -22,21 +22,29 @@ import type {
   WebSearchSource,
 } from "@deepseek-ai/dsh-web";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import type { SearchBackend } from "./search-backends.ts";
 import type { SidecarClient } from "./sidecar.ts";
 import { SidecarError } from "./sidecar-error.ts";
 
 /** 本 provider 在 ctx.web 的 search 接缝里的 id。 */
 export const SEARCH_PROVIDER_ID = "scrapling";
 
-/** 发现层后端。Brave/Serper/DDG/SearXNG 没有本机证据，不在这一档里。 */
-export type SearchBackend =
-  | "auto"
-  | "tavily"
-  | "bing"
-  | "brave"
-  | "serper"
-  | "duckduckgo"
-  | "searxng";
+/**
+ * Brave 与 Serper 的官方 JSON 端点。
+ *
+ * 这两个后端只有单一对端、没有自托管镜像的常见形态，所以没有做成部署项；Tavily / Bing /
+ * DuckDuckGo / SearXNG 的默认值都落在「部署方会换」的地址上，因此走 Config。端点仍是
+ * SearchProviderDeps 的入参，测试照旧可以从这一侧注入。
+ */
+export const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
+
+/** Serper 的搜索端点，与 {@link BRAVE_SEARCH_ENDPOINT} 同一档（只有官方对端）。 */
+export const SERPER_SEARCH_ENDPOINT = "https://google.serper.dev/search";
+
+/**
+ * 发现层后端的名单与类型住在 `lib/search-backends.ts`：CLI 判配置要读同一份名单，而它不能
+ * import 本模块（那会把 sidecar 依赖一起拖进 bin 产物）。
+ */
 
 /** 建 search provider 需要的参数。 */
 export interface SearchProviderDeps {
@@ -70,7 +78,13 @@ export interface SearchProviderDeps {
   readonly renderTopN: number;
   /** 单次抓取的字节预算。 */
   readonly maxOutputBytes: number;
-  /** 单次搜索的协同超时（毫秒）。 */
+  /**
+   * 每一次 sidecar 调用的超时（毫秒）：发现一次、逐条渲染的各次都吃这一位，
+   * 所以一次 `search` 的自身上界约为 `(1 + renderTopN) × timeoutMs`。
+   *
+   * 整次工具调用的上界不在本层：宿主把同一枚设置（`fetchTimeoutMs`）声明在
+   * `ToolDefinition.timeoutMs` 上，由它负责取消整笔调用。
+   */
   readonly timeoutMs: number;
   /**
    * 出站 URL 的准入闸门；与 sidecar 用的是同一个实现（Host 侧那道 SSRF 防线）。
@@ -80,8 +94,11 @@ export interface SearchProviderDeps {
    * 而本包对同一地址的抓取请求是会被拦下的 —— 一边说「这是你的结果」、一边说「它不可抓」。
    * 判否的条目不进 sources；通过时用它交回的那个串（闸门可能归一过），与 sidecar 发出
    * 去的是同一个地址。
+   *
+   * 必填：闸门缺席时静默放行等于把这道防线做成 fail-open 的默认值，而生产装配
+   * （`host.ts` 的 `searchProviderOf`）本来就每一侧都传同一个闸门。
    */
-  readonly urlGate?: ((url: string) => Promise<string | undefined>) | undefined;
+  readonly urlGate: (url: string) => Promise<string | undefined>;
 }
 
 /** 搜索后端返回的一条结果。 */
@@ -126,15 +143,66 @@ function hitsOf(payload: unknown): ParsedSearchHit[] {
 /**
  * 把一条 URL 归一成绝对 URL；相对 URL 拼到搜索端点上。
  *
+ * `endpoint` 为空串（后端不认识）时不借任何基准：只有本来就是绝对 URL 的才留得下来，
+ * 相对的那一条宁可丢掉，也不拼到一台不是它自己的主机上去。
+ *
  * @param raw - 端点返回的 URL 文本
- * @param endpoint - 搜索端点，作为相对 URL 的基准
+ * @param endpoint - 搜索端点，作为相对 URL 的基准；空串表示没有可用基准
  * @returns 绝对 URL；拼不出来时给空串
  */
 function absolutize(raw: string, endpoint: string): string {
   try {
-    return new URL(raw, endpoint).toString();
+    return new URL(raw, endpoint.length > 0 ? endpoint : undefined).toString();
   } catch {
     return "";
+  }
+}
+
+/** 每条后端只认自己那把 key；拼错后端名不会把 Tavily 的 key 递给 Brave。 */
+function selectKey(deps: SearchProviderDeps): string {
+  if (deps.backend === "brave") {
+    return deps.braveApiKey;
+  }
+  if (deps.backend === "serper") {
+    return deps.serperApiKey;
+  }
+  return deps.apiKey;
+}
+
+/**
+ * 各后端的基准端点：相对 URL 只能按**回包里那个后端自己的**端点归一。
+ *
+ * 一律回落到某个固定端点会把引用拼到另一台主机上（SearXNG 实例回的相对路径拼成 Bing 的
+ * 绝对 URL 就是这样），既交给模型引用错了地址，也让闸门按错误的主机下结论。认不出后端时给
+ * 空串，交给 {@link absolutize} 把相对 URL 判成拼不出来而丢掉。
+ *
+ * @param deps - provider 依赖
+ * @param backend - 回包里报的实际后端
+ * @returns 该后端的端点；后端不认识时为空串
+ */
+function endpointOf(deps: SearchProviderDeps, backend: string): string {
+  switch (backend) {
+    case "tavily": {
+      return deps.apiEndpoint;
+    }
+    case "bing": {
+      return deps.bingEndpoint;
+    }
+    case "brave": {
+      return deps.braveEndpoint;
+    }
+    case "serper": {
+      return deps.serperEndpoint;
+    }
+    case "duckduckgo": {
+      return deps.duckduckgoEndpoint;
+    }
+    case "searxng": {
+      return deps.searxngEndpoint;
+    }
+    default: {
+      return "";
+    }
   }
 }
 
@@ -150,17 +218,6 @@ function absolutize(raw: string, endpoint: string): string {
  * @param signal - 取消信号
  * @returns 命中的条目与相对 URL 的基准端点
  */
-/** 每条后端只认自己那把 key；拼错后端名不会把 Tavily 的 key 递给 Brave。 */
-function selectKey(deps: SearchProviderDeps): string {
-  if (deps.backend === "brave") {
-    return deps.braveApiKey;
-  }
-  if (deps.backend === "serper") {
-    return deps.serperApiKey;
-  }
-  return deps.apiKey;
-}
-
 async function discover(
   deps: SearchProviderDeps,
   query: string,
@@ -190,7 +247,7 @@ async function discover(
       isRecord(raw) && typeof raw["backend"] === "string" ? raw["backend"] : deps.backend;
     return {
       hits: hitsOf(raw),
-      base: backend === "tavily" ? deps.apiEndpoint : deps.bingEndpoint,
+      base: endpointOf(deps, backend),
     };
   } catch (error: unknown) {
     if (signal?.aborted === true) {
@@ -244,43 +301,53 @@ function boundResults(raw: number | undefined): number {
 }
 
 /**
- * 把一条命中归一成可引用的 source；URL 归一不出来或被闸门拦下时给空数组。
+ * 一条候选归一之后的三种下场。
+ *
+ * 「拼不成绝对 URL」与「被闸门判否」分开记是有必要的：一次搜索一条结果都没有时，
+ * 前者要用户去查后端的回包，后者才去查部署方的安全策略 —— 压成一句会让排查走错方向。
+ */
+type SourceOutcome =
+  | { readonly kind: "ok"; readonly source: WebSearchSource }
+  | { readonly kind: "unparsable" }
+  | { readonly kind: "rejected" };
+
+/**
+ * 把一条命中归一成可引用的 source。
  *
  * 闸门判否就**丢掉这一条**：它是本次搜索的输入，而输入能不能变成一条结果由部署方的安全
  * 策略说了算。丢掉的条目不进 sources，于是模型不会引用一个它紧接着就抓不到的地址。
  *
  * @param hit - 后端返回的条目
- * @param endpoint - 搜索端点，相对 URL 的基准
- * @param gate - 准入闸门；没给就不过闸（自定义 provider 的既有用法）
- * @returns 长度 0 或 1 的数组
+ * @param endpoint - 该后端自己的端点，相对 URL 的基准；空串表示没有可用基准
+ * @param gate - 出站 URL 的准入闸门
+ * @returns 通过时给那一条 source，否则给被丢掉的原因
  */
 async function toSource(
   hit: ParsedSearchHit,
   endpoint: string,
-  gate: ((url: string) => Promise<string | undefined>) | undefined,
-): Promise<WebSearchSource[]> {
+  gate: (url: string) => Promise<string | undefined>,
+): Promise<SourceOutcome> {
   const url = absolutize(hit.url, endpoint);
   if (url.length === 0) {
-    return [];
+    return { kind: "unparsable" };
   }
-  let citeable = url;
-  if (gate !== undefined) {
-    try {
-      const normalized = await gate(url);
-      // 闸门可能把 URL 归一过。判的和引用的必须是同一个串，否则归一化又成一条绕过面。
-      citeable = typeof normalized === "string" ? normalized : url;
-    } catch {
-      // 被安全闸门拦下（私网、元数据端点、非 http(s)…）：这一条不作为结果交出去。
-      return [];
-    }
+  let citeable: string;
+  try {
+    const normalized = await gate(url);
+    // 闸门可能把 URL 归一过。判的和引用的必须是同一个串，否则归一化又成一条绕过面。
+    citeable = typeof normalized === "string" ? normalized : url;
+  } catch {
+    // 被安全闸门拦下（私网、元数据端点、非 http(s)…）：这一条不作为结果交出去。
+    return { kind: "rejected" };
   }
-  return [
-    {
+  return {
+    kind: "ok",
+    source: {
       url: citeable,
       ...(hit.title === undefined ? {} : { title: hit.title }),
       ...(hit.snippet === undefined ? {} : { snippet: hit.snippet }),
     },
-  ];
+  };
 }
 
 /** 一条命中的读取结果：正文，或「为什么没正文」。 */
@@ -322,9 +389,17 @@ async function fetchContent(
       },
       { ...(signal === undefined ? {} : { signal }), timeoutMs: deps.timeoutMs },
     );
-    const payload = isRecord(raw) ? raw : {};
-    const { content } = payload;
-    return typeof content === "string" && content.length > 0
+    if (!isRecord(raw)) {
+      // 三种「读不到」分开点名：协议违例（回包不是对象、正文不是字符串）是 sidecar 或
+      // 本仓解包坏了，「这一页确实没有正文」是目标站的常态。挤成同一句话会把用户送去
+      // 查安全策略，而该查的是协议。
+      return { body: "", reason: `the fetch reply was not an object (${typeof raw})` };
+    }
+    const { content } = raw;
+    if (typeof content !== "string") {
+      return { body: "", reason: `the page came back without a text body (${typeof content})` };
+    }
+    return content.length > 0
       ? { body: content, reason: "" }
       : { body: "", reason: "the page came back with no body" };
   } catch (error: unknown) {
@@ -419,13 +494,18 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
       // 不过闸的话，那条地址就原样出现在模型眼前，而本包对同一地址的抓取会被拦下。
       // 候选先截到 MAX_SOURCES 再过闸 —— 闸门每条一次 DNS，封顶必须落在过闸之前。
       const candidates = hits.slice(0, MAX_SOURCES);
-      const gated = await Promise.all(candidates.map((hit) => toSource(hit, base, deps.urlGate)));
-      const sources = gated.flat();
+      const cited = await Promise.all(candidates.map((hit) => toSource(hit, base, deps.urlGate)));
+      const sources = cited.flatMap((outcome) => (outcome.kind === "ok" ? [outcome.source] : []));
       // 一条都不剩时必须报错，而不是回一次「成功但没有结果」的搜索：后端只回了内网地址
-      // 与「搜不到东西」是两件完全不同的事，后者才是用户想看到的那一种。
+      // 与「搜不到东西」是两件完全不同的事，后者才是用户想看到的那一种。两种丢弃原因分开
+      // 点名——只说「被闸门拒绝」会把「后端回了拼不成绝对 URL 的值」也带去查安全策略。
       if (sources.length === 0 && candidates.length > 0) {
+        const rejected = cited.filter((outcome) => outcome.kind === "rejected").length;
+        const unparsable = cited.filter((outcome) => outcome.kind === "unparsable").length;
         throw new WebError(
-          `every one of the ${candidates.length} results was rejected by the URL gate`,
+          `none of the ${String(candidates.length)} results could be cited: ` +
+            `${String(rejected)} rejected by the URL gate, ` +
+            `${String(unparsable)} were not usable URLs`,
           "SCRAPLING_SEARCH_FAILED",
         );
       }

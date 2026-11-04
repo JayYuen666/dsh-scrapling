@@ -5,7 +5,8 @@
 
 import { describe, expect, it } from "vitest";
 import { TOOL_SPECS } from "../host.ts";
-import { buildRow, readArgs, resultMetaOf, ROW_TOOLS } from "../src/client-entry.ts";
+import type { ToolCallViewProps } from "@deepseek-ai/dsh-client-ui-tool/client";
+import { apply, buildRow, inject, readArgs, resultMetaOf, ROW_TOOLS } from "../src/client-entry.ts";
 import { BUNDLE_PACKAGE_NAME, LOCALE_NS, SETTINGS_ENTRY_ID } from "../src/settings-fields.ts";
 
 /** 测试里反复用到的示例地址。 */
@@ -25,12 +26,44 @@ function resetApplyFlag(): void {
 /** 「读不到」的两个读取器都给 undefined。 */
 const NO_VALUE = (): undefined => undefined;
 
-/** 什么都不做的替身。 */
-const NO_OP = (): void => undefined;
+/**
+ * 造一个「立刻执行 effect 函数体」的替身工厂，并把 effect 交回的清理函数记进 `sink`。
+ *
+ * cordis 的 effect 会立刻执行函数体并持有它的返回值，替身必须照做：少了这一步，effect 里的
+ * 注册一次都不会发生。返回值是清理函数时还要记一份 —— 宿主到卸载才跑它们，本包的卸载路径
+ * （摘样式、注销结果行与字典）全在那一步上，不记下来就永远测不到。
+ *
+ * @param sink - 收集 effect 返回的清理函数（每个 harness 一份）
+ * @returns 可当 `ctx.effect` 用的替身
+ */
+const makeEffectRunner =
+  (sink: (() => void)[]) =>
+  (run: () => unknown): unknown => {
+    const result = run();
+    if (typeof result === "function") {
+      sink.push(result as () => void);
+    }
+    return result;
+  };
 
-// cordis 的 effect 会**立刻**执行函数体并持有它的返回值，测试替身必须照做：少了这一步，
-// effect 里的注册一次都不会发生。
-const RUN_EFFECT_IMMEDIATELY = (run: () => unknown): unknown => run();
+/**
+ * 造一份宿主 toolview 的 props 夹具。
+ *
+ * 夹具只带本包读的那几位（block 的内容按宿主联合类型无法逐位构造），但**键名与 phase 的
+ * 类型**由 `ToolCallViewProps` 约束：宿主把 `phase` 改名或换掉取值集时这里编译红，
+ * 而逐处 `as never` 会让漂移只剩运行期那一道防线（宿主 `block` 是按阶段变形的联合，
+ * 手抄一份本地接口根本拦不住）。
+ *
+ * @param props - 本用例要给的几位
+ * @returns 交给被测函数的 props
+ */
+function propsOf(props: {
+  phase?: ToolCallViewProps["phase"];
+  toolName?: string;
+  block?: unknown;
+}): ToolCallViewProps {
+  return props as ToolCallViewProps;
+}
 
 /** 结果行里"会话"那一列的字面量键：本文件多处用到。
  *  刻意写独立字面量而不是引实现的 `ROW_SESSION_KEY`——期望值必须与被测对象各写一份，
@@ -158,6 +191,9 @@ describe("buildRow", () => {
     for (const tool of ROW_TOOLS) {
       const row = buildRow(tool, { url: "u", selector: "s" }, { url: "u", statusCode: 200 });
       expect(row.tool).toBe(tool);
+      // 「结果行只剩工具名」正是这条用例要防的症状：只断 tool 时，某个工具的字段规格被
+      // 写成空表或键名拼错都照样绿。字段数按同一份输入逐个钉住。
+      expect(row.fields.length, `${tool} 的结果行没有渲染出任何字段`).toBeGreaterThan(0);
     }
   });
 });
@@ -180,8 +216,23 @@ describe("readArgs", () => {
       },
     });
     expect(args).toStrictEqual({ url: "https://a", maxPages: 20 });
-    expect(seen.filter((entry) => entry.endsWith(":selector"))).not.toHaveLength(0);
+    // 具体键而不是「有某项以 :selector 结尾」：按白名单一次探测或漏读某个键时，后半句照样绿。
+    expect(seen, "selector 要被 text() 读到").toContain("text:selector");
     expect(seen, "links 的 baseUrl 也要被惰性视图读到").toContain("text:baseUrl");
+  });
+
+  it("text() 交出空串时仍按 value() 取值：数值参数不能被空串静默吞掉", () => {
+    // 惰性视图对非字符串参数给回什么形态不是本包的契约；`??` 只挡 undefined，空串会短路，
+    // 于是 crawl 行上的「页数上限」永久空白，而 maxPages 明明在参数里。
+    const args = readArgs({
+      text: (key) => (key === "maxPages" ? "" : undefined),
+      value: (key) => (key === "maxPages" ? 20 : undefined),
+    });
+    expect(args).toStrictEqual({ maxPages: 20 });
+    expect(buildRow("scrapling_crawl", args, { jobId: "job-1" }).fields).toContainEqual({
+      labelKey: "row.pageCap",
+      value: "20",
+    });
   });
 
   it("text() 命中时不再问 value()", () => {
@@ -208,35 +259,51 @@ describe("readArgs", () => {
 describe("resultMetaOf", () => {
   it("只有 result 那一支才交回投影", () => {
     const meta = { statusCode: 200, url: SAMPLE };
-    expect(resultMetaOf({ phase: "result", block: { meta } } as never)).toStrictEqual(meta);
+    expect(resultMetaOf(propsOf({ phase: "result", block: { meta } }))).toStrictEqual(meta);
   });
 
   it("start 那一支没有 meta 可读，即便宿主给了也不认", () => {
     expect(
-      resultMetaOf({ phase: "start", block: { meta: { statusCode: 200 } } } as never),
+      resultMetaOf(propsOf({ phase: "start", block: { meta: { statusCode: 200 } } })),
     ).toBeUndefined();
   });
 
   it("preparing 那一支同样不交回投影", () => {
     expect(
-      resultMetaOf({ phase: "preparing", block: { meta: { statusCode: 200 } } } as never),
+      resultMetaOf(propsOf({ phase: "preparing", block: { meta: { statusCode: 200 } } })),
     ).toBeUndefined();
   });
 
   it("落定了但投影还没进来时是 undefined，而不是抛", () => {
-    expect(resultMetaOf({ phase: "result", block: {} } as never)).toBeUndefined();
+    expect(resultMetaOf(propsOf({ phase: "result", block: {} }))).toBeUndefined();
   });
 
   it("阶段写在 block 里不是宿主的形状：那种 props 一律读不到投影", () => {
     // 这条钉的是修复前的坏形状：宿主从不把 phase 放进 block，所以那时结果侧的字段永远不渲染。
     expect(
-      resultMetaOf({ block: { phase: "result", meta: { statusCode: 200 } } } as never),
+      resultMetaOf(propsOf({ block: { phase: "result", meta: { statusCode: 200 } } })),
     ).toBeUndefined();
   });
 });
 
 const BUNDLE_CONFIG_SLOT = "plugins.bundle.config";
 const TOOLVIEW_SLOT = "tool.call.toolview";
+
+/**
+ * 替身里渲染器的登记键。
+ *
+ * 只用 slot 名当键会把 19 个 key 各不相同的 toolview 压成同一格（后写的盖掉前面的），
+ * 于是「按具体工具取渲染器」这种断言写不出来。宿主本来就是按 name+key 登记的。
+ */
+const rendererKey = (slot: string, key: string): string => `${slot}:${key}`;
+
+/** 宿主配置表单那份快照的形状（本包只按这几位读）。 */
+interface HostSnapshot {
+  readonly status: "ready";
+  readonly value: unknown;
+  readonly revision: number;
+  readonly writable: boolean;
+}
 
 /** 本包会从 ctx 上读的服务名；替身按 harness 收到的清单决定放行哪几枚。 */
 const SERVICE_NAMES = ["slots", "locale", "configForms"];
@@ -245,11 +312,14 @@ const SERVICE_NAMES = ["slots", "locale", "configForms"];
  * 造一个够用的假宿主。
  *
  * `names` 是本包声明给宿主的 inject 清单，ctx 只放行清单里的名字：这就是 cordis 上下文
- * 代理的真行为（@deepseek-ai/cordis 的 `ReflectService.handler.get` —— 没注入的名字抛
- * `cannot get property "<name>" without inject`，而抛出落在 `ctx.effect` 体内时只被记进
- * logger）。替身要是像早先那样把整套服务无条件摆在 ctx 上，「清单里少写一枚
- * configForms」这种错在 Node 下什么都测不出来，真浏览器里的症状却是整张设置卡连同全部结果
- * 行一起静默消失 —— 这个 bug 就是这样躲在替身与宿主的差别里的。
+ * 代理的真行为（`ReflectService.handler.get` 对没注入的名字抛
+ * `cannot get property "<name>" without inject`）。抛出发生在 `ctx.effect` 的函数体里时
+ * 会穿出 `ctx.effect` / `apply` —— `Fiber._execute` 走 `composeError`，而 `handleError` 每条
+ * 路径都以 `throw reason` 收尾（@deepseek-ai/cordis src/fiber.ts、src/utils.ts）；被记进
+ * logger 的是**清理函数**那一路（`Fiber._unload` 里 catch 后 `ctx.logger.error`）。所以本文件
+ * 断的是「apply 抛出 + 一位都没登记」，界面看不到东西的原因是注册没发生。
+ * 替身要是像早先那样把整套服务无条件摆在 ctx 上，「清单里少写一枚 configForms」这种错在
+ * Node 下什么都测不出来，真浏览器里的症状却是整张设置卡连同全部结果行一起消失。
  *
  * @param names - 本包声明注入的服务名
  */
@@ -259,14 +329,21 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
   renderers: Map<string, (props: unknown) => unknown>;
   dictionaries: { ns: string; locale: string }[];
   asked: string[];
+  disposed: string[];
+  effectDisposers: (() => void)[];
 } {
+  const effectDisposers: (() => void)[] = [];
   const registered: { name: string; key?: string; locale?: string }[] = [];
+  const disposed: string[] = [];
   const dictionaries: { ns: string; locale: string }[] = [];
   const asked: string[] = [];
   const renderers = new Map<string, (props: unknown) => unknown>();
   // 宿主那一版配置：引用恒定（useSyncExternalStore 就靠这一点判「有没有变」），
   // 且整张替身只有一份 —— 与本包对值面的用法一致。
-  const hostState = { status: "ready" as const, value: {}, revision: 7, writable: true };
+  let hostState: HostSnapshot = { status: "ready", value: {}, revision: 7, writable: true };
+  // 下一笔写入是否按「宿主拒绝」收场：版本冲突与只读表单都走这条，卡片要能区分
+  // 「没保存上」与「保存成功」，否则用户以为改动了而配置没变。
+  let rejectNextWrite = false;
   const listeners: (() => void)[] = [];
   const source = {
     getSnapshot: () => hostState,
@@ -279,14 +356,24 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
         }
       };
     },
-    mutate: async (): Promise<boolean> => {
-      // 宿主收下这笔写入后会替换快照并通知订阅者 —— 卡片靠这一步把新值画上。
+    mutate: async (value: unknown): Promise<boolean> => {
+      if (rejectNextWrite) {
+        rejectNextWrite = false;
+        return false;
+      }
+      // 宿主收下这笔写入后会**换掉**快照对象并通知订阅者 —— 卡片靠这一步把新值画上。
+      // 引用必须换：useSyncExternalStore 比的是引用，原地改值等于告诉订阅者「什么都没变」。
+      hostState = { ...hostState, value, revision: hostState.revision + 1 };
       // 先拷一份再遍历：监听者可能在通知里退订，直接遍历会跳过下一个。
       const pending = [...listeners];
       for (const notify of pending) {
         notify();
       }
       return true;
+    },
+    /** 让下一次写入按宿主拒绝（返回 false、快照不动）收场。 */
+    rejectNextWrite(): void {
+      rejectNextWrite = true;
     },
   };
   const services: Record<string, unknown> = {
@@ -299,14 +386,21 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
         render: (props: never) => unknown,
       ): (() => void) => {
         registered.push(options);
-        renderers.set(options.name, render as (props: unknown) => unknown);
-        return NO_OP;
+        renderers.set(
+          rendererKey(options.name, options.key ?? ""),
+          render as (props: unknown) => unknown,
+        );
+        return (): void => {
+          disposed.push(`slot:${options.key ?? options.name}`);
+        };
       },
     },
     locale: {
       register: (ns: string, locale: string): (() => void) => {
         dictionaries.push({ ns, locale });
-        return NO_OP;
+        return (): void => {
+          disposed.push(`locale:${ns}/${locale}`);
+        };
       },
       bind:
         (): ((key: string) => string) =>
@@ -324,7 +418,7 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
   };
   // ctx 只放行清单里的名字，其余名字留一个会炸的 getter，抛的串与宿主逐字相同。
   // effect 不算「注入的服务」—— 它是 @deepseek-ai/cordis 混进每个 ctx 的方法面。
-  const ctx: Record<string, unknown> = { effect: RUN_EFFECT_IMMEDIATELY };
+  const ctx: Record<string, unknown> = { effect: makeEffectRunner(effectDisposers) };
   for (const name of SERVICE_NAMES) {
     if (names.includes(name)) {
       ctx[name] = services[name];
@@ -336,15 +430,36 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
       });
     }
   }
-  return { ctx, registered, renderers, dictionaries, asked };
+  return { ctx, registered, renderers, dictionaries, asked, disposed, effectDisposers };
+}
+
+/**
+ * 造替身、复位 HMR 幂等标记、跑一次 apply，把替身记下的东西交给用例断言。
+ *
+ * 入口只有一个：模块在本文件顶部就是静态导入的（幂等标记在每次调用前复位，动态 import
+ * 不带任何必要性），所以「谁能跑 apply」不再散在九个用例里各写一遍。
+ *
+ * @param names - 交给 ctx 的 inject 清单（默认交齐本包声明的三枚）
+ * @returns 替身记下的注册、渲染器、字典与 configForms 取用记录
+ */
+function applyWith(names: readonly string[] = ["slots", "configForms", "locale"]): {
+  ctx: unknown;
+  registered: { name: string; key?: string; locale?: string }[];
+  renderers: Map<string, (props: unknown) => unknown>;
+  dictionaries: { ns: string; locale: string }[];
+  asked: string[];
+  disposed: string[];
+  effectDisposers: (() => void)[];
+} {
+  const result = harness(names);
+  resetApplyFlag();
+  apply(result.ctx as never);
+  return result;
 }
 
 describe("apply", () => {
   it("注入清单交齐 slots、configForms 与 locale：少一枚，卡片与结果行都注册不上", async () => {
-    const { ctx, registered } = harness();
-    resetApplyFlag();
-    const { apply, inject } = await import("../src/client-entry.ts");
-    apply(ctx as never);
+    const { registered } = applyWith();
     // 清单与本包实际读用的服务必须逐字相等 —— 这条断言替我们把宿主那条硬规则钉住。
     expect([...inject].toSorted()).toStrictEqual(["configForms", "locale", "slots"]);
     expect(
@@ -352,20 +467,18 @@ describe("apply", () => {
     ).toStrictEqual(ROW_TOOLS);
   });
 
-  it("少注入 configForms 时 apply 抛错且卡片消失 —— 宿主里这声抛只进 logger", async () => {
+  it("少注入 configForms：apply 当场抛出，卡片一位都没登记", () => {
     const { ctx, registered } = harness(["slots", "locale"]);
     resetApplyFlag();
-    const { apply } = await import("../src/client-entry.ts");
     expect(() => {
       apply(ctx as never);
     }).toThrow('cannot get property "configForms" without inject');
     expect(registered.filter((entry) => entry.name === BUNDLE_CONFIG_SLOT)).toStrictEqual([]);
   });
 
-  it("少注入 locale 时连结果行一起丢，不只是卡", async () => {
+  it("少注入 locale 时连结果行一起丢，不只是卡", () => {
     const { ctx, registered } = harness(["slots", "configForms"]);
     resetApplyFlag();
-    const { apply } = await import("../src/client-entry.ts");
     expect(() => {
       apply(ctx as never);
     }).toThrow('cannot get property "locale" without inject');
@@ -380,10 +493,7 @@ describe("apply", () => {
   });
 
   it("设置卡挂在 plugins.bundle.config 上，键是包名，并带上 locale 席位", async () => {
-    const { ctx, registered } = harness();
-    resetApplyFlag();
-    const { apply } = await import("../src/client-entry.ts");
-    apply(ctx as never);
+    const { registered } = applyWith();
     const card = registered.filter((entry) => entry.name === BUNDLE_CONFIG_SLOT);
     expect(card).toStrictEqual([
       { name: BUNDLE_CONFIG_SLOT, key: BUNDLE_PACKAGE_NAME, locale: LOCALE_NS },
@@ -391,18 +501,12 @@ describe("apply", () => {
   });
 
   it("取值走本包的设置命名空间 —— bundle 页的 owner props 里没有 form", async () => {
-    const { ctx, asked } = harness();
-    resetApplyFlag();
-    const { apply } = await import("../src/client-entry.ts");
-    apply(ctx as never);
+    const { asked } = applyWith();
     expect(asked).toStrictEqual([SETTINGS_ENTRY_ID]);
   });
 
   it("字典整份插件只注册一次，中英各一份", async () => {
-    const { ctx, dictionaries } = harness();
-    resetApplyFlag();
-    const { apply } = await import("../src/client-entry.ts");
-    apply(ctx as never);
+    const { dictionaries } = applyWith();
     expect(dictionaries).toStrictEqual([
       { ns: LOCALE_NS, locale: "zh" },
       { ns: LOCALE_NS, locale: "en" },
@@ -410,11 +514,8 @@ describe("apply", () => {
   });
 
   it("宿主给的 props 里没有 form，卡片也必须拿到一个 —— 这正是这张卡曾经空白的原因", async () => {
-    const { ctx, renderers } = harness();
-    resetApplyFlag();
-    const { apply } = await import("../src/client-entry.ts");
-    apply(ctx as never);
-    const render = renderers.get(BUNDLE_CONFIG_SLOT);
+    const { renderers } = applyWith();
+    const render = renderers.get(rendererKey(BUNDLE_CONFIG_SLOT, BUNDLE_PACKAGE_NAME));
     if (render === undefined) {
       throw new Error("设置卡没有注册");
     }
@@ -436,11 +537,8 @@ describe("apply", () => {
   });
 
   it("值面在注册时造一次：每帧换一个新对象等于每帧重建订阅，会漏掉宿主的变更通知", async () => {
-    const { ctx, renderers } = harness();
-    resetApplyFlag();
-    const { apply } = await import("../src/client-entry.ts");
-    apply(ctx as never);
-    const render = renderers.get(BUNDLE_CONFIG_SLOT);
+    const { renderers } = applyWith();
+    const render = renderers.get(rendererKey(BUNDLE_CONFIG_SLOT, BUNDLE_PACKAGE_NAME));
     if (render === undefined) {
       throw new Error("设置卡没有注册");
     }
@@ -455,11 +553,10 @@ describe("apply", () => {
   });
 
   it("结果行的 render 也接上了真实 owner props，而不是渲染一个空壳", async () => {
-    const { ctx, renderers } = harness();
-    resetApplyFlag();
-    const { apply } = await import("../src/client-entry.ts");
-    apply(ctx as never);
-    const render = renderers.get(TOOLVIEW_SLOT);
+    const { renderers } = applyWith();
+    // 按被断言的那个工具取渲染器：拿「最后一个登记进来的」去配 scrapling_fetch 的 props，
+    // 实现改成按 key 捕获工具名时这条用例仍然全绿。
+    const render = renderers.get(rendererKey(TOOLVIEW_SLOT, "scrapling_fetch"));
     if (render === undefined) {
       throw new Error("结果行没有注册");
     }
@@ -477,12 +574,31 @@ describe("apply", () => {
     expect(element.props.toolName).toBe("scrapling_fetch");
   });
 
-  it("重复 apply 不会二次注册（HMR 幂等）", async () => {
-    const { ctx, registered } = harness();
-    resetApplyFlag();
-    const { apply } = await import("../src/client-entry.ts");
-    apply(ctx as never);
+  it("effect 交回的清理函数撤掉字典与结果行的登记（宿主卸载插件那一步）", () => {
+    const { disposed, effectDisposers } = applyWith();
+    // 四条：claimApply 复位 HMR 标记的那一条，加上本包的样式、字典+结果行、设置卡三条。
+    // 少任何一条，卸载时就有一批登记或标记撤不掉。
+    expect(effectDisposers).toHaveLength(4);
+    for (const dispose of effectDisposers) {
+      dispose();
+    }
+    expect(disposed.filter((entry) => entry.startsWith("locale:")).toSorted()).toStrictEqual([
+      `locale:${LOCALE_NS}/en`,
+      `locale:${LOCALE_NS}/zh`,
+    ]);
+    // 结果行的注销走的是 slots.register 交回的那一位：19 个工具一位都不能少，
+    // 少一位就是宿主重载后残留一个渲染器。
+    expect(disposed.filter((entry) => entry.startsWith("slot:scrapling_"))).toHaveLength(
+      ROW_TOOLS.length,
+    );
+  });
+
+  it("重复 apply 不会二次注册（HMR 幂等）", () => {
+    const { ctx, registered } = applyWith();
     const first = registered.length;
+    // 先钉「第一次确实登记满了」：一次都没注册时（标记没复位、claimApply 认为已应用过），
+    // 下面那句「长度没变」照样成立 —— 那是最严重的坏形状，不能被当成幂等。
+    expect(first).toBe(ROW_TOOLS.length + 1);
     apply(ctx as never);
     expect(registered).toHaveLength(first);
   });

@@ -7,7 +7,14 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { mockPlatform } from "./managed-host.ts";
 import { Context } from "@deepseek-ai/cordis";
-import type { JobHooks, JobId, JobOutcome, JobSpec, JobView } from "@deepseek-ai/dsh-jobs";
+import type {
+  JobHandle,
+  JobHooks,
+  JobId,
+  JobOutcome,
+  JobSpec,
+  JobView,
+} from "@deepseek-ai/dsh-jobs";
 import { remoteMethods } from "@deepseek-ai/dsh-typert-protocol";
 import { installRuntimeRemote, ScraplingRuntimeService } from "../lib/runtime-remote.ts";
 import type { RuntimeJobs, RuntimeRemoteDeps } from "../lib/runtime-remote.ts";
@@ -20,6 +27,8 @@ const CORE = "core";
 const BROWSER = "browser";
 const MANIFEST_STATE = "state.json";
 const CHROMIUM_DIR = "chromium-1";
+/** 一次注定的安装失败；原因要能在作业输出里读到。 */
+const PIP_FAILURE = "pip blew up";
 const INSTALL_REFUSED = "install was refused";
 const READER_MISSING = "reader missing";
 const JOB_KIND = "scrapling-runtime";
@@ -68,11 +77,6 @@ function packInstaller(dataDir: string): Pick<RuntimeRemoteDeps, "installPackFn"
   };
 }
 
-/** 替身没有 controller 平面要撤。 */
-function detach(): void {
-  // 空操作。
-}
-
 async function recordOutcome(
   done: Promise<JobOutcome>,
   record: (outcome: JobOutcome) => void,
@@ -88,6 +92,9 @@ interface FakeJobs {
   outputs: Map<string, string>;
   progress: Map<string, string[]>;
   kills: string[];
+  /** attachController 与它交回的 detach 各被调用了几次。 */
+  readonly attached: number;
+  readonly detached: number;
   /** 让注册表忘掉所有记录，对齐宿主 `remove()` 与服务销毁后的状态。 */
   forget: () => void;
 }
@@ -98,6 +105,8 @@ function fakeJobs(
     getThrows?: boolean;
     readThrows?: boolean;
     startThrows?: boolean;
+    /** 走完 `run` 再抛：注册环节在作业已经起跑之后才失败的那一档。 */
+    startThrowsAfterRun?: boolean;
     killThrows?: boolean;
   } = {},
 ): FakeJobs {
@@ -109,24 +118,41 @@ function fakeJobs(
   const kills: string[] = [];
   let sequence = 0;
   let forgotten = false;
+  let attached = 0;
+  let detached = 0;
+  /** 一条作业拿到的写入面：输出与进度都记进各自的表。 */
+  const handleOf = (id: string): JobHandle => ({
+    id: id as never,
+    append: (text: string): void => {
+      outputs.set(id, (outputs.get(id) ?? "") + text);
+    },
+    updateProgress: (line: string): void => {
+      progress.set(id, [...(progress.get(id) ?? []), line]);
+    },
+  });
   const registry = {
-    attachController: () => detach,
+    // 服务侧的契约是「起作业时必须自己挂 controller，并在 start 之后立刻摘掉」
+    // （lib/runtime-remote.ts 里那层嵌套 try/finally）。计数让这条契约可断言。
+    attachController: (): (() => void) => {
+      attached += 1;
+      return (): void => {
+        detached += 1;
+      };
+    },
     start: (spec: JobSpec): JobId => {
       if (options.startThrows === true) {
         throw new Error("start blew up");
       }
+      if (options.startThrowsAfterRun === true) {
+        // 先让 `run` 起跑（真实注册表的 `start` 就是这个次序：调过生产者再登记），再抛。
+        const late = "scrapling-runtime-late";
+        hooks.set(late, spec.run(handleOf(late)));
+        throw new Error("registry refused the job");
+      }
       const id = `scrapling-runtime-${String(sequence)}`;
       sequence += 1;
       specs.push(spec);
-      const handle = {
-        id: id as never,
-        append: (text: string): void => {
-          outputs.set(id, (outputs.get(id) ?? "") + text);
-        },
-        updateProgress: (line: string): void => {
-          progress.set(id, [...(progress.get(id) ?? []), line]);
-        },
-      };
+      const handle = handleOf(id);
       const createdHooks = spec.run(handle);
       hooks.set(id, createdHooks);
       views.set(id, "running");
@@ -194,6 +220,14 @@ function fakeJobs(
     outputs,
     progress,
     kills,
+    /** attachController 被调用了几次。 */
+    get attached(): number {
+      return attached;
+    },
+    /** 交回的 detach 被调用了几次。 */
+    get detached(): number {
+      return detached;
+    },
     forget: (): void => {
       forgotten = true;
     },
@@ -349,7 +383,14 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(running.packs.core).toBe("installing");
     expect(running.job?.id).toBe(jobId);
     expect(running.job?.output).toContain("installing core");
-    await jobs.hooks.get(jobId)?.done;
+    const finished = await jobs.hooks.get(jobId)?.done;
+    // 裸 await 在 hooks 缺席时静默 resolve undefined，作业到底有没有跑完、是不是 failed
+    // 都不影响这条用例通过——结算状态必须断出来。
+    expect(finished?.status).toBe("completed");
+    // append 之外那条并行通道：progress 一直被填却从没人读过。
+    expect(jobs.progress.get(jobId)).toStrictEqual(["installing core", "core ready"]);
+    // 起了几次 controller 就得摘掉几次，包括 start 之后那一步。
+    expect([jobs.attached, jobs.detached]).toStrictEqual([1, 1]);
     const done = await service.status();
     expect(done.packs.core).toBe("ready");
     expect(done.job?.status).toBe("completed");
@@ -367,7 +408,8 @@ describe("官方 Typert Remote：runtime 服务", () => {
     if (!started.ok) {
       throw new Error("browser install was refused");
     }
-    await jobs.hooks.get(started.jobId)?.done;
+    const finished = await jobs.hooks.get(started.jobId)?.done;
+    expect(finished?.status).toBe("completed");
     const status = await service.status();
     expect(status.packs.browser).toBe("ready");
     expect(status.job?.status).toBe("completed");
@@ -383,7 +425,8 @@ describe("官方 Typert Remote：runtime 服务", () => {
       throw new Error("repair was refused");
     }
     expect(jobs.specs[0]?.label).toBe("repair core");
-    await jobs.hooks.get(started.jobId)?.done;
+    const finished = await jobs.hooks.get(started.jobId)?.done;
+    expect(finished?.status).toBe("completed");
   });
 
   it("终态作业不挡下一次安装", async () => {
@@ -395,13 +438,16 @@ describe("官方 Typert Remote：runtime 服务", () => {
     if (!first.ok) {
       throw new Error(INSTALL_REFUSED);
     }
-    await jobs.hooks.get(first.jobId)?.done;
+    const firstOutcome = await jobs.hooks.get(first.jobId)?.done;
+    expect(firstOutcome?.status).toBe("completed");
     const second = service.installPack({ pack: BROWSER });
     expect(second.ok).toBe(true);
     expect(jobs.specs[1]?.label).toBe("install browser");
-    if (second.ok) {
-      await jobs.hooks.get(second.jobId)?.done;
+    if (!second.ok) {
+      throw new Error(INSTALL_REFUSED);
     }
+    const secondOutcome = await jobs.hooks.get(second.jobId)?.done;
+    expect(secondOutcome?.status).toBe("completed");
   });
 
   it("读数抛错时拒绝第二次安装，而不是当成没有作业放行", () => {
@@ -442,18 +488,41 @@ describe("官方 Typert Remote：runtime 服务", () => {
   });
 
   it("同一时刻只允许一条安装作业", async () => {
+    // 第一次安装显式停在 running（安装函数等一枚 gate），409 才是「有作业在跑所以挡」的判据。
+    // 原先两次 installPack 落在同一个 tick 才读得到 running：替身的 views 是同步写的、
+    // 安装函数里又没有任何 await，用例中间一旦插入等待第一条就落成 completed，这条会静默失效。
+    const gate = Promise.withResolvers<undefined>();
     const jobs = fakeJobs();
     const ctx = new Context();
-    installRuntimeRemote(ctx, depsOf(tempDir(), jobs));
+    installRuntimeRemote(
+      ctx,
+      depsOf(tempDir(), jobs, {
+        installPackFn: async (): Promise<void> => {
+          await gate.promise;
+        },
+      }),
+    );
     const service = serviceOf(ctx);
-    expect(service.installPack({ pack: CORE }).ok).toBe(true);
+    const first = service.installPack({ pack: CORE });
+    if (!first.ok) {
+      throw new Error(INSTALL_REFUSED);
+    }
+    const running = await service.status();
+    expect(running.job?.status).toBe("running");
     expect(service.installPack({ pack: CORE })).toMatchObject({ ok: false, status: 409 });
+    gate.resolve(undefined);
+    const outcome = await jobs.hooks.get(first.jobId)?.done;
+    expect(outcome?.status).toBe("completed");
   });
 
-  it("注册表 start 抛错时退 500", () => {
+  it("注册表 start 抛错时退 500，controller 照样摘掉", () => {
+    const jobs = fakeJobs({ startThrows: true });
     const ctx = new Context();
-    installRuntimeRemote(ctx, depsOf(tempDir(), fakeJobs({ startThrows: true })));
+    installRuntimeRemote(ctx, depsOf(tempDir(), jobs));
     expect(serviceOf(ctx).installPack({ pack: CORE })).toMatchObject({ ok: false, status: 500 });
+    // 服务侧那句 `try { jobs.start(spec) } finally { detach() }`：把 finally 去掉或只在成功
+    // 路径摘，就等于往宿主平面常驻一扇「有人能收这桶作业」的闸门。
+    expect([jobs.attached, jobs.detached]).toStrictEqual([1, 1]);
   });
 
   it("安装失败落成 failed 作业，detail 带原因", async () => {
@@ -477,14 +546,14 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(outcome?.detail).toContain("pip exploded");
   });
 
-  it("取消：坏请求 400、别人的作业 404、没有后端 503、kill 抛错 500、成功叫停作业", async () => {
+  it("取消：坏请求 400、归属不符 404、kill 抛错 500、成功叫停作业", async () => {
     const dataDir = tempDir();
     const jobs = fakeJobs();
     const ctx = new Context();
     installRuntimeRemote(ctx, depsOf(dataDir, jobs));
     const service = serviceOf(ctx);
-    expect(service.cancelJob(null).ok).toBe(false);
-    expect(service.cancelJob({ jobId: "" }).ok).toBe(false);
+    expect(service.cancelJob(null)).toMatchObject({ ok: false, status: 400 });
+    expect(service.cancelJob({ jobId: "" })).toMatchObject({ ok: false, status: 400 });
     expect(service.cancelJob({ jobId: "someone-else" })).toMatchObject({ ok: false, status: 404 });
     const started = service.installPack({ pack: CORE });
     if (!started.ok) {
@@ -493,6 +562,8 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(service.cancelJob({ jobId: started.jobId })).toMatchObject({ ok: true });
     expect(jobs.kills).toStrictEqual([started.jobId]);
 
+    // 没有作业后端时读到的仍是 404：cancelJob 先按本服务记录的归属判（`this.job === null`
+    // 那一支在取 jobsOf 之前），503 只在「归属对上而后端没了」时出现——那是下一条的用例。
     const noJobs = fakeJobs({ jobs: false });
     const noJobsCtx = new Context();
     installRuntimeRemote(noJobsCtx, depsOf(tempDir(), noJobs));
@@ -594,7 +665,7 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(status.job).toBeNull();
   });
 
-  it("输出环读不到时 status 也按没有作业处理", async () => {
+  it("输出环读不到时作业照旧在位，只是读不到尾部", async () => {
     const ctx = new Context();
     installRuntimeRemote(ctx, depsOf(tempDir(), fakeJobs({ readThrows: true })));
     const service = serviceOf(ctx);
@@ -603,7 +674,87 @@ describe("官方 Typert Remote：runtime 服务", () => {
       throw new Error(INSTALL_REFUSED);
     }
     const status = await service.status();
-    expect(status.job).toBeNull();
+    // 输出环失效不改变「有一个安装在跑」：整份视图退回 null 会把正在装的环境显示成没在装，
+    // 而卡片正是在这一位上决定要不要再给一次安装按钮。
+    expect(status.job?.status).toBe("running");
+    expect(status.job?.output).toBe("");
+  });
+
+  it("安装失败的原因落进作业输出，卡片看得见为什么 failed", async () => {
+    const ctx = new Context();
+    const jobs = fakeJobs();
+    installRuntimeRemote(ctx, {
+      ...depsOf(tempDir(), jobs),
+      installPackFn: async (): Promise<void> => {
+        throw new Error(PIP_FAILURE);
+      },
+    });
+    const service = serviceOf(ctx);
+    const started = service.installPack({ pack: CORE });
+    if (!started.ok) {
+      throw new Error(INSTALL_REFUSED);
+    }
+    const outcome = await jobs.hooks.get(started.jobId)?.done;
+    expect(outcome?.status).toBe("failed");
+    expect(outcome?.detail).toContain(PIP_FAILURE);
+    // 作业视图只透出 status 与 output：detail 不进输出的话，界面就只看得见一个 failed。
+    const shown = await service.status();
+    expect(shown.job?.output).toContain("FAILED:");
+    expect(shown.job?.output).toContain(PIP_FAILURE);
+  });
+
+  it("注册表在作业起跑之后才拒绝时，取消信号要发给那次安装", async () => {
+    const ctx = new Context();
+    const signals: (AbortSignal | undefined)[] = [];
+    installRuntimeRemote(ctx, {
+      ...depsOf(tempDir(), fakeJobs({ startThrowsAfterRun: true })),
+      installPackFn: async (_pack, options): Promise<void> => {
+        signals.push(options.signal);
+      },
+    });
+    const started = serviceOf(ctx).installPack({ pack: CORE });
+    if (started.ok) {
+      throw new Error("a registry that refuses the job must not report it as started");
+    }
+    // `this.job` 没写上，但那次安装已经在跑：不 abort 就是下一次安装的互斥盲区。
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  it("服务实例换了也认得在跑的安装（按 kind 问注册表）", async () => {
+    const jobs = fakeJobs();
+    const dataDir = tempDir();
+    const firstCtx = new Context();
+    installRuntimeRemote(firstCtx, depsOf(dataDir, jobs));
+    const started = serviceOf(firstCtx).installPack({ pack: CORE });
+    if (!started.ok) {
+      throw new Error(INSTALL_REFUSED);
+    }
+    const secondCtx = new Context();
+    installRuntimeRemote(secondCtx, depsOf(dataDir, jobs));
+    const again = serviceOf(secondCtx).installPack({ pack: BROWSER });
+    if (again.ok) {
+      throw new Error("a live job of our kind must block a second install");
+    }
+    expect(again.error).toContain(started.jobId);
+  });
+
+  it("注册表收走作业后取消报 404，而不是把它报成取消失败", async () => {
+    const ctx = new Context();
+    const jobs = fakeJobs();
+    installRuntimeRemote(ctx, depsOf(tempDir(), jobs));
+    const service = serviceOf(ctx);
+    const started = service.installPack({ pack: CORE });
+    if (!started.ok) {
+      throw new Error(INSTALL_REFUSED);
+    }
+    jobs.forget();
+    const refused = service.cancelJob({ jobId: started.jobId });
+    if (refused.ok) {
+      throw new Error("a forgotten job must not report a successful cancel");
+    }
+    expect(refused.status).toBe(404);
+    // 缺席按自愈处理之后，同一实例不必再被这条作业挡住。
+    expect(service.installPack({ pack: BROWSER }).ok).toBe(true);
   });
 
   it("输出超过尾窗时只留最后 4000 个字符", async () => {
@@ -615,9 +766,13 @@ describe("官方 Typert Remote：runtime 服务", () => {
     if (!started.ok) {
       throw new Error(INSTALL_REFUSED);
     }
-    jobs.outputs.set(started.jobId, "x".repeat(5000));
+    // 同字符串里 slice(0, 4000) 与 slice(-4000) 逐字节相同，尾窗改坏也测不出来；
+    // 首尾各放一个可辨识标记，长度与两端同时判。
+    jobs.outputs.set(started.jobId, `HEAD${"-".repeat(5000)}TAIL`);
     const status = await service.status();
     expect(status.job?.output.length).toBe(4000);
+    expect(status.job?.output.startsWith("HEAD")).toBe(false);
+    expect(status.job?.output.endsWith("TAIL")).toBe(true);
   });
 
   it("pack 清单覆盖计划里的六个包", () => {
@@ -667,11 +822,18 @@ describe("客户端读取器", () => {
       $mount: async (): Promise<unknown> => {
         mounts.push(1);
         const outcomes = options.mounts;
-        const outcome =
-          outcomes === undefined
-            ? { mounted: true }
-            : outcomes.at(Math.min(index, outcomes.length - 1));
+        if (outcomes === undefined) {
+          return { mounted: true };
+        }
+        const outcome = outcomes.at(index);
         index += 1;
+        if (outcome === undefined) {
+          // 不再复用最后一条：那会把「实际挂载了几次」抹平，而空清单（一份结果都不该给）
+          // 经 `at(-1)` 会交回 undefined，等于把失败伪装成挂载成功。
+          throw new TypeError(
+            `挂载脚本只有 ${String(outcomes.length)} 条，第 ${String(index)} 次 $mount 没有对应结果`,
+          );
+        }
         if (outcome instanceof Error) {
           throw outcome;
         }
@@ -754,14 +916,47 @@ describe("客户端读取器", () => {
     await expect(reader.cancel("job-1")).rejects.toThrow(/at status/u);
   });
 
-  it("strict codec 拒绝未知包与空 jobId", () => {
-    const packCodec = RUNTIME_DESCRIPTORS[1]?.parameters[0];
-    const cancelCodec = RUNTIME_DESCRIPTORS[3]?.parameters[0];
-    if (packCodec === undefined || cancelCodec === undefined || !("codec" in packCodec)) {
-      throw new Error("descriptors lost their codecs");
+  it("回包里的包状态不在取值域时判坏，卡片拿不到没配译名的状态串", async () => {
+    // #186 那条建议要在 `packStateKey` 里加白名单；这里钉住为什么不需要：域外状态在
+    // 读取器的 zod 校验就被拒，永远走不到拼译名键的那一步。
+    const reader = createRuntimeReader(
+      hostOf({
+        namespace: namespaceStub({
+          status: async () => ({
+            ok: true,
+            value: {
+              ok: true,
+              packs: { [CORE]: "draining" },
+              python: { path: "/py/bin/python", via: "managed", version: "3.14.0" },
+              dataDir: "/data",
+              jobsReady: true,
+              job: null,
+            },
+          }),
+        }),
+      }).host,
+    );
+    if (reader === undefined) {
+      throw new TypeError(READER_MISSING);
     }
-    const packTypert = packCodec.codec;
-    const cancelTypert = cancelCodec.codec;
+    await expect(reader.status()).rejects.toThrow(/packs/u);
+  });
+
+  it("strict codec 拒绝未知包与空 jobId", () => {
+    // 按方法名取，不按下标：清单增删或重排时硬编码下标会静默拿到别的方法的 codec，
+    // 或者落到一句与真实原因无关的报错上。
+    const packParameter = RUNTIME_DESCRIPTORS.find((item) => item.method === "installPack")
+      ?.parameters[0];
+    const cancelParameter = RUNTIME_DESCRIPTORS.find((item) => item.method === "cancelJob")
+      ?.parameters[0];
+    if (packParameter === undefined || cancelParameter === undefined) {
+      throw new Error("descriptor 清单里少了 installPack 或 cancelJob");
+    }
+    if (!("codec" in packParameter) || !("codec" in cancelParameter)) {
+      throw new Error("installPack / cancelJob 的入参没有 codec");
+    }
+    const packTypert = packParameter.codec;
+    const cancelTypert = cancelParameter.codec;
     if (packTypert.mode !== "strict" || cancelTypert.mode !== "strict") {
       throw new Error("runtime request codecs must be strict");
     }
@@ -769,6 +964,21 @@ describe("客户端读取器", () => {
     const cancelParser = cancelTypert.create();
     expect(() => packParser.parse({ pack: "nope" })).toThrow(/known pack/u);
     expect(() => cancelParser.parse({ jobId: "" })).toThrow(/jobId/u);
+    // 纯空白同样算「没有 jobId」：`min(1)` 只看长度，先 trim 才判得住。
+    expect(() => cancelParser.parse({ jobId: "   " })).toThrow(/jobId/u);
+    expect(cancelParser.parse({ jobId: " job-1 " })).toStrictEqual({ jobId: "job-1" });
     expect(packParser.parse({ pack: CORE })).toStrictEqual({ pack: CORE });
+  });
+
+  it("回包不是信封形状时判协议错误，而不是崩在读属性上", async () => {
+    // `result.ok` / `result.error.code` 都不做非空检查：网关交回 undefined 或一条字符串时，
+    // 症状会变成 `Cannot read properties of undefined`，读不出「哪一侧的协议坏了」。
+    const { host } = hostOf({
+      namespace: namespaceStub({ status: async () => undefined as never }),
+    });
+    const reader = createRuntimeReader(host);
+    await expect(reader?.status() ?? Promise.reject(new Error("no reader"))).rejects.toThrow(
+      /malformed envelope/u,
+    );
   });
 });

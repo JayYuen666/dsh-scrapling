@@ -87,6 +87,59 @@ function describeRaw(raw: unknown): string {
   return String(raw).slice(0, 120);
 }
 
+/** 一次 fetch 回包里本层要用的那几件。 */
+interface FetchReply {
+  readonly url: string;
+  readonly status: number;
+  readonly content: string;
+  /** sidecar 自己有没有截过正文（与 `capText` 的截断并列，共同决定 `truncated`）。 */
+  readonly sourceTruncated: boolean;
+}
+
+/**
+ * 状态码是否可用：必须是 100..599 之间的整数。
+ *
+ * `typeof === "number"` 单看类型会放行 NaN、Infinity、0、负数与 999，而宿主把这一枚原样
+ * 印进模型看到的标题行（`Fetched <url> (HTTP <status>)`）。区间取 HTTP 的合法状态码：这条
+ * 路径的 status 来自 `py/adapters.py` 的 `response.status`，一次真 HTTP 响应给不出别的数，
+ * 给得出别的数就说明回包已经不是这条协议。
+ *
+ * @param status - 回包里的 status
+ * @returns 是否可当状态码交出去
+ */
+function isUsableStatus(status: unknown): status is number {
+  return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599;
+}
+
+/**
+ * 读 sidecar 的 fetch 回包；类型与取值一起判。
+ *
+ * 判不过就报「回包坏了」，而不是补成「一个空的 200 页面」交上去：调用方会把 statusCode
+ * 当成一个真实的状态码、把空正文当成「这个页面确实没有内容」，于是对端协议一坏，
+ * 结果就是一片看起来完全正常的空结果。
+ *
+ * @param raw - sidecar 回来的原值
+ * @returns 判过的那几件
+ * @throws WebError - 形状或取值不合这条协议（`SCRAPLING_FETCH_FAILED`）
+ */
+function replyOf(raw: unknown): FetchReply {
+  if (isRecord(raw)) {
+    const { url, status, content, truncated } = raw;
+    if (
+      typeof url === "string" &&
+      url.length > 0 &&
+      isUsableStatus(status) &&
+      typeof content === "string"
+    ) {
+      return { url, status, content, sourceTruncated: truncated === true };
+    }
+  }
+  throw new WebError(
+    `sidecar returned a malformed fetch reply: ${describeRaw(raw)}`,
+    "SCRAPLING_FETCH_FAILED",
+  );
+}
+
 /**
  * 建一个 ctx.web fetch provider。
  *
@@ -140,43 +193,32 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
         if (signal?.aborted === true) {
           throw error;
         }
-        // provider 特有码：调用方只保证能容忍「不认识但可路由」的 code。把 sidecar 的码
-        // 带进去 —— 「被安全闸门拦下」（URL_BLOCKED）、「sidecar 超时」（SIDECAR_TIMEOUT）、
-        // 「sidecar 没起来」（SIDECAR_UNAVAILABLE）要采取的行动完全不同，只留一个
-        // SCRAPLING_FETCH_FAILED 就把这三种压成同一件事。
-        // WebError 的构造签名是 (message, code) —— 顺序反了的话，这段文案会跑到 code 上，
-        // 而 code 会变成一整段错误文本，调用方按码路由就全废了。
+        // code 交回本 provider 自己的那一枚（SCRAPLING_FETCH_FAILED），sidecar 的原始码走
+        // 两条路：文案前缀给模型看，`cause` 给程序读。宿主对 WebError 的契约是「按 code
+        // 路由、绝不解析 message」，而 provider 特有码只要求调用方**容得下**，所以把
+        // URL_BLOCKED / SIDECAR_TIMEOUT / SIDECAR_UNAVAILABLE 直接抬成 code 等于改这份契约
+        // 的取值面；带在 cause 上既不撑大取值域，也不把三种情况压成一件。
+        // WebError 的构造签名是 (message, code, options) —— 顺序反了的话，这段文案会跑到
+        // code 上，而 code 会变成一整段错误文本，调用方按码路由就全废了。
         // 与 host 的 probeFailure 一致，统一 String()：Error 会变成 "Error: msg"，
         // 少一条永远走不到的分支，消息里还多一个错误类名。
         const code = error instanceof SidecarError ? `${error.code}: ` : "";
-        throw new WebError(`${code}${String(error)}`, "SCRAPLING_FETCH_FAILED");
+        throw new WebError(`${code}${String(error)}`, "SCRAPLING_FETCH_FAILED", { cause: error });
       }
 
-      const payload = isRecord(raw) ? raw : undefined;
-      // 回包形状不对就报失败，而不是补成「一个空的 200 页面」交上去：调用方会把
-      // statusCode: 0 当成一个真实的状态码、把空正文当成「这个页面确实没有内容」，
-      // 于是对端协议一坏，结果就是一片看起来完全正常的空结果。
-      if (
-        payload === undefined ||
-        typeof payload["url"] !== "string" ||
-        typeof payload["status"] !== "number" ||
-        typeof payload["content"] !== "string"
-      ) {
-        throw new WebError(
-          `sidecar returned a malformed fetch reply: ${describeRaw(raw)}`,
-          "SCRAPLING_FETCH_FAILED",
-        );
-      }
-      const { content } = payload;
+      const payload = replyOf(raw);
       // 真正裁剪而不仅是标一个 truncated：超长正文原样返回的话，它会照样进上下文与会话
       // 日志，而 truncated: true 反而让调用方以为已经裁过了。与本仓各工具同一收口
       // （lib/output.ts 的 capText，按字节头尾截断）。
-      const capped = capText(content, deps.maxOutputBytes, RECOVERY_HINT);
+      const capped = capText(payload.content, deps.maxOutputBytes, RECOVERY_HINT);
       // 两种截断都算：sidecar 自己截的，和我们自己按预算截的 ——
-      // 对调用方而言语义一样，都是「正文没拿全」。
-      const truncated = payload["truncated"] === true || capped.truncated;
+      // 对调用方而言语义一样，都是「正文没拿全」。宿主把这一位翻成它自己的那句
+      // 截断告知（`packages/web/tool-web/src/fetch.ts` 的 TRUNCATION_FOOTER），所以
+      // capText 那份 `notice` 在这里刻意不进正文：并进去就是同一句告知说两遍，
+      // 还会把「页面内容」与「怎么再要一次」混成一坨。
+      const truncated = payload.sourceTruncated || capped.truncated;
       const body: WebFetchBody = { kind: toBodyKind(extractionType), content: capped.text };
-      return { url: payload["url"], statusCode: payload["status"], body, truncated };
+      return { url: payload.url, statusCode: payload.status, body, truncated };
     },
   };
 }

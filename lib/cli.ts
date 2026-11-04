@@ -23,6 +23,7 @@ import {
   readProfileSnapshot,
 } from "./mcp-profile.ts";
 import type { InstallerIO } from "./installer.ts";
+import { SEARCH_BACKENDS, isSearchBackend } from "./search-backends.ts";
 import {
   defaultInstallerIO,
   installCapabilityPack,
@@ -82,7 +83,10 @@ function defaultDataDir(): string {
   if (configured === undefined || configured === "") {
     return path.join(os.homedir(), ".dsh-scrapling");
   }
-  return configured;
+  // 归一成绝对路径再交下去：这一位最后会拼成写进 cordis.patch.yml 的 `command:`，
+  // 相对路径是按**宿主进程**的 cwd 解析的，于是 setup 打印的那条与宿主实际起的
+  // 那条不是同一个文件，而失败要等到宿主启动那次才现形。
+  return path.resolve(configured);
 }
 
 function isFeature(value: string): value is Feature {
@@ -316,20 +320,25 @@ function bareScalar(raw: string): string {
   return trimmed.replace(TRAILING_INLINE_COMMENT, "").trim();
 }
 
-/** 把 patch 文本里某个键第一次出现的标量取出来（整行注释跳过，行尾注释与引号由 bareScalar 剥掉）。 */
+/**
+ * 取 patch 文本里某个键第一个**有值**的标量（整行注释跳过，行尾注释与引号由 bareScalar 剥掉）。
+ * 只写了键名没给值的那些出现被跳过，所以返回值为 `undefined` 就等于「这份 patch 没配这一项」。
+ */
 function patchScalar(text: string, key: string): string | undefined {
   const line = new RegExp(`^[\\t ]*(?:-[\\t ]+)?${key}:(?<value>[^\\r\\n]*)$`, "u");
-  const raw = text
-    .split(LINE_BREAK)
-    .filter((line_) => !line_.trimStart().startsWith("#"))
-    .map((line_) => line.exec(line_)?.groups?.["value"])
-    .find((value) => value !== undefined);
-  return raw === undefined ? undefined : bareScalar(raw);
+  return (
+    text
+      .split(LINE_BREAK)
+      .filter((raw) => !raw.trimStart().startsWith("#"))
+      .map((raw) => bareScalar(line.exec(raw)?.groups?.["value"] ?? ""))
+      // 只写了键名的那些出现跳过而不是收尾：profile 的 cordis.patch.yml 聚合了多层 patch，
+      // 别的条目先落一个空 `pythonBin:` 会把本条目后面那份真值盖掉，读侧只剩「没配」可报。
+      .find((value) => value !== "")
+  );
 }
 
 function hasPatchValue(text: string, key: string): boolean {
-  const value = patchScalar(text, key);
-  return value !== undefined && value !== "";
+  return patchScalar(text, key) !== undefined;
 }
 
 /** 只认 YAML 1.2 的三种布尔真值拼法：与 lib/mcp-profile.ts 的 isSwitchOn 同一条判据。 */
@@ -422,9 +431,27 @@ interface SearchDiagnostics {
  * - 显式指定后端却缺凭据 → 每次查询都会 SEARCH_AUTH，按配置错判红。
  * - `searchProvider: scrapling` 而 provider 不可用 → web_search 会报 WEB_PROVIDER_CONFIGURED_UNAVAILABLE，判红并点名缺什么。
  */
+/**
+ * 后端名不在本包实现的名单里时的那一条配置错；写对了（或整行没写）交回空表。
+ * provider 不拒未知后端：它按 deps.backend 走到 endpointOf 的 switch，落空之后连对端都取不到，
+ * 坏要等到每一次查询才现形 —— 所以这一档必须由 doctor 判红，不能让「键存在且不是 auto」当成没问题。
+ */
+function backendConfigFinding(backendRaw: string | undefined): SearchFinding[] {
+  if (backendRaw === undefined || isSearchBackend(backendRaw)) {
+    return [];
+  }
+  return [
+    {
+      code: "SEARCH_BACKEND_INVALID",
+      detail: `searchBackend=${backendRaw} 不是本包实现的后端：可写的取值是 ${SEARCH_BACKENDS.join(" / ")}，删掉这一行即回到 auto。`,
+    },
+  ];
+}
+
 function searchDiagnostics(patchText: string, coreReady: boolean): SearchDiagnostics {
   const provider = patchScalar(patchText, "searchProvider");
-  const backend = patchScalar(patchText, "searchBackend") ?? "auto";
+  const backendRaw = patchScalar(patchText, "searchBackend");
+  const backend = backendRaw ?? "auto";
   const publicFallback = patchFlag(patchText, "searchPublicFallback");
   const hasTavily = hasPatchValue(patchText, "tavilyApiKey");
   const hasSearxng = hasPatchValue(patchText, "searxngEndpoint");
@@ -449,6 +476,7 @@ function searchDiagnostics(patchText: string, coreReady: boolean): SearchDiagnos
       `SEARCH_AUTH searchBackend=${backend} 但 ${credentialKey} 没配：查询会报 SEARCH_AUTH。修复：配 ${credentialKey}，或换一个后端。`,
     );
   }
+  findings.push(...backendConfigFinding(backendRaw));
   if (pointedHere && !coreReady) {
     findings.push({
       code: "WEB_PROVIDER_CONFIGURED_UNAVAILABLE",
@@ -508,8 +536,13 @@ async function runDoctor(flags: FlagMap, deps: CliDeps): Promise<number> {
     deps.log(`${profile} 与 integrationMode=${mode} 一致。`);
     return 0;
   }
+  // 只剩搜索侧的 finding 时不许指到 setup --mode：searchProvider / searchBackend / 各凭据键
+  // 都不归那条命令写（它落的是模式块与 command 那几行），按上面逐条的修复动作改 web 条目
+  // 才是出路 —— 把用户支去重跑一次不相关的命令，等于让配置错原样留着。
   deps.log(
-    `${String(total)} 处不一致：改完重跑 setup --mode ${mode} --apply，并把条目并进 profile 后重启宿主。`,
+    findings.length > 0
+      ? `${String(total)} 处不一致：改完重跑 setup --mode ${mode} --apply，并把条目并进 profile 后重启宿主。`
+      : `${String(total)} 处搜索配置不一致：按上面逐条的修复动作改 ${profile} 里 web 条目的 config，重启宿主生效。`,
   );
   return 1;
 }
@@ -572,7 +605,9 @@ async function installPack(flags: FlagMap, deps: CliDeps): Promise<number> {
     return 2;
   }
   const offline = stringFlag(flags, "offline");
-  if (flags.has("offline") && (offline === undefined || offline === "")) {
+  // `--offline` 是取值旗标：给了就一定带一个字符串（缺值或紧跟另一个旗标在 parseArgs
+  // 那层已判 invalid），所以这里只可能是「显式给了空串」这一种缺值形态。
+  if (offline === "") {
     deps.log("--offline 要给一个资产目录");
     return 2;
   }

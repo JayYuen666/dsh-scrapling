@@ -76,7 +76,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`。包在公共 npm registry 上，安装不需要凭据，也不需要 scoped-registry 配置行。
 
 - **需要 Node.js `>= 22.18`。** 本包是 ESM-only，且构建入口（`build-client.ts`、`build-host.ts`、`build-cli.ts`）由 `node` 直接执行；TypeScript 的类型剥离自 Node 22.18 起默认开启，这条下限保证 `pnpm build` 与 `prepack` 在声明支持的版本上能跑通。
-- **需要宿主 `dsh` 处在 `0.2.1-rc.3` / `0.2.2-alpha.2` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.1-rc.3`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时最近的三个已发布宿主版本上逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
+- **需要宿主 `dsh` 处在 `0.2.1-rc.5` 或 `0.2.2-alpha.3` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.1-rc.5 || ^0.2.2-alpha.3`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
 - **需要 Python 3.14+ 且装好 Scrapling** —— 由 `pythonBin` 指定，或按 `lib/runtime.ts` 的固定链找到：`dataDir/runtime` 下的托管 runtime → 仓内 `_env/.venv` → `PATH`。装出去的包里没有 `_env/.venv` 这一档，所以跑过 `setup --feature core --apply` 的机器用的是那支托管解释器，没装过就是你 `PATH` 上的 `python3`（Windows 上是 `python`）；选中哪一支会在装载时写进日志，缺 Scrapling 时报错里带着可直接照抄的安装命令。
 
 ```sh
@@ -105,7 +105,7 @@ dsh-scrapling setup --status
 ```
 
 - `core` 装托管 Python 3.14.9、Scrapling 0.5 与钉死的 wheel；`browser` 再加完整 Chromium（不是 headless shell）。
-- `search`、`media`、`mcp` 与 `adaptive-redis` 都以 `core` 的 venv 为载体：`mcp` 带来 `official-mcp` 模式要的官方 `scrapling-mcp` server（`mcp` 包，16 个工具），`adaptive-redis` 带来 `adaptiveStorage: redis` 背后的 `redis` 客户端。六个包都可安装；设置卡把每个包报成 `ready`、`missing`、`corrupt` 或 `installing`。
+- `search`、`media`、`mcp` 与 `adaptive-redis` 都以 `core` 的 venv 为载体：`mcp` 带来 `official-mcp` 模式要的官方 `scrapling-mcp` server（随钉住的 `mcp` 包进来；它的工具集由上游决定，不是本插件的面），`adaptive-redis` 带来 `adaptiveStorage: redis` 背后的 `redis` 客户端。六个包都可安装；设置卡把每个包报成 `ready`、`missing`、`corrupt` 或 `installing`。
 - `--feature` 默认 dry-run；`--apply` 才落盘。`--repair` 重装且不碰用户数据；`--uninstall <包> [--purge]` 删运行时文件，只有 `--purge` 才连 `elements_storage.db` 与 `downloads/` 一起删。
 - `--offline <目录>` 全程不联网：`<目录>` 里要有 Python 归档（文件名与清单 URL 的最后一段一致，浏览器与 `curl -O` 落盘的 `cpython-3.14.9+…-install_only.tar.gz` 可用，百分号转义那种写法也认），以及一个 `wheels/` 目录（每条钉版一枚 wheel，可用 `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <目录>/wheels` 生成）。Python 归档的哈希校验与联网路径一致，pip 带 `--no-index`；缺归档或缺 wheelhouse 时报 `INSTALL_OFFLINE_ASSETS`，不会悄悄退回联网。
 - `setup --status` 打印一份 JSON：`dataDir`、`profile`、`runtime`、`packs` 与 `state`。带 `--profile <目录>` 时读该 profile 的 `cordis.patch.yml`，按本包条目里的 `pythonBin`（宿主真正在用的那个设置）解析解释器；不带时 `profile.path` 为 `null`，输出里有一句说明没读 profile，`runtime` 回落到 CLI 自己的链（托管 runtime → 仓内 `_env/.venv` → PATH `python3`）。要拿 `--status` 和设置卡上的解释器对照，就带上 `--profile`。
@@ -230,7 +230,8 @@ dsh-scrapling setup --status
 要接进 dsh 需要 `@deepseek-ai/dsh-mcp-client`，本插件刻意不依赖它。装与当期宿主同一条线的版本 —— npm 的 `latest` 比宿主还旧，宿主对不匹配的对端是直接拒绝：
 
 ```bash
-dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.1-rc.3
+dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.2-alpha.3
+# 宿主在 0.2.1-rc.5 线时改用 @deepseek-ai/dsh-mcp-client@0.2.1-rc.5
 ```
 
 再往那个 profile 的 `cordis.patch.yml` 加一条（没配 token 就不写 `headers`）：
@@ -263,7 +264,7 @@ dsh-scrapling setup --mode native --apply     # 写出的文件里一条条目�
 dsh-scrapling doctor --mode mcp --profile <profileDir>
 ```
 
-`doctor` 读的是 profile 自己写下的东西 —— `cordis.patch.yml` 加那份 `package.json` —— 每处问题打一行：`serverName: scrapling` 下有两条例目、本插件的条目与官方 `stdio` 那条并存、条目类型与模式不符、条目的端口与 `--port` 说的不一致、profile 里没有 `@deepseek-ai/dsh-mcp-client` 或它钉的不是 `0.2.1-rc.3` / `next`、以及 `officialMcpEnabled` 关着却留着官方条目。退 `0` 是一致，`1` 是至少点出一处，`2` 是参数不对。`integrationMode` 本身是插件设置，CLI 读不到，所以 `--mode` 就是被核对的那一句声明，它必须和部署配置说的是同一件事。
+`doctor` 读的是 profile 自己写下的东西 —— `cordis.patch.yml` 加那份 `package.json` —— 每处问题打一行：`serverName: scrapling` 下有两条例目、本插件的条目与官方 `stdio` 那条并存、条目类型与模式不符、条目的端口与 `--port` 说的不一致、profile 里没有 `@deepseek-ai/dsh-mcp-client` 或它钉的不是 `0.2.2-alpha.3` / `0.2.1-rc.5` / `next`、以及 `officialMcpEnabled` 关着却留着官方条目。退 `0` 是一致，`1` 是至少点出一处，`2` 是参数不对。`integrationMode` 本身是插件设置，CLI 读不到，所以 `--mode` 就是被核对的那一句声明，它必须和部署配置说的是同一件事。
 
 `official-mcp` 要两处分开表态才会产出：profile 里的 `officialMcpEnabled: true`，以及命令行的 `--accept-risk`；缺任何一处只打 `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED`，一个字节都不写。它生成的条目起的是 `<dataDir>/runtime/venv/bin/scrapling-mcp`，所以要先跑 `setup --feature mcp --apply` —— 见[运行时能力包](#运行时能力包macos-arm64)。那枚二进制不存在时，`setup` 会额外打一行说明这条条目现在起不来。
 
@@ -297,7 +298,7 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 | `syntheticDnsRanges` | string | `""` | 合成 DNS 的手动兜底：填代理 fake-IP 池的 CIDR（逗号分隔），留给把合成地址与真地址混着返回的解析器。写错的段直接丢掉 —— 兜底坏了退化成「维持最严」，不该崩 |
 | `proxyUrl` | string | `""` | 抓取从哪儿出去（`http://…` / `socks5://…`，可带 `user:pass@`）。留空 = 跟随环境，见[代理](#代理)。卡上遮罩显示，绝不进入工具 schema |
 | `proxyBypass` | string | `""` | 直连、不走代理的主机名，对应 `NO_PROXY`；填 `*` 表示整台机器直连 |
-| `nat64Prefixes` | string | `""` | 额外的 NAT64 前缀（逗号分隔的 CIDR），给运营商自建网络用；声明的前缀对所有 IPv6 地址生效 |
+| `nat64Prefixes` | string | `""` | 额外的 NAT64 前缀（逗号分隔的 `<IPv6 前缀>/<32\|40\|48\|56\|64\|96>`），给运营商自建网络用。每个 IPv6 应答都会查这张表，声明的前缀对它覆盖范围内的地址生效。写错的项会让插件**拒绝装载**（`CONFIG_INVALID`），与下面 `syntheticDnsRanges` 的「丢掉」不同：丢掉一个前缀等于把藏在 IPv6 里的私网 IPv4 当成普通公网 IPv6 放行 |
 
 **部署级旋钮**（不在卡上，只走 `cordis.patch.yml` 的 `config:` 块）：
 

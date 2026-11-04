@@ -15,6 +15,10 @@ permissions:
   # a configured static token"），下面那个 secret 只在交换失败时才有用；registry 上该版本的
   # _npmUser 记作 GitHub Actions <npm-oidc-no-reply@github.com> 正是这条路走通的痕迹。
   id-token: write
+# 与 ci.yml 同一枚取值：门禁 certify 的那棵树与发布装的树要由同一个 pnpm 解出。GitHub Actions 没有
+# 跨文件的 env，抬版本时与 ci.yml 那份一起动。
+env:
+  PNPM_VERSION: 12.11.2
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -27,12 +31,14 @@ jobs:
       # 用「失败」而不是 job 级 `if:` 跳过：跳过在结论上是绿的，误点的人只会看到工作流"成功"。
       - name: 确认发布只发生在默认分支
         env:
-          TARGET_REF: ${{ github.ref_name }}
+          # 比完整 ref 而不是比 ref_name：`ref_name` 会剥掉 `refs/heads/` / `refs/tags/`
+          # 前缀，于是一枚叫 `main` 的 tag 也能通过这道守卫，把 tag 那棵树推上 registry。
+          TARGET_REF: ${{ github.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          if [ "$TARGET_REF" != "$DEFAULT_BRANCH" ]; then
-            echo "::error::发布只能从默认分支（$DEFAULT_BRANCH）派发，当前是 $TARGET_REF。要发版请先把改动合进默认分支再 dispatch。"
+          if [ "$TARGET_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::发布只能从默认分支（refs/heads/$DEFAULT_BRANCH）派发，当前是 $TARGET_REF。要发版请先把改动合进默认分支再 dispatch。"
             exit 1
           fi
       # action 按 tag 引用意味着上游动 tag 就等于本仓换了构建器。钉 commit SHA，
@@ -42,9 +48,9 @@ jobs:
           # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
           # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 12
+          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -53,6 +59,28 @@ jobs:
           # 全套依赖的时间。发布链本来就有 install + 完整 check + prepack，缓存命中的是其中
           # 最长的那一段。
           cache: pnpm
+      # 版本号一旦占用就撤不回（只能弃号再发新版），而 registry 上已有这一版时本次什么都不会
+      # 发出去。这一步只花一次 HTTP 请求，挡掉的是后面 venv + Chromium + 完整 check 那几十分钟；
+      # `concurrency` 那一道只挡并行的两次 dispatch，串行重复点（上次成功后又点一次）它看不见。
+      - name: 确认这个版本还没发过
+        run: |
+          set -euo pipefail
+          SELFN="$(node -p "require('./package.json').name")"
+          SELFV="$(node -p "require('./package.json').version")"
+          # 包名里的 `@` 与 `/` 都要编码：`@scope/pkg` 直接拼进路径会被 registry 读成两段。
+          SLUG="$(node -p "encodeURIComponent(process.argv[1])" "$SELFN")"
+          # curl 失败（网络抖动、registry 5xx）不能把这次发布判成失败：真正的占用判据是
+          # registry 自己在 publish 那一步回的 E409，这一道只是提前几分钟说同一件事。
+          code=$(curl -sS --max-time 30 --retry 2 -o /dev/null -w "%{http_code}" \
+            "https://registry.npmjs.org/${SLUG}/${SELFV}") || code=000
+          case "$code" in
+            200)
+              echo "::error::${SELFN}@${SELFV} 已存在于 registry，本次没有可发布的内容"
+              exit 1
+              ;;
+            404) ;;
+            *) echo "::warning::版本查询回了 ${code}，预检无法定论；继续发布，占用由 registry 判" ;;
+          esac
       # 测试里有一批用例以 existsSync(_env/.venv/bin/python3) 为前提才能真跑起来。那个目录被
       # gitignore（它是机器本地状态），所以 CI 上必须自己备一份。缺了它，那批用例会退化成空转：
       # host.ts 的覆盖率从 100% 掉到 58%，门禁随之变红——而报错只说「覆盖率不达标」，真正的原因
@@ -97,10 +125,12 @@ jobs:
       # 这一步只做两件事：token 在场就校验形态、不在场就确认 OIDC 环境在。它**不决定**走哪条——
       # 认证优先级写在 permissions 那段注释里：OIDC 在前，token 只兜底。
       - name: 确认发布凭据（OIDC 优先，回落静态 token）
-        id: norm
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # 与本文件其余 run 块同一口径：没有 `set -e` 时管道里的失败会被吞掉，
+          # 于是 `tr` 拿不到东西时下一步的判据会把「命令坏了」说成「凭据里混了非法字符」。
+          set -euo pipefail
           TOKEN="$(printf '%s' "$NPM_TOKEN" | tr -d '\r\n[:space:]')"
           if [ -n "$TOKEN" ]; then
             echo "::add-mask::$TOKEN"
@@ -159,6 +189,15 @@ jobs:
               401|403)
                 echo "::warning::静态 token 被 registry 拒（HTTP $code）——本次不启用它，按 OIDC 发布。这枚 secret 已失效，用完请到 Settings → Secrets 删掉，否则每次发布都留一条本行告警。"
                 PASS_TOKEN=""
+                # 回落要有落点：上面「凭据形态」那一步在 token 在场时提前 exit 0，OIDC 环境是否
+                # 可用从没被判过。token 在这里失效后如果 OIDC 也不在，真正的失败要等到 pnpm
+                # publish 才以它的原始报错出现，和「凭据失效」混成一件事。同一条判据先问一次。
+                if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+                  echo "静态 token 被拒（HTTP $code），且本 job 没有 OIDC 环境（ACTIONS_ID_TOKEN_REQUEST_URL 为空）——两条凭据路都不可用"
+                  echo "补法二选一：① 换掉仓库 Secrets 里的 NPM_TOKEN；② 保留 permissions: id-token: write，并在 npmjs.com 的 Trusted Publisher 里登记本仓与本 workflow"
+                  exit 1
+                fi
+                echo "回落条件成立：本 job 有 id-token 环境，按 OIDC 发布"
                 ;;
               *)
                 echo "whoami 返回 HTTP $code——既不是 200 也不是凭据被拒的 401/403，属 registry 侧异常，先查状态页再发"
@@ -172,7 +211,19 @@ jobs:
             code=$(curl "${CURL_FLAGS[@]}" -o /dev/null -w "%{http_code}" "https://registry.npmjs.org/$pkg")
             echo "读 $pkg：HTTP $code"
             if [ "$code" != "200" ]; then
-              echo "判读：404 = 该依赖库还没发到 npmjs，先发它；本包是它的消费方，装不上依赖"
+              # 只有 404 才说明「那一版还没发」；429 与 5xx 是 registry 自己没答上来（重试耗尽后
+              # 也落在这里），把它们说成「先发依赖库」会把人支到另一条路上去做一件不必要的事。
+              case "$code" in
+                404)
+                  echo "判读：404 = 该依赖库还没发到 npmjs，先发它；本包是它的消费方，装不上依赖"
+                  ;;
+                429|5??)
+                  echo "判读：HTTP $code 是 registry 侧的限流或服务异常（上面的 --retry 已耗尽），先去 status.npmjs.org 看，确认恢复后重跑本次发布，不要去动依赖库"
+                  ;;
+                *)
+                  echo "判读：HTTP $code 不是 200 也不是 404，本步判不出依赖库的发布状态；先重跑，仍然同样回执再按 registry 侧异常处理"
+                  ;;
+              esac
               exit 1
             fi
           done

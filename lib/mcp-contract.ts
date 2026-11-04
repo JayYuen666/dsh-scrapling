@@ -32,14 +32,17 @@ export const MCP_CLIENT_PACKAGE = "@deepseek-ai/dsh-mcp-client";
  * npm 的 `latest` 比宿主线还旧（`0.0.1-rc.1`），宿主对字面 peer 不匹配的对端是**拒绝装载**——
  * 装得上、永不生效，所以这里不写 `latest`，也不写范围。
  */
-export const MCP_DEFAULT_CLIENT_PIN = "0.2.1-rc.3";
+export const MCP_DEFAULT_CLIENT_PIN = "0.2.2-alpha.3";
 
-/** 客户端允许的两种钉法：与宿主同线的那一版，或 npm 的 `next` 标签。
+/** 客户端允许的钉法：两条宿主线各自的同线版本，或 npm 的 `next` 标签。
+ *
+ *  本包的宿主窗口是 `^0.2.1-rc.5 || ^0.2.2-alpha.3`，两条线都要有各自的同线客户端，
+ *  否则宿主按字面版本拒绝装载。默认取开发线 alpha.3，rc 线上部署用 rc.5。
  *
  *  `next` 是刻意的例外：它随 npm dist-tag 漂移，可能偏离宿主线而让条目「装得上、
  *  永不生效」。放行它是为了跟踪官方 server 的 beta 线；对稳定性优先的部署应使用默认
  *  的字面版本，doctor 也会在发现不匹配时点名。 */
-const MCP_CLIENT_PIN_VALUES = [MCP_DEFAULT_CLIENT_PIN, "next"] as const;
+const MCP_CLIENT_PIN_VALUES = [MCP_DEFAULT_CLIENT_PIN, "0.2.1-rc.5", "next"] as const;
 export type McpClientPin = (typeof MCP_CLIENT_PIN_VALUES)[number];
 export const MCP_CLIENT_PINS: readonly string[] = MCP_CLIENT_PIN_VALUES;
 

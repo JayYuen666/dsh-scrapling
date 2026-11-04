@@ -11,6 +11,8 @@
 // `localeDictionaries()` 把它摊成宿主 locale 服务要的扁平键，卡片只通过 `t()` 取字，
 // 于是「字段表」与「真正显示出来的文案」不可能各走各的。
 
+import { SEARCH_BACKENDS } from "../lib/search-backends.ts";
+
 /** 一个字段的控件形态。 */
 export type FieldKind = "boolean" | "text" | "number" | "enum";
 
@@ -86,8 +88,8 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         kind: "text",
         label: { zh: "Python 解释器", en: "Python interpreter" },
         hint: {
-          zh: "留空：先用仓内 _env/.venv（装了才用），否则用 PATH 上的 python3（Windows 上是 python）；装了 pyenv/conda 时填绝对路径。",
-          en: "Empty: use the repo's _env/.venv when it exists, else python3 from PATH (python on Windows); give an absolute path under pyenv/conda.",
+          zh: "留空：按「托管 runtime（macOS arm64，装过才用）→ 仓内 _env/.venv（装了才用）→ PATH 上的 python3（Windows 上是 python）」依次探测，卡面上的「运行环境」会显示命中的是哪一档；装了 pyenv/conda 时填绝对路径。",
+          en: "Empty: probed in order — managed runtime (macOS arm64, only once installed), the repo's _env/.venv when it exists, then python3 from PATH (python on Windows); the Runtime row shows which one won. Give an absolute path under pyenv/conda.",
         },
         fallback: "",
       },
@@ -359,8 +361,8 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
     id: "browser",
     title: { zh: "浏览器行为", en: "Browser behaviour" },
     note: {
-      zh: "只在渲染 / XHR 两条路径上生效。",
-      en: "Only affects the render / XHR paths.",
+      zh: "影响所有走浏览器的路径：渲染、XHR 快照与会话类工具。会话里「无头运行」与「拦广告」在开场时定死，中途改不了；其余几档每次抓取各自生效。",
+      en: "Affects every browser path: render, XHR capture and the session tools. Inside a session, Headless and Block ads are fixed at open; the rest apply per fetch.",
     },
     fields: [
       {
@@ -429,8 +431,8 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         kind: "number",
         label: { zh: "单次抓取超时（毫秒）", en: "Per-fetch timeout (ms)" },
         hint: {
-          zh: "同时是工具的超时预算与 Python 侧的请求上限。",
-          en: "Also the tool budget and the Python-side request cap.",
+          zh: "是工具调用与 sidecar 那一帧的超时预算，也当作浏览器页面的等待预算发下去。静态路径每次请求的秒数上限另有其数：部署配置里的 requestTimeoutSeconds（默认 120，这张卡上没有这一项），模型也能按次用 timeoutSeconds 调小。",
+          en: "The budget for the tool call and for one sidecar frame, and the wait budget sent for browser pages. Static requests have their own cap: requestTimeoutSeconds in the deployment config (120 by default; not a field on this card), which the model can also lower per call with timeoutSeconds.",
         },
         fallback: 120_000,
       },
@@ -542,11 +544,11 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
       {
         key: "searchBackend",
         kind: "enum",
-        options: ["auto", "tavily", "bing", "brave", "serper", "duckduckgo", "searxng"],
+        options: [...SEARCH_BACKENDS],
         label: { zh: "搜索发现后端", en: "Search discovery backend" },
         hint: {
-          zh: "auto 有 Tavily key 走 Tavily、配了 SearXNG 走 SearXNG；两者都没有时，只有打开「允许公共搜索回退」才走公共引擎（DuckDuckGo → Bing）。只有 Tavily 与 Bing 打过真实端点；其余四条按文档形状实现，真实 key 未验。",
-          en: 'auto uses Tavily when a key is set, SearXNG when an instance is configured; with neither, only "Allow public search fallback" routes to public engines (DuckDuckGo → Bing). Only Tavily and Bing have been run against the real endpoints; the other four follow their documented shapes and are unverified with real keys.',
+          zh: "auto 有 Tavily key 走 Tavily、配了 SearXNG 走 SearXNG；两者都没有时，只有打开「允许公共搜索回退」才走公共 Bing —— auto 不会挑 DuckDuckGo，那档只能显式选。只有 Tavily 与 Bing 打过真实端点；其余四条按文档形状实现，真实 key 未验。",
+          en: 'auto uses Tavily when a key is set and SearXNG when an instance is configured; with neither, only "Allow public search fallback" routes to public Bing — auto never picks DuckDuckGo, that backend has to be selected explicitly. Only Tavily and Bing have been run against the real endpoints; the other four follow their documented shapes and are unverified with real keys.',
         },
         fallback: "auto",
       },
@@ -555,8 +557,8 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         kind: "boolean",
         label: { zh: "允许公共搜索回退", en: "Allow public search fallback" },
         hint: {
-          zh: "默认关。打开后 auto 后端在没配 key、也没配 SearXNG 时会回落到 DuckDuckGo/Bing —— 查询词会发给公共引擎。",
-          en: "Off by default. When enabled, the auto backend falls back to DuckDuckGo/Bing if no API key or SearXNG is configured — queries are then sent to public engines.",
+          zh: "默认关。打开后 auto 后端在没配 key、也没配 SearXNG 时会回落到公共 Bing —— 查询词会发给公共引擎。",
+          en: "Off by default. When enabled, the auto backend falls back to public Bing if no API key or SearXNG is configured — queries are then sent to a public engine.",
         },
         fallback: false,
       },
@@ -599,10 +601,13 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         format: "url",
         // 后端按 http(s) 请求 /search?format=json；其它协议的串写得进去也发不出去。
         schemes: ["http:", "https:"],
+        // 自建实例常把 basic auth 写在地址里（`z.url()` 认 user:pass@，实测收得下），
+        // 明文摆在输入框里等于把密码摊在屏幕上。
+        secret: true,
         label: { zh: "SearXNG 实例地址", en: "SearXNG instance URL" },
         hint: {
-          zh: "SearXNG 后端必填，例如 https://searx.example.com；会拼上 /search?format=json。留空表示这条后端不可用。",
-          en: "Required by the SearXNG backend, e.g. https://searx.example.com; /search?format=json is appended. Empty means the backend is unusable.",
+          zh: "SearXNG 后端必填，例如 https://searx.example.com；会拼上 /search?format=json。留空表示这条后端不可用。值按密码遮罩显示，点「显示」可查看。",
+          en: "Required by the SearXNG backend, e.g. https://searx.example.com; /search?format=json is appended. Empty means the backend is unusable. Masked like a password; press Show to reveal it.",
         },
         fallback: "",
       },
@@ -667,7 +672,7 @@ const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = 
     statusReadonly: "这个连接以只读方式运行，设置改不了。",
     statusClean: "没有未保存的改动",
     statusChanged: "已改动 {count} 项，未保存",
-    statusInvalid: "有 {count} 项填的不是合法数字，改好后才能保存",
+    statusInvalid: "有 {count} 项填得不合法，改好后才能保存",
     rejected: "保存被宿主拒绝了，设置未改动",
     stale: "设置已经被别处改过，请重新打开这张卡再保存",
     failed: "保存失败：{reason}",
@@ -705,7 +710,7 @@ const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = 
     statusReadonly: "This connection runs read-only; settings cannot be changed here.",
     statusClean: "No unsaved changes",
     statusChanged: "{count} change(s) not saved yet",
-    statusInvalid: "{count} field(s) are not valid numbers; fix them to save",
+    statusInvalid: "{count} field(s) are not valid; fix them to save",
     rejected: "The host refused the save; nothing changed",
     stale: "Settings changed elsewhere; reopen this page before saving",
     failed: "Save failed: {reason}",
