@@ -29,9 +29,10 @@ const root = import.meta.dirname;
 // "zod"，但这条判据不该依赖「将来没人改用 JSX 自动运行时」。
 //
 // 其余裸说明符（node: 前缀与相对路径已由 rolldown 处理，不在此列）不外部化：产物是
-// 浏览器侧的单文件，除宿主提供的 react 与 zod 之外不该在运行期解析任何东西。
+// 浏览器侧的单文件，除宿主提供的 react、zod 与 shared 的客户端面之外不该在运行期解析
+// 任何东西——shared 由 profile 里那一行无 id 的组件条目供，内联会得到第二份卡片状态。
 // zod 同样是宿主 `PLATFORM_MODULES` 冻结模块表里的一枚；内联会得到第二份 zod 身份。
-const isExternal = externalizePackages(["react", "zod"]);
+const isExternal = externalizePackages(["react", "zod", "@jayyuen66/dsh-plugin-shared"]);
 
 const nameKey = "name";
 

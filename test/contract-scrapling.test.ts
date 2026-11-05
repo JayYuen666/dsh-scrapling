@@ -114,9 +114,11 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
     // capture.fetch 与 session.fetch.stealth 从 11 掉到 9：那两个默认键（blocked_domains /
     // disable_resources）不再被无条件预置——调用方没显式给就整条不发，否则等于替调用方
     // 覆盖上游默认（两键都在 FETCH_LEVEL_KEYS 里，所以两条会话路径各掉两格）。下限跟着
-    // 实测值走；若真有驱动退化，掉破的仍是这一条。
+    // 实测值走；若真有驱动退化，掉破的仍是这一条。browser.render 从 20 掉到 19：本包撤掉了
+    // CDP 端点那枚旋钮（Scrapling 0.5.1 把 cdp_url 收归 RemoteSession，递给 StealthSession
+    // 会 TypeError），少发一枚键是预期结果，不是驱动退化。
     const FLOORS: Record<string, number> = {
-      "browser.render": 20,
+      "browser.render": 19,
       "capture.open": 10,
       "capture.fetch": 9,
       "session.open.stealth": 10,
@@ -179,7 +181,6 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
         "timeout",
         "block_ads",
         "executable_path",
-        "cdp_url",
         "locale",
         "timezone_id",
         "useragent",

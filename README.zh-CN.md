@@ -11,8 +11,8 @@
   <a href="https://www.npmjs.com/package/@jayyuen66/dsh-scrapling"><img src="https://img.shields.io/npm/d18m/@jayyuen66/dsh-scrapling?style=flat-square" alt="npm downloads (total)" /></a>
   <a href="https://github.com/JayYuen666/dsh-scrapling/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-scrapling/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
-  <img src="https://img.shields.io/badge/node-%3E%3D22.18-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.3-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.5-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -75,7 +75,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`。包在公共 npm registry 上，安装不需要凭据，也不需要 scoped-registry 配置行。
 
-- **需要 Node.js `>= 22.18`。** 本包是 ESM-only，且构建入口（`build-client.ts`、`build-host.ts`、`build-cli.ts`）由 `node` 直接执行；TypeScript 的类型剥离自 Node 22.18 起默认开启，这条下限保证 `pnpm build` 与 `prepack` 在声明支持的版本上能跑通。
+- **需要 Node.js `>= 24.9`。** 本包是 ESM-only，且构建入口（`build-client.ts`、`build-host.ts`、`build-cli.ts`）由 `node` 直接执行，所以下限必须落在 TypeScript 类型剥离默认开启的那一侧（Node 22.18 起）。数字本身取自宿主：`0.2.2` 系列宿主声明 Node `>= 24.9.0`，低于它的宿主根本起不来。
 - **需要宿主 `dsh` 处在 `0.2.1-rc.5` 或 `0.2.2-alpha.3` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.1-rc.5 || ^0.2.2-alpha.3`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
 - **需要 Python 3.14+ 且装好 Scrapling** —— 由 `pythonBin` 指定，或按 `lib/runtime.ts` 的固定链找到：`dataDir/runtime` 下的托管 runtime → 仓内 `_env/.venv` → `PATH`。装出去的包里没有 `_env/.venv` 这一档，所以跑过 `setup --feature core --apply` 的机器用的是那支托管解释器，没装过就是你 `PATH` 上的 `python3`（Windows 上是 `python`）；选中哪一支会在装载时写进日志，缺 Scrapling 时报错里带着可直接照抄的安装命令。
 
@@ -130,7 +130,7 @@ dsh-scrapling setup --status
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
-- `dsh.bundle.patch` 指向 `cordis.patch.yml`，唯一一行注册是 `- id: scrapling`，`name` 用**裸包名** —— 宿主只扫裸包名条目的 `dsh.client` 声明。
+- `dsh.bundle.patch` 指向 `cordis.patch.yml`，里面是**两条条目**：`- name: "@jayyuen66/dsh-plugin-shared"`（卡片组件的供应行，**刻意不写 `id`**，所以插件页不会把它列成可停用组件）与 `- id: scrapling`，`name` 用**裸包名** —— 宿主只扫裸包名条目的 `dsh.client` 声明。
 - client 半注册两个面：设置卡（坐在 `plugins.bundle.config` 槽上，键是 bundle 包名 —— 宿主按 `entryKey: pkg.name` 派发，所以卡画在本包的详情页上），以及每个工具在 `tool.call.toolview` 上的一行结果，用官方 tool-call 视图 props 画。
 - 设置命名空间就是条目 id `scrapling`；优先级为 设置卡现值 > 注册行 `config:` > schema 默认值。把一项改回默认值保存的是**清除覆盖**而不是写入同一个值，将来默认值变了你这一项也会跟着变。
 - 闸门策略与 sidecar 环境在插件 `apply()` 时取一次快照 —— **设置卡的改动要等下次启动才生效**。
@@ -230,7 +230,8 @@ dsh-scrapling setup --status
 要接进 dsh 需要 `@deepseek-ai/dsh-mcp-client`，本插件刻意不依赖它。装与当期宿主同一条线的版本 —— npm 的 `latest` 比宿主还旧，宿主对不匹配的对端是直接拒绝：
 
 ```bash
-dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.2-alpha.3
+dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.2-rc.1
+# 宿主在 0.2.2-alpha.3 线时改用 @deepseek-ai/dsh-mcp-client@0.2.2-alpha.3
 # 宿主在 0.2.1-rc.5 线时改用 @deepseek-ai/dsh-mcp-client@0.2.1-rc.5
 ```
 
@@ -264,7 +265,7 @@ dsh-scrapling setup --mode native --apply     # 写出的文件里一条条目�
 dsh-scrapling doctor --mode mcp --profile <profileDir>
 ```
 
-`doctor` 读的是 profile 自己写下的东西 —— `cordis.patch.yml` 加那份 `package.json` —— 每处问题打一行：`serverName: scrapling` 下有两条例目、本插件的条目与官方 `stdio` 那条并存、条目类型与模式不符、条目的端口与 `--port` 说的不一致、profile 里没有 `@deepseek-ai/dsh-mcp-client` 或它钉的不是 `0.2.2-alpha.3` / `0.2.1-rc.5` / `next`、以及 `officialMcpEnabled` 关着却留着官方条目。退 `0` 是一致，`1` 是至少点出一处，`2` 是参数不对。`integrationMode` 本身是插件设置，CLI 读不到，所以 `--mode` 就是被核对的那一句声明，它必须和部署配置说的是同一件事。
+`doctor` 读的是 profile 自己写下的东西 —— `cordis.patch.yml` 加那份 `package.json` —— 每处问题打一行：`serverName: scrapling` 下有两条例目、本插件的条目与官方 `stdio` 那条并存、条目类型与模式不符、条目的端口与 `--port` 说的不一致、profile 里没有 `@deepseek-ai/dsh-mcp-client` 或它钉的不是 `0.2.2-rc.1` / `0.2.2-alpha.3` / `0.2.1-rc.5` / `next`、以及 `officialMcpEnabled` 关着却留着官方条目。退 `0` 是一致，`1` 是至少点出一处，`2` 是参数不对。`integrationMode` 本身是插件设置，CLI 读不到，所以 `--mode` 就是被核对的那一句声明，它必须和部署配置说的是同一件事。
 
 `official-mcp` 要两处分开表态才会产出：profile 里的 `officialMcpEnabled: true`，以及命令行的 `--accept-risk`；缺任何一处只打 `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED`，一个字节都不写。它生成的条目起的是 `<dataDir>/runtime/venv/bin/scrapling-mcp`，所以要先跑 `setup --feature mcp --apply` —— 见[运行时能力包](#运行时能力包macos-arm64)。那枚二进制不存在时，`setup` 会额外打一行说明这条条目现在起不来。
 
@@ -306,7 +307,7 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 | --- | --- | --- |
 | `requestTimeoutSeconds` / `maxUrlLength` | `120` / `2048` | Python 侧单次请求的硬上限；URL 长度上限与内置抓取对齐 |
 | `allowWriteMethods` | `false` | 模型能不能改对端状态 —— 见[安全说明](#安全说明) |
-| `browserExecutablePath` / `browserCdpUrl` / `browserInitScript` | `""` | 强能力：让 Chromium 执行指定文件、把浏览器交给调试端点、往每个页面注入 JS。只从部署配置来，模型入参到不了 |
+| `browserExecutablePath` / `browserInitScript` | `""` | 强能力：让 Chromium 执行指定文件、往每个页面注入 JS。只从部署配置来，模型入参到不了 |
 | `browserRealChrome` / `browserDnsOverHttps` | `false` | 改用本机安装的 Google Chrome；浏览器 DNS 走 DoH（配代理时防 DNS 泄露） |
 | `recordRequests` / `maxRecordedRequests` | `false` / `100` | 浏览器会话是否默认记录网络历史（模型可在 `scrapling_session_open` 上按次用 `recordNetwork` 打开），以及一个会话最多留多少条 |
 | `sessionStateDir` | `""` | 存放 Playwright 兼容登录态文件的目录。模型只能给**纯文件名**，目录始终是部署方的决定；留空禁用存取这一对 |
@@ -359,7 +360,7 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
   - **没有端口白名单**（默认不限端口），与 dsh 内置 fetch provider 的取舍一致。
   - **爬虫每页收进结果前复判两次** —— 一次过守卫（最终 URL 仍可能落在私网上），一次过起始域，因为 Scrapling 的 `allow_domains` 是对页面里链接的字符串比较、不管重定向目标。爬虫会话设了 `follow_redirects="safe"`，curl_cffi 拒绝跳向私网的跳转。
   - **WebSocket 覆盖依赖 Playwright 版本。** 守卫用 `route_web_socket` 拦握手；更老的 Playwright 没有这个方法，那种情况下 WebSocket 不在守卫范围内，插件把它报成握手能力里的 `websocketGuard`（启动日志会打印探测到的能力），不会静默降级。
-- **不接受来自模型的代码执行。** `page_action`、`page_setup`、`selector_config`、`proxy`、`executablePath`、`cdpUrl` 绝不进入任何工具 schema，浏览器侧的网络守卫由插件自己的代码注册。浏览器强能力与 `allowWriteMethods` 只从部署配置来。
+- **不接受来自模型的代码执行。** `page_action`、`page_setup`、`selector_config`、`proxy`、`executablePath` 绝不进入任何工具 schema，浏览器侧的网络守卫由插件自己的代码注册。浏览器强能力与 `allowWriteMethods` 只从部署配置来。
 - **写方法默认关。** `allowWriteMethods` 关着时，`method` 与 `body` 根本不在 `scrapling_fetch` 的参数面里，sidecar 那侧还独立硬拒一次非 GET（`WRITE_DISABLED`）—— 两道判断各管一侧、不依赖对方。闸门、代理判定、`follow_redirects="safe"` 管的是请求**去哪里**，不是**到了之后干什么**；被注入的页面文字完全可以要求发一个 POST，所以只有任务确实是「提交数据」时才打开。`headers` 与 `cookies` 照旧可见 —— 交给它们的任何内容按设计就会进模型上下文。
 - **反注入清洗无条件执行**，三条提取路径都过，不提供任何让模型关掉它的开关。
 

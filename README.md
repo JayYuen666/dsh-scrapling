@@ -11,8 +11,8 @@
   <a href="https://www.npmjs.com/package/@jayyuen66/dsh-scrapling"><img src="https://img.shields.io/npm/d18m/@jayyuen66/dsh-scrapling?style=flat-square" alt="npm downloads (total)" /></a>
   <a href="https://github.com/JayYuen666/dsh-scrapling/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-scrapling/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
-  <img src="https://img.shields.io/badge/node-%3E%3D22.18-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.3-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.5-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -75,7 +75,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 
 Remove with `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`. The package is on the public npm registry, so installation needs no credentials and no scoped-registry line.
 
-- **Requires Node.js `>= 22.18`.** This is an ESM-only package, and the build entry points (`build-client.ts`, `build-host.ts`, `build-cli.ts`) are executed by `node` directly; TypeScript type stripping is on by default from Node 22.18, so that is the floor that keeps `pnpm build` and `prepack` working on a declared-supported version.
+- **Requires Node.js `>= 24.9`.** This is an ESM-only package, and the build entry points (`build-client.ts`, `build-host.ts`, `build-cli.ts`) are executed by `node` directly, so the floor has to sit where TypeScript type stripping is on by default (Node 22.18 up). The number itself is the host floor: `0.2.2` hosts declare Node `>= 24.9.0`, and a host below it never starts.
 - **Requires host `dsh` at the `0.2.1-rc.5` or `0.2.2-alpha.3` line.** The requirement the host actually reads is `engines.dsh` (`^0.2.1-rc.5 || ^0.2.2-alpha.3`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against every released host version inside the window at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
 - **Requires Python 3.14+ with Scrapling installed** — named by `pythonBin`, or found by the fixed chain in `lib/runtime.ts` (managed runtime under `dataDir/runtime`, then the repository's `_env/.venv`, then `PATH`). In an installed package the `_env/.venv` leg does not exist, so after `setup --feature core --apply` the interpreter is that managed Python and otherwise the `python3` on your `PATH` (`python` on Windows); whichever one is chosen is logged at load time, and a missing Scrapling reports an error carrying the install line to copy.
 
@@ -130,7 +130,7 @@ dsh-scrapling setup --status
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
 
-- `dsh.bundle.patch` points at `cordis.patch.yml`, whose single registration line is `- id: scrapling` with the **bare package name** — the host scans `dsh.client` on bare package-name entries only.
+- `dsh.bundle.patch` points at `cordis.patch.yml`, which carries **two entries**: `- name: "@jayyuen66/dsh-plugin-shared"` (the supplier of the card components, deliberately **without an `id`** so the plugin page does not list it as a switchable component) and `- id: scrapling` with the **bare package name** — the host scans `dsh.client` on bare package-name entries only.
 - The client half registers two surfaces: the settings card (on the `plugins.bundle.config` slot, keyed by the bundle package name — the host dispatches `entryKey: pkg.name`, so the card renders on this package's detail page) and one result row per tool on `tool.call.toolview`, drawn with the official tool-call view props.
 - The settings namespace is the entry id `scrapling`; precedence is settings-card value > registration-line `config:` > schema default. Setting a field back to its default saves a **clear-override**, not a write of the same value, so a later default change still reaches you.
 - Gate policy and the sidecar environment are snapshotted once when the plugin is applied — **settings changes take effect on the next start**.
@@ -230,7 +230,8 @@ In `mcp` mode the server runs inside the plugin's own host process and calls the
 Connecting dsh needs `@deepseek-ai/dsh-mcp-client`, which this plugin deliberately does not depend on. Pin the build that matches the current host — npm `latest` is older than the host's own line and the host rejects the mismatch:
 
 ```bash
-dsh plugin --profile <name> add @deepseek-ai/dsh-mcp-client@0.2.2-alpha.3
+dsh plugin --profile <name> add @deepseek-ai/dsh-mcp-client@0.2.2-rc.1
+# host on the 0.2.2-alpha.3 line: @deepseek-ai/dsh-mcp-client@0.2.2-alpha.3
 # host on the 0.2.1-rc.5 line: @deepseek-ai/dsh-mcp-client@0.2.1-rc.5
 ```
 
@@ -264,7 +265,7 @@ dsh-scrapling setup --mode native --apply     # a file that deliberately contain
 dsh-scrapling doctor --mode mcp --profile <profileDir>
 ```
 
-`doctor` reads what the profile actually says - `cordis.patch.yml` plus that profile's `package.json` - and prints one line per problem: two entries under `serverName: scrapling`, this plugin's entry next to an official `stdio` one, entries that do not match the mode, an entry whose port disagrees with `--port`, a profile without `@deepseek-ai/dsh-mcp-client` or with it pinned to something other than `0.2.2-alpha.3` / `0.2.1-rc.5` / `next`, and an official entry while `officialMcpEnabled` is off. Exit `0` is "consistent", `1` names at least one problem, `2` is a bad argument. `integrationMode` itself is a plugin setting the CLI cannot read, so `--mode` is the claim being checked and has to match the deployment.
+`doctor` reads what the profile actually says - `cordis.patch.yml` plus that profile's `package.json` - and prints one line per problem: two entries under `serverName: scrapling`, this plugin's entry next to an official `stdio` one, entries that do not match the mode, an entry whose port disagrees with `--port`, a profile without `@deepseek-ai/dsh-mcp-client` or with it pinned to something other than `0.2.2-rc.1` / `0.2.2-alpha.3` / `0.2.1-rc.5` / `next`, and an official entry while `officialMcpEnabled` is off. Exit `0` is "consistent", `1` names at least one problem, `2` is a bad argument. `integrationMode` itself is a plugin setting the CLI cannot read, so `--mode` is the claim being checked and has to match the deployment.
 
 `official-mcp` asks for two separate statements before it produces anything: `officialMcpEnabled: true` in the profile and `--accept-risk` on the command line; missing either one prints `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED` and writes nothing. The entry it generates starts `<dataDir>/runtime/venv/bin/scrapling-mcp`, so run `setup --feature mcp --apply` first - see [Runtime packs](#runtime-packs-macos-arm64). When that binary is missing, `setup` prints a line saying so.
 
@@ -306,7 +307,7 @@ Settings live on the **scrapling** card in the plugin detail page, grouped by pu
 | --- | --- | --- |
 | `requestTimeoutSeconds` / `maxUrlLength` | `120` / `2048` | Python-side per-request ceiling; URL length cap aligned with the built-in fetch |
 | `allowWriteMethods` | `false` | Whether the model may change state on a remote host at all — see [Security](#security) |
-| `browserExecutablePath` / `browserCdpUrl` / `browserInitScript` | `""` | Strong capabilities: they hand Chromium a file to execute and the browser to a debugger endpoint, or inject a JS file into every page. Deployment config only, unreachable from model input |
+| `browserExecutablePath` / `browserInitScript` | `""` | Strong capabilities: they hand Chromium a file to execute, or inject a JS file into every page. Deployment config only, unreachable from model input |
 | `browserRealChrome` / `browserDnsOverHttps` | `false` | Use the locally installed Google Chrome; route the browser's DNS over HTTPS (useful with a proxy to avoid DNS leaks) |
 | `recordRequests` / `maxRecordedRequests` | `false` / `100` | Whether browser sessions record network history by default (the model can turn it on per session with `recordNetwork`), and how many entries a session keeps |
 | `sessionStateDir` | `""` | Directory for Playwright-compatible login-state files. The model can only pass a **plain file name**, so the directory stays a deployment decision; empty disables the state save / load pair |
@@ -359,7 +360,7 @@ Details worth knowing:
   - **No port allowlist** (any port allowed by default), matching dsh's own built-in fetch provider.
   - **The crawl re-checks every page twice** before it enters the result set — once against the guard (the final URL may still have landed somewhere private) and once against the start domain, because Scrapling's `allow_domains` is a string comparison over links found in the page, not redirect targets. The crawl session uses `follow_redirects="safe"` so curl_cffi refuses a jump into a private range.
   - **WebSocket coverage depends on the Playwright version.** The guard intercepts handshakes via `route_web_socket`; older builds lack that method, WebSocket is then outside the guard, and the plugin reports that as `websocketGuard` in the handshake capabilities (the startup log prints the probed capabilities) rather than degrading silently.
-- **No code execution from model input.** `page_action`, `page_setup`, `selector_config`, `proxy`, `executablePath` and `cdpUrl` never appear in any tool schema, and the browser-side network guard is installed by plugin code. The strong browser capabilities and `allowWriteMethods` come only from deployment config.
+- **No code execution from model input.** `page_action`, `page_setup`, `selector_config`, `proxy` and `executablePath` never appear in any tool schema, and the browser-side network guard is installed by plugin code. The strong browser capabilities and `allowWriteMethods` come only from deployment config.
 - **Write verbs are off by default.** With `allowWriteMethods` off, `method` and `body` are absent from `scrapling_fetch`'s parameter surface, and the sidecar independently refuses a non-GET with `WRITE_DISABLED` — two halves that do not rely on each other. The gate, the proxy decision and `follow_redirects="safe"` bound **where** a request goes, not **what it does once there**; prompt-injected page text can ask for a POST, so turn it on only where the task really is to submit data. `headers` and `cookies` stay available either way — anything handed to them lands in the model context by design.
 - **Prompt-injection scrubbing runs unconditionally** on all three extraction paths; there is no model-facing switch to turn it off.
 

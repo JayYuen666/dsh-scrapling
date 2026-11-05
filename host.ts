@@ -202,12 +202,6 @@ export interface Config {
    */
   browserExecutablePath: string;
   /**
-   * CDP 端点；留空表示由 Playwright 拉起进程。
-   *
-   * **安全相关**：等于把浏览器交给这个调试端点。只从部署配置来，模型入参到不了这里。
-   */
-  browserCdpUrl: string;
-  /**
    * 页面创建时注入的 JS 文件路径；留空表示不注入。部署级。
    *
    * **安全相关**：等于让页面在加载时执行这个文件里的任意 JavaScript。只从部署配置来，
@@ -434,11 +428,9 @@ const configSchema = Schema.object({
   // 官方 server 的工具集（含 browser_evaluate 这类任意 JS）不经本插件的 guard，所以默认关，
   // 且要 setup 的 --accept-risk 同一次表态才生成配置。条数不写在这里：它随上游版本漂。
   officialMcpEnabled: Schema.boolean().default(false),
-  // 浏览器二进制路径：给装在非标准位置的企业镜像 / 便携版 Chromium 用的。
+  // 浏览器二进制路径：给装在非标准位置的企业镜像 / 便携版 Chromium 用的。部署级强能力，
+  // 模型入参到不了这里。
   browserExecutablePath: Schema.string().default(""),
-  // CDP 端点：让浏览器连到一个已在运行的实例（如带着登录态的调试浏览器）。留空表示由
-  // Playwright 自己拉起进程。两项都是部署级强能力，模型入参一律到不了这里。
-  browserCdpUrl: Schema.string().default(""),
   // 页面创建时注入的 JS 文件路径：等于让页面执行这个文件，所以只从部署配置来。
   browserInitScript: Schema.string().default(""),
   // 改用本机 Google Chrome 而不是自带 Chromium：要求这台机器装了 Chrome。
@@ -1544,7 +1536,6 @@ function baseSettingsOf(config: Config, dataDir: string): BaseSettings {
     crawlMaxItems: config.crawlMaxItems.get(),
     crawlMaxRuntimeSeconds: config.crawlMaxRuntimeSeconds,
     browserExecutablePath: config.browserExecutablePath,
-    browserCdpUrl: config.browserCdpUrl,
     browserInitScript: config.browserInitScript,
     browserRealChrome: config.browserRealChrome,
     browserDnsOverHttps: config.browserDnsOverHttps,

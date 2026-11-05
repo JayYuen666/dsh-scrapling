@@ -30,8 +30,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { ToolCallViewProps } from "@deepseek-ai/dsh-client-ui-tool/client";
 import { createElement } from "react";
 import type { ReactNode } from "react";
-import { claimApply } from "@jayyuen66/dsh-plugin-shared/lib/card-apply";
-import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import { claimApply, isRecord } from "@jayyuen66/dsh-plugin-shared/client";
 import {
   BUNDLE_PACKAGE_NAME,
   LOCALE_NS,

@@ -366,9 +366,17 @@ function insertRowsOfPatch(text: string): { id: string; name: string }[] {
     }
     const id = /^\s*-\s+id:\s*(?<id>\S+)\s*$/u.exec(line)?.groups?.["id"];
     const name = /^\s+name:\s*"?(?<name>[^"]+)"?\s*$/u.exec(line)?.groups?.["name"];
+    const bareName = /^\s*-\s+name:\s*"?(?<name>[^"]+)"?\s*$/u.exec(line)?.groups?.["name"];
     if (id !== undefined) {
       finish();
       current = { id, name: "" };
+      return true;
+    }
+    if (bareName !== undefined) {
+      finish();
+      // 真实宿主把无 id 条目保持为不可定位；这里补一个仅用于 EntryOptions 的合成 id，
+      // 判据落在 name 上，组件开关的“不可停用”由宿主 dump + 沙箱验证，不靠这条夹具。
+      current = { id: bareName, name: bareName };
       return true;
     }
     if (name === undefined) {
@@ -453,9 +461,19 @@ describe("经真实 Loader 装载本插件", () => {
     // 另一条用正则扫全文取 name（会连注释与将来 config 里的 name 键一起算），两条职责重叠，
     // 补丁一演进就会静默失效。
     const text = await readFile(path.resolve(import.meta.dirname, "../cordis.patch.yml"), "utf8");
-    expect(
-      applyEntryPatches([], [{ insert: insertRowsOfPatch(text) }], (): void => undefined),
-    ).toStrictEqual([{ id: ENTRY_ID, name: PACKAGE_NAME }]);
+    const rows = applyEntryPatches(
+      [],
+      [{ insert: insertRowsOfPatch(text) }],
+      (): void => undefined,
+    );
+    const sharedPackage = "@jayyuen66/dsh-plugin-shared";
+    // shared 是卡片组件行，故意不写 id；本包的装载条目仍必须与补丁里的那一条同源。
+    expect(rows.filter((row) => row.name !== sharedPackage)).toStrictEqual([
+      { id: ENTRY_ID, name: PACKAGE_NAME },
+    ]);
+    expect(rows.find((row) => row.name === sharedPackage)).toMatchObject({
+      name: sharedPackage,
+    });
     // 装载用的就是这一条：create 交回的 id 与补丁里那条同源，链子断了这里红。
     expect(requireLoaded(loaded).id).toBe(ENTRY_ID);
   });

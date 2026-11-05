@@ -53,7 +53,7 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: 24.9
           registry-url: https://registry.npmjs.org
           # 与 ci.yml 同一口径：缓存键取自本仓的 pnpm-lock.yaml，省掉这台发布机上每次冷装
           # 全套依赖的时间。发布链本来就有 install + 完整 check + prepack，缓存命中的是其中

@@ -4,7 +4,7 @@
 与上游对得上。而真实故障形态恰好是**静默失效**：Scrapling 的会话在 fetch 层只认
 ``_fetch_params`` 的那十几个字段（``engines/_browsers/_validators.py``），其余一律
 **丢弃且不报错**；会话级才生效的东西（``record_requests``、``block_ads``、
-``executable_path``、``cdp_url``、``locale``、``timezone_id``、``useragent``、``headless``）
+``executable_path``、``locale``、``timezone_id``、``useragent``、``headless``）
 从 fetch 传进去就等于没传。表现是「设置卡拧了旋钮，行为没变」，日志里一个字都没有。
 
 做法：把引擎换成记录器，用**尽可能填满参数**的入参驱动 adapters 的真实代码路径，抓下
@@ -329,10 +329,8 @@ def _full_args(extra: dict[str, Any]) -> dict[str, Any]:
         "maxContentChars": 5000,
         "deployment": {
             # 必须是**真实存在**的文件：上游对 executable_path 有存在性校验
-            # （_validators.py 的 _is_invalid_file_path）。cdp_url 在按 kwargs
-            # 真造会话那一步会被摘掉（见 _launch_args），所以这里给什么都行。
+            # （_validators.py 的 _is_invalid_file_path）。
             "browserExecutablePath": sys.executable,
-            "browserCdpUrl": "http://127.0.0.1:9222",
             "stripInlineImages": True,
         },
     }
@@ -540,7 +538,6 @@ READ_PROBE_ARGS: dict[str, Any] = {
     "deployment": {
         "stripInlineImages": True,
         "browserExecutablePath": sys.executable,
-        "browserCdpUrl": "",
         "browserInitScript": "",
         "browserRealChrome": False,
         "browserDnsOverHttps": False,
@@ -769,9 +766,8 @@ def _launch_args(site: str) -> list[str]:
     递进来的那套反检测 flag 上（0.5 起），所以「本仓到底发没发 extra_flags」这件事只能问
     上游产物本身，而不是读我们那张表。
 
-    ``cdp_url`` / ``executable_path`` 在造之前摘掉：连上远端浏览器时上游**本来就不下发**
-    启动参数（``_base.py`` 里 ``_browser_options = {}``），留着它等于把「参数面」与
-    「上游按设计不传」两件事混成同一个读数。
+    ``executable_path`` 在造之前摘掉：它是本机文件路径而不是启动参数，留着等于把
+    「参数面」与「上游按设计不传」两件事混成同一个读数。
 
     :param site: 调用点名字（必须是 stealth 的会话级站点）
     :returns: 最终的 chromium 启动参数；造不出来时给空表
@@ -782,8 +778,8 @@ def _launch_args(site: str) -> list[str]:
     import scrapling.fetchers as fetchers
 
     kwargs = dict(call["kwargs"])
-    # page_setup 是回调，与启动参数无关；executable_path / cdp_url 见上面说明。
-    for drop in ("page_setup", "cdp_url", "executable_path"):
+    # page_setup 是回调，与启动参数无关；executable_path 见上面说明。
+    for drop in ("page_setup", "executable_path"):
         kwargs.pop(drop, None)
     try:
         session = fetchers.StealthySession(**kwargs)

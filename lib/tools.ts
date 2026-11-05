@@ -94,8 +94,6 @@ export interface ToolSettings {
   readonly crawlMaxRuntimeSeconds: number;
   /** 浏览器二进制路径；空表示用引擎自带的。部署级，模型改不了。 */
   readonly browserExecutablePath: string;
-  /** CDP 端点；空表示由引擎拉起进程。部署级，模型改不了。 */
-  readonly browserCdpUrl: string;
   /** 页面创建时注入的 JS 文件绝对路径。部署级，模型改不了。 */
   readonly browserInitScript: string;
   /** 是否改用本机安装的 Google Chrome（而不是自带 Chromium）。部署级。 */
@@ -1692,11 +1690,10 @@ function browserPayload(
       ...(args["allowWebgl"] === false ? { allowWebgl: false } : {}),
       ...networkReadParams(method, args),
       // maxUrlLength 不往线上传：它是 Host 侧 URL 闸门自己的上限，Python 从不看。
-      // deployment 是部署级能力的专用命名空间：Python 侧只从这里读浏览器二进制路径、CDP
-      // 端点、注入脚本、真实 Chrome、DoH、网络记录的开关与容量、输出形态开关。
+      // deployment 是部署级能力的专用命名空间：Python 侧只从这里读浏览器二进制路径、注入
+      // 脚本、真实 Chrome、DoH、网络记录的开关与容量、输出形态开关。
       deployment: {
         browserExecutablePath: settings.browserExecutablePath,
-        browserCdpUrl: settings.browserCdpUrl,
         browserInitScript: settings.browserInitScript,
         browserRealChrome: settings.browserRealChrome,
         browserDnsOverHttps: settings.browserDnsOverHttps,
@@ -2131,7 +2128,6 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
           blockAds: settings.blockAds,
           deployment: {
             browserExecutablePath: settings.browserExecutablePath,
-            browserCdpUrl: settings.browserCdpUrl,
             browserInitScript: settings.browserInitScript,
             browserRealChrome: settings.browserRealChrome,
             browserDnsOverHttps: settings.browserDnsOverHttps,

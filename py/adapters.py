@@ -759,7 +759,6 @@ SESSION_ONLY_KEYS = frozenset(
         "block_ads",
         "block_webrtc",
         "blocked_domains",
-        "cdp_url",
         "cookies",
         "disable_resources",
         "dns_over_https",
@@ -787,9 +786,14 @@ SESSION_ONLY_KEYS = frozenset(
 # 部署命名空间里的浏览器旋钮：源键 → 引擎参数名 → 期望类型。类型逐项写死，是因为这一层
 # 与模型入参走同一条通道而它承载的是**部署表态**：类型错了静默生效比报错更糟（例如
 # maxRecordedRequests 收到字符串，上游会拿它当容量直接炸会话构造）。
+#
+# 这里没有 CDP 端点那一枚：Scrapling 0.5.1 把 `cdp_url` 收归 RemoteSession，递给
+# StealthSession 会 `TypeError`（`engines/_browsers/_validators.py` 的
+# 「cdp_url and new_context require RemoteSession」那条），而本包没有远端会话模式。
+# 递过去在 0.5 上能用、在 0.5.1 上炸会话构造，等于让同一条文档范围 `>=0.5,<0.6` 里
+# 的两个版本行为分叉，所以这个旋钮整体撤掉。
 _DEPLOYMENT_KNOBS: tuple[tuple[str, str, type], ...] = (
     ("browserExecutablePath", "executable_path", str),
-    ("browserCdpUrl", "cdp_url", str),
     ("browserInitScript", "init_script", str),
     ("browserRealChrome", "real_chrome", bool),
     ("browserDnsOverHttps", "dns_over_https", bool),
@@ -921,7 +925,7 @@ def _session_browser_params(args: dict[str, Any]) -> dict[str, Any]:
     """会话构造期的浏览器参数：只收**只有开场才生效**的那些键。
 
     会话内每次 fetch 传 ``block_ads`` / ``record_requests`` / ``executable_path`` /
-    ``cdp_url`` / ``locale`` / ``timezone_id`` / ``useragent`` / ``headless`` 都会被
+    ``locale`` / ``timezone_id`` / ``useragent`` / ``headless`` 都会被
     ``validate_fetch`` 丢掉，于是设置卡上这些旋钮对会话路径完全不生效 —— 而且不报错。
     这里把它们挪到唯一生效的位置。
 
@@ -1587,7 +1591,7 @@ def _make_session(kind: str, args: dict[str, Any]) -> Any:
     from scrapling.fetchers import StealthySession
 
     # 只有开场才生效的那些设置（block_ads / record_requests / headless / locale /
-    # timezone_id / useragent / executable_path / cdp_url / timeout）必须在这里进会话：
+    # timezone_id / useragent / executable_path / timeout）必须在这里进会话：
     # fetch 层传过去会被 validate_fetch 静默丢掉（见 FETCH_LEVEL_KEYS）。
     common: dict[str, Any] = _session_browser_params(args)
     # 每会话的记录开关：模型可以为这一次会话打开记录（部署侧那枚是默认值）。记录不改变
@@ -1804,7 +1808,7 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
             #
             # level="fetch" 是这条路径的关键：会话内每次 fetch 只认 FETCH_LEVEL_KEYS，
             # 其余键（block_ads / record_requests / headless / locale / timezone_id /
-            # useragent / executable_path / cdp_url，以及 hide_canvas / block_webrtc /
+            # useragent / executable_path，以及 hide_canvas / block_webrtc /
             # allow_webgl）会被 validate_fetch **静默丢掉**。那些设置已经在 session.open
             # 时经 _session_browser_params 进过会话了，这里再发一遍只会制造「拧了没反应」
             # 的假象。

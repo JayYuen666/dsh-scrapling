@@ -49,7 +49,7 @@ import {
   TextField,
   ToggleField,
   splitHint,
-} from "@jayyuen66/dsh-plugin-shared/lib/card-ui";
+} from "@jayyuen66/dsh-plugin-shared/client";
 
 /** 宿主 locale 服务给的翻译函数；键域是本包的字典键。 */
 export type Translate = (key: string, params?: Record<string, unknown>) => string;
@@ -267,7 +267,7 @@ export function buildOps(draft: Readonly<Record<string, unknown>>): PathOp[] {
 const BUTTON_CLASS = "dsu-btn";
 const STATUS_CLASS = "dsu-hint";
 
-/** 卡片样式：字段版式与控件外观由 @jayyuen66/dsh-plugin-shared/lib/card-ui 提供，这里只留本卡特有的运行环境区。 */
+/** 卡片样式：字段版式与控件外观由 @jayyuen66/dsh-plugin-shared/client 提供，这里只留本卡特有的运行环境区。 */
 const CARD_CSS = `
 .dss-secret{display:flex;gap:8px;align-items:center;width:100%}
 .dss-reveal{flex:none;white-space:nowrap}

@@ -4,7 +4,7 @@ Fetches and extracts web pages — JavaScript rendering, CSS/XPath extraction wi
 
 ## What the card changes
 
-Forty-nine card values grouped by purpose; most are read per call, so a change applies on the next tool call. The values read once when the plugin is assembled need it assembled again — restart the host. That set is: the fifteen tool switches, `provideWebFetch` / `provideWebSearch` together with everything the search provider snapshots alongside them (`searchBackend`, the per-vendor keys, `searxngEndpoint`, `fetchMaxOutputChars`, `fetchTimeoutMs`), plus `pythonBin`, `failFastOnMissingPython` and `dataDir`.
+Fifty card values grouped by purpose; most are read per call, so a change applies on the next tool call. The values read once when the plugin is assembled need it assembled again — restart the host. That set is: the fifteen tool switches, `provideWebFetch` / `provideWebSearch` together with everything the search provider snapshots alongside them (`searchBackend`, the per-vendor keys, `searxngEndpoint`, `fetchMaxOutputChars`, `fetchTimeoutMs`), plus `pythonBin`, `failFastOnMissingPython` and `dataDir`.
 
 - **Runtime** — `pythonBin` (empty) chooses the interpreter: an explicit path wins, then the managed capability install, then this package's development venv, then `python3` on PATH (`python` on Windows). The managed leg is only tried on macOS arm64 — the one platform with a verified capability pack — and every other platform goes straight from the explicit path to the venv and PATH legs. The plugin logs which one it picked every time. `failFastOnMissingPython` (on) refuses to load when the sidecar cannot start; an interpreter that starts but lacks Scrapling always degrades to "tools unavailable" and names the path. `dataDir` is where the sidecar's state lives.
 - **Tool switches** — fifteen of them (fetch, extract, locate, links, render, capture XHR, network history, session, session state, crawl, answer, session read, session actions, download, screenshot). Turning one off removes that tool from the model's view, and the guidance text for it disappears too.
@@ -18,7 +18,7 @@ Forty-nine card values grouped by purpose; most are read per call, so a change a
 
 `provideWebFetch` and `provideWebSearch` on the card are not enough by themselves: the deployment side must also select this plugin as the host's fetch and search provider. The same pairing applies to session actions (`allowBrowserActions`), downloads (`allowFileDownloads`, with `downloadMaxBytes` sizing a single file) and login state (`sessionStateDir` — while it is empty the save/load tools are not registered at all). A card switch alone will look like it does nothing.
 
-## Thirty deployment values stay off the card
+## Twenty-nine deployment values stay off the card
 
 They change how the plugin is wired, not what a session decides, and each takes effect only on restart. The ones you are most likely to meet:
 
@@ -26,7 +26,7 @@ They change how the plugin is wired, not what a session decides, and each takes 
 - `mcpPort` (default 39217) must equal the URL in the profile's MCP-client entry. Neither command reads `mcpPort`, so pass it yourself: `setup --mode mcp --port <mcpPort>` and `doctor --mode mcp --port <mcpPort>`. Without `--port`, setup writes the default 39217 and doctor has no expected port to compare against — a profile left on another port then passes silently.
 - `officialMcpEnabled` (off) needs both this switch and the `setup` `--accept-risk` flag before any entry is generated, because the upstream server exposes actions this plugin's guard does not see.
 - `allowWriteMethods` (off) — reading pages is this plugin's job; changing remote state is not, so that is a deployment statement.
-- Also here: browser binary and CDP endpoint, real-Chrome and DNS-over-HTTPS options, Redis URL and adaptive storage, the crawler's runtime/robots/delay/concurrency/strategy/checkpoint settings, and the search endpoints.
+- Also here: browser binary path, real-Chrome and DNS-over-HTTPS options, Redis URL and adaptive storage, the crawler's runtime/robots/delay/concurrency/strategy/checkpoint settings, and the search endpoints.
 
 Write them in the `config:` block of this plugin's row in `cordis.patch.yml`.
 

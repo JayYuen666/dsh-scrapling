@@ -119,13 +119,17 @@ describe("client.js 的 ModuleLoader 外壳", () => {
     expect(code).toMatch(/factory: \(require\) => \{\n\s*"use strict";/u);
   });
 
-  it("产物运行期只解析 react 与 zod 两个裸包", async () => {
+  it("产物运行期只解析平台模块与共享客户端行", async () => {
     const code = await buildClient();
     const specs = Array.from(
       code.matchAll(/require\("(?<spec>[^"]+)"\)/gu),
       (match) => match.groups?.["spec"] ?? "",
     );
-    expect([...new Set(specs)].toSorted()).toStrictEqual(["react", "zod"]);
+    expect([...new Set(specs)].toSorted()).toStrictEqual([
+      "@jayyuen66/dsh-plugin-shared/client",
+      "react",
+      "zod",
+    ]);
   });
 
   it("用假 require 执行 factory 后，exports 上是可运行的 apply 与宿主装配清单 inject", async () => {

@@ -299,7 +299,6 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     requestTimeoutSeconds: plain("requestTimeoutSeconds", 120),
     maxUrlLength: plain("maxUrlLength", 2048),
     browserExecutablePath: plainText("browserExecutablePath", ""),
-    browserCdpUrl: plainText("browserCdpUrl", ""),
     browserInitScript: plainText("browserInitScript", ""),
     browserRealChrome: plainFlag("browserRealChrome", false),
     browserDnsOverHttps: plainFlag("browserDnsOverHttps", false),
@@ -1213,7 +1212,6 @@ const CRAWL_SETTINGS = {
   // 爬虫用例跑本地站点，几十毫秒就结束；给一个宽到不会误触发的截止即可。
   crawlMaxRuntimeSeconds: 600,
   browserExecutablePath: "",
-  browserCdpUrl: "",
   browserInitScript: "",
   browserRealChrome: false,
   browserDnsOverHttps: false,

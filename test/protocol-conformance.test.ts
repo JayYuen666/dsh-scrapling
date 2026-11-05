@@ -60,7 +60,6 @@ const SETTINGS: ToolSettings = {
   crawlMaxItems: 1000,
   crawlMaxRuntimeSeconds: 1800,
   browserExecutablePath: "/tmp/chromium",
-  browserCdpUrl: "",
   browserInitScript: "/tmp/init.js",
   browserRealChrome: false,
   browserDnsOverHttps: true,

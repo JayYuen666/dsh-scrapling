@@ -6779,7 +6779,6 @@ def run_inprocess_adapters() -> None:
             "extraHeaders": {"A": "b"},
             "deployment": {
                 "browserExecutablePath": "/usr/bin/true",
-                "browserCdpUrl": "http://127.0.0.1:9222",
                 "browserInitScript": str(Path(tempfile.gettempdir()) / "x.js"),
                 "browserRealChrome": True,
                 "browserDnsOverHttps": True,
@@ -6804,7 +6803,6 @@ def run_inprocess_adapters() -> None:
         check(f"_browser_params 带上 {key}", full.get(key) == want, repr(full.get(key)))
     for key in (
         "executable_path",
-        "cdp_url",
         "init_script",
         "real_chrome",
         "dns_over_https",

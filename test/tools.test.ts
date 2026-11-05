@@ -160,7 +160,6 @@ const SETTINGS: ToolSettings = {
   crawlMaxItems: 1000,
   crawlMaxRuntimeSeconds: 1800,
   browserExecutablePath: "",
-  browserCdpUrl: "",
   browserInitScript: "",
   browserRealChrome: false,
   browserDnsOverHttps: false,
@@ -3279,7 +3278,6 @@ describe("会话工具", () => {
         blockAds: SETTINGS.blockAds,
         deployment: {
           browserExecutablePath: SETTINGS.browserExecutablePath,
-          browserCdpUrl: SETTINGS.browserCdpUrl,
           browserInitScript: SETTINGS.browserInitScript,
           browserRealChrome: SETTINGS.browserRealChrome,
           browserDnsOverHttps: SETTINGS.browserDnsOverHttps,

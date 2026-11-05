@@ -6,6 +6,29 @@
 标准六类之外的小节（本仓的 `Boundaries` 收各版本的验证范围与能力边界，即哪些平台/档位真跑过、
 哪些只到本地夹具为止）。
 
+## 0.1.8
+
+宿主开发基线抬到 `0.2.2-rc.1`（支持窗口 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 未变），`engines.node` 地板抬到 `>=24.9.0`；MCP 客户端默认钉版随开发基线走到 `0.2.2-rc.1`，放行名单补上窗口内第三条线；卡片组件改由 shared 的 `./client` 供。工具与设置面不变，需要留意的是 `engines.node` 抬高后 node 22 装不上本包，以及 `setup` / `doctor` 交回的默认钉法变了。
+
+### Changed
+
+- **shared 抬到 0.2.4**：catalog、生成物与 lockfile 随之同步；shared 新增的普通依赖 `@deepseek-ai/dsh-fs-patch` 由 shared 自己安装，本包不重复声明。
+- **宿主开发基线**：`devDependencies` 的 dsh 家族抬到 `0.2.2-rc.1`，`@deepseek-ai/cordis` 抬到 `4.1.0`，cordis 插件组两枚抬到 `1.1.0`，`@deepseek-ai/schemastery` 抬到 `3.19.0`；`@deepseek-ai/dsh-ptc-runtime` 从 devDependencies 移除（源码与测试都不再引用它）。`engines.dsh` 与 `@deepseek-ai/dsh*` peer 保持 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 未动；`@deepseek-ai/schemastery` 的 peer 放宽为 `^3.18.5 || ^3.18.6-alpha.1`，与两条宿主线各自的实装版本对齐。`engines.node` 由 `>=22.18.0` 抬到 `>=24.9.0`，取值取自宿主自己的地板。
+- **MCP 客户端默认钉版走到 `0.2.2-rc.1`**：`MCP_DEFAULT_CLIENT_PIN` 随开发基线抬版，`MCP_CLIENT_PIN_VALUES` 由三条变四条（`0.2.2-rc.1`、`0.2.2-alpha.3`、`0.2.1-rc.5`、`next`）——默认钉法只覆盖一条线时，停在 alpha.3 或 rc.5 上的部署拿到的安装命令会把宿主对字面 peer 的确切版本校验撞上去，条目「装得上、永不生效」；放行名单的口径因此由「两条宿主线」改为「本包宿主窗口覆盖到的每条线」。MCP server 自述版本同步 `0.1.8`。
+- **卡片组件改由 shared 的 `./client` 供**：`src/settings-card.ts`、`src/runtime-reader.ts` 与 `src/client-entry.ts` 的运行期值导入从 `./lib/card-ui`、`./lib/record` 迁到 `./client`，`build-client.ts` 的外置清单加入 `@jayyuen66/dsh-plugin-shared`，`package.json` 新增 `dsh.bundle.client.external`；`cordis.patch.yml` 因此插入一条**不写 id** 的 `@jayyuen66/dsh-plugin-shared` 组件行（写 id 会在插件页多出一个可关闭的组件，关掉后设置卡失去组件供应）。
+- **CI 的 node 矩阵收敛**：`ci.yml` 的 `node: [22, 24]` 加 macOS 排除改为单格 `node: [24.9]`，`node-version` 由 `24` 改为 `24.9`，与 `engines.node` 同值；`python-version` 仍是 `"3.14"`，与该仓的 Python 地板四处同值（三格 runner 上取得到 3.14）。
+
+### Removed
+
+- **CDP 端点旋钮（`browserCdpUrl` → 上游 `cdp_url`）撤掉**：Scrapling 0.5.1 把 `cdp_url` 与 `new_context` 收归 `RemoteSession` / `AsyncRemoteSession`，递给非远端会话会 `TypeError`（`engines/_browsers/_validators.py` 的 “cdp_url and new_context require RemoteSession”），而本包没有远端会话模式。留在 `SESSION_ONLY_KEYS` 与 `_DEPLOYMENT_KNOBS` 里等于让同一条文档范围 `>=0.5,<0.6` 里两个上游版本行为分叉：0.5 上能用、0.5.1 上直接把会话构造炸掉。撤的落点：`host.ts` 的 `Config` 字段与 schema 默认、`lib/tools.ts` 的 deployment 两处交回、`py/adapters.py` 的旋钮表与会话键表、探针与 TS 两侧夹具。要接已在运行的 CDP 浏览器，需要的是新增远端会话模式，不是把这枚键偷偷递回去。
+  - 随撤的账面：部署值由三十项变**二十九项**（`Config` 现量 79 枚、其中 volatile 50 枚不变），两份 README 的部署表与两份 DETAIL 的计数同改；隐私段那条「绝不进入工具 schema」的名单去掉 `cdpUrl`（该键已不存在，列着它等于让读者去找一个没有的开关）。
+  - 门禁侧：`test/contract-scrapling.test.ts` 的驱动覆盖下限由 20 调到 **19**（少发一枚键是预期结果，不是驱动退化，理由写在那张表旁）。这条红是本轮 CI 首次用 0.5.1 跑出来的——本仓 `_env/.venv` 钉的是 `scrapling==0.5`（`py/runtime-requirements.txt` 带哈希），而 CI 的 Python 腿装 `scrapling[rag]>=0.5,<0.6`，两者本来就是两个版本。两侧现在都验过：0.5 与 0.5.1 下 `violations` 均为空集。
+
+### Docs
+
+- 两份 DETAIL 的「卡上四十九个取值 / Forty-nine card values」改为**五十**：`host.ts` 的 `Config` 接口里标 `Volatile<…>` 的字段现量 50 枚，与两份 README 的卡片表逐键相等（`test/readme-parity.test.ts` 钉的是 README 那侧，DETAIL 这个数字没有门）；核对时另有一处坑——用 `grep -c '\.volatile()'` 数会得到 52，因为 `host.ts` 上方那段注释里就写着 `.volatile()` 这个字面量。
+- dsh 徽章由 `^0.2.1-rc.3` 抬到 `^0.2.1-rc.5`，与 `engines.dsh` 首条同值；`cordis.patch.yml` 的注册行由「唯一一行」改写为「两条条目」并说明 shared 那行为何不写 id；`build-client.ts` 的头注释原写「只 import react 与 zod」，与它自己下一行的外置清单（含 shared）矛盾，改为三条并说明内联会得到第二份卡片状态。
+
 ## 0.1.7
 
 宿主支持窗口抬到 `0.2.1-rc.5 || 0.2.2-alpha.3`，MCP 客户端钉版、设置卡取值面与输出预算
