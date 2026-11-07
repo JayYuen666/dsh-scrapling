@@ -130,7 +130,7 @@ dsh-scrapling setup --status
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
 
-- `dsh.bundle.patch` points at `cordis.patch.yml`, which carries **two entries**: `- name: "@jayyuen66/dsh-plugin-shared"` (the supplier of the card components, deliberately **without an `id`** so the plugin page does not list it as a switchable component) and `- id: scrapling` with the **bare package name** — the host scans `dsh.client` on bare package-name entries only.
+- `dsh.bundle.patch` points at `cordis.patch.yml`, which carries a single `- id: scrapling` entry with the **bare package name** — the host scans `dsh.client` on bare package-name entries only. The card components are bundled into `client.js` (only `react` / `zod` stay external to the host's module table), so the card does not depend on a second package being loaded.
 - The client half registers two surfaces: the settings card (on the `plugins.bundle.config` slot, keyed by the bundle package name — the host dispatches `entryKey: pkg.name`, so the card renders on this package's detail page) and one result row per tool on `tool.call.toolview`, drawn with the official tool-call view props.
 - The settings namespace is the entry id `scrapling`; precedence is settings-card value > registration-line `config:` > schema default. Setting a field back to its default saves a **clear-override**, not a write of the same value, so a later default change still reaches you.
 - Gate policy and the sidecar environment are snapshotted once when the plugin is applied — **settings changes take effect on the next start**.

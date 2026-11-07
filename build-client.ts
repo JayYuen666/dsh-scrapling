@@ -28,10 +28,16 @@ const root = import.meta.dirname;
 // "zod"，但这条判据不该依赖「将来没人改用 JSX 自动运行时」。
 //
 // 其余裸说明符（node: 前缀与相对路径已由 rolldown 处理，不在此列）不外部化：产物是
-// 浏览器侧的单文件，除宿主提供的 react、zod 与 shared 的客户端代码之外不该在运行期解析
-// 任何东西——shared 由 profile 里那一行无 id 的组件条目供，内联会得到第二份卡片状态。
-// zod 同样是宿主 `PLATFORM_MODULES` 冻结模块表里的一枚；内联会得到第二份 zod 身份。
-const isExternal = externalizePackages(["react", "zod", "@jayyuen66/dsh-plugin-shared"]);
+// 浏览器侧的单文件，除宿主提供的 react 与 zod 之外不该在运行期解析任何东西。
+// zod 是宿主 `PLATFORM_MODULES` 冻结模块表里的一枚；内联会得到第二份 zod 身份。
+//
+// shared 的客户端代码刻意**不**外部化（含其 `./client` 子路径）：外部化的供应方是另一份包
+// 的 client 产物，要靠宿主把那份包装载成模块表条目才兑现；它只作为传递依赖装进 profile 时
+// （`dsh plugin add` 的正常结果），宿主侧可能既不报错也不把它的 client 产物排进启动图，
+// 设置卡的 require("@jayyuen66/dsh-plugin-shared/client") 就在页面启动时落进
+// "missed the module table"（dsh-ocr-review 仓 issue #2，宿主 0.2.2-rc.1 dsh desktop）。
+// 内联之后产物自足，react / zod 仍经模块表取宿主的唯一实例，不产生第二份身份。
+const isExternal = externalizePackages(["react", "zod"]);
 
 const nameKey = "name";
 

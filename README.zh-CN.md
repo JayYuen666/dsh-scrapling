@@ -130,7 +130,7 @@ dsh-scrapling setup --status
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
-- `dsh.bundle.patch` 指向 `cordis.patch.yml`，里面是**两条条目**：`- name: "@jayyuen66/dsh-plugin-shared"`（卡片组件的供应行，**刻意不写 `id`**，所以插件页不会把它列成可停用组件）与 `- id: scrapling`，`name` 用**裸包名** —— 宿主只扫裸包名条目的 `dsh.client` 声明。
+- `dsh.bundle.patch` 指向 `cordis.patch.yml`，里面只有一条 `- id: scrapling`，`name` 用**裸包名** —— 宿主只扫裸包名条目的 `dsh.client` 声明。设置卡组件直接打进 `client.js`（只有 `react` / `zod` 外置给宿主模块表），卡片不依赖第二份包被装载。
 - client 半注册两处：设置卡（坐在 `plugins.bundle.config` 槽上，键是 bundle 包名 —— 宿主按 `entryKey: pkg.name` 派发，所以卡画在本包的详情页上），以及每个工具在 `tool.call.toolview` 上的一行结果，用官方 tool-call 视图 props 画。
 - 设置命名空间就是条目 id `scrapling`；优先级为 设置卡现值 > 注册行 `config:` > schema 默认值。把一项改回默认值保存的是**清除覆盖**而不是写入同一个值，将来默认值变了你这一项也会跟着变。
 - 闸门策略与 sidecar 环境在插件 `apply()` 时取一次快照 —— **设置卡的改动要等下次启动才生效**。

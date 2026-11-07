@@ -119,17 +119,15 @@ describe("client.js 的 ModuleLoader 外壳", () => {
     expect(code).toMatch(/factory: \(require\) => \{\n\s*"use strict";/u);
   });
 
-  it("产物运行期只解析平台模块与共享客户端行", async () => {
+  it("产物运行期只解析平台模块（其余依赖一律内联）", async () => {
     const code = await buildClient();
     const specs = Array.from(
       code.matchAll(/require\("(?<spec>[^"]+)"\)/gu),
       (match) => match.groups?.["spec"] ?? "",
     );
-    expect([...new Set(specs)].toSorted()).toStrictEqual([
-      "@jayyuen66/dsh-plugin-shared/client",
-      "react",
-      "zod",
-    ]);
+    // shared 的客户端代码已收回内联（dsh-ocr-review 仓 issue #2：对它的外部化请求要靠
+    // 另一份包被装载成模块表条目才兑现，传递依赖安装形状下宿主可能不排进启动图）。
+    expect([...new Set(specs)].toSorted()).toStrictEqual(["react", "zod"]);
   });
 
   it("用假 require 执行 factory 后，exports 上是可运行的 apply 与宿主装配清单 inject", async () => {

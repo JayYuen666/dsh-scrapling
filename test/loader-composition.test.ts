@@ -466,14 +466,9 @@ describe("经真实 Loader 装载本插件", () => {
       [{ insert: insertRowsOfPatch(text) }],
       (): void => undefined,
     );
-    const sharedPackage = "@jayyuen66/dsh-plugin-shared";
-    // shared 是卡片组件行，故意不写 id；本包的装载条目仍必须与补丁里的那一条同源。
-    expect(rows.filter((row) => row.name !== sharedPackage)).toStrictEqual([
-      { id: ENTRY_ID, name: PACKAGE_NAME },
-    ]);
-    expect(rows.find((row) => row.name === sharedPackage)).toMatchObject({
-      name: sharedPackage,
-    });
+    // 卡片组件已内联进 client.js，补丁回到只声明本包一行（shared 供应行随
+    // dsh-ocr-review 仓 issue #2 的修复移除）；装载条目仍必须与补丁里的那一条同源。
+    expect(rows).toStrictEqual([{ id: ENTRY_ID, name: PACKAGE_NAME }]);
     // 装载用的就是这一条：create 交回的 id 与补丁里那条同源，链子断了这里红。
     expect(requireLoaded(loaded).id).toBe(ENTRY_ID);
   });
