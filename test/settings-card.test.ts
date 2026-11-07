@@ -44,7 +44,7 @@ const SEARXNG_URL = "https://searx.example.com";
 /** 非法协议样例：拼出来而不是写成字面量，`no-script-url` 会拦下 `javascript:` 字面量。 */
 const SCRIPT_SCHEME_URL = ["javascript", ":alert(1)"].join("");
 
-/** schema 的单条属性：只取本用例要用的两个面。 */
+/** schema 的单条属性：只取本用例要用的两边。 */
 interface PropertySchema {
   readonly meta?: { readonly volatile?: boolean; readonly default?: unknown };
 }
@@ -140,7 +140,7 @@ describe("字段表与 schema 同解", () => {
   });
 
   it("每个字段的默认值都等于 schema 里的默认值", () => {
-    // 红话把两侧都写出来：只给字段表那一侧时，「schema 没有 default 这一位」与「两边值
+    // 红话把两侧都写出来：只报字段表里的值时，「schema 没有 default 这一位」与「两边值
     // 不一样」看着是同一句话。
     const wrong = SETTINGS_FIELDS.filter(
       (field) => PROPERTIES[field.key]?.meta?.default !== field.fallback,
@@ -194,7 +194,7 @@ describe("locale 字典", () => {
 
   it("每个能力包的名称与每种包状态都配了中英文案", () => {
     // 判据是「键在位且非空」：只写 `.not.toBe("")` 时缺键拿到 undefined 照样通过，门禁对着
-    // 真正缺文案的那一档恒绿（变异实测：给 PACK_STATES 加一个没配译名的状态，旧写法不红）。
+    // 真正缺文案的那一档永远通过（变异实测：给 PACK_STATES 加一个没配译名的状态，旧写法不红）。
     //
     // 状态清单取自 lib/runtime-shape.ts 的运行时值域：加一个状态而没配译名，这条会点名是哪一个，
     // 而不是等卡片把 `runtime.state.<新值>` 原样露在界面上。
@@ -342,7 +342,7 @@ describe("parseInput", () => {
     });
   });
 
-  it("URL 协议按字段白名单收口：file:/data:/javascript: 不收，socks5h 收", () => {
+  it("URL 协议按字段白名单统一处理：file:/data:/javascript: 不收，socks5h 收", () => {
     expect(parseInput(fieldOf("proxyUrl"), "file:///etc/passwd")).toStrictEqual({
       kind: "invalid",
     });
@@ -405,7 +405,7 @@ describe("parseInput", () => {
     });
   });
 
-  it("小数按 schema 的整数口径判为非法 —— natural().min(1) 存不下 250.9", () => {
+  it("小数按 schema 的整数规则判为非法 —— natural().min(1) 存不下 250.9", () => {
     expect(parseInput(fieldOf("crawlMaxItems"), "250.9")).toStrictEqual({ kind: "invalid" });
   });
 

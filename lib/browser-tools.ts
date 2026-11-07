@@ -8,7 +8,7 @@ import { callSidecar, SidecarError } from "./sidecar.ts";
 import { callNumber } from "./tool-params.ts";
 import type { ToolDeps } from "./tools.ts";
 
-/** 宿主 attachment 服务的最小面；截图工具只调这一项。 */
+/** 宿主 attachment 服服务的最小类型；截图工具只调这一项。 */
 export interface AttachmentSaver {
   saveImage: (input: {
     data: Uint8Array;
@@ -87,7 +87,7 @@ function jsonRecordOf(value: unknown): Record<string, Json> | undefined {
 /**
  * 单个动作 / 单次截图的超时，夹在本次调用的截止之内。
  *
- * 只许往下调：发一个比截止大的值，先到期的是 JS 这一侧的 SIDECAR_TIMEOUT，而超时按设计
+ * 只许往下调：发一个比截止大的值，先到期的是 JS 侧的 SIDECAR_TIMEOUT，而超时按设计
  * 会拆掉常驻进程重连 —— 于是一次点击或截图超时换成全部浏览器会话陪葬。
  */
 function actionTimeoutMs(value: unknown, deadlineMs: number): number {

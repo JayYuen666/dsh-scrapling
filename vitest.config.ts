@@ -1,9 +1,9 @@
 import { definePackageConfig } from "@jayyuen66/dsh-plugin-shared/config/vitest.base";
 
-// 公共面（test.include / environment / testTimeout / provider / exclude / reporter /
-// reportsDirectory / 四项 100% 阈值）在 shared/config/vitest.base.ts 单源；这里只留本包差异。
+// 公共配置（test.include / environment / testTimeout / provider / exclude / reporter /
+// reportsDirectory / 四项 100% 阈值）在 shared/config/vitest.base.ts 唯一来源；这里只留本包差异。
 export default definePackageConfig({
-  // src/ 四个文件里，settings-fields 是纯数据面、runtime-reader 是纯逻辑面（zod strict
+  // src/ 四个文件里，settings-fields 是纯数据那一栏、runtime-reader 是纯逻辑（zod strict
   // codec 与 remote 描述符，不碰 DOM，test/runtime-remote.test.ts 与 test/build-signature.test.ts
   // 直接 import 它），两者入分母。client-entry 与 settings-card **也各有用例**：本包不装
   // happy-dom 也不装 jsdom（devDependencies 里就没有），test/settings-card-ui.test.ts 用一个按

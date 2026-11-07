@@ -43,7 +43,7 @@ def redacted_redis_url(raw: str) -> str:
     文本，把排障引去看代码而不是看配置。所以端口解析也收进 try，解不开就写 <invalid-port>
     ——主机仍要留着，那正是要看的那一位。
 
-    IPv6 字面量的方括号由 urlsplit 剥掉（hostname 是裸 ::1），重建成 redis://::1:6379/0 就
+    IPv6 字面量的方括号由 urlsplit 去掉（hostname 是不带方括号的 ::1），重建成 redis://::1:6379/0 就
     不再是可复用的连接串，这里补回方括号。
     """
     try:

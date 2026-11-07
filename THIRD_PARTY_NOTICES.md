@@ -7,7 +7,7 @@
 
 `py/`、`lib/`、`host.ts`、`src/` 下全部是本仓原创代码，不含任何第三方源码、词表或文案。
 Scrapling 及浏览器引擎都是**运行期依赖**——本包调用它们暴露的接口，其中反注入清洗用的
-`Convertor._strip_noise_tags` 与 `Convertor._sanitize_for_ai` 是上游的私有下划线方法，不在上游文档面
+`Convertor._strip_noise_tags` 与 `Convertor._sanitize_for_ai` 是上游的私有下划线方法，不在上游文档
 里（见「机制与接口来源」）。它们不由本包分发，许可文本也随各自的包走，本文件不重复。
 
 随包分发的第三方内容有两处：**图标**（`icon.svg`）与**CLI 单文件产物内联的 zod**
@@ -86,7 +86,7 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包调用它们暴
 - **完整 Chromium**：由 `patchright install chromium` 从 Playwright 的 CDN 下载；不含
   `--only-shell`，因为 headless shell 的组件不足以跑 `StealthyFetcher`（V2）。
 
-许可文本随这两个上游产物各自提供；本包只负责下载、校验与落盘。
+许可文本随这两个上游产物各自提供；本包只负责下载、校验与写到磁盘。
 
 `patchright` 是 Playwright 的补丁分支，与 `playwright` 并存安装：两者是不同的 Python 包，
 本包按能力探测判断浏览器抓取能不能用。

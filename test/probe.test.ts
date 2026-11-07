@@ -1,7 +1,7 @@
 // test/probe.test.ts —— runProbe 的启动失败分支必须点名解释器路径。
 //
 // 启动失败只有 `error` 事件、永远没有 `close`，`events.once(child, "close")` 会以同一个错误
-// 拒绝，所以实现必须把那句拒绝包成点名解释器的话；否则用户读到的是一句裸 EACCES，分不清是
+// 拒绝，所以实现必须把那句拒绝包成点名解释器的话；否则用户读到的是只有 EACCES 的一句，分不清是
 // 解释器不可执行还是别的权限问题。
 //
 // 这里造一个**存在但不可执行**的解释器（不能用不存在的路径：那会在 existsSync 预检就被换成
@@ -65,7 +65,7 @@ function messageOf(value: unknown): string {
  * 取 `Error.cause` 上这一位要判的两个字段。
  *
  * 不走 `toMatchObject({ cause: … })`：匹配器怎么比较 Error 的自有属性随版本变，红了也说不清
- * 是 cause 没了还是匹配器换了口径。这里把 cause 当成未知值读，缺席就是 undefined。
+ * 是 cause 没了还是匹配器换了规则。这里把 cause 当成未知值读，缺席就是 undefined。
  *
  * @param error - 拒绝值
  * @returns `code` 与 `path`；不是带这俩字段的 Error 时给空对象
@@ -167,9 +167,9 @@ describe("runProbe 的启动失败分支", () => {
     },
   );
 
-  it("探针挂住时看门狗杀掉它并点名预算", async () => {
+  it("探测脚本挂住时超时保护杀掉它并点名预算", async () => {
     // 拿 node 当「解释器」、一份永不退出的脚本当探针：这条要判的是「有界」，不是探针内容。
-    // 没有看门狗时这一跑会一直挂着 —— 契约测试在模块顶层 await 探针，收集期就冻结了。
+    // 没有超时保护时这一跑会一直挂着 ——契约测试在模块顶层 await 探测脚本，收集期就冻结了。
     await withTempDir("dsh-probe-hang-", async (dir) => {
       const script = path.join(dir, "hang.mjs");
       writeFileSync(script, "setInterval(() => {}, 1000);\n", { mode: 0o644 });

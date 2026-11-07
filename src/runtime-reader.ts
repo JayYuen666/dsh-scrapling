@@ -1,9 +1,9 @@
-// 设置卡读宿主侧 runtime 的那一面（官方 Typert Remote 的消费侧）。
+// 设置卡读宿主侧 runtime 的入口（官方 Typert Remote 的消费端）。
 //
 // descriptor 手写：网关在源模式下按方法签名取参数名，参数与结果都走 src-json；客户端贡献
 // 校验要求每个入参带 strict codec，所以这里用 zod schema 只在本进程校验形状、不跨网。
 //
-// remote 走 `ctx.get("remote")` 而不是 inject：没有远程面的部署里整张卡仍要渲染，把
+// remote 走 `ctx.get("remote")` 而不是 inject：没有远程通道的部署里整张卡仍要渲染，把
 // `remote` 写进 inject 会让整条 client 入口不激活。
 
 import type {
@@ -89,7 +89,7 @@ const JOB_VIEW_SCHEMA = z.object({
   output: z.string(),
 });
 
-/** 状态读面的返回形状：`ok` 是字面量 true，`job` 只可能是对象或 null。 */
+/** 状态读取接口的返回形状：`ok` 是字面量 true，`job` 只可能是对象或 null。 */
 const STATUS_SCHEMA: z.ZodType<RuntimeStatusResult> = z.object({
   ok: z.literal(true),
   packs: z.partialRecord(RUNTIME_PACK_SCHEMA, PACK_STATE_SCHEMA),
@@ -99,7 +99,7 @@ const STATUS_SCHEMA: z.ZodType<RuntimeStatusResult> = z.object({
   job: JOB_VIEW_SCHEMA.nullable(),
 });
 
-/** 动作读面的两支：启动成功带 jobId；拒绝带 error 与保留的状态码。
+/** 动作读取接口的两支：启动成功带 jobId；拒绝带 error 与保留的状态码。
  *  状态码用 zod v4 的 `z.literal(数组)` 重载（core 侧落在同一份 PrimitiveSet，
  *  等价于逐值 union，但少三层 `z.literal(...)` 调用嵌套）。 */
 const REFUSED_STATUS_SCHEMA = z.literal(REFUSED_STATUSES);

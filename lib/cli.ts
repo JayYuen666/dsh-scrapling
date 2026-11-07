@@ -1,4 +1,4 @@
-// 能力包与 MCP 模式 CLI 的参数编排。安装细节仍只住在 lib/installer.ts，条目文本住在
+// 能力包与 MCP 模式 CLI 的参数编排。安装细节仍只定义在 lib/installer.ts，条目文本定义在
 // lib/mcp-profile.ts：这一层只认旗标、落笔与退出码。
 
 import { existsSync } from "node:fs";
@@ -194,7 +194,7 @@ function modeValue(flags: FlagMap): McpMode | null {
   return value === undefined || !isMcpMode(value) ? null : value;
 }
 
-/** `--mode` 取不到合法值时点名合法取值；与 pin 那条提示同一口径。 */
+/** `--mode` 取不到合法值时点名合法取值；与 pin 那条提示同一种做法。 */
 function modeHint(flags: FlagMap): string {
   const value = stringFlag(flags, "mode");
   const given = value === undefined ? "（缺省）" : JSON.stringify(value);
@@ -211,7 +211,7 @@ interface ModeOutput {
  * 一种模式对应的条目文本、这一次放弃了什么，以及要不要装客户端。
  *
  * `official-mcp` 那一支会抛 {@link OfficialMcpError}：开关与 `--accept-risk` 是同一次表态的两半，
- * 缺哪半都不该生成配置，退 1 由 runCli 的收口负责。
+ * 缺哪半都不该生成配置，退 1 由 runCli 的统一处理负责。
  */
 function patchForMode(input: {
   readonly mode: McpMode;
@@ -255,7 +255,7 @@ async function writePatch(file: string, text: string): Promise<void> {
  * `setup --mode`：打印或写出条目文本，profile 本体一个字都不改。
  *
  * 宿主没有「安全写入 cordis.patch.yml」的 API（`--dump-config` 反而会把 profile 根配置重写一遍），
- * 所以 `--apply` 的落点是数据目录下一份可以自己并入的文件。
+ * 所以 `--apply` 的位置是数据目录下一份可以自己并入的文件。
  */
 async function setupMode(flags: FlagMap, deps: CliDeps): Promise<number> {
   const mode = modeValue(flags);
@@ -307,7 +307,7 @@ async function setupMode(flags: FlagMap, deps: CliDeps): Promise<number> {
   return 0;
 }
 
-/** 剥掉行尾注释与成对引号。`#` 前面必须有空白才算注释（YAML 的规则），`true#x` 是值不是注释。 */
+/** 去掉行尾注释与成对引号。`#` 前面必须有空白才算注释（YAML 的规则），`true#x` 是值不是注释。 */
 function bareScalar(raw: string): string {
   const trimmed = raw.trim();
   const quote = trimmed.charAt(0);
@@ -321,7 +321,7 @@ function bareScalar(raw: string): string {
 }
 
 /**
- * 取 patch 文本里某个键第一个**有值**的标量（整行注释跳过，行尾注释与引号由 bareScalar 剥掉）。
+ * 取 patch 文本里某个键第一个**有值**的标量（整行注释跳过，行尾注释与引号由 bareScalar 去掉）。
  * 只写了键名没给值的那些出现被跳过，所以返回值为 `undefined` 就等于「这份 patch 没配这一项」。
  */
 function patchScalar(text: string, key: string): string | undefined {

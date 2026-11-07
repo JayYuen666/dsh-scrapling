@@ -5,7 +5,7 @@ robots.txt 遵守、断点续爬、链接提取与去重 —— 这些我们不�
 
 为什么放到后台：一次爬取是分钟级的，而一次请求-响应撑不了那么久。所以这里**起一个
 daemon 线程**跑 spider，主线程立刻返回 crawl id；进度通过「没有 id 的事件帧」推给宿主，
-宿主把它接到后台作业的输出环上，模型就能边跑边看，而不是干等一个超时。
+宿主把它接到后台作业的输出环形缓冲上，模型就能边跑边看，而不是干等一个超时。
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ DEFAULT_MAX_RUNTIME_MS = 1_800_000
 DEFAULT_CONCURRENT_REQUESTS = 4
 
 # 只投影这些统计字段：上游 to_dict() 还带 autothrottle / log_count / proxies 等
-# 部署内部读数，模型用不上，也不该成为协议面的一部分。
+# 部署内部读数，模型用不上，也不该成为协议的一部分。
 _STATS_KEYS = (
     "requests_count",
     "failed_requests_count",
@@ -160,7 +160,7 @@ def _within_allowed_domains(url: str, allowed: set[str]) -> bool:
     """这个地址还在起始域里吗。
 
     口径与 Scrapling 引擎的 ``_is_domain_allowed`` 逐字一致（netloc 相等，或落在某个
-    允许域的子域下）—— 链接发现那一侧本来就这么滤。但**它只管链接发现**：重定向是
+    允许域的子域下）—— 链接发现本来就这么滤。但**它只管链接发现**：重定向是
     curl_cffi 自己跟的，``follow_redirects="safe"`` 只拒绝跳向私网，站外公网跳转照跟。
     所以最终落在哪个主机上，必须在收页之前自己复判一次。
 
@@ -326,7 +326,7 @@ def _make_spider(
         output_dir = None
         css_selector = content_selector
         main_content_only = content_body_only
-        # 待站策略。robots_txt_obey 打开后 0.5 的取数口径是：抓取异常或 5xx → 该域按
+        # 待站策略。robots_txt_obey 打开后 0.5 的取数规则是：抓取异常或 5xx → 该域按
         # 全面禁止处理；站点没有 robots.txt（404）→ 视作允许全部。所以这一档要么别开，
         # 要么确认目标站点 robots.txt 取得回来。
         robots_txt_obey = policy["obey_robots"]
@@ -349,7 +349,7 @@ def _make_spider(
         def configure_sessions(self, manager: Any) -> None:
             """把爬虫的会话换成「只跟安全重定向、走配置里那份代理」的那一份。
 
-            Spider 默认加的是裸 ``FetcherSession()``，重定向按 curl_cffi 的默认走 —— 跳向私网
+            Spider 默认加的是不带参数的 ``FetcherSession()``，重定向按 curl_cffi 的默认走 —— 跳向私网
             不会被拦。Host 闸门只判起点 URL，重定向目标是它看不到的，所以这里必须自己兜住：
             ``follow_redirects="safe"`` 让 curl_cffi 拒绝跳向私网的跳转。
 

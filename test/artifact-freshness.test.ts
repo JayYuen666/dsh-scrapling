@@ -1,9 +1,9 @@
-// test/artifact-freshness.test.ts —— 三张被提交的产物必须等于当前源码的内存构建，且 client 外壳可用。
+// test/artifact-freshness.test.ts —— 三张被提交的产物必须等于当前源码的内存构建，且 client 的 外壳 可用。
 //
 // host.js / client.js / bin/dsh-scrapling.mjs 都随仓库走。`prepack` 在发布前会重建它们，所以
 // 发出去的字节不会陈旧；会陈旧的是**仓库里那一份**：改完源码没重跑构建时，直接执行 bin 的人与
 // review 看到的都是上一版的字节，而没有任何门禁会响。这里拿三个 build*() 的内存构建与磁盘文件
-// 逐字节比（比整份文本而不是长度：region 路径折叠回退时字节会变，长度未必变）。
+// 逐字节比（比整份文本而不是长度：region 路径折叠 canonicalizeRegionPaths 回退时字节会变，长度未必变）。
 //
 // 判据取内存构建而不是磁盘产物，与 test/build-signature.test.ts 头部是同一条理由。
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -75,7 +75,7 @@ function stubTarget(): void {
  * 宿主在客户端侧提供的模块替身：属性访问与调用都回到替身本身。
  *
  * 每次递归都新建一份，避免「proxy 在自己的初始化式里引用自己」这种 TS 推不出类型的写法。
- * 本用例只看外壳能不能跑出一份带 apply/inject 的 exports，不看卡片行为——卡片的渲染面在
+ * 本用例只看 外壳 能不能跑出一份带 apply/inject 的 exports，不看卡片行为——卡片的渲染在
  * happy-dom 那一层（见 vitest.config.ts 里 coverageInclude 的注释）。
  */
 function stubModule(): () => void {
@@ -87,14 +87,14 @@ function stubModule(): () => void {
 }
 
 /**
- * 在只给了 window 的新上下文里跑一次产物文本，取外壳注册进来的那一个模块。
+ * 在只给了 window 的新上下文里跑一次产物文本，取 外壳 注册进来的那一个模块。
  *
  * 被测对象本身就是「交给宿主 ModuleLoader 求值的一段脚本」（build-client.ts 文件头写了这条
  * 契约），除了求值没有别的读法；上下文里除了 fakeWindow 没有任何全局，也不给它 require 的
  * 能力。文本来自本进程的 buildClient()，不是外部输入。
  *
  * @param code - client 产物全文
- * @returns 外壳注册的那一个模块
+ * @returns 外壳 注册的那一个模块
  */
 function loadClientModule(code: string): LoadedModule {
   const loaded: LoadedModule[] = [];
@@ -102,19 +102,19 @@ function loadClientModule(code: string): LoadedModule {
   runInNewContext(code, { window: fakeWindow });
   const [first, ...extra] = loaded;
   if (first === undefined || extra.length > 0) {
-    throw new Error(`外壳应当只 load 一个模块，实际 ${String(loaded.length)} 个`);
+    throw new Error(`外壳 应当只 load 一个模块，实际 ${String(loaded.length)} 个`);
   }
   return first;
 }
 
 describe("client.js 的 ModuleLoader 外壳", () => {
-  it("外壳只 load 一个模块，id 与 package.json 的 name 逐字相同", async () => {
+  it("外壳 只 load 一个模块，id 与 package.json 的 name 逐字相同", async () => {
     const code = await buildClient();
     const { name } = JSON.parse(disk("package.json")) as { name: string };
     expect(loadClientModule(code).id).toBe(name);
   });
 
-  it("factory 体的第一条语句是严格模式指令（被外壳吃掉后放回原位）", async () => {
+  it("factory 体的第一条语句是严格模式指令（被包进 外壳 后放回原位）", async () => {
     const code = await buildClient();
     expect(code).toMatch(/factory: \(require\) => \{\n\s*"use strict";/u);
   });
@@ -135,7 +135,7 @@ describe("client.js 的 ModuleLoader 外壳", () => {
   it("用假 require 执行 factory 后，exports 上是可运行的 apply 与宿主装配清单 inject", async () => {
     const code = await buildClient();
     const exports = loadClientModule(code).factory(() => stubModule());
-    // 导出名清单按 src/client-entry.ts 现量独立写死：产物少导出一位，宿主按名字取就拿到 undefined。
+    // 导出名清单按 src/client-entry.ts 当场实测独立写死：产物少导出一位，宿主按名字取就拿到 undefined。
     expect(Object.keys(exports).toSorted()).toStrictEqual([
       "ROW_TOOLS",
       "apply",
@@ -145,7 +145,7 @@ describe("client.js 的 ModuleLoader 外壳", () => {
       "resultMetaOf",
     ]);
     expect(exports["apply"]).toBeTypeOf("function");
-    // inject 是宿主用来装配注入面的清单（src/client-entry.ts 里的字面量），不是函数。
+    // inject 是宿主用来装配注入的清单（src/client-entry.ts 里的字面量），不是函数。
     // 先按可迭代对象取出来再比：factory 在 node:vm 的新上下文里跑，产出的数组不是本上下文的
     // Array 实例，直接 toStrictEqual 会因为「不是同一个类」判不等，而值本身逐位相同。
     const inject = exports["inject"] as Iterable<unknown>;
@@ -174,13 +174,13 @@ describe("clientModuleId（外壳 id 的判据）", () => {
     }
   });
 
-  it("name 只有空白时点名，而不是拼出一个带空格 id 的外壳", () => {
+  it("name 只有空白时点名，而不是拼出一个 id 带空格的 外壳", () => {
     expect(() => {
       clientModuleId(tempPackageWithName("   "));
     }).toThrow(/missing a non-empty `name`/u);
   });
 
-  it("name 两侧的空白折掉之后才是外壳 id", () => {
+  it("name 两侧的空白去掉之后才是 外壳 id", () => {
     expect(clientModuleId(tempPackageWithName(" @scope/pkg "))).toBe("@scope/pkg");
   });
 

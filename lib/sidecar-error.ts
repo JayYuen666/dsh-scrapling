@@ -20,7 +20,7 @@ export class SidecarError extends Error {
   /**
    * `details` 排在 `options` **之前**：两者都是可选的对象位，而只想带 details 的调用方
    * 若要把 options 空着，就得写一枚 `undefined` 占位；占位与实参记反时，details 会被当成
-   * cause 静默吞掉（`ErrorOptions` 只有一个可选成员，类型面拦不住这种错位）。
+   * cause 静默吞掉（`ErrorOptions` 只有一个可选成员，类型上拦不住这种错位）。
    *
    * @param code - 机器可读错误码
    * @param message - 人读信息
@@ -45,7 +45,7 @@ export class SidecarError extends Error {
  *
  * 字符串只在**非空白**时算数：空串与纯空白原样放行会抛出 message 为空的错误，日志里
  * 剩下的就是一行 `[sidecar] response error:` 这种无信息行。数字、布尔与 bigint 走
- * String() 保留原文 —— 对端协议改动时发的裸值至少还能读；对象不走 String()，那种
+ * String() 保留原文 —— 对端协议改动时发出的值至少还能读；对象不走 String()，那种
  * "[object Object]" 进了日志等于没写。
  *
  * @param value - 任意值

@@ -7,7 +7,7 @@ import { MCP_DEFAULT_CLIENT_PIN } from "../lib/mcp-contract.ts";
 
 const DATA_DIR = "/tmp/dsh-scrapling-data";
 const ENABLED = { dataDir: DATA_DIR, enabled: true, acceptedRisk: true };
-/** 托管 venv 的根：两条用例都要按它拼落点。 */
+/** 托管 venv 的根：两条用例都要按它拼位置。 */
 const VENV_DIR = path.join(DATA_DIR, "runtime", "venv");
 
 /** 取拒绝时抛出的那个值；没抛时给一个非本模块的错误类型，让调用点的断言变红。 */
@@ -166,7 +166,7 @@ describe("officialMcpPlan", () => {
     expect(plan.risk).toContain("守卫");
     expect(plan.risk).toContain("browser_evaluate");
     // 条数是官方 server 随版本变的事实：它一旦漂了，用户按这段做 `--accept-risk` 表态时
-    // 读到的就是一句过期的话，而这段是唯一的披露面。
+    // 读到的就是一句过期的话，而这段是唯的披露。
     expect(plan.risk).not.toMatch(/\d+ 个工具/u);
     expect(plan.risk).not.toMatch(/\d+ tools/u);
   });
@@ -207,7 +207,7 @@ describe("官方条目的 command 标量", () => {
   });
 
   it(String.raw`回车与不可打印的控制字符落成 \uXXXX 转义，读回仍是原路径`, () => {
-    // `\r` 与 `\u0001` 都不能裸出现在双引号标量里：只有写成转义才真的免疫。
+    // `\r` 与 `\u0001` 都不能原样出现在双引号标量里：只有写成转义才真的免疫。
     const dataDir = "/tmp/cr\rctl\u0001dir";
     const plan = officialMcpPlan({ dataDir, enabled: true, acceptedRisk: true });
     const read = readPatch(plan.patch);
@@ -218,7 +218,7 @@ describe("官方条目的 command 标量", () => {
 
   it(String.raw`转义集合的四个端点（\u0000、\u001F、\u007F、\u009F）也走转义`, () => {
     // 这四枚是字符类 [\u0000-\u001F\u007F-\u009F] 的边界。只测中间的 \u0001 时，把类别
-    // 写成 \u0001-\u001E 这种「少掉端点」的坏法不会有任何用例红；而控制字符即便裸着写进
+    // 写成 \u0001-\u001E 这种「少掉端点」的坏法不会有任何用例红；而控制字符即便原样写进
     // 文本，读回来也可能仍是那个值 —— 所以这里断的是转义写法本身，不只是往返相等。
     const bounds = [0, 31, 127, 159].map((code) => String.fromCodePoint(code)).join("");
     const dataDir = `/tmp/${bounds}`;

@@ -1,15 +1,15 @@
-// test/publish-manifest.test.ts —— 发布形态门禁：入口面必须**与发布器无关**地可解析。
+// test/publish-manifest.test.ts —— 发布形态门禁：入口必须**与发布器无关**地可解析。
 //
 // 为什么值得一条测试：构建与单测都在源码侧跑绿，而真实故障发生在装出去之后。两类坑都在
-// 那一侧。其一是入口指向没随包发出去的文件；其二是入口覆盖写在 `publishConfig` 里——
+// 装出去之后的那份产物里。其一是入口指向没随包发出去的文件；其二是入口覆盖写在 `publishConfig` 里——
 // pnpm 发布时把它合并到顶层，npm 不合并（npm 会打印
 // "Unknown publishConfig config main/exports" 并忽略），同一个仓库换个发布器就发出一个
 // import 必失败的包。这里不模仿任何发布器的实现，而是把不变式钉成断言：**顶层入口自己就
 // 完整可解析，且 publishConfig 不再承载入口字段**，于是两套发布器语义的差恒为空。
 //
 // 第二组门禁扫注释：写下时刻、列表序号、坏字节——三者都对读的人无用，且没有任何读者
-// 能从中重建当时的上下文。只扫注释行与文档；测试夹具里的日期（modifiedAfter 之类的边界
-// 值）是数据，角色文档里的日期是内容，两者都不在禁面内。
+// 能从中重建当时的上下文。只扫注释行与文档；夹具里的日期（modifiedAfter 之类的边界
+// 值）是数据，角色文档里的日期是内容，两者都不在禁止名单内。
 //
 // 第三组门禁把**构建产物本身**载入一次。这一条是被真实故障逼出来的：rolldown 内联了
 // 运行期才提供的宿主包，其中一个在模块顶层按 import.meta.url 相对解析自身 package.json，
@@ -48,17 +48,17 @@ const FORBIDDEN_IN_COMMENTS: readonly RegExp[] = [
   /\uFFFD/u,
 ];
 
-/** `publishConfig` 里唯一允许出现的字段：可见性与源，都不是入口面。 */
+/** `publishConfig` 里唯一允许出现的字段：可见性与源，都不是入口。 */
 const ALLOWED_PUBLISH_CONFIG = new Set(["access", "registry"]);
 
-/** 遍历时跳过的目录：依赖、产物、以及本门禁刻意不管的面。 */
+/** 遍历时跳过的目录：依赖、产物、以及本门禁刻刻意不管的目录。 */
 const SKIP_DIRS = new Set([
   "node_modules",
   "coverage",
   "_env",
   "dist",
   ".git",
-  // 测试夹具里的日期与轮次编号是数据，不是注释噪音。
+  // 夹具里的日期与轮次编号是数据，不是注释噪音。
   "test",
   "tests",
   "__tests__",
@@ -66,7 +66,7 @@ const SKIP_DIRS = new Set([
   "agents",
 ]);
 
-/** package.json 里与入口面有关的形状；其余字段本门禁不关心。 */
+/** package.json 里与入口有关的形状；其余字段本门禁不关心。 */
 interface Manifest {
   readonly version?: string;
   readonly main?: string;
@@ -251,10 +251,10 @@ async function loadSurface(): Promise<{ manifest: Manifest; shipped: Set<string>
 }
 
 /**
- * 发布面快照：盘读一次、解析一次，各条断言共用同一份。
+ * 发布名单快照：盘读一次、解析一次，各条断言共用同一份。
  *
  * 每条用例各调一次 `loadSurface()` 时，同一个 `package.json` 会被解析十几遍，而两遍之间
- * 磁盘状态若变了（并跑的构建任务、`files` 改动），同一文件里的断言判的就不是同一份出货面。
+ * 磁盘状态若变了（并跑的构建任务、`files` 改动），同一文件里的断言判的就不是同一份出货内容。
  */
 const surface = await loadSurface();
 
@@ -319,7 +319,7 @@ function mdProse(lines: readonly string[]): string[] {
  * 正文行同样是注释 —— 只按行首字符判会整段漏掉，而日期恰恰常写在块注释中间。`.md` 整体算，
  * 但代码块里的示例不算；`#` 那种行首只在 `.yml` 里才是注释（TypeScript 里那是私有字段）。
  *
- * @param file - 相对包根的文件名，用于决定判定口径
+ * @param file - 相对包根的文件名，用于决定判定规则
  * @param text - 文件全文
  * @returns 参与门禁的行
  */
@@ -523,8 +523,8 @@ describe("宿主依赖的版本形状（升级防线）", () => {
     // registry 上的 dist-tag 是实测出来的陷阱：`latest` 可能指向远早于宿主 ABI 的版本。
     // 精确钉是让「不带版本地装成远古版本」这件事不发生的最小条件；一旦放宽成 `^`/`~`，
     // 宿主某天发新 minor 就会自动跟上去，而插件与宿主 ABI 耦合，那等于让本包在没有测试的
-    // 情况下换掉编译用的宿主类型面。
-    // 只判 dev 这一侧：它才是本包真正装下来的那一份。peer 记的是「运行期由宿主提供」，
+    // 情况下换掉编译用的宿主类型声明。
+    // 只判 dev这一侧 段：它才是本包真正装下来的那一份。peer 记的是「运行期由宿主提供」，
     // 装什么版本由宿主决定，判据在下面那条。
     const { manifest } = surface;
     // 过滤出违规项再一次性断言，而不是在循环里按条件 expect：失败时 diff 直接列出
@@ -537,8 +537,8 @@ describe("宿主依赖的版本形状（升级防线）", () => {
   });
 
   it("devDependencies 里的 dsh-* 全部同版本（不许装出第二份宿主类型）", async () => {
-    // 宿主类型面被这些包以 type-only 方式消费；同一次安装里出现两枚 dsh-session 的拷贝，
-    // nominal 类型（品牌串、投影状态）会开始互相不认，而那不报编译错、只报运行期
+    // 宿主类型被这些包以 type-only 方式消费；同一次安装里出现两枚 dsh-session 的拷贝，
+    // nominal 类型（宿主用 brand 标记的 id 串、投影状态）会开始互相不认，而那不报编译错、只报运行期
     // 「认不出这个 callId」。同版本是让这件事不发生的最小条件。
     const { manifest } = surface;
     const dshDev = Object.entries(manifest.devDependencies ?? {}).filter(([name]) =>
@@ -609,8 +609,8 @@ describe("构建产物可载入", () => {
 
   it("产物里没有内联的宿主包正文（它们由宿主在运行期提供）", async () => {
     const code = await readFile(path.join(pkgDir, "host.js"), "utf8");
-    // 内联的痕迹是模块自己的 JSDoc 头（`@module @deepseek-ai/…`）。宿主提供的包必须以裸
-    // 说明符留在产物里，否则拿到的是本包私有的那一份副本 —— 模块级状态会裂成多份。
+    // 内联的痕迹是模块自己的 JSDoc 头（`@module @deepseek-ai/…`）。宿主提供的包必须以只写
+    // 包名的说明符留在产物里，否则拿到的是本包私有的那一份副本 —— 模块级状态会裂成多份。
     const inlined = Array.from(
       code.matchAll(/@module (?<pkg>@deepseek-ai\/[\w-]+)/gu),
       (found) => found.groups?.["pkg"],
@@ -621,7 +621,7 @@ describe("构建产物可载入", () => {
   });
 
   it("产物里的真实逻辑还能跑（压缩改形状时这条会红）", async () => {
-    // 产物是压缩过的：标识符改名、注释剥掉。只断言「导出一个叫 apply 的函数」太弱，
+    // 产物是压缩过的：标识符改名、注释被去掉。只断言「导出一个叫 apply 的函数」太弱，
     // 压缩把内部逻辑改坏它照样绿。这里让**产物自己**跑一遍注册计划：登记表里的每个工具、
     // 两条分支都要给出正确结果。任何依赖名字（constructor.name 之类）或模块级状态的压缩
     // 手法，都会在这里露出来，而不是等到装进 dsh 才发现。

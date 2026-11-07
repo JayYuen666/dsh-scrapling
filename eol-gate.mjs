@@ -5,10 +5,10 @@
 // 照绿，而 windows-latest 那格翻转时报的是格式问题不是行尾配置。
 //
 // 判读要分两种安装形状，且两边都真判：`check-attr` 与 `ls-files --eol` 都要 `.git`，而
-// `verify:published` 那份 `git archive` 导出的副本没有 `.git`——那里落盘的就是索引字节，
+// `verify:published` 那份 `git archive` 导出的副本没有 `.git`——那里写到磁盘的就是索引字节，
 // 于是判「文件里读不到 CRLF」。没有「读不到就当过」那一支。
 //
-// 期望值是一张手抄的字面表，不是从 `.gitattributes` 解析出来的：拿被验对象派生判据，改错了
+// 期望值是一张自己抄的字面表，不是从 `.gitattributes` 解析出来的：拿被验对象派生判据，改错了
 // 两边会一起绿。
 
 import { execFileSync } from "node:child_process";
@@ -17,7 +17,7 @@ import path from "node:path";
 
 const ROOT = import.meta.dirname;
 
-/** 按 `* text=auto eol=lf` 与两条 cmd 系豁免应当解析出来的行尾（键是可以不存在的探针路径） */
+/** 按 `* text=auto eol=lf` 与两条 cmd 系豁免应当解析出来的行尾（键是可以并不存在的路径） */
 export const CONTRACT_EOL = [
   { file: "host.ts", eol: "lf" },
   { file: "lib/runtime.ts", eol: "lf" },
@@ -34,7 +34,7 @@ export const CONTRACT_EOL = [
 /** `.gitattributes` 里必须逐字在位的三条规则（缺一条就是有人在改这条不变量） */
 export const CONTRACT_RULES = ["* text=auto eol=lf", "*.bat text eol=crlf", "*.cmd text eol=crlf"];
 
-/** 索引面与字节面都只管这几类源码后缀：二进制与生成物不归这条判据 */
+/** 索引与字节都只管这几类源码后缀：二进制与生成物不归这条判据*/
 export const SOURCE_SUFFIXES = [
   ".ts",
   ".tsx",
@@ -68,7 +68,7 @@ export function parseCheckAttr(stdout) {
 }
 
 /**
- * 从 `git ls-files --eol` 的行里挑出索引面行尾不对的源码文件。
+ * 从 `git ls-files --eol` 的行里挑出索引行尾不对的源码文件。
  *
  * 判的是 `i/` 那一段（索引里存的字节），不是 `w/`：机器级 `core.autocrlf=true` 换的是工作树，
  * 而这条不变量管的是仓库存了什么。

@@ -61,7 +61,7 @@ URL = "http://contract.test/page"
 # 记录下来的每个调用点：site -> 该点发出的 kwargs 列表。
 CALLS: list[dict[str, Any]] = []
 
-# 会话状态工具的落点目录。**不能写字面量 /tmp 路径**：那是 bandit 的 B108（硬编码临时目录），
+# 会话状态工具的位置目录。**不能写字面量 /tmp 路径**：那是 bandit 的 B108（硬编码临时目录），
 # 而这条门禁只收 medium 及以上。用真的临时目录既躲开它，也比一个固定路径更不容易互相踩。
 STATE_DIR = str(Path(tempfile.gettempdir()) / "scrapling-probe-state")
 
@@ -290,7 +290,7 @@ def _restore(originals: dict[str, Any]) -> None:
     client._default_retry_delay = retry_delay
 
 
-# 每个调用点该出现在上游哪一份参数面里。
+# 每个调用点该出现在上游哪一份参数表里。
 SESSION_LEVEL = {
     "browser.render": "StealthSession",
     "capture.open": "StealthSession",
@@ -305,7 +305,7 @@ STATIC_LEVEL = {
     "session.fetch.static": "GetRequestParams",
 }
 
-# 走 fetch 层参数面的站点：会话内每次抓取与 capture 的抓取步。
+# 走 fetch 层参数表的站点：会话内每次抓取与 capture 的抓取步。
 FETCH_LEVEL_SITES = frozenset({"session.fetch.stealth", "capture.fetch"})
 
 # 会话 fetch 的入参里，实现自己会 pop 掉的键（不在 _fetch_params 字段里但确实生效）。
@@ -427,7 +427,7 @@ def drive() -> None:
     adapters.close_all_sessions()
 
     # 已有 HTML 的正文归一：不发网络，但要确认传给 Response / Convertor 的键名是上游真收的。
-    # 协议面不再单开一个离线方法，这里直接摆到与 session.read 同一处的调用点上。
+    # 协议不再单开一个离线方法，这里直接摆到与 session.read 同一处的调用点上。
     offline_args = _full_args({"html": HTML})
     offline_type, offline_selector, offline_main, offline_limit = adapters._extraction(offline_args)
     adapters.to_payload(
@@ -569,7 +569,7 @@ READ_VARIANTS: dict[str, list[dict[str, Any]]] = {
         {"queryType": "regex", "adaptive": False},
         {"queryType": "similar", "adaptive": False},
         # adaptive 的 Redis 分支：只有走到这一支，`deployment.redisUrl` 才会被真的读一次。
-        # 端口 1 必然拒绝，异常发生在记账之后，由外层 suppress 收下。
+        # 端口 1 必然拒绝，异常发生在记录之后，由外层 suppress 收下。
         {
             "queryType": "css",
             "deployment": {"adaptiveStorage": "redis", "redisUrl": "redis://127.0.0.1:1/0"},
@@ -684,7 +684,7 @@ def reads_by_method() -> dict[str, list[str]]:
     saved_downloads = guard.ALLOW_FILE_DOWNLOADS
     guard.configure(allow_browser_actions=True, allow_file_downloads=True)
     originals = _install_recorders()
-    # 读取面这一趟会把引擎调用点也记进 CALLS，而 check()/facts() 读的是「按完整参数驱动
+    # 读取这一趟会把引擎调用点也记进 CALLS，而 check()/facts() 读的是「按完整参数驱动
     # adapters 的那批记录」。两拨混在一起，站点级断言就取决于跑序 —— 临时收起来，跑完再还。
     saved_calls = CALLS[:]
     CALLS.clear()
@@ -786,7 +786,7 @@ def _launch_args(site: str) -> list[str]:
     except Exception:  # noqa: BLE001 —— 造不出来本身就是结论，由调用侧按空表判
         return []
     try:
-        # 私有面本身也是被盯的对象：上游把 _browser_options 改名或换成非 dict 时，这里按
+        # 私有成员本身也是被盯的对象：上游把 _browser_options 改名或换成非 dict 时，这里按
         # 「拿不到启动参数」收进空表，由 _stealth_check 用结构化缺失报出来。docstring 承诺的
         # 就是「造不出来给空表」，而 traceback 冒到 check()/facts() 会让 stdout 一个字节都没有。
         options = getattr(session, "_browser_options", None)

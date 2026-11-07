@@ -1,4 +1,4 @@
-// dsh-scrapling/test/host.test.ts —— Host 半的配置面与工具注册计划。
+// dsh-scrapling/test/host.test.ts —— Host 半的配置表与工具注册计划。
 //
 // 覆盖三件事：（1）volatile 字段是引用而非真值，必须经 .get() 取快照；
 // （2）Config schema 的默认值；（3）planTools 如何把「用户开关」与「运行环境具备什么」
@@ -181,7 +181,7 @@ interface PromptRecord {
   text: string | ((context: { scope?: object; toolSet?: ToolSetFace }) => string);
 }
 
-/** 步骤准入的读面（官方 `ResolvedToolSet.view` 的结构投影）。 */
+/** 步骤准入的读取接口（官方 `ResolvedToolSet.view` 的结构投影）。 */
 interface ToolSetFace {
   readonly view: (scope: object | undefined) => Map<string, unknown>;
 }
@@ -189,7 +189,7 @@ interface ToolSetFace {
 /**
  * 假 ctx 的 systemPrompt 面。
  *
- * apply 会注册一段用量指引，所以每个跑 apply 的用例都得给它挂上这个面 —— 缺了它，症状不是
+ * apply 会注册一段用量指引，所以每个跑 apply 的用例都得给它挂上这一类 —— 缺了它，症状不是
  * 「指引段没注册」而是整个 apply 抛，那会把一堆无关用例一起带走，报错还不指向真正的原因。
  *
  * `into` 每次调用新建一份：默认值若是模块级共享数组，跑 apply 的用例就会互相往里面塞段，
@@ -341,7 +341,7 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
   };
 }
 
-/** 本仓探针解释器是否就位。不就位时下面这些用例整条跳过，而不是跑起来空转。 */
+/** 本仓探测脚本用的解释器是否就位。不就位时下面这些用例整条跳过，而不是跑起来却什么都不校验。 */
 const HAS_LOCAL_PYTHON = existsSync(LOCAL_PYTHON);
 
 /** 工具没被注册时的报错文案。 */
@@ -389,7 +389,7 @@ describe("config schema", () => {
     expect(volatileRef("provideWebSearch").get()).toBe(true);
   });
 
-  it("抽取默认 markdown 且只取 body —— 与 dsh 内置 web_fetch 的呈现口径对齐", () => {
+  it("抽取默认 markdown 且只取 body —— 与 dsh 内置 web_fetch 的呈现规则对齐", () => {
     expect(volatileRef("extractionType").get()).toBe("markdown");
     expect(volatileRef("mainContentOnly").get()).toBe(true);
   });
@@ -874,7 +874,7 @@ describe("apply", () => {
     writeFileSync(path.join(venvBin, "python"), "#!/bin/sh\nexit 0\n");
 
     // 可执行位是判据本身：文件在但跑不起来属于坏掉的机器本地态，跟着它走会把整轮测量带崩。
-    // `writeFileSync` 落盘是 0644，所以先显式立起可执行位，这一档才是在判「文件在且能跑」。
+    // `writeFileSync` 写到磁盘是 0644，所以先显式立起可执行位，这一档才是在判「文件在且能跑」。
     chmodSync(path.join(venvBin, "python"), 0o755);
     expect(resolvePythonBin("", root)).toStrictEqual({
       path: path.join(venvBin, "python"),
@@ -917,7 +917,7 @@ describe("apply", () => {
   });
 
   it("写方法这一档作为明确表态送到 Python 侧（两侧各判一次的前提）", async () => {
-    // 关着的时候 Host 不给参数面，Python 那边还得独立硬拒一次；这一条钉的是两侧读到
+    // 关着的时候 Host 不给参数表，Python 那边还得独立硬拒一次；这一条钉的是两侧读到
     // **同一份**表态。给 "0" 而不是留空：留空时「部署显式关」与「忘了配」在进程环境里
     // 长得一模一样，而 Python 的默认恰好也是关 —— 那种巧合最难查。
     const seen: Record<string, string | undefined>[] = [];
@@ -1339,7 +1339,7 @@ describe("apply 的爬虫作业接线", () => {
     );
     // failFastOnMissingPython=false：spawn 被拒 → 没有可用 sidecar → 作业一个都不该开。
     // 「sidecar 真起来时 apply 会注册 crawl 工具并起作业」那半由下面 makeJobHarness 那组用例驱动
-    // （真站点 + 真解释器），本用例只钉这一侧的收口。
+    // （真站点 + 真解释器），本用例只钉 spawn 被拒这一路的统一处理。
     expect(started).toStrictEqual([]);
   });
 
@@ -1526,7 +1526,7 @@ describe("apply 到爬虫作业的完整链路", () => {
         { signal: new AbortController().signal },
       );
 
-      // 作业是异步跑的，给它一点时间把页面写进输出环。
+      // 作业是异步跑的，给它一点时间把页面写进输出环形缓冲。
       // 作业是异步跑的；这里只等一小段时间把结果凑齐，不是长期轮询。
       await waitForOutput(output, "Leaf Page");
       expect(output.some((text) => text.includes(ROOT_MARK))).toBe(true);
@@ -1573,7 +1573,7 @@ function makeJobHarness({ withoutJobs = false }: { withoutJobs?: boolean } = {})
   //
   // 这个夹具**复刻真实注册表的闸门**：没有 controller 附着时 start 抛
   // 「no job controller serves this agent」。原先的夹具让 start 无条件成功，于是
-  // 「宿主平面的 tool-jobs 被 disabled」这一态在测试里根本不存在 —— 那正是
+  // 「宿主那一层的 tool-jobs 被 disabled」这一态在测试里根本不存在 —— 那正是
   // scrapling_crawl 在真实 profile 里必挂而 57 条用例全绿的原因。
   let attachDepth = 0;
   const jobsStub = {
@@ -1858,10 +1858,10 @@ describe("爬虫作业的取消与失败", () => {
   });
 
   it.runIf(HAS_LOCAL_PYTHON)(
-    "作业后端在起作业那一刻同步抛错：也按 JOBS_UNAVAILABLE 拒绝，不裸传宿主报错",
+    "作业后端在起作业那一刻同步抛错：也按 JOBS_UNAVAILABLE 拒绝，不把宿主报错原样传出去",
     async () => {
       // startCrawlJob 声明的是 Promise<string>：attachController / start 的同步异常必须
-      // 翻成 rejection，且换成可执行的文案 —— 裸的宿主报错（「no job controller …」）
+      // 翻成 rejection，且换成可执行的文案 —— 宿主原样的报错（「no job controller …」）
       // 对模型少一句该改哪里的上下文。
       const harness = makeJobHarness();
       try {
@@ -2014,7 +2014,7 @@ describe("出站 URL 闸门（Host 侧 SSRF 防线）", () => {
     await expect(gate(PUBLIC)).resolves.toBe(PUBLIC);
   });
 
-  it("nat64Prefixes 配错时报可读错并拒绝加载（而不是抛一条裸异常）", () => {
+  it("nat64Prefixes 配错时报可读错并拒绝加载（而不是抛一条原始异常）", () => {
     // 方向是拒绝加载而不是「忽略这一项」：丢掉的前缀 = 它内嵌的私网 IPv4 被当成公网放行。
     for (const bad of ["1.1.1.1/32", "not-an-ip/96", "2001:db8::/1"]) {
       expect(() => createUrlGate(makeConfig({ nat64Prefixes: bad }))).toThrow(
@@ -2180,7 +2180,7 @@ describe("接管 ctx.web 的两个接缝", () => {
   );
 });
 
-/** 起一枚真 `LocalJobRegistry`；配置走官方 schema 的默认值，不手抄数字。 */
+/** 起一枚真 `LocalJobRegistry`；配置走官方 schema 的默认值，不自己抄数字。 */
 function makeRealRegistry(): LocalJobRegistry {
   const parsed = (
     LocalJobRegistry.Config as unknown as {
@@ -2220,17 +2220,17 @@ function outcomeOf(start: () => string): { id?: string; error?: string } {
 /**
  * 夹具的作业闸门必须与**真实现**同解。
  *
- * 为什么需要这条：上面那份 `jobsStub` 手抄了 `dsh-jobs-local` 的准入判定（没有 controller
- * 附着就拒 start）。手抄件会腐烂——上游改了闸门或换了文案，夹具照旧，而用例继续绿。这条用
- * 真注册表跑同样三种状态，把「手抄件是否还等于真件」变成一条会自己变红的断言。
+ * 为什么需要这条：上面那份 `jobsStub` 自己抄了 `dsh-jobs-local` 的准入判定（没有 controller
+ * 附着就拒 start）。抄来的那份会过时——上游改了闸门或换了文案，夹具照旧，而用例继续绿。这条用
+ * 真注册表跑同样三种状态，把「抄来的那份是否还等于真注册表」变成一条会自己变红的断言。
  *
  * 三种状态就是本包生产代码所依赖的全部：
- *   ① 裸 start 被拒 —— 这正是 `scrapling_crawl` 在默认 profile 里挂掉的形态；
+ *   ① 没有 controller 附着时的 start 被拒 —— 这正是 `scrapling_crawl` 在默认 profile 里挂掉的形态；
  *   ② attach 之后 start 成功 —— `startUnderCrawlController` 的做法；
  *   ③ detach 之后回到被拒 —— 证明作用域是临时的，生产的 detach 不会给宿主留开着的闸门。
  */
 describe("作业闸门：夹具与真实现同解", () => {
-  it("裸 start 被拒，attach 后成功，detach 后回到被拒", () => {
+  it("不带凭据的 start 被拒，attach 后成功，detach 后回到被拒", () => {
     const registry = makeRealRegistry();
     const bare = outcomeOf(() => registry.start(realRegistrySpec()));
     expect(bare.id, "没有 controller 附着时真注册表必须拒绝").toBeUndefined();
@@ -2263,7 +2263,7 @@ describe("作业闸门：夹具与真实现同解", () => {
     } catch (error: unknown) {
       message = error instanceof Error ? error.message : String(error);
     }
-    // 夹具里写死的那句：两边对不上就说明手抄件已经腐烂，改夹具而不是放宽这里。
+    // 夹具里写死的那句：两边对不上就说明自己抄件已经腐烂，改夹具而不是放宽这里。
     const stubbed =
       "background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)";
     expect(message).toBe(stubbed);
@@ -2545,7 +2545,7 @@ describe("mcp 模式的装配", () => {
     await tearDown(harness);
   });
 
-  it("mcp 调用真的走工具执行面与渲染面", async () => {
+  it("mcp 调用真的走工具执行上下文与渲染面", async () => {
     const harness = await startSurface({}, LIVE_SEARCH);
     const client = await connectProbe(harness.port());
     const result = await client.callTool({ name: "search", arguments: { query: "dsh" } });

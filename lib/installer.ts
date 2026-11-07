@@ -185,13 +185,13 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-/** OS 级文件锁的最小面；模块缺失或形状不符时返回 null，由调用方报可行动错误。 */
+/** OS 级文件文件锁的最小类型；模块缺失或形状不符时返回 null，由调用方报可行动错误。 */
 export interface NativeLock {
   tryLock: (fd: number) => boolean;
   unlock: (fd: number) => void;
 }
 
-/** 按依赖名加载原生锁；`load` 可注入，单测用它覆盖模块缺失/形状不符两条失败面。 */
+/** 按依赖名加载原生锁；`load` 可注入，单测用它覆盖模块缺失/形状不符两条失败。 */
 export function loadNativeLock(
   load: (id: string) => unknown = createRequire(import.meta.url),
 ): NativeLock | null {
@@ -218,12 +218,12 @@ export function loadNativeLock(
 
 const NATIVE_LOCK = loadNativeLock();
 
-/** 安装锁的句柄面：互斥由 OS 级锁维护，释放动作只负责解锁并关闭句柄。 */
+/** 安装锁的句柄类型：互斥由 OS 级锁维护，释放动作只负责解锁并关闭句柄。 */
 export interface LockHandle {
   release: () => Promise<void>;
 }
 
-/** 拿到 fd 后尝试非阻塞排他锁；失败按「锁不可读」收口，交给调用方报可行动错误。 */
+/** 拿到 fd 后尝试非阻塞排他锁；失败按「锁不可读」统一处理，交给调用方报可行动错误。 */
 export function lockFd(fd: number, lock: NativeLock | null = NATIVE_LOCK): boolean {
   if (lock === null) {
     throw new InstallError("INSTALL_LOCK_UNREADABLE", "fs-native-extensions is not loadable");
@@ -263,7 +263,7 @@ export async function acquireLock(
       try {
         lock?.unlock(handle.fd);
       } catch {
-        // 句柄已关闭或锁已释放：第二次 release 是空转，关闭句柄仍要走到。
+        // 句柄已关闭或锁已释放：第二次 release 不执行任何操作，关闭句柄仍要走到。
       }
       await handle.close();
     },
@@ -309,7 +309,7 @@ async function ensureRuntimeDir(dataDir: string): Promise<string> {
  * （venv / state.json / browsers），并发进来就会互相踩。
  *
  * 同一进程可以重入：CLI 的卸载路径先取锁、再叫 `uninstallCapabilityPack`，而后者自己
- * 也要取同一把锁。OS 级锁按 fd 互斥，同一进程再开一个句柄同样拿不到，没有这层记账
+ * 也要取同一把锁。OS 级锁按 fd 互斥，同一进程再开一个句柄同样拿不到，没有这层记录
  * 就是自己挡住自己，卸载永远报 BUSY。
  */
 export async function withInstallLock<Result>(
@@ -367,7 +367,7 @@ async function offlineArchive(assets: string, url: string): Promise<Uint8Array> 
     );
   }
   const raw = path.basename(new URL(url).pathname);
-  // 清单 URL 里 `+` 是 `%2B`；浏览器 / curl -O 落盘时用的是解码后的名字，两种都认。
+  // 清单 URL 里 `+` 是 `%2B`；浏览器 / curl -O 写到磁盘时用的是解码后的名字，两种都认。
   let decoded: string;
   try {
     decoded = decodeURIComponent(raw);
@@ -416,7 +416,7 @@ export async function installPython(
           `python archive hash ${digest} does not match ${asset.sha256}`,
         );
       }
-      // 临时文件先落盘：解压器需要真实路径，也保证失败时能整段清掉。
+      // 临时文件先写到磁盘：解压器需要真实路径，也保证失败时能整段清掉。
       await writeFile(archive, bytes);
       const extractDir = path.join(tmpRoot, "extract");
       await mkdir(extractDir, { recursive: true });
@@ -487,7 +487,7 @@ export async function readRuntimeState(dataDir: string): Promise<Record<string, 
 }
 
 /**
- * 原子落盘状态：先写同目录临时文件再 rename。
+ * 原子写到磁盘状态：先写同目录临时文件再 rename。
  *
  * 直接 writeFile 到 state.json 时，进程在 truncate 之后、写完之前被杀就留下半份 JSON。
  * rename 是同一文件系统内的原子替换 —— 读到的要么是旧整份、要么是新整份。
@@ -694,7 +694,7 @@ export async function installCore(options: {
   });
 }
 
-/** 目录里是否有 Chromium 的可执行标记；安装后的验收与 status 的现量共用这一条判据。 */
+/** 目录里是否有 Chromium 的可执行标记；安装后的验收与 status 的当场读数共用这一条判据。 */
 async function hasChromiumUnder(browsersPath: string): Promise<boolean> {
   try {
     const entries = await readdir(browsersPath, { recursive: true });
@@ -798,7 +798,7 @@ export async function packStates(
     search: core,
     media: core,
     // adaptive-redis 的客户端与官方 server 的二进制都与 core 同住一个 venv：它们各自是
-    // 一条依赖 / 一个入口，钉在 runtime-requirements 里，所以这两包的就绪面就是 core 的面。
+    // 一条依赖 / 一个入口，钉在 runtime-requirements 里，所以这两包的就绪状态就是 core 的。
     "adaptive-redis": core,
     mcp: core,
   };
@@ -907,7 +907,7 @@ export const repairCapabilityPack: typeof installCapabilityPack = installCapabil
  *
  * 只删运行时文件；`purge` 才连同 adaptive 指纹库、下载与登录态一起删。`mcp` 与 `core` /
  * `search` / `media` 共用同一个 venv，所以撤任何一个都走同一条路：删 venv。状态文件里对应
- * 的包标记同步摘掉，下一次 status 会按文件现量。
+ * 的包标记同步摘掉，下一次 status 会按文件当场读数。
  *
  * @param pack - 能力包
  * @param options - 数据目录与是否清数据
@@ -920,7 +920,7 @@ export async function uninstallCapabilityPack(
   // CLI 的卸载路径已经在外层取过锁，这里靠 withInstallLock 的进程内重入才不会被自己挡住。
   await withInstallLock(options.dataDir, async () => {
     const runtimeDir = path.join(options.dataDir, "runtime");
-    // browser 的安装面是 browsers/，其余包共用整份 venv。
+    // browser 安装目录是 browsers/，其余包共用整份 venv。
     const removedDir = pack === "browser" ? "browsers" : "venv";
     await rm(path.join(runtimeDir, removedDir), { recursive: true, force: true });
     if (options.purge) {

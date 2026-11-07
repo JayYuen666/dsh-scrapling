@@ -1,9 +1,9 @@
-// dsh-scrapling/test/contract-plugin-surface.test.ts —— 注入面与实际摸到的服务必须一致。
+// dsh-scrapling/test/contract-plugin-surface.test.ts —— 注入与实际摸到的服务必须一致。
 //
 // cordis 的上下文是一层代理：**没写进 `inject` 的名字读不到**，读就跑
 // `cannot get property "<name>" without inject`（@deepseek-ai/cordis 的 reflect 层）。这条
 // 机制在本仓咬过一次真实故障：设置卡与它的结果行一起静默消失 —— 症状不是报错，而是页面上
-// 少了一块东西。所以两面都要钉：
+// 少了一块东西。所以两处都要钉：
 //
 // 1. **少写**：摸了一个没声明的服务。运行时抛，而抛在异步 effect 里会被 cordis 咽进日志
 //    （`lib/index.js` 的 task.catch → logger.error），用户侧只剩「界面少了一块」。
@@ -289,7 +289,7 @@ const HOST_FILES = [
 ];
 
 /**
- * 取 Host 侧的声明面与使用面。
+ * 取 Host 侧的声明与使用。
  *
  * @returns 声明集合、使用集合、可选读取集合
  */
@@ -309,7 +309,7 @@ async function hostSurface(): Promise<{
 describe("判据本身：读代码，不读注释与文案", () => {
   it("模板插值里没有 ctx 读服务：那条形状扫描器看不见，出现就要先改判据", async () => {
     // stripCommentsAndStrings 把整段模板（含 `${...}`）当文案丢掉，所以插值里真读服务时
-    // 「少声明」会虚假通过。现量：本包源码里没有这种写法。有人写出来时这条要响，
+    // 「少声明」会虚假通过。当场实测：本包源码里没有这种写法。有人写出来时这条要响，
     // 而不是留一个静默的洞。
     const files = [...HOST_FILES, ...CLIENT_FILES];
     const offenders: string[] = [];
@@ -363,7 +363,7 @@ describe("判据本身：读代码，不读注释与文案", () => {
   });
 });
 
-describe("注入面：声明的服务与真正摸到的服务必须一致", () => {
+describe("注入：声明的服务与真正摸到的服务必须一致", () => {
   it("宿主侧少声明：摸到的每个服务都在 inject 里（漏了就是运行时抛）", async () => {
     const { declared, touched } = await hostSurface();
     const missing = [...touched].filter((name) => !declared.has(name));
@@ -401,7 +401,7 @@ describe("注入面：声明的服务与真正摸到的服务必须一致", () =
 });
 
 /**
- * 往一个干净容器里装一个读服务的探针插件，把读到的东西原样带回来。
+ * 往一个干净容器里装一个读服务的探测用的插件，把读到的东西原样带回来。
  *
  * @param options - 声明清单、要读的名字、以及那个名字有没有被 provide 过
  * @returns 读取结果或错误文本；插件没被激活时给空串

@@ -14,7 +14,7 @@
 //
 // 打桩 `loader.internal` 用的也是上游自己测试里的办法（packages/session/session-turn-outline/
 // tests/loader-composition.spec.ts）：pnpm 把 loader 藏在 .pnpm 真路径下，裸包名从那里 import
-// 找不到本包，而 internal.import 正是宿主解析裸名的机制。走这一条还顺带保住覆盖率 —— 它返回
+// 找不到本包，而 internal.import 正是宿主按包名解析时走的那条路。走这一条还顺带保住覆盖率 —— 它返回
 // 的是 `../host.ts` 源码命名空间，不是构建产物。
 
 import { existsSync } from "node:fs";
@@ -64,7 +64,7 @@ function noop(): void {
 /** cordis 的 FiberState.ACTIVE（const enum，运行时不导出，只能按值钉）。 */
 const FIBER_ACTIVE = 2;
 
-/** 本包名与补丁里那行的裸名 —— 二者必须一致，否则解析不到入口。 */
+/** 本包名与补丁里那行只写的包名 —— 二者必须一致，否则解析不到入口。 */
 const PACKAGE_NAME = "@jayyuen66/dsh-scrapling";
 
 /** 补丁里那一条的 id，同时也是设置命名空间；只在这里写一次。 */
@@ -83,7 +83,7 @@ function missingInterpreter(dataDir: string): string {
   return path.join(dataDir, "no-such-interpreter");
 }
 
-/** 本桩只把三路管道交回：collect / inherit 这些形态不在侧车需要的那一面上，问到就抛。 */
+/** 本桩只把三路管道交回：collect / inherit 这些形态不是侧车会用到的，问到就抛。 */
 function pipeOnly(mode: SubprocessStdio[keyof SubprocessStdio]): "pipe" {
   if (mode !== "pipe") {
     throw new TypeError(`subprocess 替身只实现 stdio 的 "pipe"，收到的是 ${JSON.stringify(mode)}`);
@@ -92,12 +92,12 @@ function pipeOnly(mode: SubprocessStdio[keyof SubprocessStdio]): "pipe" {
 }
 
 /**
- * subprocess 服务面的替身。
+ * subprocess 宿主服务的替身。
  *
  * 入参与返回值都按真实的 `SubprocessSpawnSpec` / `SubprocessHandle` 收：原先只声明
  * `argv/cwd/env` 并把三路管道写死，`stdio` 的分流对象、`graceMs` 与 `signal` 都被静默丢掉，
- * 上游给这一面加字段时这里不会有任何反应。侧车只用 stdin/stdout/stderr/done/terminate/
- * waitForExit，所以本桩只实现这几位（control 与 collect 模式的输出环留给真实现）。
+ * 上游给这里加字段时不会有任何反应。侧车只用 stdin/stdout/stderr/done/terminate/
+ * waitForExit，所以本桩只实现这几位（control 与 collect 模式的输出环形缓冲留给真实现）。
  *
  * `resolveExecutable` 与真实语义同解：绝对路径要验在场，不在场就拒——降级因此是从这一位
  * 走出去的，而不是靠 `spawn` 的 ENOENT。
@@ -142,7 +142,7 @@ function subprocessStub(seen: SubprocessCalls): {
           child.kill("SIGTERM");
         },
         waitForExit: async (): Promise<boolean> => {
-          // 本桩没有 collect 模式的输出环，进程一退出就算排空。等的是 done 那一枚已经挂好的
+          // 本桩没有 collect 模式的输出环形缓冲，进程一退出就算排空。等的是 done 那一枚已经挂好的
           // 监听：exit 先于 close 发生，在这里重新 once("exit") 会永远等不到。
           await done;
           return true;
@@ -199,7 +199,7 @@ interface InternalImport {
  * 本仓库根的 file:// URL。
  *
  * 不手拼 `file://${path}`：Windows 上盘符前少一道斜杠、反斜杠也没转义，含空格或非 ASCII
- * 的路径同样不会被百分号编码；Loader 按 URL 解析裸名，拼错的表现是「装载失败」而不是
+ * 的路径同样不会被百分号编码；Loader 按 URL 解析包名，拼错的表现是「装载失败」而不是
  * 一条能读懂的报错。
  *
  * @returns 不带尾斜杠的 URL
@@ -209,7 +209,7 @@ function pathToFileHref(): string {
 }
 
 /**
- * 组装载荷：真实 Loader + 真实服务 + 两枚手写服务面。
+ * 组装载荷：真实 Loader + 真实服务 + 两枚手写宿主服务。
  *
  * @param dataDir - 交给 sidecar 的工作目录（必须是临时目录：默认档会写 ~/.dsh-scrapling）
  * @returns 装载结果
@@ -246,7 +246,7 @@ async function load(dataDir: string): Promise<Loaded> {
   ctx.provide("subprocess", subprocessStub(subprocessCalls));
 
   // 裸包名在 pnpm 布局下会从 loader 的 .pnpm 真路径解析而找不到本包；上游的宿主用
-  // `loader.internal` 做同一件事（把名字解析到 baseUrl 那一侧）。这里按同样的缝打桩。
+  // `loader.internal` 做同一件事（把名字按 baseUrl 去解析）。这里按同样的缝打桩。
   const internalImports: InternalImport[] = [];
   const loader = ctx.loader as unknown as {
     internal?: Pick<ModuleLoaderV2, "version"> & { import: ModuleLoaderV2["import"] };
@@ -457,7 +457,7 @@ describe("经真实 Loader 装载本插件", () => {
   });
 
   it("发布的 cordis.patch.yml 经上游合成函数得出装载用的那一条", async () => {
-    // 输入只有真实文件这一份。原先两条用例一条把补丁内容手抄进数组（证的是「我抄的这份能被合成」）、
+    // 输入只有真实文件这一份。原先两条用例一条把补丁内容自己抄进数组（证的是「我抄的这份能被合成」）、
     // 另一条用正则扫全文取 name（会连注释与将来 config 里的 name 键一起算），两条职责重叠，
     // 补丁一演进就会静默失效。
     const text = await readFile(path.resolve(import.meta.dirname, "../cordis.patch.yml"), "utf8");

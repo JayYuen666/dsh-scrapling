@@ -1,7 +1,7 @@
 // dsh-scrapling/src/settings-card.ts —— 插件页里的设置卡。
 //
 // 坐在 `plugins.bundle.config` 这张 keyed slot 上，键是本包名，宿主因此把本包的配置
-// 画在插件详情页里。卡面自己只负责把「宿主给的配置值面」翻译成一张表单。
+// 画在插件详情页里。卡片自己只负责把「宿主给的配置值」翻译成一张表单。
 //
 // **宿主不给这张卡传 form。** 插件管理器渲染 bundle 页时调的是
 // `renderSlot('plugins.bundle.config', { view: 'page' }, { entryKey })` —— owner props
@@ -59,7 +59,7 @@ export type PathOp =
   | { readonly op: "set"; readonly path: readonly [string]; readonly value: unknown }
   | { readonly op: "unset"; readonly path: readonly [string] };
 
-/** 宿主给这张卡的值面。 */
+/** 宿主给这张卡的值。 */
 export interface FormState {
   readonly status: "loading" | "ready" | "unavailable";
   readonly value?: Record<string, unknown> | undefined;
@@ -94,21 +94,21 @@ export interface CardProps {
   readonly t: Translate;
   readonly form?: FormSource | undefined;
   /**
-   * 宿主 runtime 读面；缺席（没有 remote 服务或客户端 ctx 没有 `get`）时卡片显示 CLI 命令。
+   * 宿主 runtime 读取接口；缺席（没有 remote 服务或客户端 ctx 没有 `get`）时卡片显示 CLI 命令。
    * 与 form 分开：它是动作入口，不是配置字段，和 schema 的对账表没有关系。
    */
   readonly runtime?: RuntimeReader | undefined;
 }
 
-/** 没给值面时读到的那一版：既不在线也不可写，于是卡片画出一张锁住的空表。 */
+/** 没给值时读到的那一版：既不在线也不可写，于是卡片画出一张锁住的空表。 */
 const LOADING_STATE: FormState = { status: "loading", writable: false };
 
-/** 值面缺席时的 getSnapshot：永远返回同一个引用，订阅因此不会被反复重建。 */
+/** 值缺席时的 getSnapshot：永远返回同一个引用，订阅因此不会被反复重建。 */
 function loadingSnapshot(): FormState {
   return LOADING_STATE;
 }
 
-/** 值面缺席时的 subscribe：永远不通知，回收是空操作。 */
+/** 值缺席时的 subscribe：永远不通知，回收是空操作。 */
 function loadingSubscribe(): () => void {
   return (): void => undefined;
 }
@@ -144,7 +144,7 @@ export function displayValue(
   invalidText: Readonly<Partial<Record<string, string>>> = {},
 ): string {
   // 声明成 Partial 而不是 `Record<string, string>`：没有 `noUncheckedIndexedAccess` 时
-  // 后者的下标被读成必有的 string，下面这条 undefined 判定会被判成恒真，而「没有非法
+  // 后者的下标被读成必有的 string，下面这条 undefined 判定会被判成永远成立，而「没有非法
   // 原文」恰恰是这张表的常态。
   const typed = invalidText[field.key];
   if (typed !== undefined) {
@@ -182,7 +182,7 @@ const NUMBER_INPUT_SCHEMA = z
   .transform(Number);
 
 /**
- * `format: "url"` 字段的取值判定：先过 `z.url()` 的形态，再按字段声明的协议白名单收口。
+ * `format: "url"` 字段的取值判定：先过 `z.url()` 的形态，再按字段声明的协议白名单统一处理。
  *
  * 白名单只对需要它的字段存在（代理地址与 SearXNG 端点）：`z.url()` 只判「能解析成 URL」，
  * `file:`/`data:` 这类值同样通过，而那些值要到下游真正建连时才失败。
@@ -340,7 +340,7 @@ export function browserDocument(): DocumentFace | undefined {
  * @returns 摘掉本次注入的样式；没有注入时是空操作
  */
 export function installStyle(doc: DocumentFace, id: string, css: string): () => void {
-  // 显式比 null 与 undefined 两个「没找到」的写法：本模块声明的返回面是 unknown，只比
+  // 显式比 null 与 undefined 两个「没找到」的写法：本模块声明的返回类型是 unknown，只比
   // 其中一个的话，在一个返回 undefined 的实现上会永远短路，样式一次都装不上。
   const present = doc.querySelector(`#${id}`);
   if (present !== undefined && present !== null) {
@@ -562,7 +562,7 @@ const EMPTY_DRAFT: Draft = { values: {}, baseRevision: undefined, invalid: [], i
  * 一笔写入被宿主接受之后草稿的下一状态。
  *
  * 只摘掉这次真正发出去的字段；若仍有剩余（`await` 期间的程序化改动），围栏必须清掉：
- * 这一笔已经落盘，旧 revision 对应的那一版不复存在，带着它提交只会被判成 stale。
+ * 这一笔已经写到磁盘，旧 revision 对应的那一版不复存在，带着它提交只会被判成 stale。
  * 下一次改动会按那一刻的宿主快照重新取围栏。
  *
  * @param previous - 提交前的草稿
@@ -622,14 +622,14 @@ interface RuntimeState {
  * 轮询只在作业活着时开：空闲时不断敲 status 会让浏览器网络面板一直有请求，而作业结束后
  * 结果已经落在 snapshot 里，不需要再看。
  *
- * @param reader - 宿主读面；undefined 时什么都不做（卡片显示 CLI 命令）
+ * @param reader - 宿主读取接口；undefined 时什么都不做（卡片显示 CLI 命令）
  * @returns 状态与动作
  */
 function useRuntime(reader: RuntimeReader | undefined): RuntimeState {
   const [snapshot, setSnapshot] = useState<RuntimeStatusResult | null>(null);
   const [busy, setBusy] = useState("");
   const [failure, setFailure] = useState("");
-  // 读面的请求序号：轮询、动作后的回读与初始装载会同时在途，晚返回的**旧**响应不能覆盖
+  // 读取接口的请求序号：轮询、动作后的回读与初始装载会同时在途，晚返回的**旧**响应不能覆盖
   // 新快照（作业状态会因此倒退）。只认最后发出的那一笔。
   const requestSeq = useRef(0);
   const refresh = useCallback(async (): Promise<void> => {
@@ -793,7 +793,7 @@ function renderPackRow(props: {
   );
 }
 
-/** 运行环境一节。没有远程面或没有作业后端时都退到可照抄的 CLI 命令。 */
+/** 运行环境一节。没有远程通道或没有作业后端时都退到可照抄的 CLI 命令。 */
 function renderRuntime(props: {
   readonly reader: RuntimeReader | undefined;
   readonly t: Translate;
@@ -933,7 +933,7 @@ export function SettingsCard(props: CardProps): ReactNode {
   // 宿主那边改了值（别处保存、或本卡这笔写完之后回读）要把卡跟着换掉。
   // ⚠ 这条 hook 必须留在下面那个早退之前：React 按调用顺序配对 hook，早退把 useStates
   // 之外的这一枚跳掉，下一次渲染就错位了。
-  // 值面缺席时（官方插件页的 summary 视图）退到「正在读取」那一版：两个入参都换成
+  // 值缺席时（官方插件页的 summary 视图）退到「正在读取」那一版：两个入参都换成
   // 模块级常量，引用恒定，于是既不会重建订阅也不会通知。
   const state = useSyncExternalStore(
     form === undefined ? loadingSubscribe : form.subscribe,

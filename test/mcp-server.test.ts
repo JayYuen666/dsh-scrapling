@@ -348,7 +348,7 @@ async function rawPostChunked(port: number): Promise<number> {
  * 用假会话起一条 server，把「这一条请求怎么处理」交给调用方。
  *
  * SDK 那两步只回错误响应、不抛，所以兜底分支只能从这一层注入失败 —— 判的是本模块对
- * 失败的收口，不是 SDK 的脾气。
+ * 失败的统一处理，不是 SDK 的脾气。
  *
  * @param behavior - 假会话在这条请求上做点什么
  * @returns 起好的 handle 与装配记录
@@ -560,7 +560,7 @@ describe("allowedEndpoints", () => {
       expect(guard.allowedHosts).toContain("127.0.0.1:8080");
       expect(guard.allowedHosts).toContain("localhost:8080");
       expect(guard.allowedHosts).toContain("[::1]:8080");
-      // 绑定地址本身是通配，但**允许面**不能写通配，否则防护等于没开。
+      // 绑定地址本身是通配，但**白名单**不能写通配，否则防护等于没开。
       expect(guard.allowedHosts).not.toContain(`${host}:8080`);
       expect(guard.allowedHosts.some((entry) => entry.includes("*"))).toBe(false);
     }
@@ -572,7 +572,7 @@ describe("allowedEndpoints", () => {
     expect(guard.allowedOrigins).toStrictEqual(["http://192.0.2.10:9000"]);
   });
 
-  it("::1 绑定时 Host 写成方括号形态，不出现裸 ::1:port", () => {
+  it("::1 绑定时 Host 写成方括号形态，不出现不带方括号的 ::1:port", () => {
     const guard = allowedEndpoints("::1", 39_219);
     expect(guard.allowedHosts).toContain("[::1]:39219");
     expect(guard.allowedHosts).toContain("localhost:39219");
@@ -580,14 +580,14 @@ describe("allowedEndpoints", () => {
     expect(guard.allowedHosts).not.toContain("::1:39219");
   });
 
-  it("网卡条目读成 undefined 时按空表跳过，防护面照样给出回环字面量", () => {
+  it("网卡条目读成 undefined 时按空表跳过，防护照样给出回环字面量", () => {
     networkInterfaces.mockReturnValueOnce({ lo: undefined } as never);
     const guard = allowedEndpoints("0.0.0.0", 39_218);
     expect(guard.allowedHosts).toContain("127.0.0.1:39218");
     expect(guard.allowedHosts).toContain("[::1]:39218");
   });
 
-  it("通配绑定时展开非 internal 网卡地址，IPv6 加方括号、internal 的不进允许面", () => {
+  it("通配绑定时展开非 internal 网卡地址，IPv6 加方括号、internal 的不进白名单", () => {
     networkInterfaces.mockReturnValueOnce({
       en0: [
         { address: "192.0.2.7", internal: false },
@@ -598,7 +598,7 @@ describe("allowedEndpoints", () => {
     const guard = allowedEndpoints("0.0.0.0", 39_220);
     expect(guard.allowedHosts).toContain("192.0.2.7:39220");
     expect(guard.allowedHosts).toContain("[2001:db8::1]:39220");
-    // internal 地址不是本机对外名字，进允许面只会把防护放大。
+    // internal 地址不是本机对外名字，进白名单只会把防护放大。
     expect(guard.allowedHosts).not.toContain("10.1.2.3:39220");
   });
 });
@@ -680,7 +680,7 @@ describe("startMcpServer", () => {
     expect(openClients.size).toBe(0);
   });
 
-  it("列出的工具来自同一份定义表，参数面不另起一套", async () => {
+  it("列出的工具来自同一份定义表，参数表不另起一套", async () => {
     const handle = await serve({ port: 0, entries: ENTRIES });
     const client = await clientFor(handle.port);
     const listed = await client.listTools();
@@ -694,7 +694,7 @@ describe("startMcpServer", () => {
     await closeClient(client);
   });
 
-  it("调用走同一份执行面，参数原样到达", async () => {
+  it("调用走同一份执行上下文，参数原样到达", async () => {
     const handle = await serve({ port: 0, entries: ENTRIES });
     const client = await clientFor(handle.port);
     const result = await client.callTool({ name: "fetch", arguments: { query: "hello" } });
@@ -904,7 +904,7 @@ describe("startMcpServer", () => {
   });
 
   describe("会话装配缝", () => {
-    it("会话抛错时收成一记 500，防护面仍按实际端口算好交出去", async () => {
+    it("会话抛错时收成一记 500，防护仍按实际端口算好交出去", async () => {
       const { handle, seen } = await withFakeSession(async () => {
         throw new Error("transport 炸了");
       });

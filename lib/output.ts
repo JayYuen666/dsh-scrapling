@@ -80,7 +80,7 @@ export const FALLBACK_BUDGET_BYTES = 200_000;
 /**
  * 把调用方给的预算归一成「至少 1 的整数」；非法值回落到兜底。
  *
- * 本函数是导出面，预算不是只能从 schema 来（`Schema.natural().min(1)` 只管设置卡那一侧）：
+ * 本函数是导出名单，预算不是只能从 schema 来（`Schema.natural().min(1)` 只管从设置卡进来的值）：
  * 小数预算会让尾部字节数带小数一路传进 TextRetainer，(0,1) 的预算更会让头部字节数算出负数。
  *
  * @param budgetBytes - 调用方给的预算
@@ -97,7 +97,7 @@ function normalizeBudget(budgetBytes: number): number {
  * 把正文按字节预算做头尾两段截断。
  *
  * 用字节而不是字符：`TextRetainer` 的预算本来就是字节，跟 sidecar 侧的
- * `maxContentChars`（字符）并存时，靠这个函数收口成模型最终真正看到的那一份。
+ * `maxContentChars`（字符）并存时，靠这个函数统一处理成模型最终真正看到的那一份。
  *
  * @param text - 完整正文
  * @param budgetBytes - 字节预算；非有限数或不足 1 时按兜底预算处理
@@ -121,7 +121,7 @@ export function capText(text: string, budgetBytes: number, recovery: string): Ca
   const kept = retainer.finish();
   // 到不了：走到这里的前提是正文字节数超过预算，而 TextRetainer 与本函数同按字节计，
   // 超过 budget 的正文必然有字节被它丢掉。留着这一支是为了让「没截断就没有页脚」由
-  // 构造保证，而不是依赖对 TextRetainer 记账方式的推断。
+  // 构造保证，而不是依赖对 TextRetainer 记录方式的推断。
   /* v8 ignore next 3 */
   if (!kept.truncated) {
     return { text: kept.text, truncated: false, notice: "" };
@@ -157,7 +157,7 @@ function renderLocate(value: LocateResult): string {
               `  css: ${item.cssSelector}`,
               `  xpath: ${item.xpathSelector}`,
             ];
-            // 开关打开时 sidecar 才带这些面；空对象/空数组就是「没有」，不额外打一行空壳。
+            // 开关打开时 sidecar 才带这些字段；空对象/空数组就是「没有」，不额外打一行空壳。
             if (Object.keys(item.attributes).length > 0) {
               lines.push(`  attributes: ${JSON.stringify(item.attributes)}`);
             }

@@ -229,7 +229,7 @@ def _download_via_stream(
             try:
                 with open(temporary, "wb") as sink:
                     for chunk in response.iter_content(chunk_size=_DOWNLOAD_CHUNK_BYTES):
-                        # 先判后写：写盘再判会让落盘字节超过上限最多一个块（64 KiB）。
+                        # 先判后写：写盘再判会让写到磁盘字节超过上限最多一个块（64 KiB）。
                         if total + len(chunk) > limit:
                             raise _error(
                                 "DOWNLOAD_TOO_LARGE",
@@ -304,7 +304,7 @@ def _download_via_browser(
     except Exception as error:
         # 「Page.goto: Download is starting」：Chromium 不能把「触发下载的响应」当成一次
         # 导航，fetch 这条路对附件/二进制响应天然走不通。换成等真实的 download 事件再把它
-        # 落盘。其它异常（超时、网络错误、路由拒绝）仍按失败上报：这里再导航一次会重复请求，
+        # 写到磁盘。其它异常（超时、网络错误、路由拒绝）仍按失败上报：这里再导航一次会重复请求，
         # 还会把真实原因盖成附件路径的异常类名。
         if "download is starting" not in str(error).lower():
             raise _error("DOWNLOAD_FAILED", f"download failed: {type(error).__name__}: {error}") from error
@@ -469,7 +469,7 @@ def screenshot(
             matches = locator.count()
             if matches != 1:
                 raise _error("BAD_ARGS", f"selector must match exactly one element, matched {matches}")
-            # timeout 与整页那支同源：参数面声明了 timeoutMs，两条路径都得真生效。
+            # timeout 与整页那支同源：参数表声明了 timeoutMs，两条路径都得真生效。
             data = locator.screenshot(
                 type=image_type,
                 timeout=timeout_ms,

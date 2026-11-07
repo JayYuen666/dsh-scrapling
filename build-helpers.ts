@@ -1,6 +1,6 @@
 // dsh-scrapling/build-helpers.ts —— build-host.ts、build-client.ts 与 build-cli.ts 共用的构建小工具。
 //
-// 这三个脚本只在产物名、入口、format 与外部化面上不同，其余「执行判定 / 打包形状 / 严格模式迁移 /
+// 这三个脚本只在产物名、入口、format 与外部化上不同，其余「执行判定 / 打包形状 / 严格模式迁移 /
 // 原子写盘 / 单 chunk 校验」原本各写一份。分开写的代价是修 bug 得改两处：close 掩盖原始
 // 错误、清理掩盖写入错误、严格模式只认双引号——三项都出现过单侧修一类的情况。
 //
@@ -21,7 +21,7 @@ import { rolldown } from "rolldown";
 import { canonicalizeRegionPaths } from "@jayyuen66/dsh-plugin-shared/lib/canonicalize-region-paths";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 
-/** CJS 产物的严格模式指令。折进 ModuleLoader 外壳之后它就不再是函数体的指令前导。 */
+/** CJS 产物的严格模式指令。折进 ModuleLoader 外壳 之后它就不再是函数体的指令前导。 */
 export const STRICT_DIRECTIVE = '"use strict";';
 
 /**
@@ -32,7 +32,7 @@ export const STRICT_DIRECTIVE = '"use strict";';
  * Windows 的 junction、以及「用一个 shim 转调」这三种形态下两个串恒不相等 —— 于是构建
  * 什么都不做、退出码还是 0，陈旧产物被静默发出去。两边都折成真实路径再比。
  *
- * 两个 `import.meta.*` 由调用方传入：这个函数住在共享模块里，读自己那份只会拿到本文件。
+ * 两个 `import.meta.*` 由调用方传入：这个函数定义在共享模块里，读自己那份只会拿到本文件。
  *
  * @param moduleFilename - 调用方的 `import.meta.filename`
  * @param moduleUrl - 调用方的 `import.meta.url`
@@ -66,7 +66,7 @@ export function invokedDirectly(moduleFilename: string, moduleUrl: string): bool
  * 跳过开头的空白与整段注释，返回第一处真正是代码的下标。
  *
  * 注释不是语句，所以「一行 license banner 之后紧跟 `"use strict";`」这种正文里，那条指令
- * **仍然**处于指令前导位置：判指令在不在前导，要按剥掉注释与空白之后的正文看，
+ * **仍然**处于指令前导位置：判指令在不在前导，要按去掉注释与空白之后的正文看，
  * 不能按字符串的第一个字符看。
  *
  * @param code - 原始正文
@@ -118,7 +118,7 @@ export function hoistStrictDirective(code: string): string {
   }
   const [found = ""] = match;
   const prefix = code.slice(0, start);
-  // 指令后面紧跟的那一段空白一起摘掉：旧写法也是这么收的，留着会在外壳里多出一个空行。
+  // 指令后面紧跟的那一段空白一起摘掉：旧写法也是这么收的，留着会在 外壳 里多出一个空行。
   const after = code.slice(start + found.length).replace(/^\s+/u, "");
   // 前导只有空白时一并丢掉（与旧写法一致）；带注释的前导要留着，license banner 是
   // 要随产物发出去的东西。
@@ -126,7 +126,7 @@ export function hoistStrictDirective(code: string): string {
 }
 
 /**
- * 取依赖表里的包名清单（值即外部化说明符）。
+ * 取依赖表里的包名清单（返回值即外部化用的说明符）。
  *
  * 只取键，不看值的类型：外部化判据只需要包名。按「值必须是字符串」过滤会把对象形式的
  * 声明（别名、目录依赖）静默丢掉，那个包于是被打进产物 —— 正好触发外部化想防的重复
@@ -153,8 +153,8 @@ const NOT_A_PACKAGE_SPECIFIER = /^(?:[./\\#\0]|node:)/u;
  * （和将来拿它做「白名单外一律外部化」的人）会以为子路径已经被覆盖。这里显式交回空串：
  * 空串不是包名，`externalizePackages` 的名单里也永远不会有它。
  *
- * @param id - 模块说明符
- * @returns 包名段；不是 npm 裸说明符时是空串
+ * @param id -说明符
+ * @returns 包名段；不是 npm裸说明符时是空串
  */
 export function packageNameOf(id: string): string {
   if (NOT_A_PACKAGE_SPECIFIER.test(id)) {
@@ -188,8 +188,8 @@ export function externalizePackages(names: Iterable<string>): (id: string) => bo
  * 直接覆盖目标文件的话，中断、磁盘写满或进程被杀都会在目标位置留下半截 JS —— 而那正是
  * `prepack` 之后会被发布出去的东西。同一文件系统内的改名是原子的，所以**读者**看到的要么
  * 是上一份、要么是这一份，不会读到半截。这里不承诺掉电之后的持久性：没有 fsync，写回缓存里
- * 的数据块可能比目录项晚落盘；构建产物每次 `build` 都整份重写，值得省的是构建时间而不是这次
- * 落盘的同步，真要断电恢复的语义属于数据文件，不属于产物。
+ * 的数据块可能比目录项晚写到磁盘；构建产物每次 `build` 都整份重写，值得省的是构建时间而不是这次
+ * 写到磁盘的同步，真要断电恢复的语义属于数据文件，不属于产物。
  *
  * 写入前先清掉同目录下匹配本产物名的旧残留：进程被 SIGKILL、CI 取消时临时文件留在包根，
  * pid 每次不同，没人回收；它们还可能落进 `files` 漏项的缝里随包发出去。前提是一次构建不与
@@ -308,7 +308,7 @@ const HOST_PACKAGE_SEGMENT = /@deepseek-ai[+/]/u;
  * 只有这一条判据能在构建期点名。
  *
  * rolldown 不再交回 moduleIds 时这里**抛错而不是静默放行**：那条判据从此量不到东西，
- * 打绿就是假绿。
+ * 判定通过就是误判通过。
  *
  * @param moduleIds - chunk 的 moduleIds
  * @param label - 出错文本里指名的产物
@@ -331,9 +331,9 @@ export function assertNoHostPackageInlined(
   }
 }
 
-/** 一次打包的输入面；三张产物只在这些参数上不同。 */
+/** 一次打包的输入参数；三张产物只在这些参数上不同。 */
 export interface BundlePlan {
-  /** 包根（region 路径折叠按它算）。 */
+  /** 包根（region 路径折叠 canonicalizeRegionPaths 按它算）。 */
   readonly root: string;
   /** rolldown 的入口。 */
   readonly input: string;
@@ -345,7 +345,7 @@ export interface BundlePlan {
   readonly extensions: readonly string[];
   readonly external: (id: string) => boolean;
   /**
-   * 严格模式指令要不要摘出来：嵌进 ModuleLoader 外壳的 CJS 必须摘（否则它不再是函数体的
+   * 严格模式指令要不要摘出来：嵌进 ModuleLoader 外壳 的 CJS 必须摘（否则它不再是函数体的
    * 第一条语句），直接执行的 ESM 本来就还在指令位。
    */
   readonly hoistStrict: boolean;
@@ -356,13 +356,13 @@ export interface BundlePlan {
  * bundle」这一段的共同形状。
  *
  * 三个构建脚本原先各写一份，`build-helpers.ts` 头部记的那类单侧修 bug（close 掩盖原始错误、
- * 清理掩盖写入错误、严格模式只认双引号）就是这种形状的直接后果；banner、外壳与写盘仍归各脚本。
+ * 清理掩盖写入错误、严格模式只认双引号）就是这种形状的直接后果；banner、外壳 与写盘仍归各脚本。
  *
  * region 路径折叠落在这里而不是各脚本：`//#region` 行的路径由 rolldown 按 `process.cwd()` 算出
  * ⇒ 同一份源码有两种字节（cwd=包根 写 `lib/x.ts`，cwd=上一层 写 `<包名>/lib/x.ts`），而
  * `test/artifact-freshness.test.ts` 拿内存构建与磁盘产物逐字节比 —— 只在一侧折就永远红。
  *
- * @param plan - 打包输入面
+ * @param plan - 打包输入参数
  * @returns 折叠过 region 路径的 chunk 正文
  */
 export async function bundleChunkText(plan: BundlePlan): Promise<string> {

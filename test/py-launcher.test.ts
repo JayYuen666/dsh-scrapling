@@ -64,7 +64,7 @@ async function run(args: string[]): Promise<RunResult> {
   });
   const [code, signal] = (await once(child, "close")) as [number | null, NodeJS.Signals | null];
   if (signal !== null) {
-    // 折叠成 `status = 1` 会把「启动器自己被杀」与「它按预期退了 1」画成同一个读数，
+    // 归并成 `status = 1` 会把「启动器自己被杀」与「它按预期退了 1」画成同一个读数，
     // 而红话只能说出 1。这里直接抛，并把 stderr 带出来定位。注意这与下面那条「子进程被
     // 信号结束时按 128+信号号退」的用例无关：那一条里收到信号的是 Python 子进程，启动器
     // 自己带着映射后的 143 正常退出。

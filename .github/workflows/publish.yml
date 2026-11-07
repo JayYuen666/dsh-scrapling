@@ -55,7 +55,7 @@ jobs:
         with:
           node-version: 24.9
           registry-url: https://registry.npmjs.org
-          # 与 ci.yml 同一口径：缓存键取自本仓的 pnpm-lock.yaml，省掉这台发布机上每次冷装
+          # 与 ci.yml 同一种做法：缓存键取自本仓的 pnpm-lock.yaml，省掉这台发布机上每次冷装
           # 全套依赖的时间。发布链本来就有 install + 完整 check + prepack，缓存命中的是其中
           # 最长的那一段。
           cache: pnpm
@@ -82,7 +82,7 @@ jobs:
             *) echo "::warning::版本查询回了 ${code}，预检无法定论；继续发布，占用由 registry 判" ;;
           esac
       # 测试里有一批用例以 existsSync(_env/.venv/bin/python3) 为前提才能真跑起来。那个目录被
-      # gitignore（它是机器本地状态），所以 CI 上必须自己备一份。缺了它，那批用例会退化成空转：
+      # gitignore（它是机器本地状态），所以 CI 上必须自己备一份。缺了它，那批用例会退化成什么都不校验：
       # host.ts 的覆盖率从 100% 掉到 58%，门禁随之变红——而报错只说「覆盖率不达标」，真正的原因
       # （环境没备）不出现在任何一行日志里。已实测：本地把 venv 移走，能逐位复现 CI 的数字。
       # 是 `fetchers` 不是 `rag`：后者才是本插件要的——`extractionType` 默认 markdown，而
@@ -93,7 +93,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
-          # 与 ci.yml 同一口径：依赖文件是 py/requirements-dev.txt，缓存的是它解析出来的
+          # 与 ci.yml 同一种做法：依赖文件是 py/requirements-dev.txt，缓存的是它解析出来的
           # 那一批轮子（既有检查工具，也有 pip 侧的传递依赖）。
           cache: pip
           cache-dependency-path: py/requirements-dev.txt
@@ -123,12 +123,12 @@ jobs:
       # ② 到 ③ 之间别拖太久：新建的 trusted publisher 配置有 2 天窗口，期内必须完成第一次
       # 成功发布，过期即失效且不可编辑，只能删除重建。
       # 这一步只做两件事：token 在场就校验形态、不在场就确认 OIDC 环境在。它**不决定**走哪条——
-      # 认证优先级写在 permissions 那段注释里：OIDC 在前，token 只兜底。
+      # 认证优先级写在 permissions 那段注释里：OIDC 在前，token 只后备。
       - name: 确认发布凭据（OIDC 优先，回落静态 token）
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          # 与本文件其余 run 块同一口径：没有 `set -e` 时管道里的失败会被吞掉，
+          # 与本文件其余 run 块同一种做法：没有 `set -e` 时管道里的失败会被吞掉，
           # 于是 `tr` 拿不到东西时下一步的判据会把「命令坏了」说成「凭据里混了非法字符」。
           set -euo pipefail
           TOKEN="$(printf '%s' "$NPM_TOKEN" | tr -d '\r\n[:space:]')"
@@ -189,7 +189,7 @@ jobs:
               401|403)
                 echo "::warning::静态 token 被 registry 拒（HTTP $code）——本次不启用它，按 OIDC 发布。这枚 secret 已失效，用完请到 Settings → Secrets 删掉，否则每次发布都留一条本行告警。"
                 PASS_TOKEN=""
-                # 回落要有落点：上面「凭据形态」那一步在 token 在场时提前 exit 0，OIDC 环境是否
+                # 回落要有去处：上面「凭据形态」那一步在 token 在场时提前 exit 0，OIDC 环境是否
                 # 可用从没被判过。token 在这里失效后如果 OIDC 也不在，真正的失败要等到 pnpm
                 # publish 才以它的原始报错出现，和「凭据失效」混成一件事。同一条判据先问一次。
                 if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
@@ -239,7 +239,7 @@ jobs:
       # prepack 会重建 host.js / client.js；产物不入库也发得出去。
       # 凭据优先级是本文件最容易读反的地方：不是「配了 NPM_TOKEN 就用它、没配才 OIDC」，
       # 而是 OIDC 在前、token 在后（pnpm 的 publish_options.rs 原话 "OIDC takes precedence over
-      # a configured static token"）。trusted publisher 配好时下面那段 export 等于空转，
+      # a configured static token"）。trusted publisher 配好时下面那段 export 等于没有校验作用，
       # registry 上该版本的 _npmUser 记成 GitHub Actions <npm-oidc-no-reply@github.com> 就是这个。
       # 注入方式只能是环境变量：setup-node 配了 registry-url 会把 `${NODE_AUTH_TOKEN}` 占位写进
       # RUNNER_TEMP/.npmrc 并用 NPM_CONFIG_USERCONFIG 指过去，$HOME/.npmrc 被忽略；真 token 留在

@@ -94,14 +94,14 @@ function yamlEscape(char: string): string {
     }
     default: {
       // 字符类只匹配 BMP 控制字符，char 是单个 UTF-16 码元；换 codePointAt 只会多出
-      // 一段「string 可能为空」的类型面，在这里等于造一条永远走不到的兜底分支。
+      // 一段「string 可能为空」的类型声明，在这里等于造一条永远走不到的兜底分支。
       // oxlint-disable-next-line unicorn/prefer-code-point
       return `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`;
     }
   }
 }
 
-// 这条正则**就是**用来抓「不能裸出现在 YAML 双引号标量里的控制字符」的，命中是设计意图。
+// 这条正则**就是**用来抓「不能原样出现在 YAML 双引号标量里的控制字符」的，命中是设计意图。
 // oxlint-disable-next-line eslint/no-control-regex
 const YAML_UNSAFE = /[\u0000-\u001F\u007F-\u009F"\\]/gu;
 

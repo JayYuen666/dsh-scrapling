@@ -1,7 +1,7 @@
 // lib/mcp-server.ts —— 把本插件的工具表原样端成一套 MCP server。
 //
-// 参数面与执行面都取自 native 那一份 `ToolDefinition`：这里不重写任何 schema 或映射，
-// 否则两套定义必然漂移（spec §9.1「不允许两套参数面漂移」）。SDK 只在 `mcp` 模式真的
+// 参数表与执行上下文都取自 native 那一份 `ToolDefinition`：这里不重写任何 schema 或映射，
+// 否则两套定义必然漂移（spec §9.1「不允许两套参数表漂移」）。SDK 只在 `mcp` 模式真的
 // 起服务时才动态载入，native 模式下这些依赖一行都不执行。
 
 import { timingSafeEqual } from "node:crypto";
@@ -42,7 +42,7 @@ export interface McpImageSink {
   readonly take: (id: string) => { data: string; mimeType: string } | undefined;
 }
 
-/** 搜索发现层在 MCP 侧要的那两面；宿主给的是 `createWebSearchProvider` 的产物。 */
+/** 搜索发现层在 MCP 侧要的那两处；宿主给的是 `createWebSearchProvider` 的产物。 */
 export interface McpSearchSurface {
   readonly available: () => boolean;
   readonly search: (
@@ -68,7 +68,7 @@ export interface McpServerOptions {
 /**
  * 一条请求的 MCP 会话：协议对象与它的传输，加上「处理这一条请求」。
  *
- * 生产侧由 SDK 装配；这个面存在的理由是让失败注入点落在模块自己写的那一段，
+ * 生产侧由 SDK 装配；这一类存在的理由是让失败注入点落在模块自己写的那一段，
  * 而不是落在第三方 SDK 的内部行为上。
  */
 export interface McpSession {
@@ -80,7 +80,7 @@ export interface McpSession {
   readonly handle: (request: IncomingMessage, response: ServerResponse) => Promise<void>;
 }
 
-/** 装配一请求会话的那一步；参数是按实际端口展开后的 DNS 防护面。 */
+/** 装配一请求会话的那一步；参数是按实际端口展开后的 DNS 防护。 */
 export type McpSessionFactory = (guard: McpAllowedEndpoints) => McpSession;
 
 export interface McpServerHandle {
@@ -262,7 +262,7 @@ interface SearchValue {
   readonly content: string;
 }
 
-/** 把 provider 那一面的结果收成 MCP 工具的稳定形状；缺字段一律落成空值而不是抛。 */
+/** 把 provider 返回的结果收成 MCP 工具的稳定形状；缺字段一律落成空值而不是抛。 */
 function normalizeSearch(query: string, raw: unknown): SearchValue {
   const sources = isRecord(raw) && Array.isArray(raw["sources"]) ? raw["sources"] : [];
   return {
@@ -333,7 +333,7 @@ async function runEntry(
   const params = args ?? {};
   try {
     // 每个工具只读 exec 上的 signal（native 的单测同样只给这一位），MCP 请求的取消信号
-    // 就落在这一位上。ToolRunContext 的其余成员是宿主的调用身份，这一侧没有对应事实可填。
+    // 就落在这一位上。ToolRunContext 的其余成员是宿主的调用身份，MCP 这边没有对应事实可填。
     // oxlint-disable-next-line typescript/no-unsafe-type-assertion
     const exec = { signal } as ToolRunContext;
     const value = jsonOf(await entry.definition.execute(params, exec));
@@ -449,7 +449,7 @@ export function boundPort(address: AddressInfo | string | null): number {
   return address.port;
 }
 
-/** DNS 重绑定防护的允许面：只列这条 server 真实可达的 host:port 字面量。 */
+/** DNS 重绑定防白名单：只列这条 server 真实可达的 host:port 字面量。 */
 export interface McpAllowedEndpoints {
   readonly allowedHosts: readonly string[];
   readonly allowedOrigins: readonly string[];
@@ -578,7 +578,7 @@ export async function startMcpServer(options: McpServerOptions): Promise<McpServ
       }
       return runEntry(entry, call.params.arguments, extra.signal, options.imageSink);
     });
-    // DNS 重绑定防护：SDK 会对 Host / Origin 做逐字比较，所以允许面必须是真实可达的字面量。
+    // DNS 重绑定防护：SDK 会对 Host / Origin 做逐字比较，所以白名单必须是真实可达的字面量。
     // 不写通配就是这条判据的全部意义 —— 没有它，恶意域名解析到 127.0.0.1 的请求看起来与本地请求一样。
     // SDK 把这三项标成了 deprecated、建议改用外部中间件；本插件不起任何 web 框架，
     // 「外部中间件」这一层就是这里 —— 仍用 SDK 自带判据，它与 handleRequest 同批执行，

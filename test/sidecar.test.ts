@@ -585,7 +585,7 @@ describe("sidecar client 与假 runtime", () => {
     ).rejects.toThrow(/aborted/u);
     // 一帧都不能写进管道：中止时进程正在被拆掉，写进去既不报错也不触发 error，只是静默丢弃。
     expect(sent).toStrictEqual([]);
-    // 「不在 #pending 里留下一条已结清的条目」在类外没有可读的面（`#pending` 是私有字段，
+    // 「不在 #pending 里留下一条已结清的条目」在类外没有可读的条目（`#pending` 是私有字段，
     // 对外只有 capabilities 与 alive），所以这里判的是同一次中止之后**这只客户端**还能不能
     // 重新起一代并把请求结清 —— 半拆的簿记（handle 没清、启动卡在中间态）在这里露出来。
     await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
@@ -844,7 +844,7 @@ describe("sidecar client 与假 runtime", () => {
       },
     });
     await client.ensureStarted();
-    // stderr 的 data 监听是裸监听：#log 不兜住这一抛就是未捕获异常。
+    // stderr 的 data 监听没有再包一层：#log 兜不住这一抛就是未捕获异常。
     spawned.last?.stderr.push("bridge: 一行诊断\n");
     await delay(0);
     // 回帧路径里也有 #log（坏帧与未知 id），一句打印的 bug 不该让进程收摊。
@@ -1307,7 +1307,7 @@ describe("sidecar client 与真实 python 进程", () => {
     );
     const caps = await client.ensureStarted();
     // 这里钉的是「有上报」而不是「报 true」：拦不拦得住由对端那套库有没有 route_web_socket
-    // 决定，Python 侧的 run_inprocess_capabilities 拿 Page 类的真实面比它；缺这一位才说明
+    // 决定，Python 侧的 run_inprocess_capabilities 拿 Page 类的真实值比它；缺这一位才说明
     // README 承诺的覆盖面报告又丢了。
     expect(
       caps.websocketGuard,

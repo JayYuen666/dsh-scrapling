@@ -2,7 +2,7 @@
 //
 // coverage report --fail-under=74 量的是**整包平均**，一份文件掉下去会被别处抬平；
 // 这个脚本把 package.json.files 里那几份 py 源文件逐个对到 coverage json 的分文件读数，
-// 并要求每一份都 >= 地板。地板写在两处（本文件的 FLOOR 与 package.json 的
+// 并要求每一份都 >= 下限。下限写在两处（本文件的 FLOOR 与 package.json 的
 // --fail-under），两处不一致时先判红：否则改一处就等于悄悄换了判据。
 
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -55,7 +55,7 @@ export function shippedFiles(pkg) {
  * 脚本里那条 --fail-under 的取值。
  *
  * @param pkg - package.json 内容
- * @returns 脚本地板；读不到时返回 null（并已写 stderr）
+ * @returns 脚本里那条下限；读不到时返回 null（并已写 stderr）
  */
 export function floorFromScripts(pkg) {
   const command = pkg.scripts?.["coverage:floor"];

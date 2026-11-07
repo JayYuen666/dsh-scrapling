@@ -63,8 +63,8 @@ PROXY_BYPASS_ENV = "DSH_SCRAPLING_PROXY_BYPASS"
 # **干什么**。被注入的页面文字完全可以要求发一个改状态的请求，SSRF 判定会放行（地址是公网
 # 白名单里的），而那次写入落在对端就收不回来。所以默认关，要开得部署方明确表态。
 #
-# 两侧各自判一次，不依赖对方：Host 侧按同一个设置决定要不要把 `method`/`body` 摆到模型面前
-# （关的时候模型根本看不见这两个入参），这一侧则是硬拒 —— 手搓一帧 stdin 也写不出去。
+# 两侧各自判一次，不依赖对方：Host 侧按同一个设置决定要不要把 `method`/`body` 摆到模型可见前
+# （关的时候模型根本看不见这两个入参），插件侧则是硬拒 —— 手搓一帧 stdin 也写不出去。
 ALLOW_WRITE_METHODS_ENV = "DSH_SCRAPLING_ALLOW_WRITE_METHODS"
 
 # 当前是否允许写方法；由 :func:`configure_from_env` 按上面那枚变量填。
@@ -196,7 +196,7 @@ def configure_from_env() -> None:
             network = ipaddress.ip_network(text)
         except ValueError:
             continue
-        # 只收 IPv4：合成落池没有 IPv6 形态（与 Host 侧 parseSyntheticRange 同一口径），
+        # 只收 IPv4：合成落池没有 IPv6 形态（与 Host 侧 parseSyntheticRange 同一种做法），
         # 而这一份表只与 IPv4Address 比。收一个 IPv6 段进去，它永远命中不了，还会让
         # 「配过了」的假象成立。
         if isinstance(network, ipaddress.IPv4Network):
@@ -204,7 +204,7 @@ def configure_from_env() -> None:
     SYNTHETIC_NETWORKS = tuple(networks)
     PROXY_URL = os.environ.get(PROXY_ENV, "").strip()
     PROXY_BYPASS = os.environ.get(PROXY_BYPASS_ENV, "").strip()
-    # 写方法开关只认那几种明确写法：拼错的值（"ture"）必须落在「关」那一侧，而不是被
+    # 写方法开关只认那几种明确写法：拼错的值（"ture"）必须按关闭处理，而不是被
     # `bool("非空")` 读成开 —— 一个安全开关的默认失败方向是收紧。
     ALLOW_WRITE_METHODS = os.environ.get(ALLOW_WRITE_METHODS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
     ALLOW_BROWSER_ACTIONS = os.environ.get(ALLOW_BROWSER_ACTIONS_ENV, "").strip().lower() in (
@@ -228,7 +228,7 @@ def configure_from_env() -> None:
     if PROXY_URL and split_proxy(PROXY_URL) is None:
         # 不抛：抛出去 sidecar 直接起不来，用户看到的只是「插件加载失败」，看不出是自己
         # 填错了一个地址。记一行指向明确的日志，让侧栏里的能力摘要照实报成未配置。
-        # 日志面过 redact：代理地址常带 user:pass@，不能原样进宿主日志。
+        # 日志过 redact：代理地址常带 user:pass@，不能原样进宿主日志。
         _log(
             f"ignoring an unusable {PROXY_ENV}: {redact_url_secrets(PROXY_URL)!r}"
             f" (scheme must be one of {_PROXY_SCHEMES})"

@@ -1,4 +1,4 @@
-// 协议层的属性面：FrameSplitter 是「对端任意切块 → 完整帧」的唯一入口，url-policy 的
+// 协议层的属性测试：FrameSplitter 是「对端任意切块 → 完整帧」的唯一入口，url-policy 的
 // 脱敏是「URL 凭据不进文案」的闸门。期望值来自 lib/jsonl.ts / lib/url-policy.ts 头注
 // 写明的契约，不从实现派生。
 import { describe, it } from "vitest";

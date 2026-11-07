@@ -471,7 +471,7 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         kind: "text",
         format: "url",
         // 代理交给 curl 与 Playwright：两者都认 http(s)，socks 只认 5 系；file:/data:/javascript:
-        // 这类值写进设置后要到建连才失败，所以在录入时按下游真实能力收口。
+        // 这类值写进设置后要到建连才失败，所以在录入时按下游真实能力统一处理。
         schemes: ["http:", "https:", "socks5:", "socks5h:"],
         secret: true,
         label: { zh: "代理地址", en: "Proxy URL" },
@@ -776,10 +776,10 @@ const ROW_CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>
 };
 
 /**
- * 把字段表与卡面文案摊成宿主 locale 服务要的字典。
+ * 把字段表与卡片文案摊成宿主 locale 服务要的字典。
  *
  * 键的形状：字段是 `field.<key>.label` / `field.<key>.hint`，分组是
- * `group.<id>.title` / `group.<id>.note`，卡面文案直接用自己的键。键从字段表推出来，
+ * `group.<id>.title` / `group.<id>.note`，卡片文案直接用自己的键。键从字段表推出来，
  * 所以往表里加一个字段就自动多出两条词典项 —— 不需要在这里再抄一遍。
  *
  * @returns 语言 → 键值表；两份的键集相等

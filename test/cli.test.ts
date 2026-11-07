@@ -83,7 +83,7 @@ const SEARCH_WITHOUT_KEY = [
   "",
 ].join("\n");
 
-/** 造一份「core 能力包已就绪」的 dataDir 现量：状态文件与解释器文件都要在。 */
+/** 造一份「core 能力包已就绪」的 dataDir 当场实测：状态文件与解释器文件都要在。 */
 function readyCoreData(dataDir: string): void {
   const bin = path.join(dataDir, "runtime", "venv", "bin");
   mkdirSync(bin, { recursive: true });
@@ -684,7 +684,7 @@ describe("runCli", () => {
     expect(lines.join("\n")).toContain("INSTALL_NETWORK: no network");
   });
 
-  it("未知错误也收口为退 1", async () => {
+  it("未知错误也统一处理为退 1", async () => {
     const { deps, lines } = harness();
     await expect(
       runCli([SETUP, FEATURE, CORE, APPLY], {
@@ -752,7 +752,7 @@ describe("runCli", () => {
     await expect(runCli([SETUP, UNINSTALL, CORE], deps)).resolves.toBe(0);
     expect(calls).toStrictEqual([]);
     expect(lines.join("\n")).toContain("dry-run; add --apply to uninstall");
-    // 计划行必须点名包与落点，否则「dry-run」三个字等于什么都没说。
+    // 计划行必须点名包与位置，否则「dry-run」三个字等于什么都没说。
     expect(lines.join("\n")).toContain(`uninstall core from ${path.join(dataDir, "runtime")}`);
   });
 

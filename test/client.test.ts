@@ -52,7 +52,7 @@ const makeEffectRunner =
  * 夹具只带本包读的那几位（block 的内容按宿主联合类型无法逐位构造），但**键名与 phase 的
  * 类型**由 `ToolCallViewProps` 约束：宿主把 `phase` 改名或换掉取值集时这里编译红，
  * 而逐处 `as never` 会让漂移只剩运行期那一道防线（宿主 `block` 是按阶段变形的联合，
- * 手抄一份本地接口根本拦不住）。
+ * 自己抄一份本地接口根本拦不住）。
  *
  * @param props - 本用例要给的几位
  * @returns 交给被测函数的 props
@@ -339,7 +339,7 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
   const asked: string[] = [];
   const renderers = new Map<string, (props: unknown) => unknown>();
   // 宿主那一版配置：引用恒定（useSyncExternalStore 就靠这一点判「有没有变」），
-  // 且整张替身只有一份 —— 与本包对值面的用法一致。
+  // 且整张替身只有一份 —— 与本包对值的用法一致。
   let hostState: HostSnapshot = { status: "ready", value: {}, revision: 7, writable: true };
   // 下一笔写入是否按「宿主拒绝」收场：版本冲突与只读表单都走这条，卡片要能区分
   // 「没保存上」与「保存成功」，否则用户以为改动了而配置没变。
@@ -407,7 +407,7 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
         (key: string): string =>
           key,
     },
-    // 宿主的订阅是引用比较：换了函数就重建订阅。所以值面在注册时造一次，
+    // 宿主的订阅是引用比较：换了函数就重建订阅。所以值在注册时造一次，
     // 不能每渲染一次新建一个 —— 下面 configFormsSource 用 source 变量把这点固定住。
     configForms: {
       get: (entryId: string) => {
@@ -417,7 +417,7 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
     },
   };
   // ctx 只放行清单里的名字，其余名字留一个会炸的 getter，抛的串与宿主逐字相同。
-  // effect 不算「注入的服务」—— 它是 @deepseek-ai/cordis 混进每个 ctx 的方法面。
+  // effect 不算「注入的服务」—— 它是 @deepseek-ai/cordis 混进每个 ctx 的方法子集。
   const ctx: Record<string, unknown> = { effect: makeEffectRunner(effectDisposers) };
   for (const name of SERVICE_NAMES) {
     if (names.includes(name)) {
@@ -536,7 +536,7 @@ describe("apply", () => {
     expect(element.props.form?.mutate).toBeTypeOf("function");
   });
 
-  it("值面在注册时造一次：每帧换一个新对象等于每帧重建订阅，会漏掉宿主的变更通知", async () => {
+  it("值在注册时造一次：每帧换一个新对象等于每帧重建订阅，会漏掉宿主的变更通知", async () => {
     const { renderers } = applyWith();
     const render = renderers.get(rendererKey(BUNDLE_CONFIG_SLOT, BUNDLE_PACKAGE_NAME));
     if (render === undefined) {
@@ -568,7 +568,7 @@ describe("apply", () => {
     // 交给宿主渲染器的是一个组件元素；RowView 自身才是真正读 block 的那一层。
     expect(element.type).toBeTypeOf("function");
     // props 里带着宿主给的 block 与顶层 phase，而不是本包自己的一份 args —— 这一条正是「结果行只剩
-    // 工具名」的根因：早先 RowView 只接了一个 tool 字符串，owner props 整个被丢掉。
+    // 工具名」的真正的原因：早先 RowView 只接了一个 tool 字符串，owner props 整个被丢掉。
     expect(element.props.block).toBeDefined();
     expect(element.props.phase).toBe("result");
     expect(element.props.toolName).toBe("scrapling_fetch");

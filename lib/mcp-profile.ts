@@ -62,11 +62,11 @@ const QUOTED_SCALAR = /^(?:"(?<double>[^"]*)"|'(?<single>[^']*)')$/u;
  *
  * 同一份条目文本有三种合法缩进：profile 的 patch 写法（`name:` 6 格、config 键 8 格）、
  * 宿主 `--dump-config` 打出的合成列表（2 格 / 4 格），以及人手写的别的层级。写死格数的解析
- * 会在后两种里把真存在的条目读成「没有条目」，doctor 于是报一条假红。
+ * 会在后两种里把真存在的条目读成「没有条目」，doctor 于是报一条误报。
  *
  * 标量本身也不是只有一种写法：列表项可以写 `- name:`，值可以是单引号、双引号或裸标量，
  * 行尾可以带注释或空格。这些都是合法 YAML（本仓自己的 `cordis.patch.yml` 用的就是双引号），
- * 只认「单引号 + 行尾干净」那一种会把真存在的条目读成没有 —— 假红与漏报残留都从这里来。
+ * 只认「单引号 + 行尾干净」那一种会把真存在的条目读成没有 —— 误报与漏报残留都从这里来。
  */
 const ENTRY_NAME = /^(?:-[\t ]*)?name:(?<value>.*)$/u;
 const CONFIG_KEY = /^(?<key>[\w-]+):[\t ]+(?<value>\S.*)$/u;
@@ -77,7 +77,7 @@ const CONFIG_KEY = /^(?<key>[\w-]+):[\t ]+(?<value>\S.*)$/u;
  * 不处理转义序列：这里的值只用来比对 `serverName` / `transport` / URL 端口，不做语义还原。
  *
  * @param raw - `key:` 之后的原文
- * @returns 裸值；整行只有注释或空白时为 undefined
+ * @returns 去掉包裹后的标量；整行只有注释或空白时为 undefined
  */
 function scalarOf(raw: string): string | undefined {
   const trimmed = raw.replace(TRAILING_COMMENT, "").trim();
@@ -293,7 +293,7 @@ function isSwitchOn(text: string): boolean {
  *
  * 只有 ENOENT 才是「这份文件不存在」；EACCES、EISDIR、EMFILE 这些读不到的原因不能压成
  * 空串——空串在 doctor 眼里就是「profile 里什么都没写」，于是要么静默打绿、要么报一条
- * 与事实无关的模式不匹配。其余错误原样上抛，由 CLI 的 reportFailure 收口成一句可读失败。
+ * 与事实无关的模式不匹配。其余错误原样上抛，由 CLI 的 reportFailure 统一处理成一句可读失败。
  *
  * @param file - 要读的文件
  * @returns 文件正文；文件不存在时为空串

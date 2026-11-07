@@ -52,7 +52,7 @@ function capabilities(scrapling = true): Record<string, unknown> {
  * `alive` 与 `capabilities` 在 `SidecarClient` 上是只读 getter，只能按实例覆盖；
  * 覆盖动作留在这个工厂里，用例就不再直接改共享对象。
  *
- * @param options - 活不活、能力表、以及 `call` 要不要被记账
+ * @param options - 活不活、能力表、以及 `call` 要不要被记录
  * @returns 可用的 sidecar 替身
  */
 function fakeSidecar(
@@ -189,9 +189,9 @@ describe("fetch", () => {
     expect(result.body.content.length).toBeLessThan(9000);
   });
 
-  it("多字节正文同样按预算收口，不会靠字符数蒙混过去", async () => {
+  it("多字节正文同样按预算统一处理，不会靠字符数蒙混过去", async () => {
     // 预算这一个数同时是 sidecar 的 maxContentChars（字符）与 capText 的字节预算。
-    // 中文一个字三字节，所以 3000 个中文在字节预算下确实超了：收口按字节算，如实标真截断。
+    // 中文一个字三字节，所以 3000 个中文在字节预算下确实超了：统一处理按字节算，如实标真截断。
     const client = stubSidecar();
     Object.assign(client, {
       call: async (): Promise<unknown> => ({
@@ -376,7 +376,7 @@ describe("fetch", () => {
     }
     // ctx.web.fetch 对 provider 抛出的错是原样透传（宿主 web 侧不 catch、不按 instanceof
     // 分流），跨模块副本真正流动的只有 message 与 code；而 vitest 5 的模块图会把
-    // @deepseek-ai/dsh-web 在测试侧与 lib 侧各装一份（纯 node 下同一说明符解析为同一
+    // @deepseek-ai/dsh-web 在测试侧与 lib 侧各装一份（纯 node 下同一个说明符解析为同一
     // 实例，instanceof 通过），instanceof 在这里量到的是装载器不是行为——类身份改用
     // constructor.name 钉，message 与 code 仍逐字断言。
     expect(caught).toBeInstanceOf(Error);

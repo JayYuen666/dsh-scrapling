@@ -19,7 +19,7 @@
 // 本身。mangle 把 installPack 的 request 压成单字母之后，宿主按 arguments-invalid 拒绝每一次
 // 调用 —— 现象是设置卡数据照常显示、三颗按钮必失败。代价是产物比全量压缩大约多四分之一
 // （实测 132942 与 106138 字符），换来 wire 名与源码一致；test/build-signature.test.ts 钉住这条。
-// `test/publish-manifest.test.ts` 会真的 import 产物并断言导出面，改坏对外契约时它会红。
+// `test/publish-manifest.test.ts` 会真的 import 产物并断言导出名单，改坏对外声明时它会红。
 
 import path from "node:path";
 import {
@@ -34,7 +34,7 @@ import {
 
 const root = import.meta.dirname;
 
-// 三张依赖表一律外部化：产物里保留裸说明符才拿得到单例（内联会把 shared 的
+// 三张依赖表一律外部化：产物里保留按包名引用才拿得到单例（内联会把 shared 的
 // 模块级状态复制成多份）。
 //
 // devDependencies 也要算进来，否则 cordis / dsh-tools / dsh-subprocess / dsh-jobs
@@ -44,7 +44,7 @@ const root = import.meta.dirname;
 // 判据取「声明过的包名全外部化」：本包不 import 未声明的包，那样的解析错误本来
 // 就该在构建期炸出来。
 //
-// 子路径说明符同样要外部化 —— external 的字符串项是精确匹配，所以按「包名段」判定
+// 子路径形态的模块说明符同样要外部化 —— external 的字符串项是精确匹配，所以按「包名段」判定
 // 而不是枚举子路径（见 build-helpers 的 externalizePackages）。
 const pkgJson = readPackageJson(root);
 const externalNames = new Set([

@@ -146,7 +146,7 @@ export interface Config {
    *
    * 这类图片对模型是**纯 token 噪音**：一段 base64 SVG 编码进上下文要按字符计费，而模型
    * 从里面读不出任何图形信息。不含内联图的页面逐字节不变；含内联的页面省掉的量取决于内联图
-   * 有多少—— 站点要么一个都不内联，要么就是一整面 logo 墙，中间态很少。所以默认开启对不含
+   * 有多少—— 站点要么一个都不内联，要么就是一整块 logo 墙，中间态很少。所以默认开启对不含
    * 内联图的站点零风险，收益全部出现在命中时。
    *
    * 关掉的理由只有一个：目标是把内联图当**数据**读（例如从 base64 里取配色或指纹）。那属于
@@ -185,7 +185,7 @@ export interface Config {
    *
    * **安全相关**：闸门管的是请求**去哪里**，而写方法管的是它到了之后**干什么**。被注入的
    * 页面文字完全可以要求发一个改状态的请求，而那次写入落在对端就收不回来。关的时候
-   * `scrapling_fetch` 的参数面里根本没有 `method`/`body`（模型看不见一个用了也没用的旋钮），
+   * `scrapling_fetch` 的参数表里根本没有 `method`/`body`（模型看不见一个用了也没用的旋钮），
    * Python 侧再独立硬拒一次 —— 两道判断各管一侧，不依赖对方。
    */
   allowWriteMethods: boolean;
@@ -253,7 +253,7 @@ export interface Config {
   /**
    * 爬虫是否遵守 robots.txt。默认关（沿用 Scrapling spider 的默认值）。部署级。
    *
-   * 打开后的取数口径（上游 `spiders/robotstxt.py`）：抓取**异常或 5xx** 时该域按
+   * 打开后的取数规则（上游 `spiders/robotstxt.py`）：抓取**异常或 5xx** 时该域按
    * 全面禁止处理——宁可跳过也不越界；站点**没有** robots.txt（HTTP 404）视作允许全部，
    * 这是最常见的形态，不会被阻塞。
    */
@@ -404,9 +404,9 @@ const configSchema = Schema.object({
     .default("attached")
     .volatile(),
 
-  // 这三个是 settings 卡可调的：接口声明 Volatile、消费处一律 .get()、测试夹具也按引用
+  // 这三个是 settings 卡可调的：接口声明 Volatile、消费处一律 .get()、夹具也按引用
   // 构造。漏掉 .volatile() 时 schema 产出的是裸值，.get() 就是 TypeError —— 而 TypeScript
-  // 信的是接口，测试夹具也照接口造，类型检查与单测都看不出来，只有宿主真正 resolve 之后
+  // 信的是接口，夹具也照接口造，类型检查与单测都看不出来，只有宿主真正 resolve 之后
   // 加载插件才会炸。
   sidecarHandshakeTimeoutMs: Schema.natural().min(1).default(30_000).volatile(),
   fetchTimeoutMs: Schema.natural().min(1).default(120_000).volatile(),
@@ -491,7 +491,7 @@ const configSchema = Schema.object({
   proxyBypass: Schema.string().default("").volatile(),
 });
 
-// 同名再导出：interface 提供类型面，schema 提供运行时校验面（宿主据此渲染设置卡
+// 同名再导出：interface 提供类型，schema 提供运行时校验（宿主据此渲染设置卡
 // 并校验 cordis.patch.yml 里的 `config:`）。这是 dsh 插件的约定写法。
 export { configSchema as Config };
 
@@ -520,11 +520,11 @@ export const name = "scrapling";
 export const inject = ["tools", "subprocess", "web", "systemPrompt", "settings"];
 
 /**
- * Host 半真正用到的那一点 settings 服务面。
+ * Host 半真正用到的那一点 settings 宿主服务。
  *
  * 窄声明而不是直接用 `Context["settings"]`：那条类型挂在 `@deepseek-ai/dsh-settings` 的
  * 模块增强上，本包不 import 它（只把它当可选 peer），增强就不会进本包的类型图，写出来
- * 的是 `ctx.settings` 编译不过。少声明一个面总比多依赖一个类型来源稳。
+ * 的是 `ctx.settings` 编译不过。少声明一处总比多依赖一个类型来源稳。
  */
 interface SettingsFace {
   readonly settings: {
@@ -628,7 +628,7 @@ const GUIDANCE: Record<keyof ToolFlags, string> = {
 /** 一个工具对运行环境的最低要求。 */
 export type ToolRequirement = "scrapling" | "browser" | "jobs" | "session-state";
 
-/** 会话状态工具的能力门：`sessionStateDir` 配了才有地方落盘。 */
+/** 会话状态工具的能力门：`sessionStateDir` 配了才有地方写到磁盘。 */
 const SESSION_STATE_REQUIREMENT = "session-state";
 /** 工具构造器：名字到「给定依赖造一个工具定义」的映射。 */
 type ToolBuilder = (deps: ToolDeps) => ToolDefinition;
@@ -650,7 +650,7 @@ export interface ToolSpec {
  *
  * 顺序即注册顺序，也方便测试逐条对照。构造器直接挂在每一项上，而不是另开一张
  * 「名字 → 构造器」表：两张表只要有一处对不上，`apply` 就会拿不到构造器而跳过那条，
- * 工具于是**静默地不注册** —— 日志里只有一行 warn，模型那边只是看不见这个工具，
+ * 工具于是**静默不注册** —— 日志里只有一行 warn，模型那边只是看不见这个工具，
  * 而 100% 覆盖率照样是绿的（跳过的分支也被走到了）。合成一张表之后这种走散无从发生。
  */
 export const TOOL_SPECS: readonly ToolSpec[] = [
@@ -788,7 +788,7 @@ export function guidanceFor(flags: ToolFlags, isAvailable: (tool: string) => boo
 /**
  * 一个工具的输出预算取自哪枚设置项。
  *
- * 三种抓取面的正文体量差一个数量级（静态 HTML、渲染后的 DOM、XHR 快照），共用一个
+ * 三种抓取方式的正文体量差一个数量级（静态 HTML、渲染后的 DOM、XHR 快照），共用一个
  * 旋钮就没有分别调节的余地。会话类工具产出的是句柄与列表而非页面正文，跟渲染同档。
  *
  * 导出是为了能被直接测。这一层只被 apply() 的注册循环覆盖到，而注册取决于运行环境：
@@ -846,7 +846,7 @@ export interface ToolPlan {
  * @param flags - 每工具开关快照
  * @param capabilities - sidecar 握手报上来的能力；undefined 表示尚未探测成功
  * @param jobsReady - 作业后端是否可用（false 时爬虫不注册）
- * @param attachmentsReady - 附件落库面是否可用（false 时截图不注册）
+ * @param attachmentsReady - 附件落库能力是否可用（false 时截图不注册）
  * @param sessionStateReady - sessionStateDir 是否已配置（false 时登录态存取不注册）
  * @returns 注册计划
  */
@@ -873,7 +873,7 @@ export function planTools(
     if (requires === "jobs" && !jobsReady) {
       return "jobs-unavailable";
     }
-    // 登录态存取要有落盘目录：sessionStateDir 为空时 sidecar 一律回
+    // 登录态存取要有写到磁盘目录：sessionStateDir 为空时 sidecar 一律回
     // `SESSION_STATE_DISABLED`，注册出去就是两只注定失败的工具（lead-findings F4/F11）。
     if (requires === SESSION_STATE_REQUIREMENT && !sessionStateReady) {
       return "session-state-unavailable";
@@ -960,7 +960,7 @@ export function resolvePythonBin(
  * 确保 sidecar 的工作目录存在。
  *
  * 这是必须的：`ctx.subprocess` 拿到一个不存在的 `cwd` 会直接 ENOENT，而 sidecar 还没
- * 起来，报错只会表现为「进程起不来」，看不出根因是目录缺失。目录里还要放 adaptive 的
+ * 起来，报错只会表现为「进程起不来」，看不出真正的原因是目录缺失。目录里还要放 adaptive 的
  * SQLite 指纹库，本来就得可写。
  *
  * @param dir - 绝对路径
@@ -994,7 +994,7 @@ function handleDataDirFailure(error: unknown, dataDir: string, failFast: boolean
 }
 
 /**
- * 爬虫进度事件的路由表：crawlId → 那是哪个作业的输出环。
+ * 爬虫进度事件的路由表：crawlId → 那是哪个作业的输出环形缓冲。
  *
  * 为什么不是单个槽位：`py/crawl.py` 的 `MAX_CONCURRENT_CRAWLS` 是 2，`crawl.run` 立刻
  * 返回、作业在后台跑，所以模型完全可以在第一只蜘蛛还在跑时再起一只。单槽位下两只蜘蛛的
@@ -1017,7 +1017,7 @@ export interface CrawlEventRouter {
 /**
  * 建一份爬虫事件路由表。
  *
- * 导出是为了能被直接测：`forget` 的「不匹配」那一侧与 `route` 的「没有登记」那一侧
+ * 导出是为了能被直接测：`forget` 的「不匹配」那条分支与 `route` 的「没有登记」那条分支
  * 都要靠构造两个作业才走得到，而整条链路只在真拉起 Python 的集成用例里才有事件。
  *
  * @returns 路由表
@@ -1090,7 +1090,7 @@ function probeJobsReady(jobs: unknown): boolean {
   return typeof face.attachController === "function" && typeof face.start === "function";
 }
 
-/** 作业注册表的最小面：本包只用到 start 与 attachController。
+/** 作业注册登记表的最小类型：本包只用到 start 与 attachController。
  *  两个成员都按泛型给，调用方传什么类型就回什么类型 —— 不镜像宿主那份 JobSpec。 */
 interface CrawlJobsFace<Spec, Id> {
   start: (spec: Spec) => Id;
@@ -1100,7 +1100,7 @@ interface CrawlJobsFace<Spec, Id> {
 /**
  * 在**自挂的 controller 作用域内**起一个作业，返回后立刻撤销附着。
  *
- * 为什么不是常驻附着：`attachController` 是往宿主平面登记「有人能收这桶作业」的闸门。
+ * 为什么不是常驻附着：`attachController` 是往宿主那一层登记「有人能收这桶作业」的闸门。
  * 常驻一枚等于在本插件活着的整段时间里替全宿主开着它 —— 而官方契约要求生产者起的作业
  * 必须是 owner 收得掉的。只在 `start()` 那一瞬挂着，宿主其余判定一个字不变。
  *
@@ -1174,9 +1174,9 @@ function startCrawlJob(
   }
   // 自己挂一枚 controller，只在 `start()` 那一瞬。
   //
-  // 为什么必需：`dsh-jobs-local` 的 `servesOwner` 先看**宿主平面**有没有 controller
-  // 附着，没有才看 owner 的 scope 链；而 `attachController` 只能往宿主平面注册（它用的是
-  // jobs 服务自己的 ctx）。web profile 把宿主平面的 `tool-jobs` **显式 disabled**（改由各
+  // 为什么必需：`dsh-jobs-local` 的 `servesOwner` 先看**宿主那一层**有没有 controller
+  // 附着，没有才看 owner 的 scope 链；而 `attachController` 只能往宿主那一层注册（它用的是
+  // jobs 服务自己的 ctx）。web profile 把宿主那一层的 `tool-jobs` **显式 disabled**（改由各
   // preset 提供），于是宿主平面恒为空 —— 裸 `start()` 在默认 profile 下必抛
   // 「no job controller serves this agent」，而那句文案说「装 tool-jobs」（装了也没用）。
   // 同工作区的 `dsh-ocr-review` 早就是这么解的（`startUnderOcrController`），本工具照做。
@@ -1187,7 +1187,7 @@ function startCrawlJob(
   // async 契约 —— 免得以后真要等点什么（比如先确认会话）时再改两边。
   // attachController 与 start 在调用一刻同步抛（注册表在、controller 却没了的那一类）
   // 也必须落成 rejection：本函数声明的是 Promise<string>，同步 throw 会从声明的缝里
-  // 漏出去，调用方的 .catch 收不到；文案与上面「jobs 不在」那支同码，裸的宿主报错
+  // 漏出去，调用方的 .catch 收不到；文案与上面「jobs 不在」那支同码，宿主原样的报错
   // 少一句模型可执行的上下文。
   try {
     return Promise.resolve(
@@ -1306,7 +1306,7 @@ export function urlPolicyOptionsOf(config: Config): UrlPolicyOptions {
 /**
  * Host 侧出站 URL 准入闸门：判否就地抛 `URL_BLOCKED`，请求根本不发出去。
  *
- * 这是 `lib/url-policy.ts` 的落点——那份判定此前只被自己的测试引用，生产路径上没有任何人
+ * 这是 `lib/url-policy.ts` 的位置——那份判定此前只被自己的测试引用，生产路径上没有任何人
  * 构造过策略对象，等于 Host 侧那道 SSRF 防线一直没有生效（真防线只有 Python 侧
  * guard.py 一道）。两侧都要有：Host 侧判完到子进程真连之间隔着一个进程边界，
  * DNS 记录在这中间被改就能绕过（TOCTOU）。
@@ -1411,7 +1411,7 @@ function searchProviderOf(
 /**
  * `mcp` 模式的装配：把同一份工具表端给 MCP server，原生工具一个都不注册。
  *
- * 截图在这一侧不落宿主 attachment 库，而是走 {@link createMcpImageSink}：MCP 客户端要的
+ * 截图在本模式下不落宿主 attachment 库，而是走 {@link createMcpImageSink}：MCP 客户端要的
  * 是 image content，而外部连接没有所属会话可以挂附件。
  *
  * @param ctx - 宿主上下文
@@ -1421,7 +1421,7 @@ function searchProviderOf(
  * @param search - 搜索发现层；不可用时 MCP 侧也不端 `search`
  * @param env - 读 token 用的环境，测试可注入
  */
-/** 装配工具面所需的一切；模式判据与 MCP server 共用同一份。 */
+/** 装配工具这一层所需的一切；模式判据与 MCP server 共用同一份。 */
 export interface SurfaceArgs {
   readonly ctx: Context;
   readonly config: Config;
@@ -1461,7 +1461,7 @@ export async function startMcpSurface(args: SurfaceArgs): Promise<McpServerHandl
 }
 
 /**
- * 按模式装配工具面（spec §4.3 的互斥在这里落）：native 注册原生工具，`mcp` 把同一份表
+ * 按模式装配工具这一层（spec §4.3 的互斥在这里落）：native 注册原生工具，`mcp` 把同一份表
  * 端给 MCP server，`official-mcp` 两样都不做。模式只在装配时读一次，改完必须重启。
  */
 async function registerSurface(args: SurfaceArgs): Promise<void> {
@@ -1511,7 +1511,7 @@ function registerSearchProvider(
 type BaseSettings = Omit<ToolSettings, "maxOutputBytes">;
 
 /**
- * 把 Config 收成一份共用设置：volatile 字段现取一次快照，部署级字段原样搬裸值。
+ * 把 Config 收成一份共用设置：volatile 字段现取一次快照，部署级字段原样搬过去，不包成引用。
  *
  * 抽出来是为了让 apply() 只留「注册哪些、按什么顺序」这条主干；两百多行的注册循环里再夹一
  * 整份字段表会把真正的分支淹没。
@@ -1562,7 +1562,7 @@ function baseSettingsOf(config: Config, dataDir: string): BaseSettings {
  * 摊在 apply 里会让「卸载时收干净」这条与「注册哪些工具」混成一段读不下去的逻辑。
  *
  * @param options - 已解析好的解释器、配置、URL 闸门与爬虫事件路由
- * @returns sidecar 客户端与它的事件面
+ * @returns sidecar 客户端与它的事件接口
  */
 function makeSidecar(options: {
   ctx: Context;
@@ -1592,7 +1592,7 @@ function makeSidecar(options: {
       DSH_SCRAPLING_PROXY: proxyOf(config),
       DSH_SCRAPLING_PROXY_BYPASS: config.proxyBypass.get(),
       // 写方法这一档同样两侧各判一次：这一份送过去让 Python 硬拒，而 Host 这边直接不把
-      // method/body 摆到模型面前。给 "0" 而不是留空，是为了在进程环境里一眼读得出表态。
+      // method/body 摆到模型可见前。给 "0" 而不是留空，是为了在进程环境里一眼读得出表态。
       DSH_SCRAPLING_ALLOW_WRITE_METHODS: config.allowWriteMethods ? "1" : "0",
       DSH_SCRAPLING_ALLOW_BROWSER_ACTIONS: config.allowBrowserActions ? "1" : "0",
       DSH_SCRAPLING_ALLOW_FILE_DOWNLOADS: config.allowFileDownloads ? "1" : "0",
@@ -1713,7 +1713,7 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
     return;
   }
 
-  // 运行环境远程面先于 sidecar 注册：sidecar 探测失败并降级（failFastOnMissingPython=false）
+  // 运行环境上的远程通道先于 sidecar 注册：sidecar 探测失败并降级（failFastOnMissingPython=false）
   // 时卡片仍能安装/修复。failFast=true 时插件本身不加载，首次安装走 CLI。
   // 它同时也是设置卡上“安装/修复/取消”的唯一入口，注册失败只该少掉这一栏。
   const runtimeRemote = installRuntimeRemote(ctx, {
@@ -1753,7 +1753,7 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
   // 探测走行为（见 probeJobsReady 的注释）：`ctx.jobs` 在、但 `start()` 被拒是真实存在
   // 的一态（host 层的 tool-jobs 被 disabled 时），只看对象在不在会把一个必挂的工具注册出去。
   const jobsReady = probeJobsReady(ctx.get("jobs"));
-  // 宿主 attachment 服务比截图需要的那一面大；这里只取 saveImage 这一项，
+  // 宿主 attachment 服务提供的接口比截图需要的多；这里只取 saveImage 这一项，
   // 签名由截图工具的实际调用验证。
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion
   const attachments = ctx.get("attachments") as AttachmentSaver | undefined;

@@ -391,7 +391,7 @@ interface ClientFace {
     register: (ns: string, locale: string, dict: Record<string, string>) => () => void;
     bind: (ns: string) => Translate;
   };
-  /** 显式读一个可选客户端服务；运行环境读面走它取 remote，不写进 inject。 */
+  /** 显式读一个可选客户端服务；运行环境读取接口走它取 remote，不写进 inject。 */
   readonly get?: (name: string, strict?: boolean) => unknown;
   readonly effect: Context["effect"];
 }
@@ -469,7 +469,7 @@ function apply(ctx: ClientFace): void {
   ctx.effect(() => {
     const form = ctx.configForms.get(SETTINGS_ENTRY_ID);
     const t = ctx.locale.bind(LOCALE_NS);
-    // 宿主给 row/item 页准备的那一份 form，bundle 页没有，这里补上。值面在注册体之外造
+    // 宿主给 row/item 页准备的那一份 form，bundle 页没有，这里补上。值在注册体之外造
     // 一次：卡片的 useSyncExternalStore 比的是 subscribe 的引用，每帧换一个新的就会每帧重建
     // 订阅，而重建那一拍可能漏掉一次宿主通知。宿主那份表单本身长活，所以这一份也长活。
     const source: FormSource = {

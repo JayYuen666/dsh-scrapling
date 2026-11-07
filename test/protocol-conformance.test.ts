@@ -16,7 +16,7 @@
 // * Python 侧解析 `args.get(...)` / `args[...]` / `deployment.get(...)`，并沿调用图把
 //   `_extraction(args)` 这类辅助函数读到的键并进来。
 //
-// 允许表里每一项都要写明理由 —— 那是「这段不对称是故意的」唯一的记录处。
+// 允许表里每一项都要写明理由 —— 那是「这段不对称是故意的」唯一写下理由的地方。
 
 import type { Context } from "@deepseek-ai/cordis";
 import path from "node:path";
@@ -74,8 +74,8 @@ const SETTINGS: ToolSettings = {
   crawlAutothrottle: false,
   crawlStrategy: "bfs",
   crawlCheckpointDir: "",
-  // 对表要跑**满参数面**：写方法开放时 method/body 才在参数面与线路上，两侧才逐键对得上。
-  // 关掉那一档的形状由 test/tools.test.ts 单独钉（那里判的是「参数面里根本没有这两个键」）。
+  // 对表要跑**满参数表**：写方法开放时 method/body 才在参数表与线路上，两侧才逐键对得上。
+  // 关掉那一档的形状由 test/tools.test.ts 单独钉（那里判的是「参数表里根本没有这两个键」）。
   allowWriteMethods: true,
   stripInlineImages: true,
   downloadDir: "/tmp/scrapling-downloads",
@@ -306,7 +306,7 @@ async function driveAllTools(): Promise<Record<string, ToolObservation>> {
     TOOL_SPECS.map(async (spec) => {
       const { client, calls } = recordingSidecar(REPLIES);
       // `scrapling_session_open` 的 `sessionType` 可选值跟着 `capabilities.browser` 走；
-      // 不声明就只剩 static，而下面要把满参数面发给它（见那处的 sessionType 覆盖）。
+      // 不声明就只剩 static，而下面要把满参数表发给它（见那处的 sessionType 覆盖）。
       if (spec.name === "scrapling_session_open") {
         Object.defineProperty(client, "capabilities", {
           value: { scrapling: true, static: true, extract: true, browser: true },
@@ -342,7 +342,7 @@ async function driveAllTools(): Promise<Record<string, ToolObservation>> {
       for (const [name, item] of Object.entries(parameters)) {
         args[name] = sampleValue(name, item);
       }
-      // 满参数面要给每枚参数各塞一个值，但 `scrapling_fetch` 的 GET + body/form/json 是
+      // 满参数表要给每枚参数各塞一个值，但 `scrapling_fetch` 的 GET + body/form/json 是
       // **非法组合**（J6 守卫在发帧前就回 BAD_ARGS），那样一帧都观测不到，这个工具的全部
       // 参数都会被误报成「线上没有它」。写体在场时把方法换成 POST —— 合法形态下发帧，
       // 该有的键一个不少。
@@ -352,14 +352,14 @@ async function driveAllTools(): Promise<Record<string, ToolObservation>> {
       ) {
         args["method"] = "POST";
       }
-      // 满参数面在 `scrapling_session_open` 上只有走 stealth 才合法：`py/adapters.py` 的
+      // 满参数表在 `scrapling_session_open` 上只有走 stealth 才合法：`py/adapters.py` 的
       // `_make_session` static 分支只读 impersonate 与超时，其余浏览器旋钮现在由开场那道
       // 闸门报参数错误（静默丢掉正是本包在消灭的那类故障）。static 那一档的读取由
       // `READ_VARIANTS` 的 static 分支单独覆盖，两边的键表都是并集，不靠这一帧证明。
       if (spec.name === "scrapling_session_open") {
         args["sessionType"] = "stealth";
       }
-      // 执行面这一位是宿主自己的类型，本桩只喂 `signal`（被测工具读的就这一位），
+      // 执行上下文这一位是宿主自己的类型，本桩只喂 `signal`（被测工具读的就这一位），
       // 因此断到「execute 第二个参数到底是什么」而不是 `as never`：后者连参数类型改名都
       // 不会报，等于把签名漂移咽进桩里。宿主那个类型另有数个必填成员，它们的语义本桩
       // 不认领 —— 要真按那个类型逐成员写，就得凭猜填行为，那比一处注明的双断言更坏。
@@ -409,7 +409,7 @@ interface PythonSide {
 }
 
 /**
- * Python 侧的读取面。
+ * Python 侧的读取。
  *
  * 判据来自运行时而不是静态扫源码：adapters 里有一批按表驱动的读法 ——
  * `for key, name in (("waitSelector", "wait_selector"), ...): args.get(key)` 与
@@ -459,7 +459,7 @@ const PROBE_TIMEOUT_MS = 180_000;
 /**
  * 已知「Python 读了但 Host 从不发」的键。
  *
- * 这一组与前两类不同：它们不是漂移，而是 **sidecar 协议支持、Host 侧没接线**的能力面。
+ * 这一组与前两类不同：它们不是漂移，而是 **sidecar 协议支持、Host 侧没接线**的能力清单。
  * 每条最终都要落到「接线（进 schema 或进设置）还是删除」这个产品决定上，本测试不替它决定；
  * 但清单必须逐条写在这里 —— 于是新增一段走不到的读取会立刻被点名，而不是跟着「反正有历史
  * 包袱」一起沉默。
@@ -475,7 +475,7 @@ const MODEL_ONLY: Record<string, string[]> = {
   // question 交给 ctx.llm（deps.answer），本来就不是 sidecar 的入参。
   // render 不发给 Python，它选的是发哪一个方法：true -> render，false -> fetch。
   scrapling_answer: ["question", "render"],
-  // locate 的 by/query 是模型面的新名：by -> 线上 queryType、query -> 线上 selector
+  // locate 的 by/query 是模型可见的新名：by -> 线上 queryType、query -> 线上 selector
   // （Python 只读旧名）。两个新名都在本侧映射掉，协议帧上不会出现它们。
   scrapling_locate: ["by", "query"],
 };
@@ -551,7 +551,7 @@ function sentKeysByMethod(observations: Record<string, ToolObservation>): Map<st
 /**
  * 对端读了、本侧从不发的键，以及已经接线却仍躺在豁免表里的条目。
  *
- * 两条判定口径不同：`unreachable` 问全网线，`stale` 问该方法（理由写在函数体里）。
+ * 两条判定规则不同：`unreachable` 问全网线，`stale` 问该方法（理由写在函数体里）。
  *
  * @param observations - 工具观测
  * @param reads - 对端读取表
@@ -569,7 +569,7 @@ function deadReads(
     const excused = excusedFor(KNOWN_UNREACHABLE, method);
     const sentHere = sentByMethod.get(method) ?? new Set<string>();
     for (const key of read) {
-      // 两条判定的口径**故意**不同，这里把理由写死而不是留给下一个人猜：
+      // 两条判定的规则**故意**不同，这里把理由写死而不是留给下一个人猜：
       // - unreachable 问「全网线上有没有任何一个调用点发过它」。把这一半也改成按方法判
       //   （本轮实测过）会一次点出 37 项，其中绝大多数是会话构造期的旋钮 —— Python 侧
       //   一个构造函数被多个方法共用，于是 render / capture / session.fetch 都「读」
@@ -641,7 +641,7 @@ describe("两侧对表：线路上的键必须一一对得上", () => {
       const { reads } = await pythonSide();
       const observations = await driveTools();
       // 驱动退化保护：工具一帧都没发时，下面这句会真空通过（同一条守卫在「方法都在
-      // METHODS 表里」与「声明给模型的参数」那两条里也有，三组断言同一口径）。
+      // METHODS 表里」与「声明给模型的参数」那两条里也有，三组断言同一种做法）。
       expect(
         keysOf(Object.values(observations).flatMap((item) => item.calls)).size,
       ).toBeGreaterThan(0);

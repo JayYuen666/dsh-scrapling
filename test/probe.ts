@@ -23,7 +23,7 @@ export interface ProbeCall {
   keys: string[];
 }
 
-/** 键名根本不在上游参数面里（会抛 TypeError）。 */
+/** 键名根本不在上游参数表里（会抛 TypeError）。 */
 export interface ViolationRecord {
   site: string;
   keys: string[];
@@ -41,7 +41,7 @@ export interface SilentRecord {
  * stealth 路径上的一条不变量违规。
  *
  * 字段随违规种类而变（不该出现的键、该为真却缺失的开关、被顶掉的启动参数条数），所以这里
- * 把站点单列、其余按可选出面 —— 具体形状由探针的 `_stealth_check` 决定，见其实现。
+ * 把站点单列、其余按可选处理 —— 具体形状由探测脚本的 `_stealth_check` 决定，见其实现。
  */
 export interface StealthInvariantViolation {
   /** 出问题的调用点。 */
@@ -71,7 +71,7 @@ export interface ProbeFacts {
   fetcherVerbs: string[];
   /** ``Selector.css`` 的参数名。 */
   selectorCssParams: string[];
-  /** 自愈相似度的默认门槛。 */
+  /** 自愈相似度的默认阈值。 */
   selectorCssDefaultPercentage: number;
   /** ``Response.markdown`` 的参数名。 */
   responseMarkdownParams: string[];
@@ -117,7 +117,7 @@ export interface ProbeReport {
   checked: Record<string, number>;
   /** 每个调用点实际发出的键。 */
   calls: ProbeCall[];
-  /** 键名不在上游参数面里的调用点。 */
+  /** 键名不在上游参数表里的调用点。 */
   violations: ViolationRecord[];
   /** 会话 fetch 层被静默丢弃的键。 */
   silentAtSessionFetch: SilentRecord[];
@@ -135,16 +135,16 @@ export interface ProbeReport {
 
 /** runProbe 的可替换路径：只给测试在不碰真实 venv 的情况下验启动失败那条分支用。 */
 export interface ProbeOptions {
-  /** 覆盖探针解释器路径（缺省为 py-launcher 解析出的那一支）。 */
+  /** 覆盖探测脚本用的解释器路径（缺省为 py-launcher 解析出的那一支）。 */
   pythonPath?: string;
-  /** 覆盖探针脚本路径（缺省为 py/tests/contract_probe.py）。 */
+  /** 覆盖探测脚本路径（缺省为 py/tests/contract_probe.py）。 */
   probePath?: string;
-  /** 覆盖看门狗预算（缺省 `PROBE_TIMEOUT_MS`）；只给「探针挂住」那条分支的测试用。 */
+  /** 覆盖超时保护预算（缺省 `PROBE_TIMEOUT_MS`）；只给「探测脚本挂住」那条分支的测试用。 */
   timeoutMs?: number;
 }
 
 /**
- * 探针的看门狗预算。
+ * 探测脚本的超时保护预算。
  *
  * 探针不是 sidecar：它只写一行结论到 stdout，所以正常路径等它自己退。但**挂住**必须有界：
  * 契约测试在模块顶层 await 它，而模块求值不受 vitest 的 `testTimeout` 约束 —— 上游哪天让
@@ -159,7 +159,7 @@ const STDERR_TAIL_BYTES = 256 * 1024;
 /**
  * stdout 的上限：探针的结论是一行 JSON，写到这个量说明它没在写结论。
  *
- * 数值与 `lib/jsonl.ts` 的 `MAX_FRAME_CHARS` 同档（8 MiB），两侧口径不同这点也跟那边一样：
+ * 数值与 `lib/jsonl.ts` 的 `MAX_FRAME_CHARS` 同档（8 MiB），两侧规则不同这点也跟那边一样：
  * 这里比的是**字节**，那条比的是 UTF-16 码元。
  */
 const PROBE_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
@@ -401,8 +401,8 @@ export function assertProbeReport(parsed: unknown): ProbeReport {
 /**
  * 跑一次探针。
  *
- * 解释器与脚本都先判存在：CI 上没有 `_env/.venv` 时 `spawn` 会给一个裸 ENOENT，那句
- * 「spawn ... ENOENT」分不清缺的是解释器还是探针脚本，而两者的修法完全不同。
+ * 解释器与脚本都先判存在：CI 上没有 `_env/.venv` 时 `spawn` 会给一个不带路径信息的 ENOENT，那句
+ * 「spawn ... ENOENT」分不清缺的是解释器还是探测脚本，而两者的修法完全不同。
  * 判过存在性之后，剩下的启动失败（解释器在但不可执行）走的是 `error` 事件：Node 在这里
  * 不再发 `close`，`events.once` 会把它转成拒绝，所以下面接住那条拒绝并点名解释器路径。
  *
@@ -452,7 +452,7 @@ export async function runProbe(options: ProbeOptions = {}): Promise<ProbeReport>
   });
   // 定时器 `unref`：探针正常收尾时它不该把事件循环按住。SIGKILL 而不是 SIGTERM ——
   // 挂住的探针大概率正卡在上游的阻塞调用里，TERM 未必收得到。
-  // 状态放在对象里：`let` 的赋值只发生在回调里，规则的流分析会把外层读到的一路当成恒假。
+  // 状态放在对象里：`let` 的赋值只发生在回调里，规则的流分析会把外层读到的一路当成永远不成立。
   const watchdogState = { fired: false };
   const watchdog = setTimeout(() => {
     watchdogState.fired = true;
@@ -475,7 +475,7 @@ export async function runProbe(options: ProbeOptions = {}): Promise<ProbeReport>
   clearTimeout(watchdog);
   const stderr = (): string => tailLines(stderrTail.text(), STDERR_TAIL_LINES);
   if (watchdogState.fired) {
-    // 先看门狗再谈退出码：被 SIGKILL 打死的进程也走 `code !== 0` 那一支，而那句话说它是
+    // 先超时保护再谈退出码：被 SIGKILL 打死的进程也走 `code !== 0` 那一支，而那句话说它是
     // 「自己崩了」，与「挂住到预算」是两种排查方向。
     throw new Error(
       `探针超过 ${String(options.timeoutMs ?? PROBE_TIMEOUT_MS)}ms 没写完结论，已用 SIGKILL 终止。` +
@@ -483,7 +483,7 @@ export async function runProbe(options: ProbeOptions = {}): Promise<ProbeReport>
     );
   }
   if (code !== 0) {
-    // 非零退出时栈全在 stderr 那一侧，不接出来就只剩「命令失败」一句废话。
+    // 非零退出时栈全在 stderr 里，不接出来就只剩「命令失败」一句废话。
     const how =
       signal === null
         ? `以 ${String(code)} 退出`

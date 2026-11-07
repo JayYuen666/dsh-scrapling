@@ -28,11 +28,11 @@ export interface RuntimeManifest {
 }
 
 /** sha256 的清单形态：installer 用 `createHash("sha256").digest("hex")`（64 位小写）逐字节比对，
- *  大写、缺位或空串在比对时必然失败。这里先按同一形态收口，让清单写错在加载期就暴露，
+ *  大写、缺位或空串在比对时必然失败。这里先按同一形态统一处理，让清单写错在加载期就暴露，
  *  而不是等下载完 25 MB 资产后落到一句「hash 不匹配」。 */
 const SHA256_HEX = /^[0-9a-f]{64}$/u;
 
-/** pythonVersion 会被当作目录名拼进托管落点（`managedPythonPath`，installer 复用同一落点），
+/** pythonVersion 会被当作目录名拼进托管位置（`managedPythonPath`，installer 复用同一位置），
  *  故只收形如 `3.14.9` 的三段数字：`../x` 或带分隔符的值会让 `path.join` 落到 dataDir 之外。 */
 const PYTHON_VERSION = /^\d+\.\d+\.\d+$/u;
 
@@ -54,7 +54,7 @@ const RUNTIME_MANIFEST_SCHEMA: z.ZodType<RuntimeManifest> = z.object({
 // 这个模块同时被源码（lib/）、host.js（包根）与 CLI 产物（bin/）载入，`..` 不是固定的包根。
 // 以 runtime-manifest.json 实际所在的那一级为准：打包产物里 manifest 就在 import.meta.dirname
 // 这一级（左侧），源码态的 lib/ 里没有它，只能回到上一级（右侧）。
-// publish-manifest.test.ts 直接 import host.js，负责钉住打包态那一侧真的读得到 manifest。
+// publish-manifest.test.ts 直接 import host.js，负责确认装出去的那份产物真能读到 manifest。
 /* v8 ignore next 1 */
 const packageRoot = existsSync(path.join(import.meta.dirname, "runtime-manifest.json"))
   ? import.meta.dirname
@@ -82,7 +82,7 @@ export const runtimeManifest: RuntimeManifest = parseRuntimeManifest(
   readFileSync(path.join(packageRoot, "runtime-manifest.json"), "utf8"),
 );
 
-/** 托管 Python 在 dataDir 下的固定落点。 */
+/** 托管 Python 在 dataDir 下的固定位置。 */
 export function managedPythonPath(dataDir: string): string {
   return path.join(
     dataDir,
@@ -98,7 +98,7 @@ function executable(file: string): boolean {
   // X_OK 在 Windows 上没有效果（等同 F_OK），所以这一条在两边都成立：POSIX 判可执行位，
   // Windows 判文件在。缺文件在两边都会抛同一个错误。
   //
-  // 先按普通文件收口：POSIX 的 X_OK 对目录同样成立，托管落点若在安装中断后被替换成同名
+  // 先按普通文件统一处理：POSIX 的 X_OK 对目录同样成立，托管位置若在安装中断后被替换成同名
   // 目录（或符号链接指向目录），只判 X_OK 会把目录当成可用解释器，并带上清单声明的版本
   // 返回出去——错误要到子进程启动时才以 EISDIR/ENOENT 的形式出现，来源比「没找到」更难查。
   try {
@@ -117,7 +117,7 @@ function executable(file: string): boolean {
  *
  * 这份布局导出给测试侧复用（`test/python-bin.ts` 的 `LOCAL_PYTHON` 由它算），门禁量的解释器
  * 与插件真拉起的那支因此同源，而不是两处各写一遍再靠断言对齐。`py-launcher.mjs` 里还留着
- * 同样的一段拼接，它不并入这里：那份是仓内 CLI，不在发布面上，发出去的 host 产物不能依赖
+ * 同样的一段拼接，它不并入这里：那份是仓内 CLI，不在发布名单上，发出去的 host 产物不能依赖
  * 一个不随包的文件。两边不一致由 `test/py-launcher.test.ts` 拿 `--root` 对同一棵树各算一次
  * 来判红。
  *

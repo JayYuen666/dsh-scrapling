@@ -3,7 +3,7 @@
 // 为什么值得一条测试：两份文档是手工维护的，改一侧忘另一侧**不会让任何东西变红**——
 // 构建照过、单测照过、覆盖率照满，而读者只会读到其中一份，中文读者就此少知道一件事。
 // 漂移的形态就那几种：某个旋钮只在一侧出现、某段语义只在一侧解释、乃至一侧把事实写错
-// （写错的那一侧没人看得出来，因为它是唯一有那段话的地方）。
+// （写错的那份没人看得出来，因为它是唯一有那段话的地方）。
 //
 // 官方包用逐节的哈希记录（`README.i18n.yaml`）配 `verify-translation-pairing` 把这件事交给
 // CI；本包不在那个 monorepo 里，那套脚本用不上，于是把不变式直接写成断言。
@@ -201,7 +201,7 @@ describe("判据本身：读 Config 排版与族写法", () => {
   it("族写法命中键时展开，没命中时原样留下", () => {
     const all = ["fetchMaxOutputChars", "searchMaxOutputChars"];
     expect(expandFamilies(["*MaxOutputChars"], all)).toStrictEqual(all);
-    // 拼错的后缀展开成空表就会被吞掉，留下一句看不出根因的「不一致」。
+    // 拼错的后缀展开成空表就会被吞掉，留下一句看不出真正的原因的「不一致」。
     expect(expandFamilies(["*MaxOutputChar"], all)).toStrictEqual(["*MaxOutputChar"]);
     expect(expandFamilies(["timeoutMs"], all)).toStrictEqual(["timeoutMs"]);
   });
@@ -228,7 +228,7 @@ describe("中英文文档对等", () => {
     const { en, zh } = await readPair();
     const { all } = configKeys(await readFile(path.join(pkgDir, HOST), "utf8"));
     expect(all.length, "配置键不该是空的").toBeGreaterThan(0);
-    // 判据与「设置卡旋钮找得到」那条同一口径：`*MaxOutputChars` 这类族写法算「找得到」。
+    // 判据与「设置卡旋钮找得到」那条同一种做法：`*MaxOutputChars` 这类族写法算「找得到」。
     // 用裸 includes 时，一侧写族写法、另一侧逐字列名就会被判成落后，而落后的方向还是反的。
     // 只在英文侧定位得到的：中文读者按文档找不到这一项。
     expect(
@@ -345,7 +345,7 @@ function phrasesFor(count: number): { en: string; zh: string } {
 }
 
 describe("文档里的工具计数跟着工具表走", () => {
-  it("两份 README 与随包补丁注释都写现量", async () => {
+  it("两份 README 与随包补丁注释都写当场实测", async () => {
     const { en, zh } = await readPair();
     const phrases = phrasesFor(TOOL_SPECS.length);
     expect(en, `${EN} 缺少 ${phrases.en}`).toContain(phrases.en);

@@ -63,7 +63,7 @@ MIN_PYTHON = (3, 14)
 
 
 def check_python(version_info: tuple[int, ...] = tuple(sys.version_info[:3])) -> str | None:
-    """低于 3.14 地板时返回给用户的消息，达标返回 None。
+    """低于 Python 3.14 这个下限时返回给用户的消息，达标返回 None。
 
     :param version_info: 要判定的版本；默认当前解释器的前三段，调用方可注入。
     """

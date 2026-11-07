@@ -517,7 +517,7 @@ describe("installPython", () => {
       "  if (!tryLock(handle.fd)) process.exit(2);",
       String.raw`  process.stdout.write("locked\n");`,
       // 心跳里引用 handle：FileHandle 被 GC 时 fd 会随之关闭，Linux 的 OFD 锁跟着
-      // 释放——子进程还活着、锁却没了，父进程就能拿锁走到安装面，用例随机变红
+      // 释放——子进程还活着、锁却没了，父进程就能拿锁走到安装目录，用例随机变红
       //（实测在 CI 上以 INSTALL_HASH_MISMATCH 露出）。句柄保持可达，「锁与子进程
       // 存活绑定」的语义才成立。
       "  setInterval(() => handle.fd, 1000);",
@@ -687,7 +687,7 @@ describe("installBrowser", () => {
   });
 
   // 原地 truncate+write 会保留 inode，rename 替换必然换一个新 inode —— 这就是
-  // 「读者要么看到旧整份、要么看到新整份」的可观测面，也是半截 JSON 的来源被堵住的证据。
+  // 「读者要么看到旧整份、要么看到新整份」的可记录点，也是半截 JSON 的来源被堵住的证据。
   it.skipIf(process.platform === "win32")("state.json 用改名替换，不留半截文件", async () => {
     const dataDir = tempDir();
     const runtimeDir = path.join(dataDir, "runtime");
@@ -975,7 +975,7 @@ describe("installCore", () => {
     const assets = tempDir();
     const bytes = new TextEncoder().encode("archive");
     const asset = { ...runtimeManifest.darwinArm64, sha256: sha256(bytes) };
-    // 浏览器 / curl -O 落盘的是解码后的名字（清单 URL 里 `+` 写成 `%2B`）。
+    // 浏览器 / curl -O 写到磁盘的是解码后的名字（清单 URL 里 `+` 写成 `%2B`）。
     const archiveName = decodeURIComponent(path.basename(new URL(asset.url).pathname));
     writeFileSync(path.join(assets, archiveName), bytes);
     mkdirSync(path.join(assets, "wheels"), { recursive: true });
@@ -1041,7 +1041,7 @@ describe("installCore", () => {
     expect((missing as InstallError).code).toBe("INSTALL_OFFLINE_ASSETS");
 
     // 清单 URL 解析不了 / 归档名里的百分号编码不合法：同样是安装资产的问题，
-    // 不能让 URL/decodeURIComponent 的裸异常穿透成 INSTALL_FAILED。
+    // 不能让 URL/decodeURIComponent 的原始异常穿透成 INSTALL_FAILED。
     const badUrl = await installPython({ ...plain, url: "not a url" }, tempDir(), io, assets).catch(
       (error_: unknown) => error_,
     );

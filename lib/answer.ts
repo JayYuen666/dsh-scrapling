@@ -206,7 +206,7 @@ export function resolveAnswerRoute(
   return route;
 }
 
-/** `ctx.llm` 的最小结构面。 */
+/** `ctx.llm` 的最小结构类型。 */
 interface LlmStreamer {
   stream: (options: {
     provider: string;
@@ -241,8 +241,8 @@ export interface AnswerDeps {
  * 取消不是故障：宿主中止调用时抛的是它自己的取消异常（AbortError 一类），包成 ANSWER_FAILED
  * 之后上层看到的是「模型坏了」，于是可能重试一个用户已经放弃的提问，取消也会被记进失败统计。
  *
- * 与 web-provider / search-provider 同一口径：signal 已中止时原样抛出，让取消沿途保持可识别。
- * 判据抽成函数是为了让 createAnswerer 的分支数不因这条收口而上涨（复杂度门在 15）。
+ * 与 web-provider / search-provider 同一种做法：signal 已中止时原样抛出，让取消沿途保持可识别。
+ * 判据抽成函数是为了让 createAnswerer 的分支数不因这条统一处理而上涨（复杂度门在 15）。
  *
  * @param signal - 请求的中止信号
  * @param error - 刚捕获的异常
@@ -317,7 +317,7 @@ export function createAnswerer(
       // 取消不是故障：宿主在调用被中止时抛的是它自己的取消异常（AbortError 一类），
       // 包成 ANSWER_FAILED 之后上层看到的是「模型坏了」，于是可能重试一个用户已经
       // 放弃的提问，取消也会被记进失败统计。与 web-provider / search-provider 同一
-      // 口径：signal 已中止时原样抛出，让取消沿途保持可识别。
+      // 规则：signal 已中止时原样抛出，让取消沿途保持可识别。
       rethrowIfAborted(request.signal, error);
       // 已经是本模块的错误就原样抛，保留机器可读码；其余一律归到 ANSWER_FAILED。
       if (error instanceof SidecarError) {

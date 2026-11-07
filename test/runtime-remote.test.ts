@@ -120,7 +120,7 @@ function fakeJobs(
   let forgotten = false;
   let attached = 0;
   let detached = 0;
-  /** 一条作业拿到的写入面：输出与进度都记进各自的表。 */
+  /** 一条作业拿到的写入接口：输出与进度都记进各自的表。 */
   const handleOf = (id: string): JobHandle => ({
     id: id as never,
     append: (text: string): void => {
@@ -367,7 +367,7 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(status.jobsReady).toBe(false);
   });
 
-  it("install core：作业落到注册表，状态从输出环读，完成后 core 变 ready", async () => {
+  it("install core：作业落到注册表，状态从输出环形缓冲读，完成后 core 变 ready", async () => {
     const dataDir = tempDir();
     const jobs = fakeJobs();
     const ctx = new Context();
@@ -384,7 +384,7 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(running.job?.id).toBe(jobId);
     expect(running.job?.output).toContain("installing core");
     const finished = await jobs.hooks.get(jobId)?.done;
-    // 裸 await 在 hooks 缺席时静默 resolve undefined，作业到底有没有跑完、是不是 failed
+    // 不加判空地 await，会在 hooks 缺席时静默 resolve 成 undefined，作业到底有没有跑完、是不是 failed
     // 都不影响这条用例通过——结算状态必须断出来。
     expect(finished?.status).toBe("completed");
     // append 之外那条并行通道：progress 一直被填却从没人读过。
@@ -521,7 +521,7 @@ describe("官方 Typert Remote：runtime 服务", () => {
     installRuntimeRemote(ctx, depsOf(tempDir(), jobs));
     expect(serviceOf(ctx).installPack({ pack: CORE })).toMatchObject({ ok: false, status: 500 });
     // 服务侧那句 `try { jobs.start(spec) } finally { detach() }`：把 finally 去掉或只在成功
-    // 路径摘，就等于往宿主平面常驻一扇「有人能收这桶作业」的闸门。
+    // 路径摘，就等于往宿主那一层常驻一扇「有人能收这桶作业」的闸门。
     expect([jobs.attached, jobs.detached]).toStrictEqual([1, 1]);
   });
 
@@ -665,7 +665,7 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(status.job).toBeNull();
   });
 
-  it("输出环读不到时作业照旧在位，只是读不到尾部", async () => {
+  it("输出环形缓冲读不到时作业照旧在位，只是读不到尾部", async () => {
     const ctx = new Context();
     installRuntimeRemote(ctx, depsOf(tempDir(), fakeJobs({ readThrows: true })));
     const service = serviceOf(ctx);
@@ -674,7 +674,7 @@ describe("官方 Typert Remote：runtime 服务", () => {
       throw new Error(INSTALL_REFUSED);
     }
     const status = await service.status();
-    // 输出环失效不改变「有一个安装在跑」：整份视图退回 null 会把正在装的环境显示成没在装，
+    // 输出环形缓冲失效不改变「有一个安装在跑」：整份视图退回 null 会把正在装的环境显示成没在装，
     // 而卡片正是在这一位上决定要不要再给一次安装按钮。
     expect(status.job?.status).toBe("running");
     expect(status.job?.output).toBe("");
@@ -899,7 +899,7 @@ describe("客户端读取器", () => {
     ).rejects.toThrow(/refused/u);
   });
 
-  it("返回面的拒绝码不在保留集合时判坏，不把未知状态码当合法回执", async () => {
+  it("返回类型的拒绝码不在保留集合时判坏，不把未知状态码当合法回执", async () => {
     const reader = createRuntimeReader(
       hostOf({
         namespace: namespaceStub({

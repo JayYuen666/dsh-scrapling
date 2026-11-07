@@ -26,7 +26,7 @@ function collectErrors(sink: unknown[]): (error: unknown) => void {
 /**
  * 记下转交过来的错误、然后再抛一次的 onError 替身。
  *
- * 「onError 自己抛了也不往上抛」这条得先证明转交**发生了**，再证明第二次抛被吃掉 ——
+ * 「onError 自己抛了也不往上抛」这条得先证明转交**发生了**，再证明第二次抛出被就地处理 ——
  * 只断言流安静收尾时，实现把异常整个吞掉也算通过。
  *
  * @param sink - 收账的数组
@@ -47,7 +47,7 @@ const FRAME_B = '{"b":2}';
  * 把若干片段喂给切帧器，收齐所有帧。
  *
  * 片段可以是文本，也可以是 `Buffer`：`pumpFrames` 在挂监听之前先 `setEncoding("utf8")`，
- * 所以字节案由 Node 的解码器收口，跨片段的半个多字节字符正是走这条路（见下面那条用例）。
+ * 所以字节案由 Node 的解码器统一处理，跨片段的半个多字节字符正是走这条路（见下面那条用例）。
  * 用 `finished(stream)` 而不是 `new Promise` 包 `end` 事件：前者是官方封装，也不会
  * 触发本仓对 `new Promise` 的那条规则。
  *
@@ -83,7 +83,7 @@ function kindOf(run: () => unknown): string {
 }
 
 describe("encodeFrame", () => {
-  it("产出不含裸换行的单行", () => {
+  it("产出不含未转义换行的单行", () => {
     expect(encodeFrame({ id: "1", note: "a\nb" })).not.toContain("\n");
   });
 
@@ -198,7 +198,7 @@ describe("pumpFrames", () => {
     ]);
   });
 
-  it("流被 close 而没有 end 时，残留的最后一帧仍被投递", async () => {
+  it("流被 close 而没有 end 时，残留的最后一帧仍被转交", async () => {
     const seen: string[] = [];
     const stream = new Readable({ read: noop });
     const stop = pumpFrames(stream, (line) => {
@@ -214,7 +214,7 @@ describe("pumpFrames", () => {
     await expect(collect([`${FRAME_A}\n${FRAME_B}`])).resolves.toStrictEqual([FRAME_A, FRAME_B]);
   });
 
-  it("停止后连收尾的残帧也不投递", async () => {
+  it("停止后连收尾的残帧也不转交", async () => {
     const seen: string[] = [];
     // 故意留一个没有尾随换行的残帧：end 时的 flush 会捞到它，而此时已停止。
     const stream = Readable.from([`${FRAME_A}\n{"c":3`]);
@@ -398,7 +398,7 @@ describe("pumpFrames 的错误通道", () => {
       () => {
         throw new Error("first");
       },
-      // 先记账再抛：这条判的是「转交发生了、接收方又炸了也没冒出去」。
+      // 先记录再抛：这条判的是「转交发生了、接收方又炸了也没冒出去」。
       recordThenThrow(forwarded),
     );
     await expect(finished(stream)).resolves.toBeUndefined();

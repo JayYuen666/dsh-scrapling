@@ -34,7 +34,7 @@ export const SEARCH_PROVIDER_ID = "scrapling";
  *
  * 这两个后端只有单一对端、没有自托管镜像的常见形态，所以没有做成部署项；Tavily / Bing /
  * DuckDuckGo / SearXNG 的默认值都落在「部署方会换」的地址上，因此走 Config。端点仍是
- * SearchProviderDeps 的入参，测试照旧可以从这一侧注入。
+ * SearchProviderDeps 的入参，测试照旧可以从入参注入。
  */
 export const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
 
@@ -42,7 +42,7 @@ export const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/se
 export const SERPER_SEARCH_ENDPOINT = "https://google.serper.dev/search";
 
 /**
- * 发现层后端的名单与类型住在 `lib/search-backends.ts`：CLI 判配置要读同一份名单，而它不能
+ * 发现层后端的名单与类型定义在 `lib/search-backends.ts`：CLI 判配置要读同一份名单，而它不能
  * import 本模块（那会把 sidecar 依赖一起拖进 bin 产物）。
  */
 
@@ -334,7 +334,7 @@ async function toSource(
   let citeable: string;
   try {
     const normalized = await gate(url);
-    // 闸门可能把 URL 归一过。判的和引用的必须是同一个串，否则归一化又成一条绕过面。
+    // 闸门可能把 URL 归一过。判的和引用的必须是同一个串，否则归一化又成一条绕过的路子。
     citeable = typeof normalized === "string" ? normalized : url;
   } catch {
     // 被安全闸门拦下（私网、元数据端点、非 http(s)…）：这一条不作为结果交出去。

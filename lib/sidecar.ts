@@ -9,7 +9,7 @@
 //
 // **一条必须自己接的线**：`dsh-tool-call-timeout-policy` 是**协作式**的，超时只通过
 // `exec.signal` 通知，不会杀子进程。调用级的取消只作废那一个请求（见 call() 的 abort 分支）；
-// 进程本身的收口交给握手超时与协议失败，这两条会主动 `terminate()` + `waitForExit()` ——
+// 进程本身的统一处理交给握手超时与协议失败，这两条会主动 `terminate()` + `waitForExit()` ——
 // 否则一次启动失败会把 Python 进程漏在后台，直到宿主退出。
 //
 // **返回值一律是 `unknown`**：sidecar 的载荷是跨语言的 JSON，宿主不该凭信任就断言形状。
@@ -151,7 +151,7 @@ interface ReadyWaiter {
 /**
  * 握手帧的 zod 形状：跨语言协议只在这里认一次，坏字段各自降级、不拖掉整帧。
  *
- * - 四个能力开关按 `=== true` 归一（`"yes"` / `1` 都算缺报，与旧口径一致）；
+ * - 四个能力开关按 `=== true` 归一（`"yes"` / `1` 都算缺报，与旧规则一致）；
  * - `websocketGuard` / `version` 缺报时折成 undefined，保留「没上报」与 false 的区别；
  * - `proxy` 三个字段都齐才收，否则整项当没报。
  */
@@ -257,7 +257,7 @@ async function gateRequestUrls(
       return target;
     }
     const normalized = await gate(value);
-    // 闸门可能把 URL 归一过。判的和连的必须是同一个字符串，否则归一化就成了绕过面。
+    // 闸门可能把 URL 归一过。判的和连的必须是同一个字符串，否则归一化就成了绕过的路子。
     // 换新的参数对象而不是就地改：params 可能是调用方复用的对象，就地改会把上一次的归一
     // 结果带进下一次调用。
     if (typeof normalized !== "string" || normalized === value) {
@@ -307,7 +307,7 @@ export class SidecarClient {
     try {
       this.#options.log?.(line);
     } catch {
-      // 日志回调是调用方的代码，它抛在这里有两个坏处：stderr 的 data 监听是裸监听，抛出
+      // 日志回调是调用方的代码，它抛在这里有两个坏处：stderr 的 data 监听没有包一层，抛出
       // 就是未捕获异常、掀翻宿主；而 #onFrame 里抛会被 pumpFrames 当成管道故障转交
       // onError，触发 #teardown 把整个进程拆掉。一句打印的 bug 不该带走所有在途请求。
     }
@@ -347,7 +347,7 @@ export class SidecarClient {
       return;
     }
     this.#pending.delete(rawId);
-    // timeoutMs 为 null 的请求（爬虫这类量级不定的任务）没有定时器，这一侧是真实路径，
+    // timeoutMs 为 null 的请求（爬虫这类量级不定的任务）没有定时器，这条分支真会走到，
     // 判空不可省。
     if (entry.timer !== undefined) {
       clearTimeout(entry.timer);
@@ -462,7 +462,7 @@ export class SidecarClient {
       const timer = setTimeout(() => {
         const index = this.#readyWaiters.indexOf(waiter);
         // waiter 一定还在队列里（只有被兑现或被 reject 才会移除，而那两条路都会清掉
-        // 这个定时器），所以「找不到」这一侧到不了。
+        // 这个定时器），所以走不到「找不到」那条分支。
         /* v8 ignore next 3 */
         if (index !== -1) {
           this.#readyWaiters.splice(index, 1);
@@ -573,7 +573,7 @@ export class SidecarClient {
    * 确保进程就绪（必要时拉起）。
    *
    * `signal` 只用于「这次调用在启动前就已取消」的早退，**不传给 spawn**：进程是共享的，
-   * 首个调用方的取消不能拆掉同一进程上所有并行请求；启动失败由 handshakeTimeoutMs 收口。
+   * 首个调用方的取消不能拆掉同一进程上所有并行请求；启动失败由 handshakeTimeoutMs 统一处理。
    *
    * @param signal - 取消信号
    * @returns 握手后的能力
@@ -636,7 +636,7 @@ export class SidecarClient {
     const timeoutMs =
       options.timeoutMs === undefined ? this.#options.requestTimeoutMs : options.timeoutMs;
     // 先编码再落表：encodeFrame 对不可序列化的 params（循环引用、BigInt 之类）会抛
-    // FrameError。若先登记了 pending 条目，那条目就没有任何人会回收 —— 只能等各自
+    // FrameError。若先登记了 pending 条目，那个条目就没有任何人会回收 —— 只能等各自
     // 的超时，而 timeoutMs 为 null 的爬虫请求会永久留在 #pending 里。
     const frame = `${encodeFrame({ id, method, params: outgoing })}\n`;
 
@@ -774,7 +774,7 @@ export function createSidecar(ctx: Context, options: SidecarOptions): SidecarCli
 /**
  * 造一个文案已带 `CODE: ` 前缀的 sidecar 错误（幂等）。
  *
- * 模型可见的失败文本必须是 `CODE: message`：`SidecarError.code` 只住在对象上，不进
+ * 模型可见的失败文本必须是 `CODE: message`：`SidecarError.code` 只存在于对象上，不进
  * 文案就等于模型永远看不见它，而按码分支（`BAD_ARGS` 改参数、`URL_BLOCKED` 换目标、
  * `NO_SUCH_SESSION` 重开会话）正是它该做的事。已经拼过前缀的不再拼 —— 重复前缀会让
  * 作业结算行出现 `BAD_ARGS: BAD_ARGS:` 这种噪音。

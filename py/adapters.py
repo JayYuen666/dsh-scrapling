@@ -73,7 +73,7 @@ class AdapterError(RuntimeError):
 
 
 def _require(engine: object) -> None:
-    """引擎不可用时给出可执行的提示，而不是抛一个裸 AttributeError。"""
+    """引擎不可用时给出可执行的提示，而不是抛一个只有 AttributeError 的错。"""
     if engine is None:
         # 带上解释器路径：装在哪份 Python 里是这条错误的全部信息量，而用户手上通常不止一份。
         raise AdapterError(
@@ -267,7 +267,7 @@ _ACTIVE_CONTENT_WARNED = threading.Event()
 
 
 def _strip_active_content(page: Any) -> None:
-    """剥掉元素上的可执行残留，让清洗后的 HTML 真的只剩内容。
+    """去掉元素上的可执行残留，让清洗后的 HTML 真的只剩内容。
 
     ``_strip_noise_tags`` / ``_sanitize_for_ai`` 只处理元素与文本，**不碰属性**。实测
     清洗后 ``onclick`` 照样在，``<meta http-equiv=refresh>`` 与 ``srcdoc`` 也照样在 ——
@@ -580,7 +580,7 @@ def _static_request_payload(args: dict[str, Any], method: str) -> dict[str, Any]
     if cookies is not None:
         payload["cookies"] = cookies
     if isinstance(default_encoding, str) and default_encoding:
-        # default_encoding 不在 Scrapling 声明的 GET/POST 参数面里，它是 _merge_request_args
+        # default_encoding 不在 Scrapling 声明的 GET/POST 参数表里，它是 _merge_request_args
         # 原样透传给 curl_cffi 的 Session.request 的那一位；编码名先经 codecs 归一，
         # 但 curl_cffi 若改名，这一位会由它自己报错而不是在这里被拦住。
         try:
@@ -652,7 +652,7 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
     method = _static_method(args)
     request_payload = _static_request_payload(args, method)
     if method != "GET" and not guard.ALLOW_WRITE_METHODS:
-        # 这一侧是硬拒，不依赖 Host 有没有把入参摆出来：手搓一帧 stdin 也写不出去。
+        # 插件侧是硬拒，不依赖 Host 有没有把入参摆出来：手搓一帧 stdin 也写不出去。
         raise AdapterError(
             "WRITE_DISABLED",
             f"{method} changes state on the remote side; the deployment must set "
@@ -749,7 +749,7 @@ FETCH_LEVEL_KEYS = frozenset(
 # 这张表是**上游的事实**而不是本包的透传清单：`max_pages` / `retries` / `retry_delay` 上游
 # 确实是构造期参数，但本包一个都不发（各自没有对应的部署设置），所以它们在
 # `_browser_params` 的产物里根本不出现 —— 过滤器对它们是无操作，留着是为了让
-# `py/tests/contract_probe.py` 能拿整张表与上游字段面比对，而不是只比对我们用到的那几项。
+# `py/tests/contract_probe.py` 能拿整张表与上游字段比对，而不是只比对我们用到的那几项。
 #
 # `record_requests` / `max_recorded_requests` 是 0.5 用会话网络历史替代 `capture_xhr` 之后
 # 新增的两枚：它们**只**在构造期生效，逐次 fetch 传等于没传（这正是那个替代方案的核心）。
@@ -908,7 +908,7 @@ def _browser_params(args: dict[str, Any], url: str, *, level: str = "session") -
     extra_headers = _string_map(args.get("extraHeaders"), "extraHeaders")
     if extra_headers is not None:
         params["extra_headers"] = extra_headers
-    # 四条反检测参数只在浏览器那套的参数面里。solve_cloudflare 逐次 fetch 也认，其余三条
+    # 四条反检测参数只在浏览器那套的参数表里。solve_cloudflare 逐次 fetch 也认，其余三条
     # 只有会话构造认 —— 两层的分家由上面那两张名单做。
     params["solve_cloudflare"] = bool(args.get("solveCloudflare", False))
     params["hide_canvas"] = bool(args.get("hideCanvas", False))
@@ -1101,7 +1101,7 @@ def capture(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _fake_response(html: str, url: str, status: int) -> Any:
-    """造一个不带网络的 ``Response``，让已有 HTML 走与抓取同一条归一管线。
+    """造一个不带网络的 ``Response``，让已有 HTML 走与抓取同一条归一化路径。
 
     调用方是 :mod:`session_page`（读会话当前页的 DOM）与测试夹具：正文清洗与截断只写在
     :func:`to_payload` 一处，离线进来的 HTML 不许绕过它。
@@ -1124,7 +1124,7 @@ def _adaptive_kwargs(args: dict[str, Any], url: str) -> dict[str, Any]:
 
     ``deployment.adaptiveStorage`` 只认 ``sqlite``（默认）与 ``redis``；Redis 那一支把连接
     串与按注册域分桶的 ``url`` 一起交给 ``RedisStorageSystem``，客户端不可达时翻成带码的
-    ``ADAPTIVE_STORAGE_UNAVAILABLE``，而不是让整次抽取以裸异常收场。
+    ``ADAPTIVE_STORAGE_UNAVAILABLE``，而不是让整次抽取以原始异常收场。
     """
     deployment = args.get("deployment")
     settings = deployment if isinstance(deployment, dict) else {}
@@ -1391,7 +1391,7 @@ def capabilities() -> dict[str, Any]:
         return report
     report["version"] = _scrapling_version()
     # 0.5 只剩 patchright 那一套浏览器，所以这一项就是「浏览器抓取能不能用」的全部答案 ——
-    # 0.4.15 时代那两个「普通浏览器 / 反检测浏览器」各自探测的口径已经没有第二个引擎可标。
+    # 0.4.15 时代那两个「普通浏览器 / 反检测浏览器」各自探测的规则已经没有第二个引擎可标。
     report["browser"] = _probe_browser("patchright.sync_api")
     # 浏览器守卫覆盖面的那一半（WebSocket 握手）在这里报出：拦不住时 install 只会往 stderr
     # 记一行，而那要等第一个页面建起来才看得见 —— 排障的人得在装载阶段就知道。
@@ -1671,7 +1671,7 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
     entry_lock = placeholder["lock"]
 
     # browser/stealth 先起属主线程，构造（含 sync_playwright 的启动）整个发生在它上面
-    # —— greenlet 绑定从此指向这条线程，之后每次 fetch/close 都投递回来。static 没有
+    # —— greenlet 绑定从此指向这条线程，之后每次 fetch/close 都转交回来。static 没有
     # 线程亲和，留在调用线程即可。
     worker: _SessionWorker | None = None
     try:
@@ -1700,7 +1700,7 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
                 "type": kind,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 # T10 的非敏感设置摘要：在开场时把生效值记下来，session.list 不必回头去
-                # 猜（凭据面永远不进这份摘要）。
+                # 猜（凭据一类的东西永远不进这份摘要）。
                 "settings": _session_settings(kind, args),
                 # 同一把锁：占位时建的那把，盖回来而不是新建 —— 新建会让构造期与使用期各锁各的。
                 "lock": entry_lock,
@@ -1782,7 +1782,7 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
                     raise AdapterError("URL_BLOCKED", f"{url}: {reason}")
                 # 方法与一次性 fetch 同源：显式 method 优先，没给时由 form/json/body
                 # 推 POST，显式 GET 带体会报错。只看 form/json 的两行写法会让
-                # session.fetch 的 method=PUT/DELETE 与裸 body 静默落地（请求照发、
+                # session.fetch 的 method=PUT/DELETE 与只带 body 的请求静默落地（请求照发、
                 # 语义错了），而调用方从回包上看不出这件事。
                 static_method = _static_method(args)
                 if static_method != "GET" and not guard.ALLOW_WRITE_METHODS:
@@ -1836,7 +1836,7 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
                         "BAD_ARGS",
                         f"{key} only applies to static sessions; use {hint} for a {entry['type']} session",
                     )
-            # 投递到属主线程执行：greenlet 绑定在那里（见 _SessionWorker）。排队期间调用
+            # 转交到属主线程执行：greenlet 绑定在那里（见 _SessionWorker）。排队期间调用
             # 线程原地等 —— 并发的 fetch 因此天然串行，entry 锁对浏览器会话是多余的。
             worker: _SessionWorker | None = entry["worker"]
             if worker is None:  # pragma: no cover —— 浏览器条目必有属主线程
@@ -2077,14 +2077,14 @@ def _close_entry(session_id: Any) -> None:
         return
     worker: _SessionWorker | None = entry.get("worker")
     if worker is not None:
-        # 浏览器会话的 close 是一次 Playwright 远端调用，必须在属主线程上做；投递进去
+        # 浏览器会话的 close 是一次 Playwright 远端调用，必须在属主线程上做；转交进去
         # 还天然排在在途 fetch 之后 —— 「抓取进行中收到 close」会等抓取落地再关，而
         # 不是把一次正在跑的抓取从底下抽走。
         worker.run(lambda: _release_entry(entry))
         worker.stop()
         return
     # static 没有属主线程，用 entry 锁：否则「抓取进行中收到 close」会把一次正在跑的
-    # 抓取从底下抽走，而 close 那一侧看到的是一个已经拆掉的会话。
+    # 抓取从底下抽走，而 close 这条路径看到的是一个已经拆掉的会话。
     with entry["lock"]:
         _release_entry(entry)
 
@@ -2186,7 +2186,7 @@ def _session_state(args: dict[str, Any], *, saving: bool) -> dict[str, Any]:
     try:
         if saving:
             worker.run(lambda: session.save_state(target))
-            # spec §11.6：登录态文件是凭据面（cookie / localStorage / IndexedDB），落盘后
+            # spec §11.6：登录态文件是凭据一类的东西（cookie / localStorage / IndexedDB），写到磁盘后
             # 收到 0600。Windows 上 chmod 只动只读位，失败也不该让存取整体失败。
             with contextlib.suppress(OSError):
                 Path(target).chmod(0o600)
@@ -2194,7 +2194,7 @@ def _session_state(args: dict[str, Any], *, saving: bool) -> dict[str, Any]:
             worker.run(lambda: session.load_state(target))
     except FileNotFoundError as error:
         # 上游的原文里带着**宿主绝对路径**（「[Errno 2] No such file or directory:
-        # '/Users/…/login.json'」）：那是部署面的信息，对模型既没用又是泄露。点名
+        # '/Users/…/login.json'」）：那是部署的信息，对模型既没用又是泄露。点名
         # 那个模型自己给的文件名就够了。
         raise AdapterError("STATE_FAILED", f"state file does not exist: {Path(target).name}") from error
     except json.JSONDecodeError as error:

@@ -1,6 +1,6 @@
 // dsh-scrapling/lib/search-backends.ts —— 发现后端名单的单一定义处。
 //
-// 住在独立模块而不是 lib/search-provider.ts：CLI（lib/cli.ts）要拿这份名单判配置，而
+// 名单定义在独立模块而不是 lib/search-provider.ts：CLI（lib/cli.ts）要拿这份名单判配置，而
 // search-provider 拖 sidecar 与网络依赖，被 bin 的打包一并带进来正是 lib/cli.ts 一直避开的
 // （见该文件里 SEARCH_PROVIDER_NAME 那条本地常量）。类型从这份数组派生，所以「数组里有、
 // 类型里没有」这类分叉不成立。设置卡的 enum 面（src/settings-fields.ts）读同一份数组，

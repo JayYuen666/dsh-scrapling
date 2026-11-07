@@ -1,12 +1,12 @@
-// runtime 设置卡的宿主读面：官方 Typert Remote（status / install / repair / cancel）。
+// runtime 设置卡的宿主读取接口：官方 Typert Remote（status / install / repair / cancel）。
 //
 // 为什么是 Remote：安装是宿主进程里的动作（下载 Python、建 venv、装 Chromium），卡片跑在
-// 浏览器里，设置面没有执行宿主动作的口子。这条面在 apply 的早期就注册 —— 即使这台机器
+// 浏览器里，设置界面没有执行宿主动作的口子。这一条在 apply 的早期就注册 —— 即使这台机器
 // 根本没有 Python、sidecar 起不来，用户也要能从卡片里把它装上。
 //
 // 作业走宿主注册表（ctx.jobs）：一次安装是分钟级的，不能卡住 Remote 调用；卡片按 job id
-// 轮询 status，进度从作业输出环读。取消只叫停作业并把后续步骤挡住：正在跑的 pip / tar
-// 这一拍不可中断（InstallerIO 没有信号面），这是已知粒度，不把它说成“立即停止”。
+// 轮询 status，进度从作业输出环形缓冲读。取消只叫停作业并把后续步骤挡住：正在跑的 pip / tar
+// 这一拍不可中断（InstallerIO 没有信号接口），这是已知粒度，不把它说成“立即停止”。
 
 import type { Context } from "@deepseek-ai/cordis";
 import type { JobId, JobOutcome, JobOutputRead, JobRegistry, JobSpec } from "@deepseek-ai/dsh-jobs";
@@ -76,7 +76,7 @@ function outputOf(read: JobOutputRead): string {
 /**
  * 一条作业的输出尾部；读不出来时给空串。
  *
- * 输出环被回收或读数异常都不改变「这条作业还在」的事实，所以这里的失败不能升级成
+ * 输出环形缓冲被回收或读数异常都不改变「这条作业还在」的事实，所以这里的失败不能升级成
  * 「整份作业视图没有」。
  */
 function outputTextOf(jobs: RuntimeJobs, id: JobId): string {
@@ -88,7 +88,7 @@ function outputTextOf(jobs: RuntimeJobs, id: JobId): string {
 }
 
 /**
- * 设置卡「运行环境」的宿主读面。
+ * 设置卡「运行环境」的宿主读取接口。
  *
  * 服务在构造时注册（cordis Service 的契约），随所属 fiber 卸载自动撤；调用方拿实例没有用处。
  */
@@ -115,7 +115,7 @@ export class ScraplingRuntimeService extends TypertRemoteService {
       // 注册表不认这条了（被重载或已收走）：卡片按“没有作业”处理，不把旧读数当现状。
       return null;
     }
-    // 输出与状态分开读：`readAt` 失败（输出环被回收、读数异常）改变不了「有一个作业在跑」
+    // 输出与状态分开读：`readAt` 失败（输出环形缓冲被回收、读数异常）改变不了「有一个作业在跑」
     // 这个事实。合在一个 try 里会让整份视图退回 null，于是正在装的环境被显示成没在装。
     return {
       id: String(tracked.id),
@@ -242,7 +242,7 @@ export class ScraplingRuntimeService extends TypertRemoteService {
             try {
               job.append(`${aborted ? "CANCELLED" : "FAILED"}: ${detail}\n`, { channel: "log" });
             } catch {
-              // 输出环已经不认这次写入：原因进不了界面，但作业的终态照旧交回注册表。
+              // 输出环形缓冲已经不认这次写入：原因进不了界面，但作业的终态照旧交回注册表。
             }
             return aborted ? { status: "killed", detail } : { status: "failed", detail };
           }
@@ -288,7 +288,7 @@ export class ScraplingRuntimeService extends TypertRemoteService {
       return refused(503, "this profile has no jobs backend");
     }
     if (!jobs.list().some((view) => String(view.id) === raw)) {
-      // 注册表已经把这条收走（`remove()` 或服务销毁）。本包对「缺席」的口径是自愈信号，
+      // 注册表已经把这条收走（`remove()` 或服务销毁）。本包对「缺席」的规则是自愈信号，
       // 不是一次取消失败：报 404 并忘掉它，下一次安装才不会被一条已不存在的作业挡住。
       this.job = null;
       return refused(404, `unknown jobId: ${raw}`);
@@ -303,7 +303,7 @@ export class ScraplingRuntimeService extends TypertRemoteService {
 }
 
 /**
- * 标准装饰器的程序化调用：源码不引装饰器语法，构建与测试解析器就不必挂降级管线。
+ * 标准装饰器的程序化调用：源码不引装饰器语法，构建与测试解析器就不必挂降级流水线。
  * 与 `dsh-zvec-grep/lib/rebuild-remote.ts` 的 `markRemote` 同形。
  */
 function markRemote(prototype: ScraplingRuntimeService, methodName: string): void {

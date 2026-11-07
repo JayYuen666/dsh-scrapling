@@ -1,6 +1,6 @@
 // test/build-helpers.test.ts —— 构建小工具里那几条「判错方向就 fail-open」的分支。
 //
-// build-helpers.ts 不在 vitest 的 coverageInclude 名单里（那份名单收的是随包发布的运行期面），
+// build-helpers.ts 不在 vitest 的 coverageInclude 名单里（那份名单收的是随包发布的运行期），
 // 所以这里判的是行为而不是覆盖率。
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -146,7 +146,7 @@ describe("build-helpers", () => {
       "node:fs",
       "#internal/thing",
       String.raw`\0virtual:module`,
-    ])("非裸说明符 %s 交回空串，不冒充包名", (id) => {
+    ])("不是裸说明符%s 交回空串，不冒充包名", (id) => {
       expect(packageNameOf(id)).toBe("");
     });
 

@@ -1,7 +1,7 @@
 // dsh-scrapling/lib/web-provider.ts —— 把 Scrapling 注册成 ctx.web 的 fetch provider。
 //
 // 目的：让 **dsh 内置的 web_fetch 工具**在部署侧把 fetchProvider 指到本插件后，实际由
-// Scrapling 执行 —— 这才是「替代 dsh 自带的」真正落点，而不是再加一个同名工具。
+// Scrapling 执行 —— 这才是「替代 dsh 自带的」真正位置，而不是再加一个同名工具。
 //
 // 两个必须知道的事实（都从 dsh-web 的类型与源码确认，不是推测）：
 //
@@ -40,9 +40,9 @@ export interface WebProviderDeps {
    * 单次抓取的输出上限。
    *
    * 同一个数有两个去处：作为 `maxContentChars` 发给 sidecar（字符），以及作为
-   * `capText` 的字节预算（见 lib/output.ts 说明为什么最终收口按字节）。这与本仓各工具
-   * 走的是同一条口径，代价是非 ASCII 页面在字节预算下会被裁得更早 —— 但预算必须真的
-   * 收口，只标一个 truncated 而把超长正文原样放行等于没有预算。
+   * `capText` 的字节预算（见 lib/output.ts 说明为什么最终统一处理按字节）。这与本仓各工具
+   * 走的是同一条规则，代价是非 ASCII 页面在字节预算下会被裁得更早 —— 但预算必须真的
+   * 统一处理，只标一个 truncated 而把超长正文原样放行等于没有预算。
    */
   readonly maxOutputBytes: number;
   /** 单次抓取的协同超时（毫秒）。 */
@@ -189,7 +189,7 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
       } catch (error: unknown) {
         // 取消不是故障：sidecar 在 signal 中止时抛的是 SIDECAR_ABORTED，包成抓取失败
         // 之后调用方看到的是「这个页面抓坏了」，于是会重试一个用户已经放弃的请求。
-        // 与 search-provider 同一口径：原样抛出。
+        // 与 search-provider 同一种做法：原样抛出。
         if (signal?.aborted === true) {
           throw error;
         }
@@ -197,7 +197,7 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
         // 两条路：文案前缀给模型看，`cause` 给程序读。宿主对 WebError 的契约是「按 code
         // 路由、绝不解析 message」，而 provider 特有码只要求调用方**容得下**，所以把
         // URL_BLOCKED / SIDECAR_TIMEOUT / SIDECAR_UNAVAILABLE 直接抬成 code 等于改这份契约
-        // 的取值面；带在 cause 上既不撑大取值域，也不把三种情况压成一件。
+        // 的取值；带在 cause 上既不撑大取值域，也不把三种情况压成一件。
         // WebError 的构造签名是 (message, code, options) —— 顺序反了的话，这段文案会跑到
         // code 上，而 code 会变成一整段错误文本，调用方按码路由就全废了。
         // 与 host 的 probeFailure 一致，统一 String()：Error 会变成 "Error: msg"，
@@ -208,7 +208,7 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
 
       const payload = replyOf(raw);
       // 真正裁剪而不仅是标一个 truncated：超长正文原样返回的话，它会照样进上下文与会话
-      // 日志，而 truncated: true 反而让调用方以为已经裁过了。与本仓各工具同一收口
+      // 日志，而 truncated: true 反而让调用方以为已经裁过了。与本仓各工具同一统一处理
       // （lib/output.ts 的 capText，按字节头尾截断）。
       const capped = capText(payload.content, deps.maxOutputBytes, RECOVERY_HINT);
       // 两种截断都算：sidecar 自己截的，和我们自己按预算截的 ——

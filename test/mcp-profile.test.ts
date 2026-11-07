@@ -27,7 +27,7 @@ import type { ProfileMode } from "../lib/mcp-profile.ts";
 // #378 的原点：写死 /tmp 在 Windows 上拼出一条既不存在也不合平台形态的 command 路径，
 // 而本文件与 CI 的 windows-latest 格都覆盖 CRLF 那一类场景。
 const DATA_DIR = path.join(os.tmpdir(), "dsh-scrapling-data");
-// 包名、钉版与默认端口的真源在 `lib/mcp-contract.ts`：这里再抄一份，契约换值时这些用例会
+// 包名、钉版与默认端口的唯一来源在 `lib/mcp-contract.ts`：这里再抄一份，契约换值时这些用例会
 // 把「生成器改了」报成「解析器坏了」。
 const CLIENT = MCP_CLIENT_PACKAGE;
 const PINNED = MCP_DEFAULT_CLIENT_PIN;
@@ -288,7 +288,7 @@ describe("inspectProfile", () => {
   });
 
   // 合法 YAML 的标量写法不止一种：双引号、裸标量、行尾注释、行尾空格、列表项短横。
-  // 只认「单引号 + 干净行尾」那一种，doctor 会把真存在的条目读成没有 —— 假红与漏报残留。
+  // 只认「单引号 + 干净行尾」那一种，doctor 会把真存在的条目读成没有 —— 误报与漏报残留。
   const NAME_LINE_SINGLE = `      name: '${CLIENT}'`;
 
   it.each([
@@ -308,7 +308,7 @@ describe("inspectProfile", () => {
 
   it("比 name 更浅的键不属于这一条目", () => {
     // 层级判据要真的在判：transport 写在比 name 更浅的一格，就不该被算进这条条目，
-    // 否则 doctor 会把「不属于它的键」当成条目的事实，一条假绿就出来了。
+    // 否则 doctor 会把「不属于它的键」当成条目的事实，一条误判通过就出来了。
     const shallow = [
       "- insert:",
       `    ${ENTRY_ID_LINE}`,
@@ -396,7 +396,7 @@ describe("readProfileSnapshot", () => {
   });
 
   // Windows 上编辑器写出的 patch 是 CRLF。\r 若留在行尾，条目名与键值两侧的 $ 锚点全部落空，
-  // doctor 会把一份真存在的条目读成「没有」——那是假红，用户会去改一份本来就对的配置。
+  // doctor 会把一份真存在的条目读成「没有」——那是误报，用户会去改一份本来就对的配置。
   it("patch 用 CRLF 换行时也能读出条目，判据不因换行风格改口", async () => {
     const patch = `${PLUGIN_ENTRY}        officialMcpEnabled: true\n`.replaceAll("\n", "\r\n");
     const snapshot = await readProfileSnapshot(profile(patch, "{}"));
@@ -414,8 +414,8 @@ describe("readProfileSnapshot", () => {
   /**
    * 判据是「YAML 说它是不是布尔真值」，不是「这一行看着像不像开」。
    *
-   * 前面几种是宿主解析成 true 的写法，miss 了就是假红（叫用户去改一份本来生效的配置）；
-   * 后面几种宿主解析成 false 或一个字符串，判成开启就是假绿——doctor 打绿而工具没接上更贵。
+   * 前面几种是宿主解析成 true 的写法，miss 了就是误报（叫用户去改一份本来生效的配置）；
+   * 后面几种宿主解析成 false 或一个字符串，判成开启就是误判通过——doctor 判定通过而工具没接上更贵。
    */
   const SWITCH_CASES: readonly (readonly [string, boolean, string])[] = [
     ["裸 true", true, "        officialMcpEnabled: true\n"],

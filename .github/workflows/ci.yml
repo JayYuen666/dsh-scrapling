@@ -15,7 +15,7 @@ on:
   # 但「上周没跑」不等于「上周全绿」，读结论时别把它当连续证据。
   schedule:
     - cron: "37 3 * * 1"
-# 同一分支上后到的提交取消前一个。发布用的是另一套口径（publish.yml 的
+# 同一分支上后到的提交取消前一个。发布用的是另一套规则（publish.yml 的
 # cancel-in-progress: false）——发布不能中途取消。
 # 组的键里带 event_name：周度那一跑与 main 上的 push 都落在 refs/heads/main 上，
 # 只按 ref 分组会让后到的把先到的取消掉，而周度那一跑是环境漂移的唯一信号，
@@ -24,14 +24,14 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
-# 门槛只需要读代码。写成白名单而不是省略：省略会拿到仓库默认权限，而默认可能是读写。
+# 门槛只需要读代码。写成允许名单而不是省略：省略会拿到仓库默认权限，而默认可能是读写。
 permissions:
   contents: read
 # pnpm 取具体补丁版本而不是主版本 12：`version: 12` 让每次运行拿上游最新的 12.x，补丁差在安装树的
 # 解法上是可观察的行为差异（本族各仓 cordis.patch.yml 就记着 pnpm 某个小版本的 add 缺陷）。取值与
-# 伞根 packageManager 同源，也是各仓 lockfile 当期由之生成的那一枚。口径：九仓 CI 都在 workflow 级
+# 伞根 packageManager 同源，也是各仓 lockfile 当期由之生成的那一枚。规则：九仓 CI 都在 workflow 级
 # env 里写这枚字面值；唯一例外是 dsh-lesson-loop，它的 package.json 自带 packageManager，由
-# pnpm/action-setup 自己读，再写 env 就成了两份真源。
+# pnpm/action-setup 自己读，再写 env 就成了两份唯一来源。
 env:
   PNPM_VERSION: 12.11.2
 jobs:
@@ -147,7 +147,21 @@ jobs:
       # 所以这里不重复跑 Python 面。
       - name: 跑门禁
         shell: bash
-        run: pnpm run check
+        env:
+          NO_COLOR: "1"
+        run: |
+          set -o pipefail
+          pnpm run check 2>&1 | tee "$RUNNER_TEMP/gate.log"
+      # 假绿的形态是「格子 success 但什么都没跑」（pwsh + pnpm 的历史实测）。判据落在门禁
+      # 本该产出的行上：没有 vitest 的测试汇总行就是没真跑，这里把红补上。不带 if：
+      # 门禁真红时本步不执行，不盖住真正的失败原因。
+      - name: 断言门禁真跑出测试
+        shell: bash
+        run: |
+          if ! grep -q "Test Files" "$RUNNER_TEMP/gate.log"; then
+            echo "::error::门禁日志里没有 vitest 测试汇总行——判定步骤可能没有真跑"
+            exit 1
+          fi
       # 覆盖率只在一次运行的日志里滚一遍就没了，翻起来费劲。落成产物之后，
       # 「这次为什么掉了」可以直接把报告下下来看，而不必重跑一次。
       # 只收 ubuntu 的 node 24 那一格：其余格各传一份只会得到同样的报告。
@@ -166,7 +180,7 @@ jobs:
       # 判的是门禁有没有回头改写**被跟踪文件**：为零说明这一趟没有动到仓库内容。
       # 必须带 always()：`pnpm run check` 中途红掉时，改写了文件的那一步照样可能已经跑过，
       # 跳过它就会把「门禁改了仓库」和「门禁没跑完」混成同一件事。
-      # 改写面几乎全部落在 .gitignore 里（host.js / client.js / coverage/ / __pycache__），
+      # 改写入几乎全部落在 .gitignore 里（host.js / client.js / coverage/ / __pycache__），
       # 所以这一步在现状下极少失败；它留着的理由是覆盖「产物被误提交成跟踪文件」那一档。
       - name: 校验门禁没有改写被跟踪文件
         if: always()
@@ -191,7 +205,7 @@ jobs:
 
       # 运行页顶部的摘要：把结果留在这一页，不必点进每一步的日志里找。
       # 它必须排在 job 的最后一步：job.status 在执行到那一步时才求值，后面若还有判定步骤，
-      # 后续步骤失败而摘要早已写成 success——那一行会成为唯一的结论面，且是错的。
+      # 后续步骤失败而摘要早已写成 success——那一行会成为唯一的结论，且是错的。
       - name: 运行摘要
         if: always()
         # 脚本体是 bash 写法（`{ …; } >> "$GITHUB_STEP_SUMMARY"`），显式声明 shell 是为了让
@@ -207,7 +221,7 @@ jobs:
             echo '- 门禁命令：pnpm run check'
           } >> "$GITHUB_STEP_SUMMARY"
   # install-probe：门禁绿了不等于「装出去能用」。判据只能在消费侧的安装布局上，
-  # 所以这里打真包、进干净目录、真 import。Python 腿不在这一步：它验的是 JS 产物面。
+  # 所以这里打真包、进干净目录、真 import。Python 腿不在这一步：它验的是 JS 产物。
   install-probe:
     needs: gate
     runs-on: ubuntu-latest
@@ -254,7 +268,7 @@ jobs:
           set -euo pipefail
           tarball="$(find /tmp/pkg -name '*.tgz' -print -quit)"
           # dsh-tools 是 optional peer：npm 不会自动装 optional peer，但 host.js 在运行期
-          # 按值 import 它。探针要显式补上它才验得到入口面。版本取 tarball 声明里那条 peer
+          # 按值 import 它。探测脚本要显式补上它才验得到入口。版本取 tarball 声明里那条 peer
           # 范围（peerDependencies 的字面取值），由 npm 在窗口内解析出当下最新的一格——这一步
           # 因此跟着 registry 的最新发布走，不是按精确钉版装。
           host_tools="$(node -e 'const p=require("./package.json"); process.stdout.write(p.peerDependencies["@deepseek-ai/dsh-tools"])')"
@@ -274,7 +288,7 @@ jobs:
           const NAME = "@jayyuen66/dsh-scrapling";
           const mod = await import(NAME);
           // 入口形状两态都收：本仓是纯命名导出（apply / Config / inject 平铺在模块顶层），
-          // 而同级包里也有默认导出的。写死一种形态会让另一种假红。
+          // 而同级包里也有默认导出的。写死一种形态会让另一种误报。
           const plugin = mod.default ?? mod;
           if (typeof plugin?.apply !== "function") throw new Error("入口没有 cordis 插件形状：缺 apply");
           if (plugin.Config === undefined) throw new Error("入口缺 Config：设置卡不会挂载");
@@ -288,7 +302,7 @@ jobs:
           const text = readFileSync(patch, "utf8");
           // 守卫判的是「有没有一条按裸包名引用本包的条目」。这里按缩进切成条目块，不是逐行
           // 配对：在 id 与 name 之间插一行注释、把 name 写在 id 之前、或给 name 换成单引号，
-          // 都只是排版变化，而逐行紧邻匹配会把它们报成「引用丢了」——那是判据自己失效的假红，
+          // 都只是排版变化，而逐行紧邻匹配会把它们报成「引用丢了」——那是判据自己失效的误报，
           // 不是产物缺陷。反向的一侧照样红：子路径条目不等于裸包名引用，缺 id 的条目不进候选面。
           const unquote = (raw) => {
             const s = raw.trim();
@@ -329,10 +343,10 @@ jobs:
           console.log("装载通过：apply / Config / bundle patch / py sidecar 均就位");
           '
 
-  # pack-probe：出货面的复验，钉在**本仓承诺的那一个平台**上（macos arm64）。
+  # pack-probe：出货内容的复验，钉在**本仓承诺的那一个平台**上（macos arm64）。
   # 它跑 test/install-probe.mjs：npm pack → 干净目录 npm install → host/client 载入 →
   # CLI `setup --status` 离线退 0。与 install-probe 的分工：那一步在 ubuntu 上判 JS
-  # 产物面（tarball 清单、入口、bundle patch），这一步判「在承诺平台上装出去能不能用」。
+  # 产物（tarball 清单、入口、bundle patch），这一步判「在承诺平台上装出去能不能用」。
   # 分钟级、且打真包，所以挂在 gate 之后而不是压进每一格矩阵。
   pack-probe:
     needs: gate
@@ -387,7 +401,7 @@ jobs:
           /tmp/closure-venv/bin/python -m pip install --require-hashes -r py/runtime-requirements.txt
           /tmp/closure-venv/bin/python -m pip check
       - name: 闭包里的关键导入面
-        # 这六个名字是被消费的那一面：设置卡的运行状态、浏览器路径与 MCP 装配各自依赖其中一枚。
+        # 这六个名字都是被消费的：设置卡的运行状态、浏览器路径与 MCP 装配各自依赖其中一枚。
         # 名单与本文件上方 cache-dependency-path 指的那份文件同源，改包要同时改这里。
         run: |-
           set -euo pipefail
@@ -396,7 +410,7 @@ jobs:
   # 来源证明是给「这次运行打出来的这份产物」出的第三方可验凭据，不是多一步验证：
   # 签在 PR 上，那张证明看起来属于本仓，指向的却是 PR 里 prepack 脚本产出的字节。
   # 它也不能靠在同一 job 里给某一步加 if 来做——id-token 与 attestations 是 job 级权限，
-  # 挂上去就等于 PR 也拿到了写入能力，权限面不会因为某一步被跳过而收窄。所以拆成独立 job。
+  # 挂上去就等于 PR 也拿到了写入能力，权限范围不会因为某一步被跳过而收窄。所以拆成独立 job。
   attest:
     needs: install-probe
     if: github.event_name != 'pull_request'

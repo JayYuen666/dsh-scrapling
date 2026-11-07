@@ -1,4 +1,4 @@
-# Python 侧的静态检查：ruff（检查 + 格式）、mypy（类型）、bandit（安全）与 coverage（地板棘轮）。
+# Python 侧的静态检查：ruff（检查 + 格式）、mypy（类型）、bandit（安全）与 coverage（覆盖率下限）。
 #
 # 为什么值得有：py/ 下随包发布的那几份 .py 列在 package.json 的 files 里，跑在用户的机器上。
 # 配上这一段配置之前，它们只有 py/tests/test_bridge.py 一层运行时验证：没有类型检查、没有 lint、
@@ -12,14 +12,14 @@
 #   npm run typecheck:py   mypy
 #   npm run bandit:py      bandit -q -r py/（全部 severity；误报用带理由的 # nosec）
 #   npm run test:py        py/tests/test_bridge.py 端到端
-#   npm run coverage:floor 覆盖率地板；cov:py 是"看缺口在哪"的报表面
+#   npm run coverage:floor 覆盖率下限；cov:py 是"看缺口在哪"的报表面
 # 以上全在 check:py 里，随 pnpm run check 进 CI。
 
 [tool.ruff]
 # 与仓库里中文注释的既成行宽对齐：TS 侧的 oxfmt 默认不重排注释，注释行普遍到 120。
 # 收到更窄的行宽会逼着把全部中文注释重折，那与「检查有没有缺陷」无关。
 line-length = 120
-# 地板是 Python 3.14+：README 双语承诺、[tool.mypy] 的 python_version 与 py/bridge.py 的运行时硬闸
+# 解释器下限是 Python 3.14+：README 双语承诺、[tool.mypy] 的 python_version 与 py/bridge.py 的运行时硬闸
 # 说的是同一件事。抬上来之后 ruff format 会按 PEP 758 去掉 except 元组的括号，那只有 3.14 解析得
 # 了——所以改这一行必须同时跑一次 ruff format py/ 并把产物一并提交，否则 fmt:py 立刻红。
 target-version = "py314"
@@ -68,7 +68,7 @@ warn_unused_ignores = true
 [tool.coverage.run]
 # 分支也计入：本项目的风险面恰恰在错误/降级分支（SCRAPLING_MISSING、半帧与超时、Windows
 # 路径分叉），只按行统计时未走到的 except/else 不会拉低读数。开启后现量最低的那份是
-# py/bridge.py 与 py/extraction.py（81%），仍高于 coverage:floor 的地板，所以地板值不动。
+# py/bridge.py 与 py/extraction.py（81%），仍高于 coverage:floor 的下限，所以下限值不动。
 branch = true
 # 只量随包发布的源文件 + 测试脚本本身；__pycache__ 与 _env 一概不进。
 source = ["py"]
@@ -77,9 +77,9 @@ parallel = true
 sigterm = true
 
 [tool.coverage.report]
-# 这一档不设 fail_under：地板由 package.json 的 coverage:floor 那条腿施加（它同时用
+# 这一档不设 fail_under：下限由 package.json 的 coverage:floor 那条腿施加（它同时用
 # --omit="py/tests/*" 把分母收在随包发布的源文件上），cov:py 是「看缺口在哪」的报表面，
-# 不该因为一次探查就判红。两处地板取值不一致时由 coverage-floor.mjs 判红，不靠人记。
+# 不该因为一次探查就判红。两处下限取值不一致时由 coverage-floor.mjs 判红，不靠人记。
 show_missing = true
 skip_covered = false
 

@@ -5,7 +5,7 @@ import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { pageToText, rowToText } from "./crawl-output.ts";
 import type { SidecarClient } from "./sidecar.ts";
 
-/** 爬虫作业往后台作业输出环上写东西的出口。 */
+/** 爬虫作业往后台作业输出环形缓冲上写东西的出口。 */
 export interface CrawlSink {
   /** 追加一行输出。 */
   append: (text: string) => void;
@@ -18,7 +18,7 @@ export interface CrawlSink {
    * controller，两者毫无关系。
    */
   signal: AbortSignal;
-  /** 把这次爬虫的 crawlId 交给宿主，让进度事件找到这个作业的输出环。 */
+  /** 把这次爬虫的 crawlId 交给宿主，让进度事件找到这个作业的输出环形缓冲。 */
   track?: (crawlId: string) => void;
 }
 
@@ -65,7 +65,7 @@ async function stopCrawl(sidecar: SidecarClient, crawlId: string): Promise<void>
 }
 
 /**
- * 把收尾那一拍的摘要写进输出环：统计与 notice 各一行。
+ * 把收尾那一拍的摘要写进输出环形缓冲：统计与 notice 各一行。
  *
  * @param status - crawl.status 的回包
  * @param sink - 输出出口
@@ -132,7 +132,7 @@ async function drainOnce(
   if (status["more"] === true) {
     if (total === seen) {
       // 对端说还有，却一个可消费条目都没给：继续递归既不等待也不校验 signal，
-      // 会变成打满 CPU 的忙循环。按协议错误收口。
+      // 会变成打满 CPU 的忙循环。按协议错误统一处理。
       throw new Error("crawl.status returned more=true without new pages or rows");
     }
     // 对端按字节预算只回了一段（见 py/crawl.py 的 MAX_STATUS_BYTES）：紧接着取下一段，
@@ -142,7 +142,7 @@ async function drainOnce(
   }
   appendFinalNotes(status, sink);
   // 页数比 maxPages 少时，模型该能看出是「整体截止到了点」而不是站点就这么大；挂在收尾
-  // 那一行里说，不再单独发一条进度 —— 同一件事两句进度只会让输出环里多一行噪音。
+  // 那一行里说，不再单独发一条进度 —— 同一件事两句进度只会让输出环形缓冲里多一行噪音。
   const budgetNote =
     status["running"] !== true && status["expired"] === true
       ? " (stopped at its runtime budget; the page cap was not reached)"
@@ -160,9 +160,9 @@ async function drainOnce(
 }
 
 /**
- * 把一个跑着的爬虫的页面增量写进作业输出环，直到它结束。
+ * 把一个跑着的爬虫的页面增量写进作业输出环形缓冲，直到它结束。
  *
- * 轮询而不是等一个大回包：一次爬取可能几分钟，作业的输出环是给模型增量看的，
+ * 轮询而不是等一个大回包：一次爬取可能几分钟，作业的输出环形缓冲是给模型增量看的，
  * 等全部跑完再一次性吐出来等于没有进度可言。
  *
  * 写成递归而不是循环：每一步都要等上一次 sidecar 往返，顺序不能并行；

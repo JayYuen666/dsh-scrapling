@@ -4,7 +4,7 @@
 // （shrinkJsonlTail），与本模块无关。
 //
 // 这里只解决一件事：把「字节流」和「一帧一个 JSON 对象」互相转换。切分规则必须与
-// Python 侧的 bridge.py 对齐（一帧一行、行内不得有裸换行）。
+// Python 侧的 bridge.py 对齐（一帧一行、行内不得有未转义的换行）。
 
 import type { Readable } from "node:stream";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
@@ -71,11 +71,11 @@ export function decodeFrame(line: string): Record<string, unknown> {
 /**
  * 残帧的上限，按 UTF-16 字符数计（buffer 是已解码的字符串）。
  *
- * 与 Python 侧的 8 MiB **字节**上限数值相同但口径不同：同样的数值对 CJK 文本，这里的
+ * 与 Python 侧的 8 MiB **字节**上限数值相同但规则不同：同样的数值对 CJK 文本，这里的
  * 字符数对应更多字节，所以本侧的兜底比对端更宽 —— 它只需要拦住「对端只吐不带换行的
- * 内容、缓冲按到达速度一路增长」这条失控路径，精确的协议上限由按字节判的那一侧执行。
- * 名字跟着本侧真正比较的单位写，不沿用对面的 BYTES：两侧同名同值却不同单位，读数会被
- * 当成同一个口径比对。
+ * 内容、缓冲按到达速度一路增长」这条失控路径，精确的协议上限由 Python 侧的按字节校验执行。
+ * 名字跟着本侧真正比较的单位写，不沿用另一侧的 BYTES：两侧同名同值却不同单位，读数会被
+ * 当成同一个规则比对。
  */
 export const MAX_FRAME_CHARS = 8 * 1024 * 1024;
 

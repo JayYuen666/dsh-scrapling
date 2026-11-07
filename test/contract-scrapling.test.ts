@@ -11,7 +11,7 @@
 // 逐一对照。本文件只负责跑探针、把结论变成断言。
 //
 // 两组断言各管一件事：
-// 1. **合法性**（`violations`）：键必须存在于该调用点对应的参数面里。不合法会抛 TypeError，
+// 1. **合法性**（`violations`）：键必须存在于该调用点对应的参数表里。不合法会抛 TypeError，
 //    表现为「FETCH_FAILED: Invalid argument type」——用户看到的是抓取失败。
 // 2. **有效性**（`silentAtSessionFetch`）：键必须**真被这次调用读到**。不有效不抛任何错，
 //    表现为功能静默不存在——这是更贵的一类 bug，所以单独钉一条。
@@ -52,7 +52,7 @@ function indexKeys(calls: ProbeCall[]): KeyIndex {
 // 失败时必须与「契约被破坏」分得开：探针起不来（缺解释器、解释器不可执行、非零退出、
 // 输出不是 JSON、超时被杀）会在这里抛，收集期就崩，三条 describe 的用例一起变成同一句
 // 基建错误。包一层点名原因的话，红话自己说清是哪一类——基建坏了不该被读成上游改了契约。
-// 挂死那一支由 `runProbe` 自己的看门狗收（它超时后杀掉子进程并点名预算），所以这里不必
+// 挂死那一支由 `runProbe` 自己的超时保护收（它超时后杀掉子进程并点名预算），所以这里不必
 // 再挪进 beforeAll：那会让下面的 `const { facts } = report` 在装配期读到还没值的报告。
 const report: ProbeReport = await runProbe().catch((error: unknown) => {
   throw new Error(`Scrapling 契约探针跑不起来（基建故障，不是契约被破坏）：${String(error)}`, {
@@ -135,7 +135,7 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
     // 会话 fetch 那两处发的键数**是我们自己的属性**：上游多认一个字段不会让我们多发一键，
     // 数字变了只能是本仓改了发出去的 kwargs。所以这里钉等号，不留下限与上限之间那段余量 ——
     // 余量存在时「又把构造期才生效的设置往 fetch 层塞」要涨过余量才看得见（旧的 14 对实测 9
-    // 就是这种只剩文档作用的闸）。`silentAtSessionFetch` 判的是同一类漂移的另一面：键在不在
+    // 就是这种只剩文档作用的闸）。`silentAtSessionFetch` 判的是同一类漂移的另一侧：键在不在
     // fetch 层被读到；这条判的是「发出去的键数有没有变」，两者都要。
     const FETCH_SITE_KEYS: Record<string, number> = {
       "session.fetch.static": 4,
@@ -149,7 +149,7 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
     }
   });
 
-  it("每个键都在上游对应的参数面里（不合法会抛 TypeError）", () => {
+  it("每个键都在上游对应的参数表里（不合法会抛 TypeError）", () => {
     expect(report.violations).toStrictEqual([]);
   });
 
@@ -160,7 +160,7 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
   });
 
   it("本仓声明的 fetch 层键集与上游实际字段不漂移", () => {
-    // adapters.FETCH_LEVEL_KEYS 是本仓手抄的一份上游字段表：上游加了字段而我们没跟，
+    // adapters.FETCH_LEVEL_KEYS 是本仓自己抄的一份上游字段表：上游加了字段而我们没跟，
     // 就是白扔一个能生效的设置；我们多写了上游不认的键，就是又造一个静默丢弃。
     expect(report.fetchLevelKeysDrift).toStrictEqual([]);
   });
@@ -169,7 +169,7 @@ describe("上游 Scrapling 契约：适配器发出的关键字必须被上游�
     // 构造期读、之后每次 fetch 再传会被 `validate_fetch` 丢掉的键，必须出现在开场那一帧上，
     // 否则「设置卡拧了旋钮、行为没变、日志一个字都没有」。static 与 stealth 两类会话读的不是
     // 同一组：static 只剩 impersonate / timeout，身份、区域与反检测那一整组只落在浏览器
-    // （stealth）那一侧。
+    // （stealth）会话上。
     const open = indexKeys(report.calls.filter((call) => call.site.startsWith("session.open.")));
     for (const site of SESSION_OPEN_SITES) {
       expect(open.get(site), `${site} 没被记录`).toBeDefined();
@@ -235,7 +235,7 @@ describe("上游事实钉桩：本仓代码直接依赖的形状", () => {
   it("自愈选择器的开关还是那四个参数", () => {
     // select() 只传 adaptive/auto_save，靠 identifier 默认取选择器本身：identifier 一旦
     // 变成必填，自愈就静默失效。
-    // 名单由探针排序后交出（与本文件其它 facts 同一口径）：本仓全按关键字调用，
+    // 名单由探测脚本排序后交出（与本文件其它 facts 同一种做法）：本仓全按关键字调用，
     // 上游调整形参位置不该读成契约被破坏。
     expect(facts.selectorCssParams).toStrictEqual([
       "adaptive",
@@ -249,7 +249,7 @@ describe("上游事实钉桩：本仓代码直接依赖的形状", () => {
   });
 
   it("markdown 的清洗仍走那两个私有函数", () => {
-    // _sanitized_page 直接调 Convertor 的私有面。上游改名不会通知本包。
+    // _sanitized_page 直接调 Convertor 的私有成员。上游改名不会通知本包。
     expect(facts.convertorPrivates).toStrictEqual([
       "_strip_noise_tags",
       "_sanitize_for_ai",
@@ -294,7 +294,7 @@ describe("上游事实钉桩：本仓代码直接依赖的形状", () => {
     expect(facts.spiderDefaults.autothrottle_enabled).toBe(false);
     expect(facts.spiderDefaults.download_delay).toBe(0);
     expect(facts.spiderDefaults.concurrent_requests).toBe(4);
-    // 0.5 起多了一项：默认就只要正文（`main_content_only`），爬虫的每页结果因此也走正文口径。
+    // 0.5 起多了一项：默认就只要正文（`main_content_only`），爬虫的每页结果因此也走正文规则。
     expect(facts.spiderDefaults.main_content_only).toBe(true);
     expect(facts.spiderDefaults.max_pages).toBe(0);
     expect(facts.spiderDefaults.output_dir).toBeNull();

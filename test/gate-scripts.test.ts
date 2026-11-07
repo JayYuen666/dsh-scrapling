@@ -173,9 +173,9 @@ describe("门禁脚本", () => {
   });
 });
 
-describe("eol-gate 的判据面", () => {
+describe("eol-gate 的判据", () => {
   // 这一组只喂合成回执，不读仓库：仓库那份的实跑由 `pnpm run gate:eol`（在 check 链里）承担。
-  // 判据不能拿 `.gitattributes` 解析出来的值当期望，所以这里的期望表是手抄的字面表。
+  // 判据不能拿 `.gitattributes` 解析出来的值当期望，所以这里的期望表是自己抄的字面表。
 
   const EOL_ROWS = [
     "i/lf    w/lf    attr/text=auto eol=lf\thost.ts",
@@ -248,7 +248,7 @@ describe("eol-gate 的判据面", () => {
   });
 });
 
-describe("格式化工具的配置面", () => {
+describe("格式化工具的配置表", () => {
   it("oxfmt.config.ts 的每个键都还在 oxfmt 自己的 schema 里", async () => {
     // oxfmt 对认不出的键是静默忽略，而 `satisfies OxfmtConfig` 也拦不住改名（那个类型允许额外
     // 属性：实测把 endOfLine 写成 endofLine 照常过 tsc）。所以键名要拿第三方发布的那份 schema

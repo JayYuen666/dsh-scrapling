@@ -1,7 +1,7 @@
 node_modules/
 # 锚定到仓库根：不写前导 `/` 时 `client.js` 这种模式会匹配任意层级的同名文件，
 # 于是将来 `test/fixtures/` 或 `py/` 下真需要一个叫 client.js / host.js 的文件时，
-# 它会被静默忽略 —— `git add` 不报错、文件不在版本里、别人的检出里少一份夹具。
+# 它会被不做声地忽略 —— `git add` 不报错、文件不在版本里、别人的检出里少一份夹具。
 /client.js
 /.toolchain/
 /host.js

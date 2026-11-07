@@ -74,7 +74,7 @@ export interface ToolSettings {
   readonly waitSelectorState: WaitSelectorState;
   /** 是否把 open shadow root 的内容并进正文。 */
   readonly pierceShadow: boolean;
-  /** 下载落点（dataDir/downloads）。 */
+  /** 下载位置（dataDir/downloads）。 */
   readonly downloadDir: string;
   /** 单次下载的字节上限。 */
   readonly downloadMaxBytes: number;
@@ -124,7 +124,7 @@ export interface ToolSettings {
   /**
    * 部署有没有开放**写方法**（POST/PUT/DELETE 与 `body`）。
    *
-   * 关的时候这两个入参根本不出现在 `scrapling_fetch` 的参数面里 —— 模型看不见一个用了也没
+   * 关的时候这两个入参根本不出现在 `scrapling_fetch` 的参数表里 —— 模型看不见一个用了也没
    * 用的旋钮，比给了它再在运行时报错更诚实。Python 侧按同一份环境独立硬拒，两侧不互相依赖。
    */
   readonly allowWriteMethods: boolean;
@@ -176,7 +176,7 @@ export interface FetchResult {
  *
  * 与上游 `output.schema` 推断出的 `JsonValue` 结构同形：本包不直接依赖定义它的
  * `@deepseek-ai/dsh-util-values`（那是 dsh-tools 的传递依赖），所以在这里按结构写一遍，
- * 而不是把内部包名变成自己的依赖面。
+ * 而不是把内部包名变成自己的依赖。
  */
 type Jsonish = string | number | boolean | null | Jsonish[] | { [key: string]: Jsonish };
 
@@ -405,7 +405,7 @@ function toSessionOpen(raw: unknown): SessionOpenResult {
 /**
  * 归一一条会话记录。
  *
- * 三枚可选面原样透传：给就带、不给就不注入 —— 会话存活状态与页池统计是 Python 侧才
+ * 三项可选能力原样透传：给就带、不给就不注入 —— 会话存活状态与页池统计是 Python 侧才
  * 知道的事实，Host 不替它编默认值（编出来的 alive:false 会被模型读成「这个会话死了」）。
  *
  * @param item - 回包里的一条会话记录
@@ -671,7 +671,7 @@ function selectAdaptivePayload(args: Record<string, unknown>): Record<string, un
 }
 
 /**
- * select 的输出参数；limit/attribute/includeAttributes 始终发送，保持旧载荷字段面。
+ * select 的输出参数；limit/attribute/includeAttributes 始终发送，保持旧载荷字段。
  *
  * @param args - 工具入参
  * @param settings - 已解析设置
@@ -689,7 +689,7 @@ function selectOutputPayload(
     // 但不给时行为与旧载荷逐字一致。
     // 单位在这里是错开的：这一位按**字符**截断（Python 侧 clip），settings.maxOutputBytes
     // 按**字节**计（宿主侧 capText）。同一个数值对 CJK 内容意味着对端可以交出约 3 倍的字节量，
-    // 最终模型可见长度仍由字节那一档收口，所以这一位只决定「对端白攒多少」，不决定给出去多少。
+    // 最终模型可见长度仍由字节那一档统一处理，所以这一位只决定「对端白攒多少」，不决定给出去多少。
     maxContentChars: callNumber(args["maxContentChars"], settings.maxOutputBytes),
   };
 }
@@ -717,7 +717,7 @@ function buildSelectPayload(
   };
 }
 
-/** `scrapling_extract` 的参数面；拆出来避免单函数超过行数上限。 */
+/** `scrapling_extract` 的参数表；拆出来避免单函数超过行数上限。 */
 const EXTRACT_PARAMETERS = {
   html: { type: "string", required: true, description: "要抽取的 HTML 源码。" },
   selector: {
@@ -841,7 +841,7 @@ const REQUEST_PARAMS = {
  *
  * 与上面那份分开写是有原因的：闸门管的是请求去哪里，而这两个键管的是到了之后干什么。
  * 被注入的页面文字唯一能造成不可恢复后果的路径就是这里，所以默认不给 —— 不给就不出现在
- * 模型的参数面里，比「给了再用运行时报错拦住」更诚实，也更省一轮往返。
+ * 模型的参数表里，比「给了再用运行时报错拦住」更诚实，也更省一轮往返。
  */
 const WRITE_PARAMS = {
   method: {
@@ -903,7 +903,7 @@ function fetchPayload(
     // 调用值优先，缺省仍用部署的 requestTimeoutSeconds；Python 侧 _static_params 用
     // _positive_number 校验，非法值会被它报成 BAD_ARGS，不在这一层静默改值。
     timeoutSeconds: callNumber(args["timeoutSeconds"], settings.requestTimeoutSeconds),
-    // 关着的时候连帧上都不发这两个键：Python 缺 method 时按 GET 走，而「参数面里看不见、
+    // 关着的时候连帧上都不发这两个键：Python 缺 method 时按 GET 走，而「参数表里看不见、
     // 帧上却带着 method」会让两侧的对表门禁各说各话。
     ...(settings.allowWriteMethods
       ? { method: impliedFetchMethod(args), body: args["body"] ?? null }
@@ -913,8 +913,8 @@ function fetchPayload(
     impersonate: args["impersonate"] ?? "",
     retries: args["retries"] ?? 3,
     ...(args["params"] === undefined ? {} : { params: args["params"] }),
-    // form/json 是写意图：部署没开放写方法时参数面里没有它们，帧上也不发 ——
-    // 「参数面看不见、帧上却带着」正是上一处注释在防的那种两边对不上。
+    // form/json 是写意图：部署没开放写方法时参数表里没有它们，帧上也不发 ——
+    // 「参数表看不见、帧上却带着」正是上一处注释在防的那种两边对不上。
     ...(settings.allowWriteMethods && args["form"] !== undefined ? { form: args["form"] } : {}),
     ...(settings.allowWriteMethods && args["json"] !== undefined ? { json: args["json"] } : {}),
     ...(typeof args["defaultEncoding"] === "string" && args["defaultEncoding"].length > 0
@@ -999,7 +999,7 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
       timeoutSeconds: { type: "integer", description: "本次抓取超时（秒），缺省用部署值。" },
       ...REQUEST_PARAMS,
       ...STATIC_REQUEST_PARAMS,
-      // 部署没开放写方法时，这四枚入参**根本不出现在参数面里**：模型看不见一个用了也没用
+      // 部署没开放写方法时，这四枚入参**根本不出现在参数表里**：模型看不见一个用了也没用
       // 的旋钮，比给了之后再用 WRITE_DISABLED 拦它更诚实，也少一轮往返。form/json 与
       // method/body 同档 —— 它们的缺省语义是 POST，本身就是写意图。
       ...(settings.allowWriteMethods ? { ...WRITE_PARAMS, ...WRITE_BODY_PARAMS } : {}),
@@ -1048,7 +1048,7 @@ export function createFetchTool(deps: ToolDeps): ToolDefinition {
       //
       // 上游的参数校验是开放根对象：未声明的键不报错、不剥离，原样进 `execute`
       // （`parameterSchemaSpecToJsonSchema` 不写 `additionalProperties:false`）。所以
-      // 「参数面里没有 method」拦得住模型，却拦不住截断后重放的旧调用、别的插件代发的调用，
+      // 「参数表里没有 method」拦得住模型，却拦不住截断后重放的旧调用、别的插件代发的调用，
       // 或任何手搓的一帧。把它们改成 GET 是最坏的结果：调用方以为写成功了，而对端什么都没
       // 发生 —— 那正是本包在消灭的「看起来生效了」的故障。Python 侧那道硬拒仍然留着。
       //
@@ -1144,7 +1144,7 @@ export function createExtractTool(deps: ToolDeps): ToolDefinition {
   });
 }
 
-/** `scrapling_locate` 的参数面。 */
+/** `scrapling_locate` 的参数表。 */
 const LOCATE_PARAMETERS = {
   html: { type: "string", required: true, description: "要定位的 HTML 源码。" },
   by: {
@@ -1225,7 +1225,7 @@ const LOCATE_OUTPUT_SCHEMA = {
   },
 } as const;
 
-/** `scrapling_links` 的参数面。 */
+/** `scrapling_links` 的参数表。 */
 const LINKS_PARAMETERS = {
   html: { type: "string", required: true, description: "要抽出链接的 HTML 源码。" },
   baseUrl: {
@@ -1304,7 +1304,7 @@ export function createLocateTool(deps: ToolDeps): ToolDefinition {
     timeoutMs: settings.timeoutMs,
     isConcurrencySafe: () => true,
     async execute(args, exec: ToolRunContext): Promise<LocateResult> {
-      // by/query 是模型面的名字，selector/queryType 是协议帧上 Python 真正读的键：
+      // by/query 是模型可见的名字，selector/queryType 是协议帧上 Python 真正读的键：
       // 两套同时给时以新名为准，老调用只给旧名时行为逐字不变。query 与 selector 都没有
       // 就等于没给查询目标 —— Python 侧也会报 BAD_ARGS，这里先拦一次是为了让文案点名
       // 模型看得见的两个参数，而不是只在报错里说「selector is required」。
@@ -1336,7 +1336,7 @@ export function createLocateTool(deps: ToolDeps): ToolDefinition {
           limit: args["limit"] ?? 200,
           includeAncestors: args["includeAncestors"] !== false,
           generateSelectors: args["generateSelectors"] !== false,
-          // 上限单位与 selectOutputPayload 那一处一致（字符截断与字节预算两套口径），说明写在那里。
+          // 上限单位与 selectOutputPayload 那一处一致（字符截断与字节预算两套规则），说明写在那里。
           maxContentChars: callNumber(args["maxContentChars"], settings.maxOutputBytes),
         },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
@@ -2179,8 +2179,8 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
       googleSearch: BROWSER_REQUEST_PARAMS.googleSearch,
       includeMetadata: BROWSER_REQUEST_PARAMS.includeMetadata,
       params: STATIC_REQUEST_PARAMS.params,
-      // form/json 与 method/body 同档的写意图，但会话侧参数面不随 allowWriteMethods 收窄
-      // （那是静态抓取那一面的事）：这里逐键取用同一份描述，帧上仍由 Python 侧的
+      // form/json 与 method/body 同档的写意图，但会话侧参数表不随 allowWriteMethods 收窄
+      // （那是静态抓取参数表上的事）：这里逐键取用同一份描述，帧上仍由 Python 侧的
       // session.fetch 判写意图，别让两边对一份文案各改各的。
       form: WRITE_BODY_PARAMS.form,
       json: WRITE_BODY_PARAMS.json,
@@ -2396,7 +2396,7 @@ function createSessionStateTool(deps: ToolDeps, saving: boolean): ToolDefinition
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
       );
       /* v8 ignore next —— 同 scrapling_session_network 那条：sessionId 由 schema 保证是
-         字符串，非字符串那一侧不可达（defineTool 先校验后执行）。 */
+         字符串，非字符串那条分支不可达（defineTool 先校验后执行）。 */
       const sessionId = typeof args["sessionId"] === "string" ? args["sessionId"] : "";
       return toStateResult(raw, sessionId, saving);
     },

@@ -1,11 +1,11 @@
-// face-py.mjs —— 测量之前先数面：数的是 **bandit 那一面**。
+// face-py.mjs —— 测量之前先数文件：数的是 **bandit 量到的面**。
 //
 // 单独成脚本而不是写成 `python -c`：那条命令要经 npm 的 shell 重新拼参数，而 Node 在
 // shell 模式下不转义 args，带空格的 `-c` 正文到 Windows 的 cmd 上会被拆成多个参数，
-// 于是同一条判据只在 POSIX 上成立。数面的规则（递归数 py/**/*.py、要求 py/tests/
+// 于是同一条判据只在 POSIX 上成立。数文件的规则（递归数 py/**/*.py、要求 py/tests/
 // 存在）与 bandit -r py/ 实际量到的范围同源：用例也在里面。
 //
-// coverage 那一面**不是**这个数：它 --omit="py/tests/*" 之后只剩随包发布的源文件，
+// coverage 用的**不是**这个数：它 --omit="py/tests/*" 之后只剩随包发布的源文件，
 // 分母与 files 清单逐份核对，归 coverage-floor.mjs。两侧份数本来就不该相等，别拿这里
 // 的下限去核对那边。
 

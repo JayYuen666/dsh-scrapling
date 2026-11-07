@@ -31,7 +31,7 @@ interface SidecarCall {
   readonly extractionType: unknown;
 }
 
-/** 默认能力面：能抓取、有浏览器。 */
+/** 默认能力清单：能抓取、有浏览器。 */
 const DEFAULT_CAPS = { scrapling: true, browser: true };
 
 interface SidecarOptions {
@@ -153,8 +153,8 @@ describe("search provider 可用性", () => {
     expect(ready.available()).toBe(true);
     expect(calls).toStrictEqual([]);
 
-    // 三条「不可用」路径各配一只会记账的假 sidecar：标题里那句「不发任何网络请求」只有
-    // 在账本上才判得出来。内联假件里那个永远 resolve、又不记账的 call 判不了这件事。
+    // 三条「不可用」路径各配一只会记录的假 sidecar：标题里那句「不发任何网络请求」只有
+    // 在账本上才判得出来。内联假件里那个永远 resolve、又不记录的 call 判不了这件事。
     const deadCalls: SidecarCall[] = [];
     const dead = Object.assign(makeSidecar({ calls: deadCalls }), { alive: false });
     expect(createWebSearchProvider(deps({ sidecar: dead })).available()).toBe(false);

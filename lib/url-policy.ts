@@ -264,7 +264,7 @@ function embeddedV4(parsed: ipaddr.IPv6, table: readonly Nat64Prefix[]): Nat64Ma
 function ipv4Compatible(parsed: ipaddr.IPv6): Nat64Match | null {
   const packed = parsed.toByteArray();
   // `::/96` 覆盖的是**前六组**，也就是 16 字节里的前 12 字节；内嵌 IPv4 在最后 4 字节。
-  // 偏移取错会让 `::5db8:d818` 读成 0.0.93.184 —— 仍然是私网，于是公网那一侧被误拒。
+  // 偏移取错会让 `::5db8:d818` 读成 0.0.93.184 —— 仍然是私网，于是真正的公网地址被误拒。
   if (packed.slice(0, 12).some((byte) => byte !== 0)) {
     return null;
   }
@@ -335,7 +335,7 @@ function ipv4ToLong(parsed: ipaddr.IPv4): number {
  *
  * 与 {@link isPublicAddress} 的差别只有一处：处在「解析结果不可信」的状态时，主机名的答案
  * 不再参与公网判定。该放宽**只作用于这里**——字面量不走这条路径，`isPublicAddress` 始终
- * 按严格口径判。
+ * 按严格规则判。
  *
  * @param address - 解析得到的地址
  * @param table - NAT64 前缀表
@@ -370,8 +370,8 @@ interface SyntheticRange {
  * 只列**不可能是真实公网目标**的段：私网、回环、链路本地一个都不在表内——那正是 SSRF 要打的，
  * 放进表里等于把闸门自己拆了。
  *
- * 198.18.0.0/15 是 RFC 2544 的基准测试段（clash / mihomo 的 fake-ip 默认落点），
- * 100.64.0.0/10 是 RFC 6598 的 CGNAT 段（部分 TUN 客户端的落点）。两者在公网上都不可路由。
+ * 198.18.0.0/15 是 RFC 2544 的基准测试段（clash / mihomo 的 fake-ip 默认位置），
+ * 100.64.0.0/10 是 RFC 6598 的 CGNAT 段（部分 TUN 客户端的位置）。两者在公网上都不可路由。
  */
 const SYNTHETIC_POOLS: readonly SyntheticRange[] = [
   {
@@ -385,7 +385,7 @@ const SYNTHETIC_POOLS: readonly SyntheticRange[] = [
 ];
 
 /**
- * 解析一条合成段 CIDR。只支持 IPv4 —— IPv6 的合成落点本就不存在，写出来也是误导。
+ * 解析一条合成段 CIDR。只支持 IPv4 —— IPv6 的合成位置本就不存在，写出来也是误导。
  *
  * @param entry - CIDR 文本
  * @returns 区间；不是合法 IPv4 CIDR 时给 null
@@ -535,7 +535,7 @@ function authorityOf(input: string): string {
  * @returns 脱敏后的串；没有 userinfo 时原样返回
  */
 export function redactUrlSecrets(input: string): string {
-  // 前导空白先剥掉再判：`^` 锚点的正则对「  https://user:pw@…」不命中，口令会原样进文案。
+  // 前导空白先去掉再判：`^` 锚点的正则对「  https://user:pw@…」不命中，口令会原样进文案。
   const trimmed = input.trimStart();
   const lead = input.slice(0, input.length - trimmed.length);
   const masked = trimmed.replace(URL_USERINFO, "$<scheme>***@");

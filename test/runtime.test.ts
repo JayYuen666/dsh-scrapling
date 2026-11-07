@@ -12,7 +12,7 @@ import {
   runtimeManifest,
 } from "../lib/runtime.ts";
 
-/** Windows 没有可执行位，那一侧的判据由同名的 win32 用例负责，不在这里两头判。 */
+/** Windows 没有可执行位，对应的判据由同名的 win32 用例负责，不在这里两头判。 */
 const WINDOWS = process.platform === "win32";
 
 const created: string[] = [];
@@ -80,10 +80,10 @@ describe("resolveRuntime", () => {
     });
   });
 
-  it("托管落点的层级是 runtime/python/<清单版本>/bin/python3", () => {
+  it("托管位置的层级是 runtime/python/<清单版本>/bin/python3", () => {
     // 期望值在这里按层级自己拼一遍，而不是复用 managedPythonPath：层级一旦被改出另一
     // 个形状（少一层、结尾换成 python），本条要红。installer 与 resolveRuntime 共用
-    // 这一个落点，拼错的后果是装好的资产永远探不到，而现场只会说「没找到解释器」。
+    // 这一个位置，拼错的后果是装好的资产永远探不到，而现场只会说「没找到解释器」。
     const dataDir = tempDir();
     expect(managedPythonPath(dataDir)).toBe(
       path.join(
@@ -99,7 +99,7 @@ describe("resolveRuntime", () => {
 
   it.runIf(!WINDOWS)("托管落点是个没有可执行位的文件时回落到仓内 _env", () => {
     // 安装中断、或 tar 解包丢了权限位时的形态：文件在、跑不起来。跟着它走会得到一个
-    // 立刻 ENOENT 的 sidecar，回落才是可用答案。同一条判据在仓内 venv 那一侧由
+    // 立刻 ENOENT 的 sidecar，回落才是可用答案。同一条判据在仓内 venv 上由
     // host.test.ts 的 0o644 用例判（两者共用 lib/runtime.ts 的 executable）。
     const dataDir = tempDir();
     const repoRoot = tempDir();
@@ -200,7 +200,7 @@ describe("resolveRuntime", () => {
     }
   });
 
-  it("pythonVersion 必须是三段数字：带路径分隔符的值会被拒（它要拼进落点路径）", () => {
+  it("pythonVersion 必须是三段数字：带路径分隔符的值会被拒（它要拼进位置路径）", () => {
     for (const value of ["../../x", "/abs/path", "3.14"]) {
       expect(() => parseRuntimeManifest(manifestWith({ pythonVersion: value }))).toThrow(
         /pythonVersion/u,
@@ -230,7 +230,7 @@ describe("resolveRuntime", () => {
     expect(() => parseRuntimeManifest(text)).toThrow(/unsupported/u);
   });
 
-  it("托管落点被替换成同名目录时不算可用解释器", () => {
+  it("托管位置被替换成同名目录时不算可用解释器", () => {
     const dataDir = tempDir();
     const repoRoot = tempDir();
     const fakeManaged = managedPythonPath(dataDir);

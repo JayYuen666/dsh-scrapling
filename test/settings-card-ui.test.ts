@@ -346,7 +346,7 @@ function runPendingEffects(): void {
   }
 }
 
-/** 用例之间换一份干净的槽位：整套替身状态都住在 runtime.box 里。 */
+/** 用例之间换一份干净的槽位：整套替身状态都放在 runtime.box 里。 */
 function resetBox(): void {
   Object.assign(runtime.box, {
     values: [],
@@ -654,7 +654,7 @@ describe("scrapling 设置卡：渲染结构", () => {
     expect(textOf(tree)).toContain(t("statusReadonly"));
   });
 
-  it("没有运行环境读面时给出可照抄的 CLI 命令", () => {
+  it("没有运行环境读取接口时给出可照抄的 CLI 命令", () => {
     const { form } = formOf({});
     const tree = mountCard({ ...PAGE, t, form }).tree();
     expect(textOf(tree)).toContain(t("runtimeUnavailable"));
@@ -730,7 +730,7 @@ async function actionMustNotRun(): Promise<RuntimeActionResult> {
 }
 
 /**
- * 卡片带 runtime 读面时才会开轮询计时器，所以清理回路只在这一组用例里真正跑到。
+ * 卡片带 runtime 读取接口时才会开轮询计时器，所以清理回路只在这一组用例里真正跑到。
  */
 describe("scrapling 设置卡：运行时轮询计时器的回收", () => {
   beforeEach(resetBox);
@@ -774,8 +774,8 @@ describe("scrapling 设置卡：运行时轮询计时器的回收", () => {
     expect(reads).toBeGreaterThan(beforePoll);
   });
 
-  it("afterEach 收口：上一条用例的轮询计时器没有带进这一条", () => {
-    // 上一条用例故意不自己收口，所以这里红不红只由 afterEach 那一条回路决定。
+  it("afterEach 统一处理：上一条用例的轮询计时器没有带进这一条", () => {
+    // 上一条用例故意不自己统一处理，所以这里红不红只由 afterEach 那一条回路决定。
     // 计时器没被 mock 时这一句直接抛，不会在「上一条用例没跑到」时打绿。
     expect(vi.getTimerCount()).toBe(0);
   });

@@ -7,7 +7,7 @@ function strField(page: Record<string, unknown>, field: string): string {
 }
 
 /**
- * 把一页爬取结果写成输出环上的一段文本。
+ * 把一页爬取结果写成输出环形缓冲上的一段文本。
  *
  * 逐字段判类型而不是直接 String(...)：回包是跨语言进程给的，String({}) 会变成
  * "[object Object]" 混进模型上下文。
@@ -21,7 +21,7 @@ export function pageToText(page: Record<string, unknown>): string {
   return `## ${title}\n${url}\n\n${strField(page, "markdown")}\n`;
 }
 
-/** 把一行结构化 feed 数据写成输出环上的一段文本。 */
+/** 把一行结构化 feed 数据写成输出环形缓冲上的一段文本。 */
 export function rowToText(row: Record<string, unknown>): string {
   return `- ${JSON.stringify(row)}\n`;
 }

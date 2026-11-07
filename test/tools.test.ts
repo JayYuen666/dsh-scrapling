@@ -174,7 +174,7 @@ const SETTINGS: ToolSettings = {
   crawlAutothrottle: false,
   crawlStrategy: "bfs",
   crawlCheckpointDir: "",
-  // 开着的：这一份夹具要覆盖写方法那条支路（参数面与帧上都得带着 method/body）。
+  // 开着的：这一份夹具要覆盖写方法那条支路（参数表与帧上都得带着 method/body）。
   // 关的那一支在下面 `scrapling_fetch 的写方法闸门` 那一组里逐条钉。
   allowWriteMethods: true,
   stripInlineImages: true,
@@ -269,7 +269,7 @@ function isLowSurrogate(code: number): boolean {
 }
 
 /**
- * 造一份 `scrapling_session_open` 的参数面里 `sessionType` 那一格。
+ * 造一份 `scrapling_session_open` 的参数表里 `sessionType` 那一格。
  *
  * @param browser - 这台机器有没有可用的浏览器
  * @returns 该参数的 enum 与 description
@@ -758,7 +758,7 @@ describe("scrapling_fetch", () => {
       timeoutSeconds: SETTINGS.requestTimeoutSeconds,
     });
     expect(fake.calls[1]?.params).toMatchObject({ timeoutSeconds: 120 });
-    // 参数面里真有这一格，否则模型给的值会被 schema 挡在外面。
+    // 参数表里真有这一格，否则模型给的值会被 schema 挡在外面。
     expect(
       Object.keys(
         (tool.parameters as { properties?: Record<string, unknown> } | undefined)?.properties ?? {},
@@ -815,7 +815,7 @@ describe("scrapling_fetch 的写方法闸门", () => {
   /** 一次工具调用用的执行上下文。 */
   const exec = { signal: new AbortController().signal } as never;
 
-  it("闸门关着时，写意图四枚入参（method/body/form/json）都不在参数面里", () => {
+  it("闸门关着时，写意图四枚入参（method/body/form/json）都不在参数表里", () => {
     const names = parameterNames(gated(false).tool);
     for (const key of ["method", "body", "form", "json"]) {
       expect(names).not.toContain(key);
@@ -842,7 +842,7 @@ describe("scrapling_fetch 的写方法闸门", () => {
 
   it("关着时手搓的 method 被就地拒绝，而不是悄悄发成 GET", async () => {
     // 上游的参数校验是**开放根对象**：未声明的键不报错也不剥离，原样进 execute
-    // （tools.spec.ts 里那条 "allows extra keys"）。所以「参数面里没有 method」只拦得住
+    // （tools.spec.ts 里那条 "allows extra keys"）。所以「参数表里没有 method」只拦得住
     // 模型，拦不住重放的旧调用或代发的调用。把写请求改成 GET 是最坏的失败形态：调用方以为
     // 写成功了，对端什么都没发生，而且没有一行日志能看出这件事。
     const { tool, calls } = gated(false);
@@ -1246,7 +1246,7 @@ describe("scrapling_extract", () => {
 
   it("status 缺失或不是非负整数时报可读错误，而不是补成一个 0", async () => {
     // 补成 0 的话，宿主与模型看到的是一条真实的状态码 0 —— 而对端协议其实已经坏了。
-    // 补齐让破损静默，报错才让人知道该去修 Python 那一侧。
+    // 补齐让破损静默，报错才让人知道该去修 Python 侧。
     const fake = fakeSidecar({
       url: SAMPLE_URL,
       status: -1,
@@ -1654,7 +1654,7 @@ describe("scrapling_locate / scrapling_links", () => {
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
     });
-    // 模型面只给新名字：帧上仍是 Python 读的 queryType/selector。
+    // 模型可见只给新名字：帧上仍是 Python 读的 queryType/selector。
     await tool.execute({ html: LOCATE_HTML, by: "text", query: "P1", maxContentChars: 123 }, exec);
     expect(fake.calls[0]?.params).toMatchObject({
       queryType: "text",
@@ -1933,9 +1933,9 @@ function realCtx(): unknown {
 }
 
 /**
- * 起一个只回 SPA 外壳的本地服务：内容要等 JS 执行后才出现。
+ * 起一个只回 SPA 骨架页的本地服务：内容要等 JS 执行后才出现。
  *
- * 这正是 dsh 内置 web_fetch 结构上给不了的那部分 —— 它不执行 JS，只能拿到壳。
+ * 这正是 dsh 内置 web_fetch 结构上给不了的那部分 —— 它不执行 JS，只能拿到这张骨架页。
  */
 async function startSpaServer(): Promise<{ base: string; close: () => Promise<void> }> {
   const page = Buffer.from(
@@ -2182,7 +2182,7 @@ describe("scrapling_render", () => {
     expect(fake.calls[3]?.params).toMatchObject({ timeoutMs: 0 });
     await tool.execute({ url: SAMPLE_URL, timeoutMs: -5 }, exec);
     expect(fake.calls[4]?.params).toMatchObject({ timeoutMs: -5 });
-    // 这一格只加给 render：capture_xhr 的参数面不被顺手扩充。
+    // 这一格只加给 render：capture_xhr 的参数表不被顺手扩充。
     expect(parameterNames(tool)).toContain("timeoutMs");
     expect(
       parameterNames(
@@ -3087,7 +3087,7 @@ describe("scrapling_session_state_save / _load", () => {
       saved: boolean;
     };
     expect(fake.calls[0]?.method).toBe("session.state_load");
-    // 回包没有 path 时退回空串；saved 这一格按「取」这一支的口径为真（见 lib/tools.ts 的
+    // 回包没有 path 时退回空串；saved 这一格按「取」这一支的规则为真（见 lib/tools.ts 的
     // toStateResult：保存时看回包，取时恒为真）。
     expect(result).toStrictEqual({ sessionId: "s1", path: "", saved: true });
     expect(JSON.stringify(tool.output.render({}, result))).toContain("loaded from");
@@ -3115,7 +3115,7 @@ describe("scrapling_session_state_save / _load", () => {
     expect(load.presentCall?.({ sessionId: "s1", name: "login" })).toStrictEqual(pending);
   });
 
-  it("回包不是对象时，归一那一侧退回空表并据此判「没存下」", async () => {
+  it("回包不是对象时，归一函数退回空表并据此判「没存下」", async () => {
     const fake = fakeSidecar("nope");
     const tool = createSessionStateSaveTool({
       sidecar: fake.client,
@@ -3128,7 +3128,7 @@ describe("scrapling_session_state_save / _load", () => {
       path: string;
       saved: boolean;
     };
-    // 回包不是对象 → 归一那一侧的 record 退回空表；path 退回空串；保存时回包没说 saved
+    // 回包不是对象 → 归一函数里的 record 退回空表；path 退回空串；保存时回包没说 saved
     // 就按「没存下」判（取那一支才是恒为真）。
     expect(result).toStrictEqual({ sessionId: "s1", path: "", saved: false });
   });
@@ -3574,7 +3574,7 @@ describe("会话工具", () => {
       answer: fakeAnswer,
     });
     const result = (await tool.execute({}, sessionExec())) as { sessions: unknown[] };
-    // 给了的三枚面逐字段原样出现（不重新归一并丢字段），没给的那一条一个键都不补。
+    // 给了的三项逐字段原样出现（不重新归一并丢字段），没给的那一条一个键都不补。
     expect(result.sessions).toStrictEqual([
       {
         sessionId: "s1",

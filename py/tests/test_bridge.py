@@ -125,8 +125,8 @@ passes = 0
 # 下限分两档，档位由「这台机器能不能真起一次浏览器」决定：没有二进制时，依赖浏览器的那几节
 # 整段不参与（实测差 57 条），那不是静默消失。只写一档的后果实测过——该仓 CI 刻意不装浏览器，
 # 于是门禁红在环境上，红完读者先去怀疑代码。两档各自钉死、都只禁下降。
-MIN_CHECKS_WITH_BROWSER = 541
-MIN_CHECKS_WITHOUT_BROWSER = 484
+MIN_CHECKS_WITH_BROWSER = 1052
+MIN_CHECKS_WITHOUT_BROWSER = 969
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -171,7 +171,7 @@ def _sidecar_argv() -> list[str]:
 
     ``--source`` 必须给**绝对路径**：``pyproject.toml`` 里的 ``source = ["py"]`` 按进程的工作目录
     解析，而子进程的工作目录是 ``py/`` —— 留给它相对形式，解析出来的就是 ``py/py``，于是子进程
-    照样写出一个**空的数据文件**（不是报错，是零测量），地板读数里那句「有浏览器的路径都量到了」
+    照样写出一个**空的数据文件**（不是报错，是零测量），下限读数里那句「有浏览器的路径都量到了」
     就成了假的。``--data-file`` 同理必须绝对（见下）。
 
     ``--data-file`` 必须给**绝对路径**：子进程的工作目录是 py/，而覆盖率默认把数据写在
@@ -220,7 +220,7 @@ class Sidecar:
             stderr=subprocess.DEVNULL,
             cwd=str(self.cwd),
             text=True,
-            # 宿主按 UTF-8 解 bridge 的 stdout；这里必须同口径，否则 Windows 的
+            # 宿主按 UTF-8 解 bridge 的 stdout；这里必须同规则，否则 Windows 的
             # text=True 会按本地代码页（cp1252）解，非 ASCII 正文变成乱码，断言就对不上。
             encoding="utf-8",
             bufsize=1,
@@ -319,7 +319,7 @@ _SEQ_LOCK = threading.Lock()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    """只回 SPA 外壳；其余路径回一张占位图片；写方法把请求本身回显成 JSON。"""
+    """只回 SPA 骨架页；其余路径回一张占位图片；写方法把请求本身回显成 JSON。"""
 
     def do_GET(self) -> None:  # BaseHTTPRequestHandler 的命名约定
         """回一页、一张图、一段接口 JSON，或回显请求本身。"""
@@ -536,7 +536,7 @@ def run(sidecar: Sidecar, base: str, caps: dict[str, Any]) -> None:
     check("坏帧之后仍能正常响应", answer.get("ok") is True, repr(answer)[:120])
 
     print("\n== 离线正文不再单开一个协议方法 ==")
-    # 已有 HTML 的正文归一住在 to_payload 里（scrapling_session_read 走的就是它），协议面
+    # 已有 HTML 的正文归一实现在 to_payload 里（scrapling_session_read 走的就是它），协议
     # 再开一个入口等于多留一条可能绕开清洗的旁路。这里钉的是「那条口已经封上」。
     answer = sidecar.call("extract", {"html": "<html><body><h1>Hi</h1></body></html>"})
     check(
@@ -602,11 +602,11 @@ def run(sidecar: Sidecar, base: str, caps: dict[str, Any]) -> None:
     content = result.get("content", "")
     check("fetch 成功", answer.get("ok") is True, repr(answer)[:220])
     check("fetch 拿到 200", result.get("status") == 200, repr(result)[:160])
-    check("静态管线不执行 JS（只看到占位）", "LOADING_PLACEHOLDER" in content, repr(content)[:120])
-    check("静态管线拿不到渲染后内容", "Server Price" not in content, "静态管线不该渲染")
+    check("静态路径不执行 JS（只看到占位）", "LOADING_PLACEHOLDER" in content, repr(content)[:120])
+    check("静态路径拿不到渲染后内容", "Server Price" not in content, "静态路径不该渲染")
 
     # cssSelector 此前只在 markdown 路径生效，html/text 拿到它却悄悄返回整页 ——
-    # 三条路径现在同一口径：命中 0 个元素就给空正文，不回退成整页。
+    # 三条路径现在同一种做法：命中 0 个元素就给空正文，不回退成整页。
     answer = sidecar.call("fetch", {"url": f"{base}/", "cssSelector": "#app", "extractionType": "html"})
     html_content = answer.get("result", {}).get("content", "")
     check(
@@ -962,8 +962,8 @@ def run_guard() -> None:
             guard._SYNTHETIC_POOL = real_cache
             guard._dns_cache_clear()
 
-        # 守卫日志的脱敏面：日志会进宿主日志，URL 里的凭据不能原样出现在那里。
-        # 此前「密钥不进日志」只有错误消息与结果两面有断言，这一段把第三面钉上。
+        # 守卫日日志的脱敏：日志会进宿主日志，URL 里的凭据不能原样出现在那里。
+        # 此前「密钥不进日志」只有错误消息与结果两处有断言，这一段把第三处钉上。
         # 判定必须走 route handler 那条路——日志发生在拦截点，url_allowed 本身不记日志。
         log_buffer = io.StringIO()
         page_for_log = FakePage()
@@ -1265,8 +1265,8 @@ def run_browser_params() -> None:
     )
 
     # 上游 PlaywrightConfig 把这两个键收在 RetriesCount(1..10) 与 PagesCount(1..50) 里，
-    # 越界值不在 Scrapling 报错，而是在 msgspec 那边炸成 TypeError —— 静态那一侧的
-    # retries 是裸 Optional[int]，所以天花板只落在浏览器这一条路径上。
+    # 越界值不在 Scrapling 报错，而是在 msgspec 那边炸成 TypeError —— 静态这条路径的
+    # retries 只是 Optional[int]、没有数值界，所以天花板只落在浏览器这一条路径上。
     for field, key, ceiling in (("retries", "retries", 10), ("maxPages", "max_pages", 50)):
         over = {field: ceiling + 1}
         try:
@@ -2272,7 +2272,7 @@ def run_media_units() -> None:
         )
         check("浏览器下载照常落盘并回字节数", downloaded.get("bytes") == 5, repr(downloaded)[:200])
 
-        # 附件回退的触发面只有「Download is starting」：超时/网络错误必须按失败上报，
+        # 附件回退的触发条件只有「Download is starting」：超时/网络错误必须按失败上报，
         # 不能为一次真实失败再导航一次，也不能用附件路径的异常类名盖住原因。
         class _GenericFailureFetcher:
             @staticmethod
@@ -3469,7 +3469,7 @@ def run_crawl_guards() -> None:
     import crawl
     import guard
 
-    # 域内判定：口径与 Scrapling 引擎的 _is_domain_allowed 逐字一致。
+    # 域内判定：规则与 Scrapling 引擎的 _is_domain_allowed 逐字一致。
     allowed = {"a.test", "a.test:8080"}
     uppercase = crawl._allowed_domains("http://Example.COM:8080/start")
     check(
@@ -4568,7 +4568,7 @@ def run_bridge_wire_encoding() -> None:
 
 
 def run_python_floor_gate() -> None:
-    """解释器地板：低于 (3, 14) 要有消息，且 bridge 在导入期非零退出、只写 stderr。
+    """解释器下限：低于 (3, 14) 要有消息，且 bridge 在导入期非零退出、只写 stderr。
 
     负路径靠注入 ``sys.version_info`` 的子进程验证——支持面只有 3.14+，真旧解释器不在
     范围内，而「退出码 / stdout 干净 / stderr 有话」这三条本来就只能量子进程。
@@ -4580,13 +4580,13 @@ def run_python_floor_gate() -> None:
         sys.path.insert(0, str(PY_DIR))
     import bridge
 
-    check("地板常量是 (3, 14)", bridge.MIN_PYTHON == (3, 14), str(bridge.MIN_PYTHON))
+    check("下限常量是 (3, 14)", bridge.MIN_PYTHON == (3, 14), str(bridge.MIN_PYTHON))
     check("3.14 恰好达标放行", bridge.check_python((3, 14, 0)) is None)
     check("更高版本放行", bridge.check_python((3, 15, 1)) is None)
     message = bridge.check_python((3, 13, 7))
     check("3.13 被拦下并给出消息", isinstance(message, str), repr(message))
     text = str(message)
-    check("消息点名地板与当前版本", "需要 Python 3.14+" in text and "当前 3.13.7" in text, text)
+    check("消息点名下限与当前版本", "需要 Python 3.14+" in text and "当前 3.13.7" in text, text)
     if inserted:
         sys.path.remove(str(PY_DIR))
 
@@ -4679,7 +4679,7 @@ def run_proxy() -> None:
     """代理判定的验证：设置 > 环境 > 直连，绕过清单，以及守卫在代理下的放宽口径。
 
     全部是纯判定，不发网络请求：出口选错了要在**每一次**抓取里都错，而这里能把每一格
-    都点到。真实打通的那一侧（curl_cffi 与 Playwright 认不认这份代理）由 fetch / render
+    都点到。真实打通的那一步（curl_cffi 与 Playwright 认不认这份代理）由 fetch / render
     的端到端用例在本地 HTTP 服务上覆盖。
     """
     sys.path.insert(0, str(PY_DIR))
@@ -4717,7 +4717,7 @@ def run_proxy() -> None:
         check("空清单项不命中任何主机", not guard._host_matches("example.com", "  "))
 
         # 地址拆分：协议白名单、IPv6 方括号、凭据解码、路径丢弃。
-        # 测试夹具里的假凭据，不是真实密码；用变量承接，避免把它写成硬编码密码。
+        # 夹具里的假凭据，不是真实密码；用变量承接，避免把它写成硬编码密码。
         demo_text = "p"
         check(
             "拆出 Playwright 要的 server/username/password",
@@ -4767,7 +4767,7 @@ def run_proxy() -> None:
             "curl_cffi 形态是 proxies 表",
             guard.proxies_for("https://example.com/") == {"all": "http://127.0.0.1:7890"},
         )
-        # 测试夹具里的空凭据，不是真实密码；用变量承接，避免把它写成硬编码密码。
+        # 夹具里的空凭据，不是真实密码；用变量承接，避免把它写成硬编码密码。
         empty_text = ""
         check(
             "浏览器形态是 server/username/password",
@@ -4816,7 +4816,7 @@ def run_proxy() -> None:
         check("没命中的主机仍走代理", guard.proxy_for("https://other.test/") == "socks5://127.0.0.1:1080")
 
         load(**{guard.PROXY_ENV: "http://127.0.0.1:7890", guard.PROXY_BYPASS_ENV: "intranet, .corp.test"})
-        check("绕过清单里的裸名覆盖子域", guard.proxy_for("https://box.intranet/") == "")
+        check("绕过清单里不带点开头的主机名也覆盖子域", guard.proxy_for("https://box.intranet/") == "")
         check("绕过清单命中 .corp.test", guard.proxy_for("https://a.corp.test/") == "")
         check("没命中的仍走代理", guard.proxy_for("https://example.com/") == "http://127.0.0.1:7890")
 
@@ -4835,7 +4835,7 @@ def run_proxy() -> None:
             guard.proxy_settings() == {"configured": False, "source": "none", "server": ""},
         )
 
-        # 不可用地址会进日志（宿主日志面）。无 scheme 的 user:pass@ 是最容易漏的形态：
+        # 不可用地址会进日志（宿主日志）。无 scheme 的 user:pass@ 是最容易漏的形态：
         # 报告 §2.10 的触发点就是这里。
         unusable_log = io.StringIO()
         with contextlib.redirect_stderr(unusable_log):
@@ -4984,8 +4984,8 @@ def run_proxy() -> None:
         finally:
             guard._SYSTEM_PROXIES = real_system
 
-        # 守卫在代理下的口径：只有「本机解析不出来」这一条放宽。字面量、本地能解析出来的私网
-        # 答案、单标签主机名，三条都照旧拒 —— 那才是 SSRF 的实际落点。
+        # 守卫在代理下的规则：只有「本机解析不出来」这一条放宽。字面量、本地能解析出来的私网
+        # 答案、单标签主机名，三条都照旧拒 —— 那才是 SSRF 的实际位置。
         #
         # 「解析不出来」这一格用**注入的 getaddrinfo** 而不是找一个真的解析不了的名字：
         # 开 fake-ip 的机器上任何域名都有合成答案，`.invalid` 也不例外，拿它当前提的用例在
@@ -5150,7 +5150,7 @@ def run_synthetic_pools() -> None:
             allowed, why = guard.url_allowed("https://target.test/")
             check(f"池内任意落点 {answer} 都放行（不是切一小片）", allowed, why)
 
-        # 收紧的那一侧：合成模式**只**放宽已知池，私网 / 回环 / 链路本地照旧拒。
+        # 收紧方向的检查：合成模式**只**放宽已知池，私网 / 回环 / 链路本地照旧拒。
         for answer in ("127.0.0.1", "192.168.1.1", "10.0.0.5", "169.254.169.254"):
             answers["target.test"] = [answer]
             guard._SYNTHETIC_POOL = None
@@ -5348,7 +5348,7 @@ def _run_concurrency_core(adapters: Any) -> None:
     # 爬虫名额同理：并发判、占位登记都要在锁内。
     #
     # 起点用本地服务而不是外网：外网在 CI 上可能压根不通，那时 busy 里一个 "ok" 都没有，
-    # 「名额不超发」就退化成 0 <= 2 的恒真式 —— 而那种绿看起来与真跑过一模一样。
+    # 「名额不超发」就退化成 0 <= 2 的永远成立式 —— 而那种绿看起来与真跑过一模一样。
     crawl._CRAWLS.clear()
     guard.configure(allowed_hosts=frozenset({"127.0.0.1"}))
     server, slow_base = _serve(_SlowHandler)
@@ -5568,7 +5568,7 @@ def run_network_summary() -> None:
     check("没有正文时把上游的原因带出去", noted[0].get("bodyNote") == "body dropped", repr(noted))
 
     # URL 过滤正则由用户手写，而上游拿它做 re.compile；编译不过会抛 ValueError，读的人看不出
-    # 根因是自己正则写错了。所以在读历史之前就地判。
+    # 真正的原因是自己正则写错了。所以在读历史之前就地判。
     try:
         adapters._url_pattern({"urlPattern": "(["})
         check("坏 urlPattern 报 BAD_ARGS", False, "竟然放行了")
@@ -5697,7 +5697,7 @@ def run_capture(sidecar: Sidecar, base: str) -> None:
         check("条目状态 200", api.get("status") == 200, repr(api)[:200])
         check("没要求正文时不回正文", "body" not in api, repr(api)[:200])
 
-    # 坏正则要在读历史之前就被拦下，而不是让上游在事件回调里抛一句看不出根因的话。
+    # 坏正则要在读历史之前就被拦下，而不是让上游在事件回调里抛一句看不出真正的原因的话。
     bad = sidecar.call("capture", {"url": f"{base}/", "urlPattern": "([", "extractionType": "text"})
     check("坏 urlPattern 回 BAD_ARGS", bad.get("error", {}).get("code") == "BAD_ARGS", repr(bad)[:200])
 
@@ -5813,7 +5813,7 @@ def run_session_state(sidecar: Sidecar) -> None:
     check("saved 为真", saved_result.get("saved") is True, repr(saved_result)[:200])
     check("状态文件真的落了盘", (Path(state_dir) / "login.json").exists(), "")
     if os.name != "nt":
-        # spec §11.6：登录态文件是凭据面，落盘后收到 0600。Windows 的 chmod 只动只读位，
+        # spec §11.6：登录态文件是凭据一类的东西，写到磁盘后收到 0600。Windows 的 chmod 只动只读位，
         # 那条路径由实现里的 OSError 抑制兜住，不在断言里假装它成立。
         state_mode = os.stat(Path(state_dir) / "login.json").st_mode & 0o777
         check("状态文件权限收到 0600", state_mode == 0o600, oct(state_mode))
@@ -5830,7 +5830,7 @@ def run_session_state(sidecar: Sidecar) -> None:
         {"sessionId": session_id, "name": "no-such-state", "deployment": {"sessionStateDir": state_dir}},
     )
     check(
-        "载入不存在的状态翻成 STATE_FAILED（而不是裸栈）",
+        "载入不存在的状态翻成 STATE_FAILED（而不是原始调用栈）",
         missing.get("error", {}).get("code") == "STATE_FAILED",
         repr(missing)[:200],
     )
@@ -5910,7 +5910,7 @@ def _probe_session_params(adapters: Any) -> None:
                 hint in message,
                 message,
             )
-        # 没给那两个键时不该被这条判据拦下（往下走到投递那一步才失败）。
+        # 没给那两个键时不该被这条判据拦下（往下走到转交那一步才失败）。
         code, message = probe(kind, {})
         check(f"{kind} 会话不给 headers/retries 时不被误拦", code != "BAD_ARGS", f"{code} / {message}")
 
@@ -6094,7 +6094,7 @@ def run_write_gate(base: str) -> None:
     finally:
         closed.close()
 
-    # 环境变量的读法：一个安全开关的「认不出来」必须落在紧的那一侧。拼错的 "ture" 若被
+    # 环境变量的读法：一个安全开关的「认不出来」必须按关闭处理。拼错的 "ture" 若被
     # `bool(非空)` 读成开，部署方会以为自己关了。
     saved = os.environ.get(guard.ALLOW_WRITE_METHODS_ENV)
     try:
@@ -6121,7 +6121,7 @@ def run_write_gate(base: str) -> None:
     guard.configure(allow_write_methods=not keep)
     check("configure 显式给值时改写它", guard.ALLOW_WRITE_METHODS is (not keep), repr(guard.ALLOW_WRITE_METHODS))
 
-    # 进程内那一侧的硬拒（第二个 sidecar 验的是同一段逻辑的跨语言形状，这里验它抛得对）。
+    # 进程内的硬拒（第二个 sidecar 验的是同一段逻辑的跨语言形状，这里验它抛得对）。
     guard.configure(allow_write_methods=False)
     try:
         adapters.fetch({"url": "https://contract.test/", "method": "DELETE"})
@@ -6134,8 +6134,8 @@ def run_write_gate(base: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 进程内单元。`py/package.json` 的覆盖率地板只量**这个进程**（`source = ["py"]` 是相对子进程
-# cwd 解析的，sidecar 里跑的代码一条都不进地板），所以凡是想进地板的 adapters / crawl 代码，
+# 进程内单元。`py/package.json` 的覆盖率下限只量**这个进程**（`source = ["py"]` 是相对子进程
+# cwd 解析的，sidecar 里跑的代码一条都不进下限），所以凡是想让下限量到的 adapters / crawl 代码，
 # 都必须由这里直接 import 调用，不能只经 `sidecar.call(...)`。替身引擎不发网络，除了
 # `capabilities()` 那次真探针外一律不起浏览器。
 # ---------------------------------------------------------------------------
@@ -6565,7 +6565,7 @@ def _select_with_deployment(args: dict[str, Any], deployment: dict[str, Any]) ->
 
 
 def run_inprocess_adapters() -> None:
-    """进程内直接驱动 adapters 的参数收口与工具函数（让它们进覆盖率地板）。"""
+    """进程内直接驱动 adapters 的参数统一处理与工具函数（让它们被覆盖率下限那条腿量到）。"""
     sys.path.insert(0, str(PY_DIR))
     import adapters
     import guard
@@ -6841,7 +6841,7 @@ def run_inprocess_adapters() -> None:
     fake = adapters._fake_response("<p>x</p>", "https://x.test/", 200)
     check("_fake_response 造出真 Response", fake.status == 200 and fake.url == "https://x.test/", "")
 
-    # 已有 HTML 的正文清洗与抓取同一条管线：scrapling_session_read 走的就是下面这三行拼起来
+    # 已有 HTML 的正文清洗与抓取走同一条路径：scrapling_session_read 走的就是下面这三行拼起来
     # 的那次调用，所以清洗判据钉在 to_payload 上，而不是钉在一个协议方法名上。
     offline = adapters.to_payload(
         adapters._fake_response("<html><body><h1>Hi</h1><p>yo</p></body></html>", "about:blank", 200),
@@ -7023,7 +7023,7 @@ def _browser_ground_truth() -> bool:
         sync_playwright = importlib.import_module("patchright.sync_api").sync_playwright
         with sync_playwright() as driver:
             driver.chromium.launch(headless=True).close()
-    except Exception:  # noqa: BLE001 —— 对照只关心起不起得来；起不来的原因由真探测那一侧报
+    except Exception:  # noqa: BLE001 —— 对照只关心起不起得来；起不来的原因由真探测那条路径报
         return False
     return True
 
@@ -7186,7 +7186,7 @@ def run_inprocess_sessions() -> None:
         adapters._make_session = saved_make_session
 
         # T10：设置摘要必须在**开场那一刻**就记进登记条目 —— session.list 不该回头去猜，
-        # 更不该把凭据面（cookies / 代理口令 / key）带进这份可被模型读到的摘要。
+        # 更不该把凭据一类的东西（cookies / 代理口令 / key）带进这份可被模型读到的摘要。
         adapters._make_session = lambda kind, args: (object(), _RecordingCloser())
         try:
             static_opened = adapters.session_open({"sessionType": "static"})
@@ -7241,7 +7241,7 @@ def run_inprocess_sessions() -> None:
         }
         # 上面把键整个换掉了，`entry` 还指着旧那份：后面几条用例要在新条目上开网络记录。
         entry = adapters._SESSIONS["cov-stealth"]
-        # 这枚替身的 fetch 会抛，正好证明调用**真的投递到了属主线程并被执行**：
+        # 这枚替身的 fetch 会抛，正好证明调用**真的转交到了属主线程并被执行**：
         # 若路由没走到浏览器分支，抛的会是 NO_SUCH_SESSION 而不是 FETCH_FAILED + reachable。
         try:
             adapters.session_fetch(
@@ -7487,7 +7487,7 @@ def run_inprocess_sessions() -> None:
 def _run_static_session_methods(adapters: Any) -> None:
     """static 会话的方法路由与写方法门禁：session.fetch 与一次性 fetch 同源。"""
     # static 会话的方法路由：session.fetch 曾只看 form/json 推 POST，method=PUT/DELETE
-    # 与裸 body 被静默丢掉（请求照发、语义错了）。契约是与一次性 fetch 同源。
+    # 与只有 body、没写 method 的请求被静默丢掉（请求照发、语义错了）。契约是与一次性 fetch 同源。
     import guard as guard_module
 
     calls_static: list[tuple[str, str, dict[str, Any]]] = []
@@ -7540,7 +7540,7 @@ def _run_static_session_methods(adapters: Any) -> None:
             repr(calls_static[-1:]),
         )
         check(
-            "裸 body 进入 PUT 的请求体",
+            "只有 body 时它进入 PUT 的请求体",
             calls_static[-1][2].get("data") == "x",
             repr(calls_static[-1][2]),
         )
@@ -7926,7 +7926,7 @@ def main() -> int:
     print("\n== 提取路径的反注入清洗 ==")
     run_extraction()
 
-    print("\n== 解释器地板（运行时硬闸）==")
+    print("\n== 解释器下限（运行时硬闸）==")
     run_python_floor_gate()
 
     print("\n== 协议通道的编码与 py/ 目录解析 ==")

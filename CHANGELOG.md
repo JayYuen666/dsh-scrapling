@@ -8,43 +8,43 @@
 
 ## 0.1.8
 
-宿主开发基线抬到 `0.2.2-rc.1`（支持窗口 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 未变），`engines.node` 地板抬到 `>=24.9.0`；MCP 客户端默认钉版随开发基线走到 `0.2.2-rc.1`，放行名单补上窗口内第三条线；卡片组件改由 shared 的 `./client` 供。工具与设置面不变，需要留意的是 `engines.node` 抬高后 node 22 装不上本包，以及 `setup` / `doctor` 交回的默认钉法变了。
+宿主开发基线抬到 `0.2.2-rc.1`（支持窗口 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 未变），`engines.node` 下限抬到 `>=24.9.0`；MCP 客户端默认钉版随开发基线走到 `0.2.2-rc.1`，放行名单补上窗口内第三条线；卡片组件改由 shared 的 `./client` 供。工具与设置界面不变，需要留意的是 `engines.node` 抬高后 node 22 装不上本包，以及 `setup` / `doctor` 交回的默认钉法变了。
 
 ### Changed
 
 - **shared 抬到 0.2.4**：catalog、生成物与 lockfile 随之同步；shared 新增的普通依赖 `@deepseek-ai/dsh-fs-patch` 由 shared 自己安装，本包不重复声明。
-- **宿主开发基线**：`devDependencies` 的 dsh 家族抬到 `0.2.2-rc.1`，`@deepseek-ai/cordis` 抬到 `4.1.0`，cordis 插件组两枚抬到 `1.1.0`，`@deepseek-ai/schemastery` 抬到 `3.19.0`；`@deepseek-ai/dsh-ptc-runtime` 从 devDependencies 移除（源码与测试都不再引用它）。`engines.dsh` 与 `@deepseek-ai/dsh*` peer 保持 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 未动；`@deepseek-ai/schemastery` 的 peer 放宽为 `^3.18.5 || ^3.18.6-alpha.1`，与两条宿主线各自的实装版本对齐。`engines.node` 由 `>=22.18.0` 抬到 `>=24.9.0`，取值取自宿主自己的地板。
-- **MCP 客户端默认钉版走到 `0.2.2-rc.1`**：`MCP_DEFAULT_CLIENT_PIN` 随开发基线抬版，`MCP_CLIENT_PIN_VALUES` 由三条变四条（`0.2.2-rc.1`、`0.2.2-alpha.3`、`0.2.1-rc.5`、`next`）——默认钉法只覆盖一条线时，停在 alpha.3 或 rc.5 上的部署拿到的安装命令会把宿主对字面 peer 的确切版本校验撞上去，条目「装得上、永不生效」；放行名单的口径因此由「两条宿主线」改为「本包宿主窗口覆盖到的每条线」。MCP server 自述版本同步 `0.1.8`。
+- **宿主开发基线**：`devDependencies` 的 dsh 家族抬到 `0.2.2-rc.1`，`@deepseek-ai/cordis` 抬到 `4.1.0`，cordis 插件组两枚抬到 `1.1.0`，`@deepseek-ai/schemastery` 抬到 `3.19.0`；`@deepseek-ai/dsh-ptc-runtime` 从 devDependencies 移除（源码与测试都不再引用它）。`engines.dsh` 与 `@deepseek-ai/dsh*` peer 保持 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 未动；`@deepseek-ai/schemastery` 的 peer 放宽为 `^3.18.5 || ^3.18.6-alpha.1`，与两条宿主线各自的实装版本对齐。`engines.node` 由 `>=22.18.0` 抬到 `>=24.9.0`，取值取自宿主自己的下限。
+- **MCP 客户端默认钉版走到 `0.2.2-rc.1`**：`MCP_DEFAULT_CLIENT_PIN` 随开发基线抬版，`MCP_CLIENT_PIN_VALUES` 由三条变四条（`0.2.2-rc.1`、`0.2.2-alpha.3`、`0.2.1-rc.5`、`next`）——默认钉法只覆盖一条线时，停在 alpha.3 或 rc.5 上的部署拿到的安装命令会把宿主对字面 peer 的确切版本校验撞上去，条目「装得上、永不生效」；放行名单的规则因此由「两条宿主线」改为「本包宿主窗口覆盖到的每条线」。MCP server 自述版本同步 `0.1.8`。
 - **卡片组件改由 shared 的 `./client` 供**：`src/settings-card.ts`、`src/runtime-reader.ts` 与 `src/client-entry.ts` 的运行期值导入从 `./lib/card-ui`、`./lib/record` 迁到 `./client`，`build-client.ts` 的外置清单加入 `@jayyuen66/dsh-plugin-shared`，`package.json` 新增 `dsh.bundle.client.external`；`cordis.patch.yml` 因此插入一条**不写 id** 的 `@jayyuen66/dsh-plugin-shared` 组件行（写 id 会在插件页多出一个可关闭的组件，关掉后设置卡失去组件供应）。
-- **CI 的 node 矩阵收敛**：`ci.yml` 的 `node: [22, 24]` 加 macOS 排除改为单格 `node: [24.9]`，`node-version` 由 `24` 改为 `24.9`，与 `engines.node` 同值；`python-version` 仍是 `"3.14"`，与该仓的 Python 地板四处同值（三格 runner 上取得到 3.14）。
+- **CI 的 node 矩阵收敛**：`ci.yml` 的 `node: [22, 24]` 加 macOS 排除改为单格 `node: [24.9]`，`node-version` 由 `24` 改为 `24.9`，与 `engines.node` 同值；`python-version` 仍是 `"3.14"`，与该仓写明 Python 解释器下限的四处同值（三格 runner 上取得到 3.14）。
 
 ### Removed
 
-- **CDP 端点旋钮（`browserCdpUrl` → 上游 `cdp_url`）撤掉**：Scrapling 0.5.1 把 `cdp_url` 与 `new_context` 收归 `RemoteSession` / `AsyncRemoteSession`，递给非远端会话会 `TypeError`（`engines/_browsers/_validators.py` 的 “cdp_url and new_context require RemoteSession”），而本包没有远端会话模式。留在 `SESSION_ONLY_KEYS` 与 `_DEPLOYMENT_KNOBS` 里等于让同一条文档范围 `>=0.5,<0.6` 里两个上游版本行为分叉：0.5 上能用、0.5.1 上直接把会话构造炸掉。撤的落点：`host.ts` 的 `Config` 字段与 schema 默认、`lib/tools.ts` 的 deployment 两处交回、`py/adapters.py` 的旋钮表与会话键表、探针与 TS 两侧夹具。要接已在运行的 CDP 浏览器，需要的是新增远端会话模式，不是把这枚键偷偷递回去。
-  - 随撤的账面：部署值由三十项变**二十九项**（`Config` 现量 79 枚、其中 volatile 50 枚不变），两份 README 的部署表与两份 DETAIL 的计数同改；隐私段那条「绝不进入工具 schema」的名单去掉 `cdpUrl`（该键已不存在，列着它等于让读者去找一个没有的开关）。
+- **CDP 端点旋钮（`browserCdpUrl` → 上游 `cdp_url`）撤掉**：Scrapling 0.5.1 把 `cdp_url` 与 `new_context` 收归 `RemoteSession` / `AsyncRemoteSession`，递给非远端会话会 `TypeError`（`engines/_browsers/_validators.py` 的 “cdp_url and new_context require RemoteSession”），而本包没有远端会话模式。留在 `SESSION_ONLY_KEYS` 与 `_DEPLOYMENT_KNOBS` 里等于让同一条文档范围 `>=0.5,<0.6` 里两个上游版本行为分叉：0.5 上能用、0.5.1 上直接把会话构造炸掉。撤的位置：`host.ts` 的 `Config` 字段与 schema 默认、`lib/tools.ts` 的 deployment 两处交回、`py/adapters.py` 的旋钮表与会话键表、探测脚本与 TS 两侧测试数据。要接已在运行的 CDP 浏览器，需要的是新增远端会话模式，不是把这枚键偷偷递回去。
+  - 随撤的账面：部署值由三十项变**二十九项**（`Config` 当场实测 79 枚、其中 volatile 50 枚不变），两份 README 的部署表与两份 DETAIL 的计数同改；隐私段那条「绝不进入工具 schema」的名单去掉 `cdpUrl`（该键已不存在，列着它等于让读者去找一个没有的开关）。
   - 门禁侧：`test/contract-scrapling.test.ts` 的驱动覆盖下限由 20 调到 **19**（少发一枚键是预期结果，不是驱动退化，理由写在那张表旁）。这条红是本轮 CI 首次用 0.5.1 跑出来的——本仓 `_env/.venv` 钉的是 `scrapling==0.5`（`py/runtime-requirements.txt` 带哈希），而 CI 的 Python 腿装 `scrapling[rag]>=0.5,<0.6`，两者本来就是两个版本。两侧现在都验过：0.5 与 0.5.1 下 `violations` 均为空集。
 
 ### Docs
 
-- 两份 DETAIL 的「卡上四十九个取值 / Forty-nine card values」改为**五十**：`host.ts` 的 `Config` 接口里标 `Volatile<…>` 的字段现量 50 枚，与两份 README 的卡片表逐键相等（`test/readme-parity.test.ts` 钉的是 README 那侧，DETAIL 这个数字没有门）；核对时另有一处坑——用 `grep -c '\.volatile()'` 数会得到 52，因为 `host.ts` 上方那段注释里就写着 `.volatile()` 这个字面量。
+- 两份 DETAIL 的「卡上四十九个取值 / Forty-nine card values」改为**五十**：`host.ts` 的 `Config` 接口里标 `Volatile<…>` 的字段当场实测 50 枚，与两份 README 的卡片表逐键相等（`test/readme-parity.test.ts` 钉的是 README 那侧，DETAIL 这个数字没有门）；核对时另有一处坑——用 `grep -c '\.volatile()'` 数会得到 52，因为 `host.ts` 上方那段注释里就写着 `.volatile()` 这个字面量。
 - dsh 徽章由 `^0.2.1-rc.3` 抬到 `^0.2.1-rc.5`，与 `engines.dsh` 首条同值；`cordis.patch.yml` 的注册行由「唯一一行」改写为「两条条目」并说明 shared 那行为何不写 id；`build-client.ts` 的头注释原写「只 import react 与 zod」，与它自己下一行的外置清单（含 shared）矛盾，改为三条并说明内联会得到第二份卡片状态。
 
 ## 0.1.7
 
-宿主支持窗口抬到 `0.2.1-rc.5 || 0.2.2-alpha.3`，MCP 客户端钉版、设置卡取值面与输出预算
-一起收口；构建与门禁补齐产物新鲜度、行尾与 lint 偏差三条判据，Python 侧补上有界关机。
+宿主支持窗口抬到 `0.2.1-rc.5 || 0.2.2-alpha.3`，MCP 客户端钉版、设置卡取值与输出预算
+一起统一处理；构建与检查补齐产物一致性、行尾与 lint 偏差三条判据，Python 侧补上有界关机。
 
 ### Changed
 
-- **宿主与发布元数据**：devDependencies 全族抬到 `0.2.2-alpha.3`（cordis `4.0.6-alpha.2`、schemastery `3.18.6-alpha.2`）；`engines.dsh` 与 dsh 家族 peer 写 `^0.2.1-rc.5 || ^0.2.2-alpha.3`；MCP 客户端默认钉版改为 `0.2.2-alpha.3`，`doctor` 同时放行 rc 线的 `0.2.1-rc.5`；MCP server 自述版本同步 0.1.7。
+- **宿主与发布元数据**：devDependencies 里的 @deepseek-ai/* 整组抬到 `0.2.2-alpha.3`（cordis `4.0.6-alpha.2`、schemastery `3.18.6-alpha.2`）；`engines.dsh` 与 dsh 家族 peer 写 `^0.2.1-rc.5 || ^0.2.2-alpha.3`；MCP 客户端默认钉版改为 `0.2.2-alpha.3`，`doctor` 同时放行 rc 线的 `0.2.1-rc.5`；MCP server 自述版本同步 0.1.7。
 - **搜索后端**：名单收进 `lib/search-backends.ts` 单一定义（CLI 判配置与设置卡 enum 同源），Brave/Serper 端点与 `auto` 的分流提示一起显式化；`searxngEndpoint` 改为遮罩输入。
 - **输出预算**：浏览器抓取的网络历史单独封顶；正文被对端 `maxContentChars` 截断而本地未再截时也给出恢复指引，`scrapling_answer` 的截断落到同一条尾巴。
 - **会话参数**：`cookies` / `blockedDomains` 给了非数组时报 `ToolArgsError`；`sessionType=static` 时递进来的浏览器档旋钮直接报错，不再静默丢掉；网络历史的方法名与说明常量收成单一定义。
 - **运行环境与配置**：托管 runtime 只在 macOS arm64 尝试，其余平台报 `INSTALL_PACK_BLOCKED`；Windows 解释器名与根脚本统一为 `python`；`setup` / `doctor` 的 MCP 端口改为显式 `--port`；`nat64Prefixes` 非法时拒绝装载（`CONFIG_INVALID`），`stripInlineImages` 进卡；逗号串统一去空白，空列表不交空数组。
 - **构建与门禁**：`build-helpers.ts` 收拢三份构建脚本的入口判定、原子写与「宿主包被内联」断言；新增 `eol-gate.mjs`、`test/artifact-freshness.test.ts`、`test/build-helpers.test.ts`、`test/lint-deviations.test.ts`，`check` 串上 `gate:eol`；oxlint 的每处规则收窄逐条登记理由并由测试双向核对。
-- **Python 门禁**：ruff 开 RUF100（失效的 `noqa` 判红）；mypy 去掉全局 `ignore_missing_imports`，只对 `lxml` 与可选依赖 `redis` 逐模块放行；coverage 开分支统计，地板仍由 `coverage-floor.mjs` 施加。
-- **CI**：pnpm 钉到 `12.11.2`（与伞根 `packageManager` 同源）；工作树改写判据先打印再判红；产物探针按 tarball 声明的 peer 范围解析 `dsh-tools`。
-- **文档**：双语 README 与 DETAIL 对齐现量（49 个卡上取值、19 个工具、15 个开关、MCP 端口显式 `--port`、官方 MCP 工具集归上游）。
+- **Python门禁**：ruff 开 RUF100（失效的 `noqa` 判红）；mypy 去掉全局 `ignore_missing_imports`，只对 `lxml` 与可选依赖 `redis` 逐模块放行；coverage 开分支统计，下限仍由 `coverage-floor.mjs` 施加。
+- **CI**：pnpm 对齐到 `12.11.2`（与伞根 `packageManager` 同源）；工作树改写判据先打印再判红；产物探测脚本按 tarball 声明的 peer 范围解析 `dsh-tools`。
+- **文档**：双语 README 与 DETAIL 对齐实测数字（49 个卡上取值、19 个工具、15 个开关、MCP 端口显式 `--port`、官方 MCP 工具集归上游）。
 
 ### Fixed
 
@@ -61,15 +61,15 @@
 
 ## 0.1.6
 
-一轮跨面审查修复，TS 与 Python 两侧一起收口：协议边界、安装器与 sidecar 生命周期、
-Python 子命令判据；门禁脚本与发布链同步加固。
+一轮跨模块审查修复，TS 与 Python 两侧一起统一处理：协议边界、安装器与 sidecar 生命周期、
+Python 子命令判据；检查脚本与发布链同步加固。
 
 ### Changed
 
 - **门禁脚本硬化**：`py-launcher.mjs`（usable 先判 isFile、parseArgs 严格化、`--bin` 无 venv 退 1、信号映射 128+n）；`coverage-floor.mjs` / `deps-check.mjs` / `face-py.mjs`（realpath 主模块判据、地板两处互校、uv/pip 失败点名、py/ 缺失判红）。`check:py` 移除独立 `test:py` 步（coverage run 即 sidecar 端到端）。
 - **构建与测试面**：`build-cli.ts` 的 bin 产物改 tmp+rename 原子写并加 `invokedDirectly` 守卫；vitest 并行化（fileParallelism + maxWorkers 50%）、coverage include 收进 `src/runtime-reader.ts`；CI 注释同步 `check:py` 新链，actionlint 改按文件豁免。
-- **依赖与元数据**：`engines.node` 下限 22.12→22.18（build 脚本用 node 直接跑 .ts 需要类型剥离）；peer 五个宿主包从双范围收敛为单范围 `^0.2.1-rc.3`，`@deepseek-ai/schemastery` 放宽为 `^3.18.6-alpha.1`；新增依赖 `fs-native-extensions` 1.5.3（安装锁的 OS 级实现）、devDep fast-check 4.10.2；catalog 的 shared 抬到 0.2.2；MCP server 自述版本同步 0.1.6。
-- **`_env/` 四份探针脚本**改到 Scrapling 0.5 真实 API（StealthySession / network.search / wait_selector）。
+- **依赖与元数据**：`engines.node` 下限 22.12→22.18（build 脚本用 node 直接跑 .ts 需要类型剥离）；peer 五个宿主包从双范围统一成单范围 `^0.2.1-rc.3`，`@deepseek-ai/schemastery` 放宽为 `^3.18.6-alpha.1`；新增依赖 `fs-native-extensions` 1.5.3（安装锁的 OS 级实现）、devDep fast-check 4.10.2；catalog 的 shared 抬到 0.2.2；MCP server 自述版本同步 0.1.6。
+- **`_env/` 四份探测脚本**改到 Scrapling 0.5 真实 API（StealthySession / network.search / wait_selector）。
 
 ### Fixed
 
@@ -79,7 +79,7 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 - **协议**（`lib/jsonl.ts`、`py/bridge.py`）：`FrameSplitter.clear()`、单帧回调异常不再丢同 chunk 后续帧、stop 后摘除 end/error 并挂吞错监听、切行后超长帧即报 FrameError；bridge 的 stdin 改 read1 增量切帧、超长残帧弃缓冲报 BAD_FRAME（与宿主 FrameSplitter 同解）、emit 失败补发 INTERNAL 兜底帧。
 - **MCP server**（`lib/mcp-server.ts`）：缺 Content-Length 的 POST 回 411；token 比较改 `timingSafeEqual`；截图 sink 加 16 份/60s 上限；非回环绑定且无 token 直接拒启。
 - **安装器**（`lib/installer.ts`）：还原失败时保留旧 venv（`restoreFailed`）；安装锁由 pid 文件改为 OS 级锁；卸载只摘被卸包的状态位，不再连带触发 browser 重下；offline 归档 URL 百分号编码防御。
-- **MCP profile**（`lib/mcp-profile.ts`）：兼容双引号、列表项与行尾注释，URL 端口按 scheme 默认值比对，消除 doctor 假红。
+- **MCP profile**（`lib/mcp-profile.ts`）：兼容双引号、列表项与行尾注释，URL 端口按 scheme 默认值比对，消除 doctor 误报。
 - **sidecar 稳定性**（`lib/browser-tools.ts`、`lib/tool-params.ts`、`lib/sidecar.ts`）：act/screenshot 的 `timeoutMs` 夹进调用截止，单动作超时不再拆掉整个 sidecar 进程；调用级取消不再传给 spawn。
 - **runtime**（`lib/runtime.ts`、`lib/runtime-remote.ts`、`lib/official-mcp.ts`）：解释器候选先判 isFile、win32 PATH 名与 py-launcher 统一为 `python`、manifest 强校验 sha256/pythonVersion；用 `list()` 区分「作业已不存在」与「读失败」，修安装状态永久 500；补 Windows `Scripts/scrapling-mcp.exe` 入口；CLI 未知旗标不再吞参。
 
@@ -89,27 +89,27 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 - `py/session_page.py`：dialog handler 批次结束即摘；动作校验全部先 isinstance 再白名单。
 - `py/media.py`：下载先 stat 后读、流式下载先判后写；非 download 异常如实上报。
 - `py/extraction.py`：`queryType` 缺省不再压掉 `useXpath`；预算按 json 序列化长度二分收缩，locate 按整条载荷计预算。
-- `py/adapters.py`：session.fetch 的 static 分支改 `_static_method`，PUT/DELETE/裸 body 不再静默变 GET；closed 条目持锁前复判。
-- `py/crawl.py`：crawl_started 播报失败撤占位；allowed_domains 统一小写；域判定源单源化；crawl_status 快照移出全局锁；未 start 线程可 stop。
+- `py/adapters.py`：session.fetch 的 static 分支改 `_static_method`，PUT/DELETE 与只带 body 的请求不再静默变 GET；closed 条目持锁前复判。
+- `py/crawl.py`：crawl_started 播报失败撤占位；allowed_domains 统一小写；域判定源唯一来源化；crawl_status 快照移出全局锁；未 start 线程可 stop。
 - `py/guard.py`：urlparse 包 try 返回 malformed；`NO_PROXY=*` 三路同解；NAT64 前缀配置校验；PAC 串脱敏；合成池只在单一池命中时放宽。
 - 其余：`py/redact.py` 畸形 URL 按参数名兜底脱敏并扩 key 表；`py/search.py` DDG 跳板按 host 精确/后缀匹配。
 
 ### Added
 
 - **测试三层**：`test/gate-scripts.test.ts`、`test/mcp-contract.test.ts`、`test/platform/interpreter.platform.test.ts`、`test/property/protocol.property.test.ts`（fast-check）、`test/e2e/byte-pipe.e2e.test.ts`（真进程字节层回路）、`test/readme-parity.test.ts`；`py/tests/test_bridge.py` 加 662 行。
-- **扩展点**：`lib/mcp-server.ts` 新增 `McpSessionFactory`/`McpSession` 装配缝与 `MCP_AUTH_REQUIRED` 错误码；`src/settings-fields.ts` 新增 `schemes` 协议白名单（proxyUrl、searxngEndpoint 录入期收口）。
+- **扩展点**：`lib/mcp-server.ts` 新增 `McpSessionFactory`/`McpSession` 装配缝与 `MCP_AUTH_REQUIRED` 错误码；`src/settings-fields.ts` 新增 `schemes` 协议白名单（proxyUrl、searxngEndpoint 录入期统一处理）。
 
 ## 0.1.5
 
-这一版把设置卡与读面校验统一到 shared 组件和 zod，让提示指引跟随宿主的步骤准入视图，
-并把插件页展示面收进包。宿主开发线抬到 0.2.2-alpha.2。
+这一版把设置卡与读取接口校验统一到 shared 组件和 zod，让提示指引跟随宿主的步骤准入视图，
+并把插件页展示收进包。宿主开发线抬到 0.2.2-alpha.2。
 
 ### Changed
 
 - **设置卡迁到 shared 组件**：字段版式、保存条与状态条改用 `@jayyuen66/dsh-plugin-shared/lib/card-ui`，
   本卡只保留运行环境区样式；布尔、数字、枚举与 URL 输入改由 zod schema 校验，非法原文留在控件里并
   挡住保存。
-- **读面形状校验改 zod**：`src/runtime-reader.ts` 的 strict codec、`lib/sidecar.ts` 的 capabilities、
+- **读取接口形状校验改 zod**：`src/runtime-reader.ts` 的 strict codec、`lib/sidecar.ts` 的 capabilities、
   `lib/runtime.ts` 的 manifest 都改用 zod；client 对 `status` / 动作回执也按 schema 收，坏形状不再当
   合法值渲染。
 - **runtime 状态里的能力包改为可选**：旧宿主少报某个包时整份状态照常解析，不再因为一个缺键把整张
@@ -120,9 +120,9 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 - **宿主开发线抬到 `0.2.2-alpha.2`**：devDependencies 与 catalog/overrides 同值；`engines.dsh` 与
   peer 范围同为 `^0.2.1-rc.3`（见下方 Fixed），README 补滚动窗口说明；
   MCP server 自述版本同步到 0.1.5。
-- **插件页展示面进包**：新增 `locale/en.json`、`locale/zh.json` 与 `docs/DETAIL.md`、`docs/DETAIL.zh.md`；
+- **插件页展示进包**：新增 `locale/en.json`、`locale/zh.json` 与 `docs/DETAIL.md`、`docs/DETAIL.zh.md`；
   `exports` 增加 `./locale/*.json`，`files` 收进 locale 与 docs。
-- **正则常量与迭代写法收口**：CLI、安装器、MCP profile、URL 策略与测试里的内联正则提取为命名常量，
+- **正则常量与迭代写法统一处理**：CLI、安装器、MCP profile、URL 策略与测试里的内联正则提取为命名常量，
   展开迭代器改用 `Array.from`，行为不变。
 
 ### Fixed
@@ -135,7 +135,7 @@ Python 子命令判据；门禁脚本与发布链同步加固。
   pnpm pack（发布同款，会落成版本号）。
 - **pack-probe 安装可选 peer 时解析出互斥的宿主版本**：探针原先只显式装 `dsh-tools`，npm 按
   peer 范围解析出 rc.3，而 `dsh-web` 同一次安装里解析到 rc.4，两者要求不同的 `dsh-llm`；
-  探针改按 devDependency 的精确版装同一宿主线，安装树回到同一档。
+  探测脚本改按 devDependency 的精确版装同一宿主线，安装树回到同一档。
 - **`@deepseek-ai/dsh*` 的 peer 范围覆盖 alpha.2**：`^0.2.1-rc.3` 的预发布语义不含
   `0.2.2-alpha.2`（不是同一 patch 元组），而本包装配和测试正是对着 alpha.2；范围改为
   `^0.2.1-rc.3`，与 README 的三版窗口一致。
@@ -144,7 +144,7 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 
 ### Fixed
 
-- **`scrapling_fetch` 的 `form` / `json` 不再静默落地**：`allowWriteMethods=false` 时这两个参数与 `method` / `body` 走同一道闸，模型参数面里根本不出现；写方法开启时，给了 `form` / `json` 而没给 `method` 会隐含 `POST`（与静态会话抓取一致），显式 `GET` 配请求体判 `BAD_ARGS`。此前请求照发、对端收到空体，而回包上没有任何一行能看出这件事。
+- **`scrapling_fetch` 的 `form` / `json` 不再静默落地**：`allowWriteMethods=false` 时这两个参数与 `method` / `body` 走同一道闸，模型参数表里根本不出现；写方法开启时，给了 `form` / `json` 而没给 `method` 会隐含 `POST`（与静态会话抓取一致），显式 `GET` 配请求体判 `BAD_ARGS`。此前请求照发、对端收到空体，而回包上没有任何一行能看出这件事。
 - **离线解析器的 `url` 不再被出站闸门误拦**：`scrapling_extract` / `scrapling_locate` / `scrapling_links` 的 `url` 只作相对地址基准，不做 DNS 解析也不连网；此前它被当成取回目标，给一个内网基准地址就会报 `URL_BLOCKED`。
 - **URL 守卫错误文案不再回显凭据**：`https://user:pass@host` 在 `URL_BLOCKED` 里脱敏成 `***@`，判定与连接仍用原串。
 - **`sessionStateDir` 未配置时不再注册登录态存取工具**：`scrapling_session_state_save` / `scrapling_session_state_load` 现在与 jobs / attachments 同一种门，目录为空时那两只注定回 `SESSION_STATE_DISABLED` 的工具不会出现在工具目录里，并给一条点名修法的告警。
@@ -156,7 +156,7 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 - **`sitemapFollow` 不再放大抓取**：发现期抓子 sitemap 与 sitemap URL 各自按 `maxPages` 封顶，`maxPages=2` 不会再打出几百次请求。
 - **浏览器页面超时与工具调用预算解耦**：`scrapling_render` / `scrapling_capture_xhr` / 会话抓取 / `session_act` 在模型未给 `timeoutMs` 时不再下发页面超时（交给 Python 的 30s），显式值只按 `min(调用值, pageTimeoutMs)` 下发；坏选择器与永不 idle 的页面因此能返回 `ACTION_FAILED` / 结构化超时，而不是把整次调用拖到宿主外层 120s。
 - **静态会话的 `extraHeaders` 生效**：此前只有浏览器会话合并它、静态路径静默丢掉；现在与 `headers` 合并，同名以 `extraHeaders` 为准。
-- **浏览器下载走附件回退**：`useBrowser=true` 抓二进制响应时 Chromium 会报 `Page.goto: Download is starting`，现在改为先开会话取 URL、再经附件链路落盘；`DOWNLOAD_FAILED` 也补回原始原因。
+- **浏览器下载走附件回退**：`useBrowser=true` 抓二进制响应时 Chromium 会报 `Page.goto: Download is starting`，现在改为先开会话取 URL、再经附件链路写到磁盘；`DOWNLOAD_FAILED` 也补回原始原因。
 - **登录态文件错误不再泄漏宿主绝对路径**：`state_load` 的 `FileNotFoundError` / JSON 解析错误只点名模型自己给的文件名。
 - **文档与 CLI 同步**：随包 `cordis.patch.yml` 的工具数从 13 改到 19；`setup --status --profile <目录>` 读该 profile 的 `pythonBin`（不再永远回 `python3/path/unknown`）；README 设置卡表把 `duckduckgoEndpoint` 从 volatile 栏移出，并新增 README 与 config schema 的一致性测试。
 
@@ -170,7 +170,7 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 - **爬虫内容选项与统计**：`scrapling_crawl` 支持 CSS 选择器与内容规则、`mainContentOnly`、页数/时长上限；作业状态带已抓页数与跳过原因。
 - **搜索 provider**：`ctx.web` 的 `web_search` 可由 Scrapling 的 Tavily/Bing 发现层接管（`searchBackend`），搜索结果可选择性渲染。
 - **浏览器与媒体工具**：`scrapling_session_read`、`scrapling_session_act`、`scrapling_download`、`scrapling_screenshot`；动作与下载有部署级门禁，截图经宿主 attachment 服务。
-- **`mcp` 模式（`integrationMode: mcp`）**：插件在宿主进程内起一个 streamable-http 的 MCP server，默认 `http://127.0.0.1:39217/mcp`（端口走部署项 `mcpPort`），端出与 native **同一份** `ToolDefinition` 表：19 个原始名去掉 `scrapling_answer`，再加 MCP 独有的 `search`。URL 闸门、会话、作业与 adaptive 存储全部复用，门禁一致（`allowBrowserActions=false` 就没有 `session_act`）。只绑回环，声明正文超过 1 MiB 判 `413`，非 `/mcp` 路径 `404`；token 只从环境变量 `DSH_SCRAPLING_MCP_TOKEN` 读，不写进 profile；截图以 MCP image content 交出而不是宿主附件。新增运行期依赖 `@modelcontextprotocol/sdk@1.32.2`，它只在真的起 server 时才动态载入，`native` 模式一行都不执行。
+- **`mcp` 模式（`integrationMode: mcp`）**：插件在宿主进程内起一个 streamable-http 的 MCP server，默认 `http://127.0.0.1:39217/mcp`（端口走部署项 `mcpPort`），端出与 native **同一份** `ToolDefinition` 表：19 个原始名去掉 `scrapling_answer`，再加 MCP 独有的 `search`。URL 闸门、会话、作业与 adaptive 存储全部复用，检查一致（`allowBrowserActions=false` 就没有 `session_act`）。只绑回环，声明正文超过 1 MiB 判 `413`，非 `/mcp` 路径 `404`；token 只从环境变量 `DSH_SCRAPLING_MCP_TOKEN` 读，不写进 profile；截图以 MCP image content 交出而不是宿主附件。新增运行期依赖 `@modelcontextprotocol/sdk@1.32.2`，它只在真的起 server 时才动态载入，`native` 模式一行都不执行。
 - **`setup --mode` 与 `doctor`**：`dsh-scrapling setup --mode native|mcp|official-mcp [--port N] [--with-auth] [--accept-risk] [--profile 目录] [--apply]` 产出 `dsh-mcp-client` 的条目文本；不带 `--apply` 只打印，带上就写到 `<dataDir>/mcp/<模式>.patch.yml` 并打出路径，profile 本体一个字都不改（宿主没有安全追加 `cordis.patch.yml` 的接口）。`dsh-scrapling doctor --mode <模式> --profile <目录> [--port N]` 读那份 profile 自己写下的 `cordis.patch.yml` 与 `package.json`，逐条点名：同一 `serverName` 两条例目、本插件条目与官方 `stdio` 条目并存、条目类型与模式不符、条目端口与 `--port` 不一致、客户端缺失或钉的不是 `0.2.1-rc.3`/`next`、`officialMcpEnabled` 关着却留着官方条目；一致退 0、有点名退 1、参数不对退 2。`official-mcp` 需要 profile 的开关与命令行的 `--accept-risk` 两处分别表态，缺任一处只打错误码不写文件；官方二进制尚未由 `mcp` 包提供时，它额外打一行说明这条条目起不来。
 - **运行时能力包安装器与 CLI**：`core` 装托管 Python 3.14.9 + Scrapling 0.5，`browser` 装完整 Chromium；`dsh-scrapling setup --status|--feature|--repair|--uninstall|--purge` 是唯一安装入口，设置卡显示包状态并可在有 remote/作业后端时发起安装、修复与取消。
 
@@ -179,8 +179,8 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 - **两道 URL 闸门不再一边宽一边严**：Python 侧此前在每条发出请求的路径上都接受 `ws:`/`wss:`（那只有 WebSocket 握手判定该认），也不看 URL 内嵌的凭据。现在请求侧只认 `http`/`https`，内嵌凭据一律判拒 —— Host 侧 `url-policy` 的这两条在 Python 侧同样成立。放行名单只豁免「地址必须公网」这一条，不豁免这两条。
 - **crawl 的第二、第三个 URL 现在过宿主闸门**：`SidecarClient.call` 原先只筛 `params.url`，模型给的 `sitemapUrl` / `feedUrl` 原样进 payload；现在三处都筛，归一过的写进同一份新的参数对象，判否即止、不再为后面的 URL 继续解析。
 - **浏览器参数越界不再被报成一次抓取失败**：上游把会话的这两个键收在 `RetriesCount`（1..10）与 `PagesCount`（1..50）里，越界值不在 Scrapling 的参数校验里被拒，而是在它的类型层炸成 `TypeError: Invalid argument type: Expected int <= 10 - at $.retries`，本包再把它归成一次失败。现在 `retries` 与 `maxPages` 在浏览器路径上先判，超限直接 `BAD_ARGS` 并点名上限；静态抓取那一侧的 `retries` 仍不设上限（上游那张表里它是裸 `Optional[int]`）。
-- **检索后端扩到六条**：新增 Brave（API）、Serper（API）、DuckDuckGo HTML 与 SearXNG（JSON API）四条发现路径，部署面新增 `braveApiKey` / `serperApiKey` / `searxngEndpoint` / `duckduckgoEndpoint`，`searchBackend` 的取值域随之扩大；每条后端只把自己那把 key 递给 sidecar（拼错后端名不会把 Tavily 的 key 递出去），选中却没配凭据的后端报 `SEARCH_AUTH` 而不是静默换后端。四条后端按各家文档的请求/响应形状实现，用本地 stub 验证形状与错误面（命中映射、401/429、无效 JSON、DDG 的 `uddg` 跳板解码、无结果带 note）；**真实端点与真实 key 未验证**。
-- **adaptive 指纹库可放 Redis**：新增 `py/redis_storage.py`（`StorageSystemMixin` 子类，按键 `<prefix>:<注册域>:<sha256(identifier)>` 落、值是该元素的 orjson 指纹；口令不进日志与错误文本），部署面新增 `adaptiveStorage`（`sqlite`/`redis`，默认 sqlite）与 `redisUrl`；`adaptive-redis` 能力包解除 blocked，`redis==8.1.0` 连同哈希钉进 `py/runtime-requirements.txt`。真机：本机 redis-server 上 save/retrieve 往返、经 sidecar 的 `select` 真的把指纹写进 Redis；连不上与缺客户端各有一条点名的 `ADAPTIVE_STORAGE_UNAVAILABLE`。
+- **检索后端扩到六条**：新增 Brave（API）、Serper（API）、DuckDuckGo HTML 与 SearXNG（JSON API）四条发现路径，部署新增 `braveApiKey` / `serperApiKey` / `searxngEndpoint` / `duckduckgoEndpoint`，`searchBackend` 的取值域随之扩大；每条后端只把自己那把 key 递给 sidecar（拼错后端名不会把 Tavily 的 key 递出去），选中却没配凭据的后端报 `SEARCH_AUTH` 而不是静默换后端。四条后端按各家文档的请求/响应形状实现，用本地 stub 验证形状态与错误（命中映射、401/429、无效 JSON、DDG 的 `uddg` 跳板解码、无结果带 note）；**真实端点与真实 key 未验证**。
+- **adaptive指纹库可放 Redis**：新增 `py/redis_storage.py`（`StorageSystemMixin` 子类，按键 `<prefix>:<注册域>:<sha256(identifier)>` 落、值是该元素的 orjson指纹；口令不进日志与错误文本），部署新增 `adaptiveStorage`（`sqlite`/`redis`，默认 sqlite）与 `redisUrl`；`adaptive-redis` 能力包解除 blocked，`redis==8.1.0` 连同哈希钉进 `py/runtime-requirements.txt`。真机：本机 redis-server 上 save/retrieve 往返、经 sidecar 的 `select` 真的把指纹写进 Redis；连不上与缺客户端各有一条点名的 `ADAPTIVE_STORAGE_UNAVAILABLE`。
 - **离线安装可用**：`setup --feature <包> --offline <目录> --apply` 全程不联网完成安装 —— 目录里放 Python 归档（名字同清单 URL 最后一段，解码与转义两种写法都认）与 `wheels/`（每条钉版一枚 wheel）。归档哈希照旧按清单校验，pip 带 `--no-index --find-links`；缺归档或缺 wheelhouse 报 `INSTALL_OFFLINE_ASSETS`，不再是一句「未验证」。真机：在代理指向死端口的进程里用 130 MB 资产包装出 core，venv 里 `scrapling` 与 `mcp` 可导入、`scrapling-mcp --help` 可跑。
 - **`mcp` 能力包上线**：安装器过去只装 `scrapling==0.5`，而官方 server 的依赖挂在 Scrapling 的 `ai` extra 上（`mcp>=2.0.0`），托管 venv 里因此没有可跑的 `scrapling-mcp`。现在把 `mcp==2.3.0` 及 22 个传递依赖连同哈希钉进 `py/runtime-requirements.txt`，`setup --feature mcp --apply` 走与 `core` 同一条安装/卸载路径。真机验证：CLI 装出的 venv 里 `scrapling-mcp --help` 可用、stdio `tools/list` 回 16 枚工具，宿主在 `integrationMode=official-mcp` 下按本插件生成的条目把 16 枚全部注册成 `mcp__scrapling__*`。
 - **venv 里的 console script 不再因为暂存目录改名而失效**：venv 建在 `runtime/.tmp/venv-<uuid>` 再整体 rename 到 `runtime/venv`，而 pip 把解释器绝对路径写进入口脚本的 shebang，于是 `scrapling-mcp` 一跑就是 `bad interpreter: .../.tmp/venv-…/bin/python3`（装 `mcp` 包时真机撞到）。安装后现在会把 `bin/` 下以暂存路径开头的 shebang 改到最终路径；判据是一条用假 pip 写出暂存 shebang 的单测。
@@ -201,20 +201,20 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 - **旧代 sidecar 的退出回调会拆掉新一代**：上一代进程延迟触发的 `error` / `done` 事件会把刚起来的进程收尾掉（表现为工具偶发 `SIDECAR_CLOSED`）。`#teardown` 增加第三参 `origin` 做代际判定，非当前句柄的事件记一行 `[sidecar] ignoring stale teardown` 后返回。
 - **搜索的公共回退默认被打开**（D10）：`searchPublicFallback` 现在默认 `false`，`auto` 在既没有 Tavily key、也没有 SearXNG 端点、又没开回退时抛 `SEARCH_BACKEND_MISSING`，不再擅自把查询词发给公共引擎；`available()` 同步把这个开关当作发现路径的输入。打开时只发 Bing（两级 DDG → Bing 链等 B4 真实端点验证后再接，见 spec §6.2）。
 - **adaptive 存储故障连正文一起失败**：指纹库写/读失败现在返回正文并附 `ADAPTIVE_STORAGE_FAILED: <异常类型>: <原因>` notice，与 spec §7.2 对齐；`extractionType=json` 的结果先剥 `data:` URI 再按 `maxContentChars` 截断（内嵌 base64 之前会把预算吃光）。
-- **`scrapling_locate` 参数面与 spec A14 对齐**：新增 `by`（`text`/`regex`/`similar`，与旧名 `queryType` 互认）与 `query`，两者都缺时报 `BAD_ARGS`；抓取 / 渲染 / 抽取 / 定位支持每次调用的 `timeoutSeconds` / `timeoutMs` / `maxContentChars`（仍受设置里的上限封顶）；`session_list` 透传 `alive` / `settings` / `poolStats`。
+- **`scrapling_locate` 参数表与 spec A14 对齐**：新增 `by`（`text`/`regex`/`similar`，与旧名 `queryType` 互认）与 `query`，两者都缺时报 `BAD_ARGS`；抓取 / 渲染 / 抽取 / 定位支持每次调用的 `timeoutSeconds` / `timeoutMs` / `maxContentChars`（仍受设置里的上限封顶）；`session_list` 透传 `alive` / `settings` / `poolStats`。
 - **`doctor` 不提示搜索接管**：现在按 spec §6.4 检查 `searchProvider`：未设时提示 `SEARCH_PROVIDER_NOT_CONFIGURED`；设成 `scrapling` 但 `auto` 没有任何发现路径（或显式后端缺凭据）时给 `SEARCH_BACKEND_MISSING` / `SEARCH_AUTH` 与修法；发现「指向 scrapling 但能力包未就绪 / 后端不可用」时计入退出码（`WEB_PROVIDER_CONFIGURED_UNAVAILABLE`）。
-- **测试基建：探针起不来时给的是裸 spawn 错误**：`test/probe.ts` 现在先做两道路径预检、再 `await once(child, "close")`，失败转成「探针起不来：<python>（<message>）」并带 `cause`；`test/probe.test.ts` 用假 python 路径钉住这条拒绝。`py/tests/test_bridge.py` 里那条超长 `# nosec` 注释按 bandit 要求拆行。
+- **测试基建：探测脚本起不来时给的是 spawn 自己的错误**：`test/probe.ts` 现在先做两道路径预检、再 `await once(child, "close")`，失败转成「探针起不来：<python>（<message>）」并带 `cause`；`test/probe.test.ts` 用假 python 路径钉住这条拒绝。`py/tests/test_bridge.py` 里那条超长 `# nosec` 注释按 bandit 要求拆行。
 - **能力报告缺 WebSocket 覆盖面**：两份 README 承诺「日志与能力报告都如实标出」，实际只有 `guard.install` 往 stderr 记的那一行 —— 握手时的 `capabilities` 里根本没有这一位，装载阶段的日志看不出这台机器到底拦不拦得住握手。现在报 `websocketGuard`（不启浏览器，按 Page 类上有没有 `route_web_socket` 判），`install` 与能力报告共用同一条判据。
 - **sidecar 收尾不停爬虫**：`bridge` 的两条关机路径只关会话，蜘蛛线程留给进程退出带走，而那段里它们还在往 stdout 推事件帧 —— 宿主已经不读这一路了。`close_all_crawls` 现在逐只叫停、按 `SHUTDOWN_JOIN_SECONDS` 有界等地等线程退出（等不到的记一行 stderr，不拖成假关机），并接进两条收尾路径的会话关闭之前。
 - **MCP 无鉴权警告指了一处不存在的设置**：警告写「Set `DSH_SCRAPLING_MCP_TOKEN` (or the mcpToken setting)」，而本包刻意没有 `mcpToken` 这一项 —— token 只从环境读、绝不进 profile。文案改成只说环境变量。
 
 ### Removed
 
-- **协议面下线 `extract`**：`scrapling_extract` 自始至终走 `select`，离线正文归一的 `extract` 方法没有任何调用方，留着等于给「已有 HTML → 正文」多开一条可以绕开清洗的入口。清洗只剩 `to_payload` 一条口（`scrapling_session_read` 走的就是它）：判据改钉在进程内的 `to_payload` 调用上，上游键名对照由 `contract_probe` 直接摆到同一处调用点，协议侧只钉「`extract` 回 `UNKNOWN_METHOD`」。
+- **协议下线 `extract`**：`scrapling_extract` 自始至终走 `select`，离线正文归一的 `extract` 方法没有任何调用方，留着等于给「已有 HTML → 正文」多开一条可以绕开清洗的入口。清洗只剩 `to_payload` 一条口（`scrapling_session_read` 走的就是它）：判据改钉在进程内的 `to_payload` 调用上，上游键名对照由 `contract_probe` 直接摆到同一处调用点，协议侧只钉「`extract` 回 `UNKNOWN_METHOD`」。
 
 ### Changed
 
-- **门禁与 Python 启动器改成跨平台**：`py` / `py:which` 从 `sh -c` 换成 `py-launcher.mjs`（POSIX 找 `_env/.venv/bin/python`，Windows 找 `_env/.venv/Scripts/python.exe`；都没有才落 PATH 上的 `python3` / `python`），`face:py` 从 `python -c` 移到 `face-py.mjs`，覆盖率链不再用 `DSH_PY_COVERAGE=1` 这种前缀式赋值与 `mkdir -p`。CI 矩阵因此加了一格 `windows-latest`（node 24）：验的是插件与门禁在 Windows 上跑得通，运行时能力包仍只在 macOS arm64 提供。
+- **检查与 Python 启动器改成跨平台**：`py` / `py:which` 从 `sh -c` 换成 `py-launcher.mjs`（POSIX 找 `_env/.venv/bin/python`，Windows 找 `_env/.venv/Scripts/python.exe`；都没有才落 PATH 上的 `python3` / `python`），`face:py` 从 `python -c` 移到 `face-py.mjs`，覆盖率链不再用 `DSH_PY_COVERAGE=1` 这种前缀式赋值与 `mkdir -p`。CI 矩阵因此加了一格 `windows-latest`（node 24）：验的是插件与检查在 Windows 上跑得通，运行时能力包仍只在 macOS arm64 提供。
 - **`pythonBin` 留空时的回落文案说清平台**：POSIX 上的回落名是 `python3`，Windows 上是 `python`（`resolveRuntime` 交给宿主的是 `python.exe`）；两份 README 与设置卡提示同步。
 
 ### Boundaries
@@ -225,14 +225,14 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 
 ## 0.1.2
 
-这一版收口协议边界、sidecar 生命周期与 Windows 路径/编码三类只在真实部署里才暴露的缺陷；工具面与设置项未增。
+这一版统一处理协议边界、sidecar 生命周期与 Windows 路径/编码三类只在真实部署里才暴露的缺陷；工具清单与设置项未增。
 
 ### Changed
 
-- **宿主线抬到 `0.2.1-rc.3`**：`engines.dsh`、peer/dev 依赖、overrides 与 README 徽标/正文同值；shared 下限随根真源投影。
+- **宿主线抬到 `0.2.1-rc.3`**：`engines.dsh`、peer/dev 依赖、overrides 与 README 徽标/正文同值；shared 下限随根唯一来源投影。
 - **构建脚本薄化**：host/client 构建统一走 shared 的 `lib/build-*`，产物仍落 `dist/`；CI/CodeQL/Scorecard/Dependabot 同步。
 - **`dataDir` 建不出来时按 `failFastOnMissingPython` 处置**：开着拒绝加载并点明路径，关着降级为不注册任何工具，不再留下「设置卡能开、工具全没有」的空壳。
-- **crawl 作业的同步异常落成拒绝**：`attachController` / `start` 在调用那一刻抛错时也走 `JOBS_UNAVAILABLE`，不再从 Promise 的声明缝里漏出裸宿主错误。
+- **crawl 作业的同步异常落成拒绝**：`attachController` / `start` 在调用那一刻抛错时也走 `JOBS_UNAVAILABLE`，不再从 Promise 的声明缝里漏出宿主原样的报错。
 
 ### Fixed
 
@@ -242,7 +242,7 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 - **帧错误分类与序列化**：新增 `frame-too-large`；`JSON.stringify` 返回 `undefined` 的值也判帧失败，不再写出字面量 `undefined`。
 - **输出预算非法时绕过截断**：`NaN`、0、负数与小数回落到 200000 字节并取整，不再把 `NaN` 传给 `TextRetainer`。
 - **错误文本可能是空串或 `[object Object]`**：`asText` 对空白串回退，对数字/布尔/bigint 取 `String`。
-- **属主线程停止后投递永久阻塞**：会话 worker 加 `_closed` 标记与 600 秒兜底，分别报 `NO_SUCH_SESSION` / `SESSION_CLOSED`。
+- **属主线程停止后转交永久阻塞**：会话 worker 加 `_closed` 标记与 600 秒兜底，分别报 `NO_SUCH_SESSION` / `SESSION_CLOSED`。
 - **构造中被关闭的浏览器会话跨线程 close 抛 greenlet 且被吞**：改在属主线程关闭后再停线程，墓碑与 `pop` 放在同一临界区，防会话复活。
 - **capture 的会话路径漏部署代理与 `block_webrtc`**：配了代理的机器上这条路径会直连、泄露真实出口 IP；现在补 proxy，走代理时强制 `block_webrtc`。
 - **Windows 管道按本地 ANSI 编码**：非 ASCII 帧编码失败会被 worker 吞掉、调用方只能等超时；stdout/stderr 强制 UTF-8。反斜杠 `bridgePath` 下 `py/` 目录解析失败，改用 `os.path.dirname`。
@@ -260,9 +260,9 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 
 ### Fixed
 
-- **默认 profile 下 crawl 作业必挂**：`dsh-jobs-local` 的 `servesOwner` 先看宿主平面有没有 controller，而 web profile 把宿主平面的 `tool-jobs` 显式 disabled。现在起作业时自挂 controller、`start()` 后立即 detach；只挂一瞬是刻意的，常驻会替全宿主打开那道闸门。
+- **默认 profile 下 crawl 作业必挂**：`dsh-jobs-local` 的 `servesOwner` 先看宿主那一层有没有 controller，而 web profile 把宿主那一层的 `tool-jobs` 显式 disabled。现在起作业时自挂 controller、`start()` 后立即 detach；只挂一瞬是刻意的，常驻会替全宿主打开那道闸门。
 - **`planTools` 增加 jobs 维度**：后端不可用时不注册 `scrapling_crawl`，其余工具照常，并给出可读的跳过原因。
-- **测试夹具不再让 `start` 无条件成功**：改为复刻真注册表的闸门，并用真 `LocalJobRegistry` 钉住「裸 start 被拒 / attach 后成功 / detach 后回到被拒」三态。
+- **夹具不再让 `start` 无条件成功**：改为复刻真注册表的闸门，并用真 `LocalJobRegistry` 钉住「不带凭据的 start 被拒 / attach 后成功 / detach 后回到被拒」三态。
 - **URL 准入闸门此前只被自身测试引用**：生产路径上无人构造策略对象，Host 侧 SSRF 防线实际未生效；现在 crawl/adapters 与输出环一并接上。
 
 ## 0.1.0
@@ -271,8 +271,8 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 
 - **跟上 Scrapling 0.5**：普通 Playwright 后端删除，浏览器抓取只剩 patchright；`scrapling_stealth_fetch` 并进 `scrapling_render`；`capture_xhr` 变成会话级记录，新增 `scrapling_session_network` 与 `scrapling_session_state_save` / `_load`；`extra_flags` 从「替换」改为「叠加」，本包一条都不发。
 - **爬虫礼仪改成部署级 knobs**：robots、delay、并发、autothrottle、strategy、checkpoint 目录；默认值沿用上游。
-- **宿主族依赖与 peer 升到 `0.2.1-rc.2`**，`engines.node >=22.12.0`；Python 门禁走八步链，解释器地板 3.14 同时落在两份 README、`pyproject.toml` 与 `bridge.py` 的运行时硬闸。
-- **结果行改用宿主官方 `ToolCallViewProps`**：此前手抄的 props 把 `phase` 放在 `block` 里，结果侧字段永远不渲染；现在按顶层 `phase` 与 `result` 分支的 `block.meta` 投影。
+- **宿主族依赖与 peer 升到 `0.2.1-rc.2`**，`engines.node >=22.12.0`；Python门禁走八步链，解释器下限 3.14 同时落在两份 README、`pyproject.toml` 与 `bridge.py` 的运行时硬闸。
+- **结果行改用宿主官方 `ToolCallViewProps`**：此前自己抄的 props 把 `phase` 放在 `block` 里，结果侧字段永远不渲染；现在按顶层 `phase` 与 `result` 分支的 `block.meta` 投影。
 - 补 `dsh-client-ui-tool` 与三枚 provider 作 devDependencies，修掉新检出里类型感知 lint 的 4 条 `no-unsafe-*`；清理注释里的文件行号引用。
 
 ### Fixed
@@ -286,7 +286,7 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 ### Changed
 
 - **契约测试改用上游判据**：新增 `py/tests/contract_probe.py`，把三套引擎换成记录器驱动 adapters 的真实路径，并用记录型字典问运行时「到底读了哪个键」；静态扫源码会把按表驱动的读法误判成没读。
-- **写方法默认关**：新增部署开关 `allowWriteMethods`（默认 false，只走 `cordis.patch.yml`）。关着时参数面里没有 `method` / `body`，Host 与 Python 两侧各判一次。
+- **写方法默认关**：新增部署开关 `allowWriteMethods`（默认 false，只走 `cordis.patch.yml`）。关着时参数表里没有 `method` / `body`，Host 与 Python 两侧各判一次。
 - **系统提示的降级路按装配 scope 现问 `ctx.tools.get`**：没装浏览器或 Python 起不来时，模型不再读到一串点了就报 `UNKNOWN_TOOL` 的建议。
 
 ### Fixed
@@ -303,14 +303,14 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 
 ### Added
 
-- 真站点端到端正例、真 `curl_cffi` 写方法往返、能力帧与注入面一致性门禁；两份构建与 Python 门禁全绿。
+- 真站点端到端正例、真 `curl_cffi` 写方法往返、能力帧与注入一致性门禁；两份构建与 Python门禁全绿。
 
 ## 0.0.2
 
 ### Fixed
 
 - **设置卡与结果行一起静默消失**：模块级 `inject` 只有 `["slots"]`，`apply` 却从同一个 ctx 读 `ctx.locale` 与 `ctx.configForms`；cordis 对没注入的名字抛错，异常落在 `ctx.effect` 体内只进 logger，后面的 `slots.register` 一次都没跑。现在清单交齐三枚服务，`apply` 平铺。
-- **卡片值面改成可订阅的 FormSource**：原先每帧读一次快照、不订阅宿主变化；现在走 `useSyncExternalStore`。
+- **卡片值改成可订阅的 FormSource**：原先每帧读一次快照、不订阅宿主变化；现在走 `useSyncExternalStore`。
 - **测试替身按声明的清单放行服务**：未注入的名字抛与宿主逐字相同的错，不再无条件交出整套服务。
 
 ## 0.0.1
@@ -319,7 +319,7 @@ Python 子命令判据；门禁脚本与发布链同步加固。
 
 - 会话专属执行线程：browser/stealth 的 open/fetch/close 固定在属主线程，消除 Playwright sync 的 greenlet 跨线程崩溃与 close 静默失败导致的浏览器泄漏。
 - WHATWG IPv4 精确解析替换字符形态正则：八进制/整数/十六进制写法照拦，真实域名不再误杀。
-- `adaptive` 自愈选择器落地 `scrapling_extract`，指纹库按 `dataDir` 落盘；`cssSelector` 在 html/text 路径生效。
+- `adaptive` 自愈选择器落地 `scrapling_extract`，指纹库按 `dataDir` 写到磁盘；`cssSelector` 在 html/text 路径生效。
 - sidecar 优雅关闭：dispose 发 shutdown 帧，bridge 关会话后退出。
 - 会话注册表原子化、爬虫总时长上限与 `crawl.stop`、XHR 摘要脱敏、协议严格校验、截断标记合并、构建原子写；依赖升到 dsh 0.2.1-alpha.2，Python 侧 ruff/mypy 门禁。
 - CI 的 Python 门禁在 hostedtoolcache 解释器上找不到 ruff；备检查工具一步把 `_env/.venv/bin` 写进 `GITHUB_PATH`。

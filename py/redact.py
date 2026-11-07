@@ -17,7 +17,7 @@ _QUERY_SECRET_FALLBACK = re.compile(
 _NON_AUTHORITY_SCHEMES = frozenset({"mailto", "tel", "data", "javascript", "urn", "about", "blob"})
 
 # 查询串里这些名字的参数装的是凭据而不是筛选条件。XHR 摘要与守卫日志都是要离开本进程的
-# 文本——摘要进会话上下文、进第三方 provider，日志进宿主日志面——而真实站点把 access
+# 文本——摘要进会话上下文、进第三方 provider，日志进宿主日志——而真实站点把 access
 # token、会话 id、签名都放在查询串里。抓到一条就等于把凭据抄进载体，而读者既用不上它、
 # 也拦不住它被复述出来。值的部分一律换成固定占位符：定位接口靠的是路径与参数名，不是那个
 # token。
@@ -126,7 +126,7 @@ def redact_url_secrets(raw: str) -> str:
         netloc = ""
     else:
         path = parsed.path
-        # rpartition 取最后一段：IPv6 字面量与端口都留在主机那一侧，只把用户信息摘掉。
+        # rpartition 取最后一段：IPv6 字面量与端口都留在主机名那一段，只把用户信息摘掉。
         netloc = parsed.netloc.rpartition("@")[2]
     query = _redacted_query(parsed.query)
     fragment = _redacted_fragment(parsed.fragment)

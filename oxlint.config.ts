@@ -61,7 +61,7 @@ export const OFF_REASONS = {
  * - 构建脚本：writeFileSync/mkdirSync/mkdtempSync 造产物与临时目录，renameSync 是原子写的
  *   最后一步（先写临时文件再改名），rmSync/unlinkSync 只清理上次中断留下的临时文件，
  *   chmodSync 给 venv 入口补可执行位。
- * - `test/**`：夹具造现场要落盘；同步写在这里没有并发问题，但也不许外溢到 lib/ 与 host.ts。
+ * - `test/**`：夹具造现场要写到磁盘；同步写在这里没有并发问题，但也不许外溢到 lib/ 与 host.ts。
  * - `lib/runtime.ts`：用 accessSync 判「venv 解释器还能不能跑」——插件装载期的一次性探测，
  *   不在热路径上，而基线的只读组不含这一枚。
  */

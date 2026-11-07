@@ -39,8 +39,8 @@ const REQUIRED = [
   "package/py/runtime-requirements.txt",
 ];
 
-/** 出货面禁止出现的路径片段。
- * `tests?` 而不是 `test`：Python 用例目录是 `py/tests/`，只匹配 `test/` 会把它当干净面放过。 */
+/** 出货内容禁止出现的路径片段。
+ * `tests?` 而不是 `test`：Python 用例目录是 `py/tests/`，只匹配 `test/` 会把它当干净状态放过。 */
 const FORBIDDEN = [/(?:^|\/)tests?\//u, /(?:^|\/)_env\//u, /site-packages/u, /chromium/iu];
 
 const repo = path.resolve(import.meta.dirname, "..");
@@ -76,7 +76,7 @@ async function run(command, args, options = {}) {
  * 主流程。
  */
 async function main() {
-  // 本探针的承诺面是「在本仓唯一支持的平台上证装出去能用」：托管包的判据按 darwin/arm64 走
+  // 本探承诺的范围是「在本仓唯一支持的平台上证装出去能用」：托管包的判据按 darwin/arm64 走
   // （lib/installer.ts），换了架构时后面那条 packs.core 断言会红成 missing 与 blocked 的差异，
   // 从回执里看不出是 runner 镜像换了。平台先判，红在第一行。
   assert.equal(
@@ -126,7 +126,7 @@ async function main() {
     // 上面那条前缀判据已经把它排除在名单之外（host.js 不 import 它）。
     // --legacy-peer-deps：peer 写的是支持窗口，dev 线的精确版落在窗口文本外——宿主自己
     // 按 engines.dsh 以 includePrerelease 单独判兼容、不比较 peer，npm 的严格 peer 解析
-    // 不认 includePrerelease，会把这组钉版当成冲突拒装；探针要验的是出货面可装可载，
+    // 不认 includePrerelease，会把这组钉版当成冲突拒装；探测脚本要验的是出货内容可装可载，
     // 不是 npm 的 peer 视图。
     const hostPeers = Object.keys(manifest.peerDependencies ?? {})
       .filter((name) => name.startsWith("@deepseek-ai/dsh-"))

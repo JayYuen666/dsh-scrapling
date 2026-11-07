@@ -54,7 +54,7 @@ export const NETWORK_ITEM = {
 /**
  * 读网络历史的那几个参数，按方法分档。
  *
- * 只有 capture 与 session.network 读它们；发给 render 或会话抓取等于递过去一个对面根本
+ * 只有 capture 与 session.network 读它们；发给 render 或会话抓取等于递过去另一侧的名字根本
  * 不读的键。
  *
  * @param method - sidecar 方法名
@@ -234,7 +234,7 @@ export const STATIC_REQUEST_PARAMS = {
  * 一次性静态抓取的「请求体」两枚：`form` / `json`。
  *
  * 与 `method`/`body` 同档 —— 它们表达的是**写意图**（没给 method 时隐含 POST），
- * 所以部署没开放写方法时不出现在 `scrapling_fetch` 的参数面上。static 会话的
+ * 所以部署没开放写方法时不出现在 `scrapling_fetch` 的参数表上。static 会话的
  * `session_fetch` 仍逐键取用（会话侧的写语义由它自己声明）。
  */
 export const WRITE_BODY_PARAMS = {
