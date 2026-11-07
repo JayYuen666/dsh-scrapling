@@ -48,7 +48,7 @@ jobs:
           # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
           persist-credentials: false
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}
       # 来自 fork 的 pull_request 里 GITHUB_TOKEN 一律是只读的，job 上声明的
@@ -61,6 +61,6 @@ jobs:
       # 「未扫描即绿」，合并前盲区原样留着。
       - name: Perform CodeQL Analysis
         continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
-        uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: /language:${{ matrix.language }}
