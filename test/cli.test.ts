@@ -162,6 +162,7 @@ interface Status {
   readonly profile: {
     readonly path: string | null;
     readonly pythonBin: string | null;
+    readonly dataDir: string | null;
     readonly note?: string;
   };
   readonly runtime: {
@@ -169,6 +170,9 @@ interface Status {
     readonly via: string;
     readonly version: string;
   };
+  readonly packs?: Partial<
+    Record<"core" | "browser" | "search" | "media" | "adaptive-redis" | "mcp", string>
+  >;
 }
 
 /**
@@ -267,11 +271,33 @@ describe("runCli", () => {
     expect(status.profile.path).toBe(profile);
     expect(status.profile.pythonBin).toBe(configured);
     expect(status.profile.note).toBeUndefined();
+    // patch 里没写 dataDir：状态仍按 CLI 自己的数据目录报，profile 段如实标 null。
+    expect(status.profile.dataDir).toBeNull();
+    expect(status.dataDir).toBe(dataDir);
     expect(status.runtime).toStrictEqual({
       pythonPath: configured,
       via: "configured",
       version: "unknown",
     });
+  });
+
+  it("--status --profile 读 patch 里的 dataDir，能力包状态跟着那份数据目录走", async () => {
+    // 宿主把运行时放在 profile 声明的 dataDir 下：status 报家目录那份包状态就等于
+    // 在回答「另一台部署装没装」。期望值独立写明：顶层 dataDir 取 patch 值，且
+    // 那个目录里手工布置好的 core 包被报成 ready。
+    const { deps, lines, dataDir } = harness();
+    const deployed = path.join(dataDir, "deployed-data");
+    readyCoreData(deployed);
+    const configured = path.join(dataDir, "venv", "bin", "python");
+    const profile = profileDir(
+      dataDir,
+      `- id: scrapling\n  name: "@jayyuen66/dsh-scrapling"\n  config:\n    pythonBin: ${configured}\n    dataDir: ${deployed}\n`,
+    );
+    await expect(runCli([SETUP, STATUS, PROFILE, profile], deps)).resolves.toBe(0);
+    const status = parseStatus(lines);
+    expect(status.dataDir).toBe(deployed);
+    expect(status.profile.dataDir).toBe(deployed);
+    expect(status.packs?.core).toBe("ready");
   });
 
   it("--status 的 profile 没写 pythonBin 时回落并说明", async () => {
@@ -283,6 +309,23 @@ describe("runCli", () => {
     expect(status.profile.pythonBin).toBeNull();
     expect(status.profile.note ?? "").toContain("没有 scrapling 的 pythonBin");
     expect(status.runtime.via).toBe("path");
+  });
+
+  it("--status 的 profile 只写 dataDir 不写 pythonBin 时，两段各自如实", async () => {
+    // 解释器回落 CLI 链与数据目录改报 profile 声明的那份，是两条独立的事实：
+    // 只有 pythonBin 缺席时的提示，不该把 dataDir 已声明这件事也吞掉。
+    const { deps, lines, dataDir } = harness();
+    const deployed = path.join(dataDir, "only-datadir");
+    const profile = profileDir(
+      dataDir,
+      `- id: scrapling\n  name: "@jayyuen66/dsh-scrapling"\n  config:\n    dataDir: ${deployed}\n`,
+    );
+    await expect(runCli([SETUP, STATUS, PROFILE, profile], deps)).resolves.toBe(0);
+    const status = parseStatus(lines);
+    expect(status.profile.pythonBin).toBeNull();
+    expect(status.profile.note ?? "").toContain("没有 scrapling 的 pythonBin");
+    expect(status.profile.dataDir).toBe(deployed);
+    expect(status.dataDir).toBe(deployed);
   });
 
   it("--status 跳过只写了键名的 pythonBin，取后面那条真值", async () => {

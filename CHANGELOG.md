@@ -6,6 +6,24 @@
 标准六类之外的小节（本仓的 `Boundaries` 收各版本的验证范围与能力边界，即哪些平台/档位真跑过、
 哪些只到本地夹具为止）。
 
+## 0.1.10
+
+真机验收（dsh 宿主 0.2.2-rc.1，标准/PTC/极简/创造四种 Agent 预设 × native/mcp/official-mcp 三种集成模式）发现的两处功能缺陷与两处排障缺口：登录态存取在目录缺失时的失败形态，与宿主侧 DNS 停摆时抓取全部挂到工具超时的形态。工具与设置界面不变。
+
+### Fixed
+
+- **登录态存取自动创建 `sessionStateDir` 目录**：部署配了 `sessionStateDir` 但目录不存在时，`scrapling_session_state_save` 此前以 `STATE_FAILED: state file does not exist` 失败——那是 Playwright `save_state` 不创建父目录、而 `FileNotFoundError` 被统一映射成给 load 路径写的「文件不存在」那句。现在 save 路径先按 `downloads/` 的同一待遇自建目录；目录在创建之后仍不可用（竞态、权限）时报 `state directory is not usable`，与 load 路径「文件还没存过」分开说。
+- **DNS 解析加超时**：宿主侧 URL 闸门对每个抓取目标做 DNS 解析，此前没有超时——系统解析器间歇停摆时（国内网络环境实测复现），并行的抓取会全部挂到宿主的工具超时（默认 120 秒）而看不出成因。现在单次解析 5 秒到点按 `resolve-failed` 拒绝，错误消息带超时说明，调用方可立刻重试；底层的 lookup 不可中止，到点后仍在后台跑完只是不再等它。
+
+### Changed
+
+- **设置卡的「保存被宿主拒绝」补上常见成因**：宿主的写接口只回布尔，卡片此前只显示「保存被宿主拒绝了」。补充的文案点名两类真实成因：条目配置被部署 patch 或命令行 overlay 压制（写下的值会在下次启动被覆盖回，宿主因此拒绝），或值没有通过 schema 校验。
+- **`setup --status --profile` 同时读条目里的 `dataDir`**：此前只读 `pythonBin`，`packs` 与 `state` 恒报 CLI 默认目录上的状态——非默认 dataDir 部署下「宿主装没装」会答错对象。现在这两项跟随 profile 声明的目录，条目未写 `dataDir` 时才回落默认。
+
+### Boundaries
+
+- README「已知边界」补两条实测：`maxPages` 只收敛收页数、发现层请求量由部署侧礼貌性旋钮控制（一次 `maxPages=3` 的爬取实测发出约 680 个请求）；重资源站点在浏览器支路可能等不到 `load` 事件（默认 30 秒页面超时），用 `waitSelector` 或 `disableResources` 缓解。
+
 ## 0.1.9
 
 修复 0.1.8 引入的 web 启动隐患：设置卡组件收回 `client.js` 内联，移除对 `@jayyuen66/dsh-plugin-shared/client` 的模块表外置与 `cordis.patch.yml` 里的 shared 供应行。工具与设置界面不变。

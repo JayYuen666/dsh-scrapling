@@ -39,12 +39,24 @@ export type UrlVerdict =
 /** DNS 解析器签名。注入它是为了让测试不碰真实网络。 */
 export type ResolveAddresses = (hostname: string) => Promise<readonly string[]>;
 
+/**
+ * DNS 解析的默认超时（毫秒）。
+ *
+ * 解析没有内建的超时：系统解析器间歇停摆时，`node:dns/promises` 的 lookup 会一直挂着，
+ * 而每个带 URL 的调用都要先过这一步 —— 不设上限的话，一次停摆就表现为「每个抓取都
+ * 挂到宿主的工具超时（默认 120s）」，从错误文本看不出成因在 DNS。到点按「解析失败」
+ * 处理，让调用方立刻拿到可重试的错误。
+ */
+const RESOLVE_TIMEOUT_MS = 5000;
+
 /** 策略参数。 */
 export interface UrlPolicyOptions {
   /** URL 最大字符数；与 dsh 内置 web_fetch 的 2048 对齐。 */
   readonly maxUrlLength: number;
   /** DNS 解析器；不传则用 `node:dns/promises` 的 lookup。 */
   readonly resolve?: ResolveAddresses;
+  /** 单次 DNS 解析的超时（毫秒）；到点按解析失败处理。 */
+  readonly resolveTimeoutMs?: number;
   /**
    * 额外的 NAT64 前缀（如运营商自建前缀）。默认只含两个标准化前缀；用自建前缀的
    * 网络必须把该前缀传进来，否则藏在里面的私网 IPv4 会被当成普通 IPv6 放行。
@@ -568,6 +580,35 @@ async function resolveWithNodeDns(hostname: string): Promise<readonly string[]> 
 }
 
 /**
+ * 给一个 Promise 加超时；到点以带说明的 Error 拒绝。
+ *
+ * 底层操作（getaddrinfo）不可中止：到点后它仍在后台跑完，这里只是不再等它。
+ * 计时器在两端都要清掉，否则成功路径会给事件循环留一枚空转的定时器。
+ * 限时拒绝这一类 deferred 用 `Promise.withResolvers` 落笔：除先把 reject 拿到手
+ * 没有别的写法，而 `new Promise` 的 executor 形态在本仓被 lint 关着。
+ *
+ * @param promise - 要等的那次操作
+ * @param timeoutMs - 超时毫秒数
+ * @param label - 超时消息开头的操作名
+ * @returns 带超时保护的同一个结果
+ */
+async function withTimeout<Value>(
+  promise: Promise<Value>,
+  timeoutMs: number,
+  label: string,
+): Promise<Value> {
+  const { promise: limit, reject } = Promise.withResolvers<never>();
+  const timer = setTimeout(() => {
+    reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  try {
+    return await Promise.race([promise, limit]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * 建一个 URL 策略。
  *
  * @param options - 策略参数
@@ -575,7 +616,13 @@ async function resolveWithNodeDns(hostname: string): Promise<readonly string[]> 
  */
 export function createUrlPolicy(options: UrlPolicyOptions): UrlPolicy {
   const { maxUrlLength } = options;
-  const resolve = options.resolve ?? resolveWithNodeDns;
+  const resolveTimeoutMs = options.resolveTimeoutMs ?? RESOLVE_TIMEOUT_MS;
+  const resolve: ResolveAddresses = (hostname) =>
+    withTimeout(
+      (options.resolve ?? resolveWithNodeDns)(hostname),
+      resolveTimeoutMs,
+      `DNS lookup for ${hostname}`,
+    );
   const table = buildNat64Table([...DEFAULT_NAT64_PREFIXES, ...(options.nat64Prefixes ?? [])]);
   const allowed = new Set((options.allowHosts ?? []).map((host) => host.trim().toLowerCase()));
   // 合成段的手动兜底；自动检测才是主路径，见 detectSyntheticResolver。

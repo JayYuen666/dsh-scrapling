@@ -285,6 +285,32 @@ describe("带 DNS 的整体判定", () => {
     expect(reasonOf(verdict)).toBe("resolve-failed");
   });
 
+  it("解析挂起时按超时拒绝，不等到调用方的工具超时", async () => {
+    // 系统解析器停摆时 lookup 永不返回：策略要在自己的超时点上给出 resolve-failed，
+    // 而不是让宿主侧的工具超时（默认 120s）来收场。期望值独立写明：原因码
+    // resolve-failed，消息里带着「timed out after 20ms」与本策略配置的超时值。
+    const policy = createUrlPolicy({
+      maxUrlLength: NAT64_MAX_URL_LENGTH,
+      resolve: () => Promise.withResolvers<readonly string[]>().promise,
+      resolveTimeoutMs: 20,
+    });
+    const verdict = await policy.verify(HOME_URL);
+    expect(reasonOf(verdict)).toBe("resolve-failed");
+    const detail = verdict.ok ? "(allowed)" : verdict.message;
+    expect(detail).toContain("timed out after 20ms");
+  });
+
+  it("解析器正常返回时超时包装不误伤", async () => {
+    // 成功臂也要走到：race 由解析结果先落定，计时器被清掉，判定照常放行。
+    const policy = createUrlPolicy({
+      maxUrlLength: NAT64_MAX_URL_LENGTH,
+      resolve: async (hostname) => (hostname === HOST ? [PUBLIC_V4] : []),
+      resolveTimeoutMs: 2000,
+    });
+    const verdict = await policy.verify(HOME_URL);
+    expect(verdict.ok).toBe(true);
+  });
+
   it("解析出空表按拒绝处理", async () => {
     const verdict = await policyWith({ "empty.test": [] }).verify("https://empty.test/");
     expect(reasonOf(verdict)).toBe("no-address");

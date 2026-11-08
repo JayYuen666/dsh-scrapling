@@ -673,7 +673,8 @@ const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = 
     statusClean: "没有未保存的改动",
     statusChanged: "已改动 {count} 项，未保存",
     statusInvalid: "有 {count} 项填得不合法，改好后才能保存",
-    rejected: "保存被宿主拒绝了，设置未改动",
+    rejected:
+      "保存被宿主拒绝了，设置未改动。常见原因：这一条目的配置被部署 patch 或命令行 overlay 压制（此时写下的值会在下次启动被覆盖回，宿主因此拒绝），或值没有通过 schema 校验。",
     stale: "设置已经被别处改过，请重新打开这张卡再保存",
     failed: "保存失败：{reason}",
     runtimeTitle: "运行环境",
@@ -711,7 +712,8 @@ const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = 
     statusClean: "No unsaved changes",
     statusChanged: "{count} change(s) not saved yet",
     statusInvalid: "{count} field(s) are not valid; fix them to save",
-    rejected: "The host refused the save; nothing changed",
+    rejected:
+      "The host refused the save; nothing changed. Common causes: this entry's config is overridden by a deployment patch or command-line overlay (the host refuses because anything written here would be reverted on the next boot), or the value failed schema validation.",
     stale: "Settings changed elsewhere; reopen this page before saving",
     failed: "Save failed: {reason}",
     runtimeTitle: "Runtime",

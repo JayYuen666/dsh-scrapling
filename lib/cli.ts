@@ -351,6 +351,7 @@ function patchFlag(text: string, key: string): boolean {
 interface StatusProfile {
   readonly path: string | null;
   readonly pythonBin: string | null;
+  readonly dataDir: string | null;
   readonly note?: string;
 }
 
@@ -362,44 +363,60 @@ const NO_PYTHON_BIN_NOTE =
   "profile 里没有 scrapling 的 pythonBin：runtime 回落到 CLI 自身的解析链（托管 runtime → 仓内 _env/.venv → PATH python3）";
 
 /**
- * `--status` 的解释器来源。
+ * `--status` 的解释器与数据目录来源。
  *
- * 宿主按 profile 里的 `pythonBin` 起 sidecar，CLI 不读 profile 时只能走自己的解析链——那会让
- * `--status` 报 `python3/path/unknown`，而部署实际用的是别的解释器。给了 `--profile` 就读
- * 那份 `cordis.patch.yml` 里的 `pythonBin`（与 doctor 读同一份文本、同一个 `patchScalar`），
- * 没给则在输出里明说没读，而不是假装那已经是宿主会用的解释器。
+ * 宿主按 profile 里的 `pythonBin` 起 sidecar、按同一份条目里的 `dataDir` 放运行时与
+ * 能力包；CLI 不读 profile 时只能走自己的链——那会让 `--status` 报 `python3/path`，
+ * 并把能力包状态报到默认数据目录上，而部署实际用的是别的解释器与目录。给了
+ * `--profile` 就读那份 `cordis.patch.yml` 里的 `pythonBin` 与 `dataDir`（与 doctor
+ * 读同一份文本、同一个 `patchScalar`）；没给则在输出里明说没读，而不是假装那已经是
+ * 宿主会用的解释器。
  *
  * @param flags - 本次命令行旗标
- * @returns 写进 JSON 的 profile 段，以及交给 `resolveRuntime` 的 `pythonBin`
+ * @returns 写进 JSON 的 profile 段、交给 `resolveRuntime` 的 `pythonBin`，
+ *   以及 profile 声明的 dataDir（未声明时为 undefined，调用方沿用默认）
  */
 async function statusProfile(
   flags: FlagMap,
-): Promise<{ profile: StatusProfile; pythonBin: string }> {
+): Promise<{ profile: StatusProfile; pythonBin: string; dataDirOverride?: string }> {
   const dir = stringFlag(flags, "profile");
   if (dir === undefined) {
-    return { profile: { path: null, pythonBin: null, note: NO_PROFILE_NOTE }, pythonBin: "" };
+    return {
+      profile: { path: null, pythonBin: null, dataDir: null, note: NO_PROFILE_NOTE },
+      pythonBin: "",
+    };
   }
   const snapshot = await readProfileSnapshot(dir);
   const pythonBin = patchScalar(snapshot.patchText, "pythonBin") ?? "";
+  const dataDir = patchScalar(snapshot.patchText, "dataDir") ?? "";
   return {
     profile:
       pythonBin === ""
-        ? { path: dir, pythonBin: null, note: NO_PYTHON_BIN_NOTE }
-        : { path: dir, pythonBin },
+        ? {
+            path: dir,
+            pythonBin: null,
+            dataDir: dataDir === "" ? null : dataDir,
+            note: NO_PYTHON_BIN_NOTE,
+          }
+        : { path: dir, pythonBin, dataDir: dataDir === "" ? null : dataDir },
     pythonBin,
+    ...(dataDir === "" ? {} : { dataDirOverride: dataDir }),
   };
 }
 
 async function showStatus(flags: FlagMap, deps: CliDeps): Promise<number> {
-  const { profile, pythonBin } = await statusProfile(flags);
+  const { profile, pythonBin, dataDirOverride } = await statusProfile(flags);
+  // 能力包与运行时状态跟着部署实际用的那份数据目录走：profile 声明了 dataDir 时，
+  // 状态报的就是那一份，而不是 CLI 默认目录上的（那会让「宿主装没装」答错对象）。
+  const dataDir = dataDirOverride ?? deps.dataDir;
   const runtime = resolveRuntime({
     pythonBin,
-    dataDir: deps.dataDir,
+    dataDir,
     repoRoot: deps.repoRoot,
   });
-  const state = await readRuntimeState(deps.dataDir);
-  const packs = await packStates(deps.dataDir);
-  deps.log(JSON.stringify({ dataDir: deps.dataDir, profile, runtime, packs, state }, null, 2));
+  const state = await readRuntimeState(dataDir);
+  const packs = await packStates(dataDir);
+  deps.log(JSON.stringify({ dataDir, profile, runtime, packs, state }, null, 2));
   return 0;
 }
 

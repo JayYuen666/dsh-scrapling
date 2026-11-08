@@ -108,7 +108,7 @@ dsh-scrapling setup --status
 - `search`、`media`、`mcp` 与 `adaptive-redis` 都以 `core` 的 venv 为载体：`mcp` 带来 `official-mcp` 模式要的官方 `scrapling-mcp` server（随钉住的 `mcp` 包进来；它的工具集由上游决定，不是本插件的能力），`adaptive-redis` 带来 `adaptiveStorage: redis` 背后的 `redis` 客户端。六个包都可安装；设置卡把每个包报成 `ready`、`missing`、`corrupt` 或 `installing`。
 - `--feature` 默认 dry-run；`--apply` 才写到磁盘。`--repair` 重装且不碰用户数据；`--uninstall <包> [--purge]` 删运行时文件，只有 `--purge` 才连 `elements_storage.db` 与 `downloads/` 一起删。
 - `--offline <目录>` 全程不联网：`<目录>` 里要有 Python 归档（文件名与清单 URL 的最后一段一致，浏览器与 `curl -O` 写到磁盘的 `cpython-3.14.9+…-install_only.tar.gz` 可用，百分号转义那种写法也认），以及一个 `wheels/` 目录（每条钉版一枚 wheel，可用 `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <目录>/wheels` 生成）。Python 归档的哈希校验与联网路径一致，pip 带 `--no-index`；缺归档或缺 wheelhouse 时报 `INSTALL_OFFLINE_ASSETS`，不会悄悄退回联网。
-- `setup --status` 打印一份 JSON：`dataDir`、`profile`、`runtime`、`packs` 与 `state`。带 `--profile <目录>` 时读该 profile 的 `cordis.patch.yml`，按本包条目里的 `pythonBin`（宿主真正在用的那个设置）解析解释器；不带时 `profile.path` 为 `null`，输出里有一句说明没读 profile，`runtime` 回落到 CLI 自己的链（托管 runtime → 仓内 `_env/.venv` → PATH `python3`）。要拿 `--status` 和设置卡上的解释器对照，就带上 `--profile`。
+- `setup --status` 打印一份 JSON：`dataDir`、`profile`、`runtime`、`packs` 与 `state`。带 `--profile <目录>` 时读该 profile 的 `cordis.patch.yml`，按本包条目里的 `pythonBin` 与 `dataDir`（宿主真正在用的那两个设置）解析解释器，`packs` 与 `state` 也改报那份目录——条目里没写 `dataDir` 时这两项回落 CLI 自己的默认目录；不带 `--profile` 时 `profile.path` 为 `null`，输出里有一句说明没读 profile，`runtime` 回落到 CLI 自己的链（托管 runtime → 仓内 `_env/.venv` → PATH `python3`）。要拿 `--status` 和设置卡上的解释器对照，就带上 `--profile`。
 - profile 同时有远程读取接口与作业后端时，设置卡能经 `scraplingRuntime` 发起同一套安装/修复/取消；否则显示可照抄的 CLI 命令。
 - `integrationMode` 只在部署配置里；`setup --mode` 负责打印或写出两种 MCP 接法的客户端条目，`doctor` 用来核对一份 profile —— 见 [MCP 模式](#mcp-模式)。`official-mcp` 起的是托管 venv 里的 `scrapling-mcp`，由 `mcp` 能力包装进去（`setup --feature mcp --apply`）。
 - 只验证了 **macOS arm64**。Windows、Linux 与 macOS x64 是 blocked（B1/B2）：所有包都报 `blocked`，安装器直接拒绝，不猜资产路径。
@@ -126,7 +126,7 @@ dsh-scrapling setup --status
 - **它不是搜索引擎。** 检索由 Python sidecar 走六条后端之一（`searchBackend`：`auto` / `tavily` / `bing` / `brave` / `serper` / `duckduckgo` / `searxng`）；Scrapling 自己的 `google_search` 选项只是加一个 Google referer 头。每条后端都要自己的配置（`tavilyApiKey`、`braveApiKey`、`serperApiKey`、`searxngEndpoint`）—— 选中却没配的后端报 `SEARCH_AUTH`，不会静默换到别的后端。
 - **npm tarball 里没有解释器与浏览器。** 它们来自你的机器，或来自可选的 CLI 安装器 —— 后者把已验证的 macOS arm64 资产装进 `dataDir/runtime`；装载时缺什么就少注册什么，不会临时去下载。
 - **它不在宿主侧新增 HTTP 路由。** 设置卡是宿主的配置表单，本包没有自己的 `/api` 面。唯一真会 listen 的是 `integrationMode: mcp` 下那个 MCP server，只绑 `127.0.0.1`（`http://127.0.0.1:<mcpPort>/mcp`）：非 `/mcp` 路径回 404，声明超过 1 MiB 的正文回 413、不带 `Content-Length` 的回 411，Bearer token 只从环境变量 `DSH_SCRAPLING_MCP_TOKEN` 读，没设时启动会往 stderr 打一条「无鉴权、本机任意进程可调」的告知。
-- **它不加 dsh 子命令。** 本包自己的 `dsh-scrapling` CLI 管运行时能力包，另外管 MCP 接法的两件事：`setup --mode native|mcp|official-mcp` 生成客户端条目、带 `--apply` 时写到 `<dataDir>/mcp/<模式>.patch.yml`（profile 本体一个字不改），`doctor --mode` 拿那份条目与 profile 的 `cordis.patch.yml` 逐条核对。`setup --status` 给了 `--profile` 时读的也是那份文件里的 `pythonBin`。
+- **它不加 dsh 子命令。** 本包自己的 `dsh-scrapling` CLI 管运行时能力包，另外管 MCP 接法的两件事：`setup --mode native|mcp|official-mcp` 生成客户端条目、带 `--apply` 时写到 `<dataDir>/mcp/<模式>.patch.yml`（profile 本体一个字不改），`doctor --mode` 拿那份条目与 profile 的 `cordis.patch.yml` 逐条核对。`setup --status` 给了 `--profile` 时读的也是那份文件里的 `pythonBin` 与 `dataDir`。
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
@@ -390,6 +390,8 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 - **运行时能力包只在 macOS arm64 上验证过。** Windows、Linux 与 macOS x64 的所有包都报 `blocked`；安装器直接拒绝，不猜资产路径（B1/B2）。
 - **`adaptive-redis` 包是客户端，不是存储引擎。** 上游只发 `SQLiteStorageSystem`；这里的 Redis 后端是本插件的 `py/redis_storage.py`，一个按注册域分桶的 `StorageSystemMixin` 子类。启用它改变的是指纹存哪儿，属于部署决定而不是逐次开关。本插件自己的 MCP server 是另一件事 —— 它跑在宿主进程内，不需要能力包。
 - **Shopify 爬虫模式走店铺的 JSON 接口。** `mode=shopify` 用店铺的 `/collections.json` 与每个集合的 `/products.json`（上游的 `ShopifySpider`），按变体出行 —— `name`（商品名 + 变体名，`Default Title` 不拼）、`price`、`sku`、`stock`（有货为 `null`、缺货为 `0`）、`identifier`、`brand`、`category`、`image_url`、`url`、`barcode`、`old_price`、`description`。它不抓商品 HTML，URL 闸门、robots、间隔与并发与其他爬虫模式同一批旋钮。已在本地测试数据店上验证；真实 Shopify 店铺未跑过（B11）。
+- **`maxPages` 收敛的是收进结果的页数，不是爬虫发出的请求量。** 链接发现层会继续请求队列里的页面（实测一次 `maxPages=3` 的爬取发出了约 680 个请求，收页 3）。对目标站点的礼貌性由部署侧旋钮控制：`crawlRespectRobots`、`crawlDownloadDelayMs`、`crawlConcurrentRequests`、`crawlAutothrottle`。
+- **重资源站点在浏览器支路上可能等不到 `load` 事件。** 默认页面超时 30 秒内一直有资源在途时，`scrapling_session_fetch` / `scrapling_render` 以抓取失败收场，而同一 URL的静态抓取正常。缓解：`waitSelector`（等到关键元素出现）或 `disableResources`（拦截图片与字体），两者都是模型可按次传的参数。
 - **`official-mcp` 只生成配置。** `integrationMode=official-mcp` 不注册原生工具、也不起本插件的 server；`setup --mode official-mcp --accept-risk` 交回官方 server 的 `dsh-mcp-client` 条目，而它指向的那枚二进制由 `mcp` 能力包提供（B10 就是这条条目背后那次风险确认）。
 
 ## <img src="https://api.iconify.design/lucide/circle-help.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 常见问题

@@ -2179,6 +2179,12 @@ def _session_state(args: dict[str, Any], *, saving: bool) -> dict[str, Any]:
     if entry["type"] == "static":
         raise AdapterError("BAD_ARGS", "static sessions have no browser state")
     target = _state_path(args)
+    if saving:
+        # Playwright 的 save_state 不创建父目录：目录缺失时抛 FileNotFoundError，落进下面的
+        # 映射会被说成「文件不存在」。downloads/ 由 media.download 自建，登录态目录在这里
+        # 补齐同一待遇；建不出来（权限、父级是文件等）让它以原始异常类型进 STATE_FAILED，
+        # 文案里分得清是目录这一层的问题。
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
     worker: _SessionWorker | None = entry["worker"]
     if worker is None:  # pragma: no cover —— 浏览器条目必有属主线程
         raise AdapterError("NO_SUCH_SESSION", "session has no owner thread")
@@ -2193,6 +2199,10 @@ def _session_state(args: dict[str, Any], *, saving: bool) -> dict[str, Any]:
         else:
             worker.run(lambda: session.load_state(target))
     except FileNotFoundError as error:
+        if saving:
+            # save 路径的 FileNotFoundError 只能是目录在 mkdir 之后又不可用（竞态、权限）：
+            # 与 load 的「文件还没存过」是两件事，采取的行动不同，不能共用一句文案。
+            raise AdapterError("STATE_FAILED", f"state directory is not usable: {Path(target).parent}") from error
         # 上游的原文里带着**宿主绝对路径**（「[Errno 2] No such file or directory:
         # '/Users/…/login.json'」）：那是部署的信息，对模型既没用又是泄露。点名
         # 那个模型自己给的文件名就够了。

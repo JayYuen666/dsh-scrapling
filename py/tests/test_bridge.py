@@ -7098,6 +7098,53 @@ def run_inprocess_capabilities() -> None:
             sys.modules["patchright.sync_api"] = saved_sync_api
 
 
+def run_state_dir_recovery(tmp: str, default_session: object) -> None:
+    """state save 的目录自愈：嵌套目录自动创建，目录仍不可用时点名目录这一层。
+
+    :param tmp: 本段的临时目录（sessionStateDir 的既有值）
+    :param default_session: 用完要装回会话槽的默认替身（run_inprocess_sessions 的内层类）
+    """
+    import adapters
+
+    # save 路径要自动建目录：sessionStateDir 指向的子树不存在时，保存应当成功而不是
+    # 以「文件不存在」收场（下载目录 downloads/ 的既有待遇）。期望值独立写明：
+    # 返回 saved=True，且落点真的是 <嵌套目录>/login.json 这个文件。
+    nested_dir = Path(tmp) / "nested" / "deep"
+    nested_save = adapters.session_state_save(
+        {
+            "sessionId": "cov-stealth",
+            "name": "login",
+            "deployment": {"sessionStateDir": str(nested_dir)},
+        }
+    )
+    check(
+        "state_save 自动创建缺失的目录",
+        nested_save["saved"] is True and (nested_dir / "login.json").is_file(),
+        repr(nested_save),
+    )
+
+    class _MissingDirSession:
+        """save_state 抛 FileNotFoundError 的替身：目录在 mkdir 之后仍不可用的一态。"""
+
+        def save_state(self, target: str) -> None:
+            """模拟上游在目录缺失时抛的那一类错。"""
+            raise FileNotFoundError(2, "No such file or directory", target)
+
+    adapters._SESSIONS["cov-stealth"]["session"] = _MissingDirSession()
+    try:
+        adapters.session_state_save(
+            {"sessionId": "cov-stealth", "name": "login", "deployment": {"sessionStateDir": tmp}}
+        )
+        check("save 路径的 FileNotFoundError 点名目录", False, "放行")
+    except adapters.AdapterError as error:
+        check(
+            "save 路径的 FileNotFoundError 点名目录",
+            error.code == "STATE_FAILED" and "state directory is not usable" in str(error),
+            str(error),
+        )
+    adapters._SESSIONS["cov-stealth"]["session"] = default_session
+
+
 def run_inprocess_sessions() -> None:
     """进程内：会话注册表、network 与 state 的全部错误/成功分支。"""
     sys.path.insert(0, str(PY_DIR))
@@ -7393,6 +7440,8 @@ def run_inprocess_sessions() -> None:
             {"sessionId": "cov-stealth", "name": "login", "deployment": {"sessionStateDir": tmp}}
         )
         check("session_state_load 的 saved 为假", load["saved"] is False, repr(load))
+
+        run_state_dir_recovery(tmp, _FetchableSession())
         try:
             adapters._session_state(
                 {"sessionId": "cov-static", "name": "x", "deployment": {"sessionStateDir": tmp}}, saving=True
