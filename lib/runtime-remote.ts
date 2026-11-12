@@ -10,8 +10,9 @@
 
 import type { Context } from "@deepseek-ai/cordis";
 import type { JobId, JobOutcome, JobOutputRead, JobRegistry, JobSpec } from "@deepseek-ai/dsh-jobs";
-import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
+import { TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import { markRemote } from "@jayyuen66/dsh-plugin-shared/lib/remote-marker";
 import { packStates } from "./installer.ts";
 import type { installCapabilityPack, InstallerIO } from "./installer.ts";
 import { resolveRuntime } from "./runtime.ts";
@@ -300,25 +301,6 @@ export class ScraplingRuntimeService extends TypertRemoteService {
     }
     return { ok: true, jobId: String(tracked.id) };
   }
-}
-
-/**
- * 标准装饰器的程序化调用：源码不引装饰器语法，构建与测试解析器就不必挂降级流水线。
- * 与 `dsh-zvec-grep/lib/rebuild-remote.ts` 的 `markRemote` 同形。
- */
-function markRemote(prototype: ScraplingRuntimeService, methodName: string): void {
-  const context = {
-    kind: "method",
-    name: methodName,
-    static: false,
-    private: false,
-    addInitializer: (initializer: (this: unknown) => void): void => {
-      Reflect.apply(initializer, Object.create(prototype), []);
-    },
-  };
-  // oxlint-disable-next-line eslint/new-cap -- Remote(…) 是装饰器工厂，不是大写开头的构造调用
-  const decorate = Remote(methodName);
-  Reflect.apply(decorate, undefined, [Reflect.get(prototype, methodName), context]);
 }
 
 markRemote(ScraplingRuntimeService.prototype, "status");

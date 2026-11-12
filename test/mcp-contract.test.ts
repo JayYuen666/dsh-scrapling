@@ -28,15 +28,15 @@ describe("mcpUrl", () => {
 
 describe("客户端钉版", () => {
   // 期望值逐字写死，不从 MCP_DEFAULT_CLIENT_PIN 派生：常量本身改坏时这一条必须红。
-  const DEV_LINE = "0.2.2-rc.1";
-  const RELEASED_LINES: readonly string[] = [DEV_LINE, "0.2.2-alpha.3", "0.2.1-rc.5"];
+  const DEV_LINE = "0.2.2-rc.2";
+  const RELEASED_LINES: readonly string[] = [DEV_LINE, "0.2.2-rc.1"];
 
   it("默认命令钉开发线同版", () => {
     expect(clientInstallCommand()).toContain(`@deepseek-ai/dsh-mcp-client@${DEV_LINE}`);
     expect(MCP_DEFAULT_CLIENT_PIN).toBe(DEV_LINE);
   });
 
-  it("窗口内每条宿主线的同线版本都放行", () => {
+  it("窗口内每个宿主预发布的同版都放行", () => {
     for (const pin of RELEASED_LINES) {
       expect(clientInstallCommand(pin as never)).toContain(`@deepseek-ai/dsh-mcp-client@${pin}`);
     }
@@ -48,7 +48,7 @@ describe("客户端钉版", () => {
 
   it("白名单之外的钉版在运行期也拒绝（JS 调用者没有联合类型保护）", () => {
     expect(MCP_CLIENT_PINS).toStrictEqual([...RELEASED_LINES, "next"]);
-    for (const bad of ["latest", "0.2.2-alpha.2", `^${DEV_LINE}`]) {
+    for (const bad of ["latest", "0.2.2-alpha.2", "0.2.2-alpha.3", "0.2.1-rc.5", `^${DEV_LINE}`]) {
       expect(() => clientInstallCommand(bad as never)).toThrow(/unsupported MCP client pin/u);
     }
   });

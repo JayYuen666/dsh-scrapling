@@ -22,7 +22,7 @@
 
 它们改的是本插件怎么接进宿主，不是某次会话该怎么走，而且都要重启才生效。最可能遇到的是这几项：
 
-- `integrationMode` — `native` 把工具注册进宿主；`mcp` 改为把同一份工具表交给 MCP；`official-mcp` 两者都不做，只引入上游 server 那一项。三档互斥，且只在装配时读一次，切换必须重启。
+- `integrationMode` — `native` 把工具注册进宿主；`mcp` 改为把同一份工具表交给 MCP；`official-mcp` 两者都不做：宿主有 `mcpManager` 时动态注册上游 server，没有时只引入上游 server 的 `dsh-mcp-client` 条目。三档互斥，且只在装配时读一次，切换必须重启。
 - `mcpPort`（默认 39217）要与 profile 里 MCP 客户端条目的 URL 同值。这两条命令都不读 `mcpPort`，要自己带上：`setup --mode mcp --port <mcpPort>` 与 `doctor --mode mcp --port <mcpPort>`。不带 `--port` 时，setup 按默认的 39217 生成，doctor 也没有期望端口可比——profile 停在别的端口上照样一声不响地过。
 - `officialMcpEnabled`（默认关）需要这一档加上 `setup` 的 `--accept-risk` 同一次表态才生成条目，因为上游 server 暴露的动作不归本插件的守卫看。
 - `allowWriteMethods`（默认关）——读网页是这插件的本职，改对端状态不是，所以这一档属于部署表态。

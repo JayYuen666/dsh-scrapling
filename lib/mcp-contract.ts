@@ -27,27 +27,25 @@ export const MCP_TOKEN_ENV = "DSH_SCRAPLING_MCP_TOKEN";
 export const MCP_CLIENT_PACKAGE = "@deepseek-ai/dsh-mcp-client";
 
 /**
- * 与宿主同线的那一版：安装命令与官方条目都钉它。
+ * 与宿主同版的那一支：安装命令与官方条目都钉它。
  *
- * npm 的 `latest` 比宿主线还旧（`0.0.1-rc.1`），宿主对字面 peer 不匹配的对端是**拒绝装载**——
- * 装得上、永不生效，所以这里不写 `latest`，也不写范围。
+ * npm 的 `latest` 比宿主线还旧（`0.0.1-rc.1`），而客户端对宿主各包的 peer 是**逐字同版**——
+ * 版本差一个预发布就装得上、永不生效，所以这里不写 `latest`，也不写范围。
+ *
+ * 默认值跟开发基线走：`0.2.2-rc.2`。宿主窗口 `^0.2.2-rc.1` 覆盖 rc.1 与 rc.2 两个预发布，
+ * 停在前者的宿主必须装 `0.2.2-rc.1`（见放行名单）。
  */
-export const MCP_DEFAULT_CLIENT_PIN = "0.2.2-rc.1";
+export const MCP_DEFAULT_CLIENT_PIN = "0.2.2-rc.2";
 
-/** 客户端允许的钉法：本包宿主窗口覆盖到的每条宿主线各自的同线版本，或 npm 的 `next` 标签。
+/** 客户端允许的钉法：本包宿主窗口覆盖到的每个宿主预发布的同版客户端，或 npm 的 `next` 标签。
  *
- *  本包的宿主窗口是 `^0.2.1-rc.5 || ^0.2.2-alpha.3`，窗口内的每条线都要有各自的同线客户端，
- *  否则宿主按字面版本拒绝装载。默认取开发线 rc.1；还在 alpha.3 或 rc.5 上的部署逐字钉自己那一版。
+ *  本包的宿主窗口是 `^0.2.2-rc.1`，窗口内已发布的 rc.1 / rc.2 各要一份同版客户端；
+ *  宿主按字面 peer 拒绝装载不匹配的客户端，所以两份都放行，默认取开发基线 rc.2。
  *
  *  `next` 是刻意的例外：它随 npm dist-tag 漂移，可能偏离宿主线而让条目「装得上、
  *  永不生效」。放行它是为了跟踪官方 server 的 beta 线；对稳定性优先的部署应使用默认
  *  的字面版本，doctor 也会在发现不匹配时点名。 */
-const MCP_CLIENT_PIN_VALUES = [
-  MCP_DEFAULT_CLIENT_PIN,
-  "0.2.2-alpha.3",
-  "0.2.1-rc.5",
-  "next",
-] as const;
+const MCP_CLIENT_PIN_VALUES = [MCP_DEFAULT_CLIENT_PIN, "0.2.2-rc.1", "next"] as const;
 export type McpClientPin = (typeof MCP_CLIENT_PIN_VALUES)[number];
 export const MCP_CLIENT_PINS: readonly string[] = MCP_CLIENT_PIN_VALUES;
 

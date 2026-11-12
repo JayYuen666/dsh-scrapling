@@ -6,6 +6,18 @@
 标准六类之外的小节（本仓的 `Boundaries` 收各版本的验证范围与能力边界，即哪些平台/档位真跑过、
 哪些只到本地夹具为止）。
 
+## 0.1.11
+
+Scrapling 钉版抬到 `0.5.1`；MCP 接入支持宿主 mcpManager 动态注册；宿主开发基线抬到 `0.2.2-rc.2`，支持窗口收到 `^0.2.2-rc.1`。
+
+### Changed
+
+- **Scrapling 钉版抬到 `0.5.1`**：`py/runtime-requirements.txt` 的 scrapling 由 `0.5` 抬到 `0.5.1`（wheel 哈希重算，传递依赖地板已满足）；契约探针与 sidecar 端到端在 0.5.1 上取证通过（调用面零违规、零静默丢弃）。`bridge.py` 的版本闸 `>=0.5,<0.6` 不变。
+- **MCP 动态注册**：`mcp` 模式起好自有 HTTP server 后、`official-mcp` 模式启用时，探测宿主 `ctx.get("mcpManager")` 并动态注册（streamable-http / stdio），注册项随插件生命周期撤除；取不到 mcpManager（CLI/headless 无此服务）或注册失败（重名等）时回退既有接入方式（手配 dsh-mcp-client / setup 产 patch）。`MCP_SERVER_VERSION` 同步到包版本。
+- **宿主开发基线抬到 `0.2.2-rc.2`**：`devDependencies` 整组 `@deepseek-ai/dsh-*` 抬到 `0.2.2-rc.2`；rc.2 新增的 `@deepseek-ai/dsh-error` 作为 devDependency 直接钉到 `0.2.2-rc.2` —— 它是 `dsh-llm` / `dsh-jobs` / `dsh-subprocess` 的字面 peer，本仓 `autoInstallPeers: false`，不显式声明就装不进来，`dsh-llm` 的 `HarnessError` 类型会解析失败。
+- **MCP 客户端默认钉版抬到 `0.2.2-rc.2`**：`@deepseek-ai/dsh-mcp-client` 对宿主各包的 peer 是逐字同版，rc.2 宿主上装 rc.1 客户端会被宿主按 peer 不匹配拒绝装载；`setup` 打印的安装命令与 `official-mcp` 的安装提示随开发基线走到 rc.2。放行名单同时保留 `0.2.2-rc.1`（窗口内仍停在 rc.1 的宿主）与 `next`，`doctor` 三档都认。
+- **支持窗口收到 `^0.2.2-rc.1`**：`engines.dsh` 与 `@deepseek-ai/dsh*` peer 由 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 改为 `^0.2.2-rc.1`（单条 0.2.2 线）；`@deepseek-ai/schemastery` peer 由 `^3.18.5 || ^3.18.6-alpha.1` 收到 `^3.19.0`。devDependencies 仍精确钉版。
+
 ## 0.1.10
 
 真机验收（dsh 宿主 0.2.2-rc.1，标准/PTC/极简/创造四种 Agent 预设 × native/mcp/official-mcp 三种集成模式）发现的两处功能缺陷与两处排障缺口：登录态存取在目录缺失时的失败形态，与宿主侧 DNS 停摆时抓取全部挂到工具超时的形态。工具与设置界面不变。

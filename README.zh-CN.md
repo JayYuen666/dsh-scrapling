@@ -12,7 +12,7 @@
   <a href="https://github.com/JayYuen666/dsh-scrapling/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-scrapling/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.5-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.1-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -31,23 +31,27 @@
 
 ## <img src="https://api.iconify.design/lucide/file-text.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 目录
 
-- [它做什么](#它做什么)
-- [安装](#安装)
+- [ 目录](#-目录)
+- [ 它做什么](#-它做什么)
+- [ 安装](#-安装)
+  - [ shared 的版本下限](#-shared-的版本下限)
 - [运行时能力包（macOS arm64）](#运行时能力包macos-arm64)
-- [确认它真的在工作](#确认它真的在工作)
-- [它不提供什么](#它不提供什么)
-- [在 dsh 里启用](#在-dsh-里启用)
-- [工具一览](#工具一览)
-- [替代内置的抓取与搜索](#替代内置的抓取与搜索)
-- [MCP 模式](#mcp-模式)
-- [设置项](#设置项)
-- [代理](#代理)
-- [安全说明](#安全说明)
-- [数据与隐私](#数据与隐私)
-- [已知边界](#已知边界)
-- [常见问题](#常见问题)
-- [开发](#开发)
-- [许可证](#许可证)
+- [ 确认它真的在工作](#-确认它真的在工作)
+- [ 它不提供什么](#-它不提供什么)
+- [ 在 dsh 里启用](#-在-dsh-里启用)
+- [ 工具一览](#-工具一览)
+  - [渲染还是静态](#渲染还是静态)
+- [ 替代内置的抓取与搜索](#-替代内置的抓取与搜索)
+- [ MCP 模式](#-mcp-模式)
+  - [ `setup --mode` 与 `doctor`](#-setup---mode-与-doctor)
+- [ 设置项](#-设置项)
+- [ 代理](#-代理)
+- [ 安全说明](#-安全说明)
+- [ 数据与隐私](#-数据与隐私)
+- [ 已知边界](#-已知边界)
+- [ 常见问题](#-常见问题)
+- [ 开发](#-开发)
+- [ 许可证](#-许可证)
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它做什么
 
@@ -76,7 +80,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`。包在公共 npm registry 上，安装不需要凭据，也不需要 scoped-registry 配置行。
 
 - **需要 Node.js `>= 24.9`。** 本包是 ESM-only，且构建入口（`build-client.ts`、`build-host.ts`、`build-cli.ts`）由 `node` 直接执行，所以下限必须落在 TypeScript 类型剥离默认开启的那批版本上（Node 22.18 起）。数字本身取自宿主：`0.2.2` 系列宿主声明 Node `>= 24.9.0`，低于它的宿主根本起不来。
-- **需要宿主 `dsh` 处在 `0.2.1-rc.5` 或 `0.2.2-alpha.3` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.1-rc.5 || ^0.2.2-alpha.3`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
+- **需要宿主 `dsh` 处在 `0.2.2-rc.1` 或更新的 `0.2.2` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.2-rc.1`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
 - **需要 Python 3.14+ 且装好 Scrapling** —— 由 `pythonBin` 指定，或按 `lib/runtime.ts` 的固定链找到：`dataDir/runtime` 下的托管 runtime → 仓内 `_env/.venv` → `PATH`。装出去的包里没有 `_env/.venv` 这一档，所以跑过 `setup --feature core --apply` 的机器用的是那支托管解释器，没装过就是你 `PATH` 上的 `python3`（Windows 上是 `python`）；选中哪一支会在装载时写进日志，缺 Scrapling 时报错里带着可直接照抄的安装命令。
 
 ```sh
@@ -110,7 +114,7 @@ dsh-scrapling setup --status
 - `--offline <目录>` 全程不联网：`<目录>` 里要有 Python 归档（文件名与清单 URL 的最后一段一致，浏览器与 `curl -O` 写到磁盘的 `cpython-3.14.9+…-install_only.tar.gz` 可用，百分号转义那种写法也认），以及一个 `wheels/` 目录（每条钉版一枚 wheel，可用 `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <目录>/wheels` 生成）。Python 归档的哈希校验与联网路径一致，pip 带 `--no-index`；缺归档或缺 wheelhouse 时报 `INSTALL_OFFLINE_ASSETS`，不会悄悄退回联网。
 - `setup --status` 打印一份 JSON：`dataDir`、`profile`、`runtime`、`packs` 与 `state`。带 `--profile <目录>` 时读该 profile 的 `cordis.patch.yml`，按本包条目里的 `pythonBin` 与 `dataDir`（宿主真正在用的那两个设置）解析解释器，`packs` 与 `state` 也改报那份目录——条目里没写 `dataDir` 时这两项回落 CLI 自己的默认目录；不带 `--profile` 时 `profile.path` 为 `null`，输出里有一句说明没读 profile，`runtime` 回落到 CLI 自己的链（托管 runtime → 仓内 `_env/.venv` → PATH `python3`）。要拿 `--status` 和设置卡上的解释器对照，就带上 `--profile`。
 - profile 同时有远程读取接口与作业后端时，设置卡能经 `scraplingRuntime` 发起同一套安装/修复/取消；否则显示可照抄的 CLI 命令。
-- `integrationMode` 只在部署配置里；`setup --mode` 负责打印或写出两种 MCP 接法的客户端条目，`doctor` 用来核对一份 profile —— 见 [MCP 模式](#mcp-模式)。`official-mcp` 起的是托管 venv 里的 `scrapling-mcp`，由 `mcp` 能力包装进去（`setup --feature mcp --apply`）。
+- `integrationMode` 只在部署配置里；宿主有 `mcpManager`（rc.2 的 web 组合包）时，MCP server 在装载时自动动态注册；`setup --mode` 负责为没有该服务的 CLI/headless profile 打印或写出客户端条目，`doctor` 用来核对一份 profile —— 见 [MCP 模式](#mcp-模式)。`official-mcp` 起的是托管 venv 里的 `scrapling-mcp`，由 `mcp` 能力包装进去（`setup --feature mcp --apply`）。
 - 只验证了 **macOS arm64**。Windows、Linux 与 macOS x64 是 blocked（B1/B2）：所有包都报 `blocked`，安装器直接拒绝，不猜资产路径。
 
 ## <img src="https://api.iconify.design/lucide/circle-check.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 确认它真的在工作
@@ -126,7 +130,7 @@ dsh-scrapling setup --status
 - **它不是搜索引擎。** 检索由 Python sidecar 走六条后端之一（`searchBackend`：`auto` / `tavily` / `bing` / `brave` / `serper` / `duckduckgo` / `searxng`）；Scrapling 自己的 `google_search` 选项只是加一个 Google referer 头。每条后端都要自己的配置（`tavilyApiKey`、`braveApiKey`、`serperApiKey`、`searxngEndpoint`）—— 选中却没配的后端报 `SEARCH_AUTH`，不会静默换到别的后端。
 - **npm tarball 里没有解释器与浏览器。** 它们来自你的机器，或来自可选的 CLI 安装器 —— 后者把已验证的 macOS arm64 资产装进 `dataDir/runtime`；装载时缺什么就少注册什么，不会临时去下载。
 - **它不在宿主侧新增 HTTP 路由。** 设置卡是宿主的配置表单，本包没有自己的 `/api` 面。唯一真会 listen 的是 `integrationMode: mcp` 下那个 MCP server，只绑 `127.0.0.1`（`http://127.0.0.1:<mcpPort>/mcp`）：非 `/mcp` 路径回 404，声明超过 1 MiB 的正文回 413、不带 `Content-Length` 的回 411，Bearer token 只从环境变量 `DSH_SCRAPLING_MCP_TOKEN` 读，没设时启动会往 stderr 打一条「无鉴权、本机任意进程可调」的告知。
-- **它不加 dsh 子命令。** 本包自己的 `dsh-scrapling` CLI 管运行时能力包，另外管 MCP 接法的两件事：`setup --mode native|mcp|official-mcp` 生成客户端条目、带 `--apply` 时写到 `<dataDir>/mcp/<模式>.patch.yml`（profile 本体一个字不改），`doctor --mode` 拿那份条目与 profile 的 `cordis.patch.yml` 逐条核对。`setup --status` 给了 `--profile` 时读的也是那份文件里的 `pythonBin` 与 `dataDir`。
+- **它不加 dsh 子命令。** 本包自己的 `dsh-scrapling` CLI 管运行时能力包，另外管没有 `mcpManager` 的 profile 上那半套手工 MCP 接法：`setup --mode native|mcp|official-mcp` 生成客户端条目、带 `--apply` 时写到 `<dataDir>/mcp/<模式>.patch.yml`（profile 本体一个字不改），`doctor --mode` 拿那份条目与 profile 的 `cordis.patch.yml` 逐条核对。`setup --status` 给了 `--profile` 时读的也是那份文件里的 `pythonBin` 与 `dataDir`。
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
@@ -195,7 +199,7 @@ dsh-scrapling setup --status
 |---|---|
 | `native`（默认） | 上面列出的 `scrapling_*` 工具 |
 | `mcp` | 不注册原生工具；把同一份工具表端成 MCP server |
-| `official-mcp` | 既不注册原生工具，也不起本插件的 server；`setup` 只生成官方 `scrapling-mcp` 的 `dsh-mcp-client` 条目 —— 它跑在自己的进程与会话里，**不经本插件的 URL 闸门** |
+| `official-mcp` | 既不注册原生工具，也不起本插件的 server；宿主有 `mcpManager` 时它动态注册官方 `scrapling-mcp`，没有时由 `setup` 生成官方 `scrapling-mcp` 的 `dsh-mcp-client` 条目 —— 它跑在自己的进程与会话里，**不经本插件的 URL 闸门** |
 
 `mcp` 模式的 server 跑在插件自己的宿主进程里，调的还是同一个 sidecar，所以 URL 闸门、会话、作业与 adaptive 存储都是原生工具那一份 —— 不存在第二套实现可以漂移。
 
@@ -227,12 +231,12 @@ dsh-scrapling setup --status
 | `scrapling_screenshot` | `screenshot` |
 | —（只在 `ctx.web`） | `search` |
 
-要接进 dsh 需要 `@deepseek-ai/dsh-mcp-client`，本插件刻意不依赖它。装与当期宿主同一条线的版本 —— npm 的 `latest` 比宿主还旧，宿主对不匹配的对端是直接拒绝：
+宿主有 `mcpManager` 服务时（rc.2 的 web/桌面组合包），插件在装载时把自己的 server 注册进去：不用装 `dsh-mcp-client`，也不用往 profile 加条目，只有 `mcpPort` 决定端点。下面的手工条目是给没有该服务的 CLI/headless profile 用的。升级上来的 profile 若还留着那条手工条目，切到动态注册时请把它删掉 —— 否则 manager 会因重名拒绝动态注册，实际仍由旧条目提供服务。
+
+要接进 dsh 需要 `@deepseek-ai/dsh-mcp-client`，本插件刻意不依赖它。装与宿主**逐版**相同的那一支 —— npm 的 `latest` 比宿主还旧，而客户端对宿主各包的 peer 是逐字同版，差一个预发布就会「装得上、永不生效」。默认是 `0.2.2-rc.2`；仍停在 rc.1 的宿主装 `0.2.2-rc.1`，`next` 跟官方 beta 线：
 
 ```bash
-dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.2-rc.1
-# 宿主在 0.2.2-alpha.3 线时改用 @deepseek-ai/dsh-mcp-client@0.2.2-alpha.3
-# 宿主在 0.2.1-rc.5 线时改用 @deepseek-ai/dsh-mcp-client@0.2.1-rc.5
+dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.2-rc.2
 ```
 
 再往那个 profile 的 `cordis.patch.yml` 加一条（没配 token 就不写 `headers`）：
@@ -265,9 +269,9 @@ dsh-scrapling setup --mode native --apply     # 写出的文件里一条条目�
 dsh-scrapling doctor --mode mcp --profile <profileDir>
 ```
 
-`doctor` 读的是 profile 自己写下的东西 —— `cordis.patch.yml` 加那份 `package.json` —— 每处问题打一行：`serverName: scrapling` 下有两条例目、本插件的条目与官方 `stdio` 那条并存、条目类型与模式不符、条目的端口与 `--port` 说的不一致、profile 里没有 `@deepseek-ai/dsh-mcp-client` 或它钉的不是 `0.2.2-rc.1` / `0.2.2-alpha.3` / `0.2.1-rc.5` / `next`、以及 `officialMcpEnabled` 关着却留着官方条目。退 `0` 是一致，`1` 是至少点出一处，`2` 是参数不对。`integrationMode` 本身是插件设置，CLI 读不到，所以 `--mode` 就是被核对的那一句声明，它必须和部署配置说的是同一件事。
+`doctor` 读的是 profile 自己写下的东西 —— `cordis.patch.yml` 加那份 `package.json` —— 每处问题打一行：`serverName: scrapling` 下有两条例目、本插件的条目与官方 `stdio` 那条并存、条目类型与模式不符、条目的端口与 `--port` 说的不一致、profile 里没有 `@deepseek-ai/dsh-mcp-client` 或它钉的不是 `0.2.2-rc.2` / `0.2.2-rc.1` / `next`、以及 `officialMcpEnabled` 关着却留着官方条目。退 `0` 是一致，`1` 是至少点出一处，`2` 是参数不对。`integrationMode` 本身是插件设置，CLI 读不到，所以 `--mode` 就是被核对的那一句声明，它必须和部署配置说的是同一件事。
 
-`official-mcp` 要两处分开表态才会产出：profile 里的 `officialMcpEnabled: true`，以及命令行的 `--accept-risk`；缺任何一处只打 `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED`，一个字节都不写。它生成的条目起的是 `<dataDir>/runtime/venv/bin/scrapling-mcp`，所以要先跑 `setup --feature mcp --apply` —— 见[运行时能力包](#运行时能力包macos-arm64)。那枚二进制不存在时，`setup` 会额外打一行说明这条条目现在起不来。
+`setup` 生成 `official-mcp` 条目要两处分开表态：profile 里的 `officialMcpEnabled: true`，以及命令行的 `--accept-risk`；缺任何一处只打 `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED`，一个字节都不写。装载时的宿主侧路径只由 `officialMcpEnabled` 决定：有 `mcpManager` 的宿主直接动态注册托管的 `scrapling-mcp`，`setup` 生成的 `dsh-mcp-client` 条目则留给没有该服务的 CLI/headless profile。两条路径起的都是 `<dataDir>/runtime/venv/bin/scrapling-mcp`，所以要先跑 `setup --feature mcp --apply` —— 见[运行时能力包](#运行时能力包macos-arm64)。那枚二进制不存在时，`setup` 会额外打一行说明这条条目现在起不来。
 
 ## <img src="https://api.iconify.design/lucide/sliders-horizontal.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 设置项
 
@@ -392,7 +396,7 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 - **Shopify 爬虫模式走店铺的 JSON 接口。** `mode=shopify` 用店铺的 `/collections.json` 与每个集合的 `/products.json`（上游的 `ShopifySpider`），按变体出行 —— `name`（商品名 + 变体名，`Default Title` 不拼）、`price`、`sku`、`stock`（有货为 `null`、缺货为 `0`）、`identifier`、`brand`、`category`、`image_url`、`url`、`barcode`、`old_price`、`description`。它不抓商品 HTML，URL 闸门、robots、间隔与并发与其他爬虫模式同一批旋钮。已在本地测试数据店上验证；真实 Shopify 店铺未跑过（B11）。
 - **`maxPages` 收敛的是收进结果的页数，不是爬虫发出的请求量。** 链接发现层会继续请求队列里的页面（实测一次 `maxPages=3` 的爬取发出了约 680 个请求，收页 3）。对目标站点的礼貌性由部署侧旋钮控制：`crawlRespectRobots`、`crawlDownloadDelayMs`、`crawlConcurrentRequests`、`crawlAutothrottle`。
 - **重资源站点在浏览器支路上可能等不到 `load` 事件。** 默认页面超时 30 秒内一直有资源在途时，`scrapling_session_fetch` / `scrapling_render` 以抓取失败收场，而同一 URL的静态抓取正常。缓解：`waitSelector`（等到关键元素出现）或 `disableResources`（拦截图片与字体），两者都是模型可按次传的参数。
-- **`official-mcp` 只生成配置。** `integrationMode=official-mcp` 不注册原生工具、也不起本插件的 server；`setup --mode official-mcp --accept-risk` 交回官方 server 的 `dsh-mcp-client` 条目，而它指向的那枚二进制由 `mcp` 能力包提供（B10 就是这条条目背后那次风险确认）。
+- **`official-mcp` 接的是上游 server。** `integrationMode=official-mcp` 不注册原生工具、也不起本插件的 server；宿主有 `mcpManager`（rc.2 的 web 组合包）时动态注册托管的 `scrapling-mcp`，没有该服务（CLI/headless）时改由 `setup --mode official-mcp --accept-risk` 交回 `dsh-mcp-client` 条目。那枚二进制由 `mcp` 能力包提供（B10 就是这条条目背后那次风险确认）。
 
 ## <img src="https://api.iconify.design/lucide/circle-help.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 常见问题
 

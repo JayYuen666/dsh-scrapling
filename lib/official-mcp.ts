@@ -175,6 +175,6 @@ export function officialMcpPlan(options: OfficialMcpOptions): OfficialMcpPlan {
  */
 export function officialMcpHint(enabled: boolean): string {
   return enabled
-    ? `生成接入配置请跑 setup：dsh-scrapling setup --mode official-mcp --accept-risk。${RISK}`
-    : "official-mcp 未启用：先在部署配置里设 officialMcpEnabled=true，再跑 setup --mode official-mcp --accept-risk。";
+    ? `宿主没有 mcpManager（CLI/headless）或动态注册失败时，用 setup 生成手工接入配置：dsh-scrapling setup --mode official-mcp --accept-risk。${RISK}`
+    : "official-mcp 未启用：先在部署配置里设 officialMcpEnabled=true；宿主没有 mcpManager 时再跑 setup --mode official-mcp --accept-risk。";
 }

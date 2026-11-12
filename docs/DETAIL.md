@@ -22,7 +22,7 @@ Fifty card values grouped by purpose; most are read per call, so a change applie
 
 They change how the plugin is wired, not what a session decides, and each takes effect only on restart. The ones you are most likely to meet:
 
-- `integrationMode` — `native` registers the tools with the host; `mcp` serves the same tool table over MCP instead; `official-mcp` does neither and only carries the upstream server's entry. The three are mutually exclusive and are read once at assembly, so switching means restarting.
+- `integrationMode` — `native` registers the tools with the host; `mcp` serves the same tool table over MCP instead; `official-mcp` does neither: on a host exposing `mcpManager` it registers the upstream server dynamically, and otherwise it only carries the upstream server's `dsh-mcp-client` entry. The three are mutually exclusive and are read once at assembly, so switching means restarting.
 - `mcpPort` (default 39217) must equal the URL in the profile's MCP-client entry. Neither command reads `mcpPort`, so pass it yourself: `setup --mode mcp --port <mcpPort>` and `doctor --mode mcp --port <mcpPort>`. Without `--port`, setup writes the default 39217 and doctor has no expected port to compare against — a profile left on another port then passes silently.
 - `officialMcpEnabled` (off) needs both this switch and the `setup` `--accept-risk` flag before any entry is generated, because the upstream server exposes actions this plugin's guard does not see.
 - `allowWriteMethods` (off) — reading pages is this plugin's job; changing remote state is not, so that is a deployment statement.

@@ -44,6 +44,11 @@ export const OFF_REASONS = {
     measured: 2,
     note: "lib/sidecar.ts 的两个回调位：`pumpFrames` 的错误回调，与 `child.done.then(…)` 的 rejection 臂。让本条满足就得把进程退出清理改成 await，而那正是上一条实测否证掉的写法 —— 同一行上两条规则各要一个答案。",
   },
+  "promise/prefer-catch": {
+    kind: "实测有害",
+    measured: 8,
+    note: "8 处两臂 `then` 的第二臂都**只**接 Promise 自身的拒绝：lib/sidecar.ts 两处要按 done 的落定形态选收尾文案，改成 `.then(f).catch(r)` 会把 f 自己的拒绝也算成 spawn 失败并再收一次尾；六个用例的第一臂故意 `throw`，让「本该拒绝却兑现」当场判红，`.catch` 会把这处判红吞成通过。规则建议的写法在这里不是等价改写。",
+  },
   "unicorn/prefer-spread": {
     kind: "与已启用规则互斥",
     measured: 1,
@@ -149,9 +154,26 @@ export const EXTRA_OVERRIDES = [
       // 同两处的回调位（pumpFrames 的错误回调与 child.done.then 的第二臂）：让本条满足
       // 就得改成 await，而那正是上一条否证掉的写法。
       "promise/prefer-await-to-callbacks": "off",
+      // 两臂 then 的第二臂只接 done 自身的拒绝；`.then(f).catch(r)` 会把 f 的拒绝
+      // 也算成 spawn 失败并二次收尾。理由与实测条数见 OFF_REASONS。
+      "promise/prefer-catch": "off",
       // 与 unicorn/no-useless-spread 直接互斥：Map/Set 的 values() 展开会被那条规则
       // 判成 no-useless-spread，改用 Array.from 又会被本条判成 prefer-spread。
       "unicorn/prefer-spread": "off",
+    },
+  },
+  {
+    // 这些用例用两臂 then 把「兑现」写成 `throw`（断言失败），只让拒绝臂接
+    // Promise 自身的拒绝；`.then(f).catch(r)` 会把断言失败吞进拒绝臂。理由与
+    // 实测条数见 OFF_REASONS。
+    files: [
+      "test/mcp-server.test.ts",
+      "test/host.test.ts",
+      "test/tools.test.ts",
+      "test/sidecar.test.ts",
+    ],
+    rules: {
+      "promise/prefer-catch": "off",
     },
   },
 ] satisfies NonNullable<PluginLintOptions["extraOverrides"]>;

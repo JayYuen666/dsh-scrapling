@@ -2307,6 +2307,7 @@ function surfaceHarness(): {
     effect: (factory: () => Disposer): void => {
       disposers.push(factory());
     },
+    get: (): undefined => undefined,
     logger: {
       info: (line: string): void => {
         logs.push(line);
@@ -2403,6 +2404,60 @@ async function tearDown(harness: ReturnType<typeof surfaceHarness>): Promise<voi
 }
 
 describe("mcp 模式的装配", () => {
+  it("mcpManager 可用时把自有 server 动态注册为 streamable-http", async () => {
+    const harness = surfaceHarness();
+    const calls: { name: string; entry: Record<string, unknown> }[] = [];
+    (harness.ctx as { get: (name: string) => unknown }).get = (serviceName) =>
+      serviceName === "mcpManager"
+        ? {
+            register: (serverName: string, entry: Record<string, unknown>) => {
+              calls.push({ name: serverName, entry });
+              return () => {
+                /* 撤除由 ctx.effect 管，测试不单独断言 */
+              };
+            },
+          }
+        : undefined;
+    await startMcpSurface({
+      ctx: harness.ctx as never,
+      config: makeConfig({ mcpPort: 0 }),
+      plan: MCP_PLAN,
+      depsFor: STUB_DEPS,
+      search: LIVE_SEARCH as never,
+      env: {},
+    });
+    expect(calls).toHaveLength(1);
+    const [call] = calls;
+    expect(call?.name).toBe("scrapling");
+    expect(call?.entry["transport"]).toBe("streamable-http");
+    expect(String(call?.entry["url"])).toContain("127.0.0.1");
+    expect(harness.logs.join("\n")).toContain("已动态注册到宿主 mcpManager");
+  });
+
+  it("mcpManager 注册抛错时回退既有接入并告警", async () => {
+    const harness = surfaceHarness();
+    (harness.ctx as { get: (name: string) => unknown }).get = (serviceName) =>
+      serviceName === "mcpManager"
+        ? {
+            register: (): (() => void) => {
+              throw new Error("server already registered");
+            },
+          }
+        : undefined;
+    await startMcpSurface({
+      ctx: harness.ctx as never,
+      config: makeConfig({ mcpPort: 0 }),
+      plan: MCP_PLAN,
+      depsFor: STUB_DEPS,
+      search: LIVE_SEARCH as never,
+      env: {},
+    });
+    const log = harness.logs.join("\n");
+    expect(log).toContain("MCP 动态注册失败，回退既有接入");
+    expect(log).toContain("需手配 dsh-mcp-client 接入");
+    await tearDown(harness);
+  });
+
   it("apply 在 mcp 模式下不注册原生工具，只起 server", async () => {
     const harness = degradedHarness();
     await apply(
@@ -2435,6 +2490,34 @@ describe("mcp 模式的装配", () => {
     // 指路要指到能动手的那一句：没开开关时要点名 officialMcpEnabled 与 --accept-risk。
     expect(joined).toContain("officialMcpEnabled");
     expect(joined).toContain("--accept-risk");
+    await Promise.all(harness.disposers.map((dispose) => dispose()));
+  });
+
+  it("official-mcp 模式且开关打开时把官方 server 动态注册到宿主", async () => {
+    const harness = degradedHarness();
+    const calls: { name: string; entry: Record<string, unknown> }[] = [];
+    (harness.ctx as { get: (name: string) => unknown }).get = (serviceName) =>
+      serviceName === "mcpManager"
+        ? {
+            register: (serverName: string, entry: Record<string, unknown>) => {
+              calls.push({ name: serverName, entry });
+              return (): void => undefined;
+            },
+          }
+        : undefined;
+    await apply(
+      harness.ctx,
+      makeConfig({
+        pythonBin: "",
+        failFastOnMissingPython: false,
+        integrationMode: "official-mcp",
+        officialMcpEnabled: true,
+      }),
+    );
+    expect(harness.names).toStrictEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.entry["transport"]).toBe("stdio");
+    expect(harness.infos.join("\n")).toContain("官方 scrapling-mcp 已动态注册");
     await Promise.all(harness.disposers.map((dispose) => dispose()));
   });
 

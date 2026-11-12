@@ -12,7 +12,7 @@
   <a href="https://github.com/JayYuen666/dsh-scrapling/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-scrapling/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.5-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.1-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -31,23 +31,27 @@
 
 ## <img src="https://api.iconify.design/lucide/file-text.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Contents
 
-- [What it does](#what-it-does)
-- [Install](#install)
+- [ Contents](#-contents)
+- [ What it does](#-what-it-does)
+- [ Install](#-install)
+  - [ Shared version floor](#-shared-version-floor)
 - [Runtime packs (macOS arm64)](#runtime-packs-macos-arm64)
-- [Verify it is live](#verify-it-is-live)
-- [What it does not provide](#what-it-does-not-provide)
-- [Enabling it in dsh](#enabling-it-in-dsh)
-- [The tools](#the-tools)
-- [Replacing the built-in fetch and search](#replacing-the-built-in-fetch-and-search)
-- [MCP mode](#mcp-mode)
-- [Settings](#settings)
-- [Proxies](#proxies)
-- [Security](#security)
-- [Data and privacy](#data-and-privacy)
-- [Known boundaries](#known-boundaries)
-- [FAQ](#faq)
-- [Development](#development)
-- [License](#license)
+- [ Verify it is live](#-verify-it-is-live)
+- [ What it does not provide](#-what-it-does-not-provide)
+- [ Enabling it in dsh](#-enabling-it-in-dsh)
+- [ The tools](#-the-tools)
+  - [Render or static](#render-or-static)
+- [ Replacing the built-in fetch and search](#-replacing-the-built-in-fetch-and-search)
+- [ MCP mode](#-mcp-mode)
+  - [ `setup --mode` and `doctor`](#-setup---mode-and-doctor)
+- [ Settings](#-settings)
+- [ Proxies](#-proxies)
+- [ Security](#-security)
+- [ Data and privacy](#-data-and-privacy)
+- [ Known boundaries](#-known-boundaries)
+- [ FAQ](#-faq)
+- [ Development](#-development)
+- [ License](#-license)
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> What it does
 
@@ -76,7 +80,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 Remove with `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`. The package is on the public npm registry, so installation needs no credentials and no scoped-registry line.
 
 - **Requires Node.js `>= 24.9`.** This is an ESM-only package, and the build entry points (`build-client.ts`, `build-host.ts`, `build-cli.ts`) are executed by `node` directly, so the floor has to sit where TypeScript type stripping is on by default (Node 22.18 up). The number itself is the host floor: `0.2.2` hosts declare Node `>= 24.9.0`, and a host below it never starts.
-- **Requires host `dsh` at the `0.2.1-rc.5` or `0.2.2-alpha.3` line.** The requirement the host actually reads is `engines.dsh` (`^0.2.1-rc.5 || ^0.2.2-alpha.3`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against every released host version inside the window at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
+- **Requires host `dsh` at the `0.2.2-rc.1` line or later.** The requirement the host actually reads is `engines.dsh` (`^0.2.2-rc.1`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against every released host version inside the window at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
 - **Requires Python 3.14+ with Scrapling installed** — named by `pythonBin`, or found by the fixed chain in `lib/runtime.ts` (managed runtime under `dataDir/runtime`, then the repository's `_env/.venv`, then `PATH`). In an installed package the `_env/.venv` leg does not exist, so after `setup --feature core --apply` the interpreter is that managed Python and otherwise the `python3` on your `PATH` (`python` on Windows); whichever one is chosen is logged at load time, and a missing Scrapling reports an error carrying the install line to copy.
 
 ```sh
@@ -110,7 +114,7 @@ dsh-scrapling setup --status
 - `--offline <dir>` installs with no network at all: `<dir>` must hold the Python archive named exactly as the manifest URL's last segment (browser and `curl -O` both keep `cpython-3.14.9+…-install_only.tar.gz`, and the percent-encoded spelling is accepted too) plus a `wheels/` directory with one wheel per pinned requirement - `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <dir>/wheels` produces it. The hash check on the Python archive is the same one the networked path runs, and pip is invoked with `--no-index`; a missing archive or wheelhouse fails as `INSTALL_OFFLINE_ASSETS` instead of silently going online.
 - `setup --status` prints one JSON document: `dataDir`, `profile`, `runtime`, `packs` and `state`. With `--profile <dir>` it reads that profile's `cordis.patch.yml`, resolves the interpreter from this package's `pythonBin` and the data directory from `dataDir` (the two settings the host actually uses); `packs` and `state` are then reported for that directory — when the entry carries no `dataDir`, both fall back to the CLI's own default. Without `--profile`, `profile.path` is `null`, a note says the profile was not read, and `runtime` falls back to the CLI's own chain (managed runtime → repo `_env/.venv` → PATH `python3`). Pass `--profile` whenever you compare the card's interpreter with what `--status` reports.
 - The settings card can start the same install/repair/cancel actions through the `scraplingRuntime` remote when the profile has both a remote surface and a jobs backend; otherwise it prints the CLI command.
-- `integrationMode` is deployment-only; `setup --mode` prints or writes the client entry for the two MCP shapes and `doctor` checks a profile against it — see [MCP mode](#mcp-mode). `official-mcp` starts `scrapling-mcp` from the managed venv, which the `mcp` pack provisions (`setup --feature mcp --apply`).
+- `integrationMode` is deployment-only; on a host that exposes `mcpManager` (the rc.2 web bundle) the MCP server is registered dynamically at load, while `setup --mode` prints or writes the client entry for CLI/headless profiles and `doctor` checks a profile against it — see [MCP mode](#mcp-mode). `official-mcp` starts `scrapling-mcp` from the managed venv, which the `mcp` pack provisions (`setup --feature mcp --apply`).
 - Only **macOS arm64** is verified. Windows, Linux and macOS x64 are blocked (B1/B2): every pack reports `blocked` and the installer refuses rather than guessing an asset path.
 
 ## <img src="https://api.iconify.design/lucide/circle-check.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Verify it is live
@@ -126,7 +130,7 @@ dsh-scrapling setup --status
 - **It is not a search engine.** Discovery runs in the Python sidecar against one of six backends (`searchBackend`: `auto` / `tavily` / `bing` / `brave` / `serper` / `duckduckgo` / `searxng`); Scrapling's own `google_search` option only sets a referer header. Each backend needs its own setting (`tavilyApiKey`, `braveApiKey`, `serperApiKey`, `searxngEndpoint`) — a backend that is selected but not configured reports `SEARCH_AUTH` instead of silently switching to another one.
 - **The npm tarball bundles no interpreter or browser.** They come from your machine or from the optional CLI installer, which downloads the verified macOS arm64 set into `dataDir/runtime`; missing pieces remove the matching tools instead of being fetched at load time.
 - **It adds no HTTP route on the host side.** The settings card is a host config form and this package exposes no `/api` surface. The one socket that really listens is the MCP server under `integrationMode: mcp`, bound to `127.0.0.1` (`http://127.0.0.1:<mcpPort>/mcp`): any other path gets 404, a declared body over 1 MiB gets 413, a request without `Content-Length` gets 411, and the bearer token is read only from `DSH_SCRAPLING_MCP_TOKEN` — with no token set, startup prints a stderr notice that the endpoint is unauthenticated and reachable from any local process.
-- **It adds no dsh subcommand.** The package's own `dsh-scrapling` CLI manages runtime packs, plus the two halves of the MCP hookup: `setup --mode native|mcp|official-mcp` generates the client entry and, with `--apply`, writes it to `<dataDir>/mcp/<mode>.patch.yml` (the profile itself is never touched), while `doctor --mode` compares that entry against the profile's `cordis.patch.yml` item by item. Given `--profile`, `setup --status` reads `pythonBin` and `dataDir` from that same file.
+- **It adds no dsh subcommand.** The package's own `dsh-scrapling` CLI manages runtime packs, plus the manual half of the MCP hookup for profiles without `mcpManager`: `setup --mode native|mcp|official-mcp` generates the client entry and, with `--apply`, writes it to `<dataDir>/mcp/<mode>.patch.yml` (the profile itself is never touched), while `doctor --mode` compares that entry against the profile's `cordis.patch.yml` item by item. Given `--profile`, `setup --status` reads `pythonBin` and `dataDir` from that same file.
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
 
@@ -195,7 +199,7 @@ One consequence to know: `dsh-web`'s fetch body is a **closed** union of `html |
 |---|---|
 | `native` (default) | the `scrapling_*` tools listed above |
 | `mcp` | no native tools; the plugin serves the same tool table over MCP |
-| `official-mcp` | no native tools and no server from this plugin; `setup` only generates the `dsh-mcp-client` entry for the official `scrapling-mcp`, which runs in its own process, with its own sessions, and **without this plugin's URL guard** |
+| `official-mcp` | no native tools and no server from this plugin; on a host that exposes `mcpManager` it registers the official `scrapling-mcp` dynamically, otherwise `setup` generates the `dsh-mcp-client` entry for it - it runs in its own process, with its own sessions, and **without this plugin's URL guard** |
 
 In `mcp` mode the server runs inside the plugin's own host process and calls the same sidecar, so the URL guard, sessions, jobs and adaptive storage are the same ones the native tools use — there is no second implementation to drift.
 
@@ -227,12 +231,12 @@ In `mcp` mode the server runs inside the plugin's own host process and calls the
 | `scrapling_screenshot` | `screenshot` |
 | — (`ctx.web` only) | `search` |
 
-Connecting dsh needs `@deepseek-ai/dsh-mcp-client`, which this plugin deliberately does not depend on. Pin the build that matches the current host — npm `latest` is older than the host's own line and the host rejects the mismatch:
+On a host that exposes the `mcpManager` service (the rc.2 web/desktop bundle) the plugin registers its server there at load: no `dsh-mcp-client` install and no profile entry are needed, and `mcpPort` alone decides the endpoint. The manual entry below is for CLI/headless profiles, where that service is absent. If an upgraded profile still carries the manual entry, remove it when relying on dynamic registration - otherwise the manager refuses the duplicate server name and the old entry keeps serving.
+
+Connecting dsh needs `@deepseek-ai/dsh-mcp-client`, which this plugin deliberately does not depend on. Pin the exact build matching the host version - npm `latest` is older than the host's own line, and the client's peer versions are literal, so one prerelease off installs but never activates. `0.2.2-rc.2` is the default; a host still on rc.1 takes `0.2.2-rc.1`, and `next` tracks the official beta line:
 
 ```bash
-dsh plugin --profile <name> add @deepseek-ai/dsh-mcp-client@0.2.2-rc.1
-# host on the 0.2.2-alpha.3 line: @deepseek-ai/dsh-mcp-client@0.2.2-alpha.3
-# host on the 0.2.1-rc.5 line: @deepseek-ai/dsh-mcp-client@0.2.1-rc.5
+dsh plugin --profile <name> add @deepseek-ai/dsh-mcp-client@0.2.2-rc.2
 ```
 
 Then add one entry to that profile's `cordis.patch.yml` — this is exactly what `dsh-scrapling setup --mode mcp` prints, so you can also let the CLI write it (drop `headers` when no token is configured):
@@ -265,9 +269,9 @@ dsh-scrapling setup --mode native --apply     # a file that deliberately contain
 dsh-scrapling doctor --mode mcp --profile <profileDir>
 ```
 
-`doctor` reads what the profile actually says - `cordis.patch.yml` plus that profile's `package.json` - and prints one line per problem: two entries under `serverName: scrapling`, this plugin's entry next to an official `stdio` one, entries that do not match the mode, an entry whose port disagrees with `--port`, a profile without `@deepseek-ai/dsh-mcp-client` or with it pinned to something other than `0.2.2-rc.1` / `0.2.2-alpha.3` / `0.2.1-rc.5` / `next`, and an official entry while `officialMcpEnabled` is off. Exit `0` is "consistent", `1` names at least one problem, `2` is a bad argument. `integrationMode` itself is a plugin setting the CLI cannot read, so `--mode` is the claim being checked and has to match the deployment.
+`doctor` reads what the profile actually says - `cordis.patch.yml` plus that profile's `package.json` - and prints one line per problem: two entries under `serverName: scrapling`, this plugin's entry next to an official `stdio` one, entries that do not match the mode, an entry whose port disagrees with `--port`, a profile without `@deepseek-ai/dsh-mcp-client` or with it pinned to something other than `0.2.2-rc.2` / `0.2.2-rc.1` / `next`, and an official entry while `officialMcpEnabled` is off. Exit `0` is "consistent", `1` names at least one problem, `2` is a bad argument. `integrationMode` itself is a plugin setting the CLI cannot read, so `--mode` is the claim being checked and has to match the deployment.
 
-`official-mcp` asks for two separate statements before it produces anything: `officialMcpEnabled: true` in the profile and `--accept-risk` on the command line; missing either one prints `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED` and writes nothing. The entry it generates starts `<dataDir>/runtime/venv/bin/scrapling-mcp`, so run `setup --feature mcp --apply` first - see [Runtime packs](#runtime-packs-macos-arm64). When that binary is missing, `setup` prints a line saying so.
+`setup` for `official-mcp` asks for two separate statements before it writes anything: `officialMcpEnabled: true` in the profile and `--accept-risk` on the command line; missing either one prints `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED` and writes nothing. At load time the host-side path is gated by `officialMcpEnabled` alone: a host exposing `mcpManager` registers the managed `scrapling-mcp` directly, while the `setup`-generated `dsh-mcp-client` entry is the fallback for CLI/headless profiles. Either path starts `<dataDir>/runtime/venv/bin/scrapling-mcp`, so run `setup --feature mcp --apply` first - see [Runtime packs](#runtime-packs-macos-arm64). When that binary is missing, `setup` prints a line saying so.
 
 ## <img src="https://api.iconify.design/lucide/sliders-horizontal.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Settings
 
@@ -392,7 +396,7 @@ Registered honestly, one entry per class.
 - **Shopify crawl mode walks the store's JSON API.** `mode=shopify` uses the store's `/collections.json` and each collection's `/products.json` (upstream's `ShopifySpider`) and yields one row per variant — `name` (product + variant, minus `Default Title`), `price`, `sku`, `stock` (`null` when available, `0` when not), `identifier`, `brand`, `category`, `image_url`, `url`, `barcode`, `old_price`, `description`. It never scrapes product HTML, and it obeys the same URL gate, robots setting, delay and concurrency knobs as the other crawl modes. Verified against a local fixture store; a real Shopify store has not been exercised (B11).
 - **`maxPages` caps the pages collected, not the requests the spider makes.** The link discovery layer keeps requesting queued pages (one measured `maxPages=3` crawl issued about 680 requests while collecting 3). Politeness toward the target site is governed by the deployment knobs: `crawlRespectRobots`, `crawlDownloadDelayMs`, `crawlConcurrentRequests`, `crawlAutothrottle`.
 - **Heavy pages can keep the browser path from ever settling.** When resources stay in flight past the default 30-second page timeout, `scrapling_session_fetch` / `scrapling_render` fail while a static fetch of the same URL succeeds. Mitigations: `waitSelector` (wait for a key element) or `disableResources` (block images and fonts), both per-call parameters the model can pass.
-- **`official-mcp` generates configuration only.** `integrationMode=official-mcp` registers no native tool and starts no server from this plugin; `setup --mode official-mcp --accept-risk` produces the `dsh-mcp-client` entry for the official server, whose binary comes from the `mcp` pack (B10 is the risk decision that entry stands on).
+- **`official-mcp` connects the upstream server.** `integrationMode=official-mcp` registers no native tool and starts no server from this plugin; on a host that exposes `mcpManager` (the rc.2 web bundle) the managed `scrapling-mcp` is registered dynamically, and where that service is absent (CLI/headless) `setup --mode official-mcp --accept-risk` produces the `dsh-mcp-client` entry instead. The binary comes from the `mcp` pack (B10 is the risk decision that entry stands on).
 
 ## <img src="https://api.iconify.design/lucide/circle-help.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> FAQ
 

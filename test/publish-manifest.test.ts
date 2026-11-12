@@ -669,3 +669,21 @@ describe("构建产物可载入", () => {
     expect(withoutBrowser).toStrictEqual(ready.filter((name) => !browserTools.includes(name)));
   });
 });
+
+describe("版本与变更记录", () => {
+  it("变更记录顶部版本与 package.json 的 version 一致", async () => {
+    // 只抬 version 不写条目时，发出去的新版本没有变更记录，而其余门禁全绿。
+    const { manifest } = await loadSurface();
+    if (manifest.version === undefined) {
+      throw new Error("package.json 没有 version");
+    }
+    const changelog = await readFile(path.join(pkgDir, "CHANGELOG.md"), "utf8");
+    const top = /^## (?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/mu.exec(changelog)?.groups?.[
+      "version"
+    ];
+    if (top === undefined) {
+      throw new Error("CHANGELOG.md 里没有任何版本标题");
+    }
+    expect(top, "CHANGELOG 顶部版本必须与 package.json 的 version 一致").toBe(manifest.version);
+  });
+});

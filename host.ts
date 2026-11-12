@@ -42,9 +42,9 @@ import {
   startMcpServer,
 } from "./lib/mcp-server.ts";
 import type { McpServerHandle } from "./lib/mcp-server.ts";
-import { DEFAULT_MCP_PORT, MCP_MODES, MCP_TOKEN_ENV } from "./lib/mcp-contract.ts";
+import { DEFAULT_MCP_PORT, MCP_MODES, MCP_SERVER_NAME, MCP_TOKEN_ENV } from "./lib/mcp-contract.ts";
 import type { McpMode } from "./lib/mcp-contract.ts";
-import { officialMcpHint } from "./lib/official-mcp.ts";
+import { officialMcpBinary, officialMcpHint } from "./lib/official-mcp.ts";
 import type { SearchBackend } from "./lib/search-backends.ts";
 import { createAnswerer, profileRoute } from "./lib/answer.ts";
 import {
@@ -191,9 +191,9 @@ export interface Config {
   allowWriteMethods: boolean;
   /** 三种互斥模式；`mcp` 与 `official-mcp` 都不注册原生工具。 */
   integrationMode: McpMode;
-  /** 本插件 MCP server 的端口；要与 profile 里 dsh-mcp-client 条目的 URL 同值。 */
+  /** 本插件 MCP server 的端口；动态注册直接用这一位，手工接入时还要与 profile 里那条 URL 同值。 */
   mcpPort: number;
-  /** 官方 MCP 模式的开关，与 setup 的 `--accept-risk` 是同一次表态。 */
+  /** 官方 MCP 模式的开关：宿主有 mcpManager 时它就是动态注册开关；没有时 setup 生成手工条目还要 --accept-risk 同一次表态。 */
   officialMcpEnabled: boolean;
   /**
    * 浏览器二进制路径；留空表示用 Playwright 自带的 chromium。
@@ -420,13 +420,16 @@ const configSchema = Schema.object({
   // 表态属于「这台部署允许什么」，属于部署方而不是某次会话。
   allowWriteMethods: Schema.boolean().default(false),
   // 模式互斥，切换后必须重启：native 注册原生工具，mcp 只起本插件的 MCP server，
-  // official-mcp 连 server 都不起、只由 setup 给 dsh-mcp-client 生成官方条目配置。
+  // official-mcp 两种都不做 —— 宿主有 mcpManager（rc.2 web-app）时动态注册官方 server，
+  // 没有（CLI/headless）时由 setup 生成 dsh-mcp-client 条目。
   // 这一档刻意是部署级而不是会话级 —— 一个模型不该在回合里决定自己被怎么接进去。
   integrationMode: Schema.union([...MCP_MODES]).default("native"),
-  // 端口要与 profile 里那条 dsh-mcp-client 的 URL 同值；改完必须重跑 setup，doctor 会查。
+  // 端口要与 profile 里那条 dsh-mcp-client 的 URL 同值（手工接入）；动态注册直接用这一位。
+  // 改完必须重跑 setup 或重启宿主，doctor 会查。
   mcpPort: Schema.natural().default(DEFAULT_MCP_PORT),
-  // 官方 server 的工具集（含 browser_evaluate 这类任意 JS）不经本插件的 guard，所以默认关，
-  // 且要 setup 的 --accept-risk 同一次表态才生成配置。条数不写在这里：它随上游版本漂。
+  // 官方 server 的工具集（含 browser_evaluate 这类任意 JS）不经本插件的 guard，所以默认关。
+  // 宿主有 mcpManager 时这一位就是动态注册的开关；没有时 setup 还要 --accept-risk 同一次表态
+  // 才生成手工条目。条数不写在这里：它随上游版本漂。
   officialMcpEnabled: Schema.boolean().default(false),
   // 浏览器二进制路径：给装在非标准位置的企业镜像 / 便携版 Chromium 用的。部署级强能力，
   // 模型入参到不了这里。
@@ -1431,6 +1434,54 @@ export interface SurfaceArgs {
   readonly env: NodeJS.ProcessEnv;
 }
 
+/** 宿主 mcpManager 只在 web-app bundle 装配（CLI/headless 取不到）。可选服务一律 ctx.get 取。 */
+interface McpManagerLike {
+  register: (name: string, entry: McpRegistrationEntry) => () => void;
+}
+
+/** 动态注册 entry 的最小形状（宿主 ServerEntrySchema 校验；超时必填，reconnect 走宿主默认）。 */
+interface McpRegistrationEntry {
+  transport: "stdio" | "streamable-http";
+  command?: string;
+  args?: string[];
+  url?: string;
+  headers?: Record<string, string>;
+  toolCallTimeoutMs: number;
+  closeTimeoutMs: number;
+  reconnect: Record<string, unknown>;
+}
+
+function isMcpManager(value: unknown): value is McpManagerLike {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "register" in value &&
+    typeof value.register === "function"
+  );
+}
+
+function mcpManagerOf(ctx: Context): McpManagerLike | undefined {
+  const manager: unknown = ctx.get("mcpManager");
+  return isMcpManager(manager) ? manager : undefined;
+}
+
+/** 动态注册一枚 MCP server（名 MCP_SERVER_NAME）；取不到 mcpManager 或注册失败（重名等）
+ *  回退既有接入方式，返回是否注册成功。注册项随本插件生命周期撤除（ctx.effect）。 */
+function registerMcpDynamic(ctx: Context, entry: McpRegistrationEntry): boolean {
+  const manager = mcpManagerOf(ctx);
+  if (manager === undefined) {
+    return false;
+  }
+  try {
+    const dispose = manager.register(MCP_SERVER_NAME, entry);
+    ctx.effect(() => dispose);
+    return true;
+  } catch (error) {
+    ctx.logger.warn(`[dsh-scrapling] MCP 动态注册失败，回退既有接入：${String(error)}`);
+    return false;
+  }
+}
+
 export async function startMcpSurface(args: SurfaceArgs): Promise<McpServerHandle> {
   const { config, ctx, depsFor, env, plan, search } = args;
   const sink = createMcpImageSink();
@@ -1453,16 +1504,26 @@ export async function startMcpSurface(args: SurfaceArgs): Promise<McpServerHandl
     ...(token.length > 0 ? { token } : {}),
   });
   ctx.effect(() => () => handle.close());
+  const registered = registerMcpDynamic(ctx, {
+    transport: "streamable-http",
+    url: handle.url,
+    ...(token.length > 0 ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+    toolCallTimeoutMs: 120_000,
+    closeTimeoutMs: 5000,
+    reconnect: {},
+  });
   const notice = token.length > 0 ? " · 需要 bearer token" : " · 无 token，只绑回环";
+  const via = registered ? "已动态注册到宿主 mcpManager" : "需手配 dsh-mcp-client 接入";
   ctx.logger.info(
-    `[dsh-scrapling] MCP server：${handle.url} · ${String(entries.length)} 个工具${notice}`,
+    `[dsh-scrapling] MCP server：${handle.url} · ${String(entries.length)} 个工具${notice} · ${via}`,
   );
   return handle;
 }
 
 /**
  * 按模式装配工具这一层（spec §4.3 的互斥在这里落）：native 注册原生工具，`mcp` 把同一份表
- * 端给 MCP server，`official-mcp` 两样都不做。模式只在装配时读一次，改完必须重启。
+ * 端给 MCP server，`official-mcp` 两样都不做 —— 只在宿主有 mcpManager 时动态注册官方 server。
+ * 模式只在装配时读一次，改完必须重启。
  */
 async function registerSurface(args: SurfaceArgs): Promise<void> {
   const { config, ctx, depsFor, plan } = args;
@@ -1471,10 +1532,24 @@ async function registerSurface(args: SurfaceArgs): Promise<void> {
     return;
   }
   if (config.integrationMode === "official-mcp") {
+    const dataDir = resolveDataDir(config.dataDir.get());
+    const command = officialMcpBinary(dataDir);
+    const registered =
+      config.officialMcpEnabled &&
+      registerMcpDynamic(ctx, {
+        transport: "stdio",
+        command,
+        args: [],
+        toolCallTimeoutMs: 120_000,
+        closeTimeoutMs: 5000,
+        reconnect: {},
+      });
     ctx.logger.info(
-      `[dsh-scrapling] integrationMode=official-mcp：不注册原生工具，也不起本插件的 MCP server。${officialMcpHint(
-        config.officialMcpEnabled,
-      )}`,
+      registered
+        ? "[dsh-scrapling] integrationMode=official-mcp：官方 scrapling-mcp 已动态注册到宿主 mcpManager。"
+        : `[dsh-scrapling] integrationMode=official-mcp：不注册原生工具，也不起本插件的 MCP server。${officialMcpHint(
+            config.officialMcpEnabled,
+          )}`,
     );
     return;
   }
