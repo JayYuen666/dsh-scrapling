@@ -6,6 +6,21 @@
 标准六类之外的小节（本仓的 `Boundaries` 收各版本的验证范围与能力边界，即哪些平台/档位真跑过、
 哪些只到本地夹具为止）。
 
+## 0.1.12
+
+设置卡的下拉候选与说明浮层不再漂到浏览器最左边；shared 抬到 `^0.2.8`（含运行时几何自检），CI 的 action 钉版升到最新。`MCP_SERVER_VERSION` 随包版本同步。
+
+### Fixed
+
+- **下拉候选与说明浮层被钉在视口左边缘**：`.dsu-menu` 与 `.dsu-tip` 的 `position-area: block-end span-inline-start` 选中的是「行内起始列 + 中间列」，而 `position: fixed` 下该区域的起始边是**视口左边缘**、不是触发器左边缘，再叠一条 `justify-self: start`，浮层就落在 `x=0`。改为 `block-end span-inline-end`——真实 Chromium（patchright headless，156.0.8078.4）实测：1440px 视口、触发器左边缘 860px，改前浮层左边缘 0，改后 860；触发器贴到右侧时 `flip-inline` 会改成右边缘对齐，贴到视口底部时 `flip-block` 翻到上方。
+- **锚定没兑现时改回 JS 矩形定位**：`select.ts` 与 `field.ts` 的 `place()` 此前只要 `CSS.supports("position-area: block-end")` 为真就直接 `return`，方向性错误没有任何兜底。现在锚定后先量一次浮层矩形，用 shared 0.2.8 的 `anchorPlacementOff` 判它是否真贴在触发器上（行内起始边或结束边任一在 2px 容差内贴住，且块向落在触发器下方或上方），不通过才把 `position-area` 显式置 `none` 再写 `left` / `top`。顺序是承重的：实测同时留着 `position-area` 只写坐标时块向仍由锚定决定（浮层 `y` 落在 314 而不是 160），必须先关。回退是单向的——同一个浮层一旦走过 JS 路径，后续 `resize` 不再尝试锚定，避免两个定位源来回抢。
+- **回归测试**：`test/card-ui.test.ts` 新增 `anchorPlacementOff` 的四种对齐形态（左边缘对齐、`flip-inline` 右对齐、`flip-block` 翻上方、两轴都不沾）与容差边界，以及三条锚定用例（浮层真贴住时不写 JS 坐标、被钉到视口左侧时改写坐标并关掉 `position-area`、回退过的浮层不再重试锚定）。
+
+### Changed
+
+- **运行时依赖 shared 抬到 `^0.2.8`**：`pnpm-workspace.yaml` 的 catalog 由根 `sync` 投影，`pnpm-lock.yaml` 随 `sync:lock` 重解；`client.js` 按新 shared 重建，内联的 `CARD_UI_CSS` 逐字节等于已装 shared 导出的那一份。0.2.8 新增的 `anchorPlacementOff` / `ANCHOR_PLACEMENT_TOLERANCE` 只被卡片内部使用，本包对外工具与 Remote 方法名单不变。
+- **CI 的 action 钉版升到最新**：`github/codeql-action` 的 `init` / `analyze` / `upload-sarif` 由 `v4.39.2` 升到 `v4.39.3`（`33d7b85da1a04171e211befe2c739303b9a4c066`）。钉版仍是 40 位 commit SHA + 版本注释，由根 `scripts/upgrade-actions.mjs` 现量比对上游 tag 后改写，`--check` 可复跑。
+
 ## 0.1.11
 
 Scrapling 钉版抬到 `0.5.1`；MCP 接入支持宿主 mcpManager 动态注册；宿主开发基线抬到 `0.2.2-rc.2`，支持窗口收到 `^0.2.2-rc.1`。
