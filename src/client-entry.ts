@@ -39,6 +39,8 @@ import {
 } from "./settings-fields.ts";
 import { SettingsCard, browserDocument, installStyle, installStyles } from "./settings-card.ts";
 import { createRuntimeReader } from "./runtime-reader.ts";
+import { SCRAPLING_LOGO_ACCENT_URI, SCRAPLING_LOGO_BODY_URI } from "./scrapling-icon.ts";
+import type { RuntimeReader } from "./runtime-reader.ts";
 import type {
   CardProps,
   DocumentFace,
@@ -52,6 +54,14 @@ import type {
 /** 结果行字段的文案键：多处复用，抽一份免得字面量散落。 */
 const ROW_TYPE_KEY = "row.type";
 const ROW_SESSION_KEY = "row.session";
+
+/** 设置页一级分区的 id（`settings.section` 的 `id`，图标靠同一个值对上）。
+ *  与设置命名空间分开写：分区 id 是**页面位置**的名字，`SETTINGS_ENTRY_ID` 是**配置与文案**
+ *  的名字，两者哪天拆开（比如一个分区放两张卡）时不该互相牵连。 */
+const SECTION_ID = "dsh-scrapling";
+
+/** 分区在导航里的位次：宿主已占 -10/0/10/15/20，本包三仓的分区排 30 起。 */
+const SECTION_ORDER = 30;
 
 export interface RowField {
   /** 字段名（展示用，不参与计算）；渲染时经 t() 取字。 */
@@ -303,6 +313,10 @@ const ROW_CSS = `
 .dsh-scrapling-rowButton{align-self:flex-start;border:0;background:0 0;padding:0;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:12px;cursor:pointer}
 .dsh-scrapling-rowButton:hover{color:var(--dsw-alias-label-primary)}
 .dsh-scrapling-rowButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
+.dsh-scrapling-page{padding:4px 0 8px}
+.dsh-scrapling-icon{position:relative;display:inline-block;flex:none}
+.dsh-scrapling-iconLayer{position:absolute;inset:0;background-color:currentColor;-webkit-mask-size:100% 100%;mask-size:100% 100%;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-image:url(${SCRAPLING_LOGO_BODY_URI});mask-image:url(${SCRAPLING_LOGO_BODY_URI})}
+.dsh-scrapling-iconAccent{position:absolute;inset:0;background-color:#B3FB2A;-webkit-mask-size:100% 100%;mask-size:100% 100%;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-image:url(${SCRAPLING_LOGO_ACCENT_URI});mask-image:url(${SCRAPLING_LOGO_ACCENT_URI})}
 `;
 
 /**
@@ -376,7 +390,18 @@ interface ClientFace {
   readonly slots: {
     inject: (slot: string, register: () => void) => void;
     register: (
-      options: { name: string; key?: string; locale?: string },
+      // `key` 是 keyed 槽（`plugins.bundle.config`）的寻址位，`id` 是 list 槽
+      // （`settings.section` / `settings.section.icon`）的寻址位；`order` 与 `label` 只有 list 槽要。
+      // 三处签名合写一份是因为宿主那两个 register 是同一个方法，只是选项按槽位 kind 变形。
+      options: {
+        name: string;
+        key?: string;
+        id?: string;
+        order?: number;
+        label?: () => string;
+        locale?: string;
+        inject?: () => CardInject;
+      },
       render: (props: never) => unknown,
     ) => () => void;
   };
@@ -418,6 +443,74 @@ function registerToolViews(ctx: ClientFace): () => void {
       dispose();
     }
   };
+}
+
+/**
+ * 设置页导航图标（`settings.section.icon`）。
+ *
+ * 图形是 **scrapling 官方标记**（`src/scrapling-icon.ts` 里那两张遮罩位图）：用户要求三个仓
+ * 都用官方图形。这里把官方图拆成「本体」与「高光」两层分别上色 —— 本体取 `currentColor`
+ * （跟随导航行前景色，深色主题是浅色、浅色主题是深色），高光保留官方绿。于是两种主题下
+ * 都与官方图一致，而形状与 alpha 一个像素都没改。
+ *
+ * 为什么不直接 `<img src>`：官方标记本体是**纯黑**（scrapling logo 的黑章鱼），
+ * 深色主题下直接放进去就是一团黑；而先改图再内联等于动官方像素。遮罩只取 alpha。
+ *
+ * @param props - `size` 是导航行要的方形边长，`active` 表示该分区当前被选中。
+ * @returns 两层遮罩叠出来的方块。
+ */
+function ScraplingSectionIcon(props: {
+  readonly size: number;
+  readonly active: boolean;
+}): ReactNode {
+  const box = { width: props.size, height: props.size };
+  return createElement(
+    "span",
+    {
+      className: "dsh-scrapling-icon",
+      style: box,
+      "aria-hidden": true,
+      "data-scrapling-section-icon": props.active ? "active" : "idle",
+    },
+    createElement("span", { className: "dsh-scrapling-iconLayer", style: box }),
+    createElement("span", { className: "dsh-scrapling-iconAccent", style: box }),
+  );
+}
+
+/** 详情页与一级分区共用的注入面（`view` 由宿主给，不在这一份里）。 */
+interface CardInject {
+  readonly t: Translate;
+  readonly form: FormSource;
+  readonly runtime: RuntimeReader | undefined;
+}
+
+/** 一级分区的 owner props：宿主只给 `close`，**没有 `view`**（那是插件详情页那一侧的位）。 */
+interface SectionOwnerProps {
+  readonly close: () => void;
+}
+
+/**
+ * 分区页面外壳：一级分区没有插件页那层卡片外壳，这里补一点留白。
+ *
+ * ⚠ `view` 必须由这里显式传 `"page"`：`SettingsCard` 在 `view !== "page"` 时早退成一张空表单
+ * （`src/settings-card.ts` 里那个早退是给插件详情页的 summary 视图准备的），而
+ * `settings.section` 的 owner props 里根本没有 `view` 这一位 —— 直接把 props 透传下去，
+ * 分区里就是一片空白，且不报任何错。这是本包在两类槽之间唯一的**形状差异**。
+ *
+ * @param props - 宿主的 owner props 与本文件的 inject 面合起来的那一份
+ * @returns 卡片元素
+ */
+function ScraplingSection(props: SectionOwnerProps & CardInject): ReactNode {
+  return createElement(
+    "div",
+    { className: "dsh-scrapling-page" },
+    createElement(SettingsCard, {
+      view: "page",
+      t: props.t,
+      form: props.form,
+      runtime: props.runtime,
+    }),
+  );
 }
 
 /**
@@ -477,16 +570,50 @@ function apply(ctx: ClientFace): void {
       subscribe: (listener: () => void): (() => void) => form.subscribe(listener),
       mutate: (operations, revision) => form.mutate(operations, revision),
     };
+    const runtime = createRuntimeReader(ctx);
+    // 详情页与设置页一级分区吃同一批注入位：`t` 来自 locale 席位，`form` 是本文件补的那一份，
+    // `runtime` 是运行环境读取接口。写成一处工厂是为了「两处显示同一份配置」没有第二种实现。
+    const cardInject = (): CardInject => ({ t, form: source, runtime });
+
     let disposeCard: (() => void) | undefined;
     ctx.slots.inject("plugins.bundle.config", () => {
-      const runtime = createRuntimeReader(ctx);
       disposeCard = ctx.slots.register(
         { name: "plugins.bundle.config", key: BUNDLE_PACKAGE_NAME, locale: LOCALE_NS },
-        (props: CardProps) => createElement(SettingsCard, { ...props, t, form: source, runtime }),
+        (props: CardProps) => createElement(SettingsCard, { ...props, ...cardInject() }),
       );
     });
+
+    // 设置页左侧一级分区。`label` 给的是 thunk 而不是字符串：宿主每次读导航行都重新求值，
+    // 于是切语言时这一行跟着变，而不需要本插件重新注册。
+    let disposeSection: (() => void) | undefined;
+    ctx.slots.inject("settings.section", () => {
+      disposeSection = ctx.slots.register(
+        {
+          name: "settings.section",
+          id: SECTION_ID,
+          order: SECTION_ORDER,
+          label: () => t("navLabel"),
+          locale: LOCALE_NS,
+          inject: cardInject,
+        },
+        ScraplingSection,
+      );
+    });
+
+    // 导航图标：id 必须与上面那条 `settings.section` 的 id 逐字相同，对不上时宿主一条都不渲染
+    // （`settings.section.icon` 的 doc 原文），症状是分区还在、图标一直是默认齿轮。
+    let disposeIcon: (() => void) | undefined;
+    ctx.slots.inject("settings.section.icon", () => {
+      disposeIcon = ctx.slots.register(
+        { name: "settings.section.icon", id: SECTION_ID, order: SECTION_ORDER },
+        ScraplingSectionIcon,
+      );
+    });
+
     return (): void => {
       disposeCard?.();
+      disposeSection?.();
+      disposeIcon?.();
     };
   }, "dsh-scrapling: settings card");
 }

@@ -44,6 +44,14 @@ import {
 import type { McpServerHandle } from "./lib/mcp-server.ts";
 import { DEFAULT_MCP_PORT, MCP_MODES, MCP_SERVER_NAME, MCP_TOKEN_ENV } from "./lib/mcp-contract.ts";
 import type { McpMode } from "./lib/mcp-contract.ts";
+import { MESSAGES } from "./lib/messages.ts";
+import type { ScraplingMessages } from "./lib/messages.ts";
+import { registerGuidanceSkill } from "./lib/skill.ts";
+import {
+  LOCALE_SETTINGS_NAMESPACE,
+  messagesFor,
+  resolveLocalePreference,
+} from "@jayyuen66/dsh-plugin-shared/lib/locale";
 import { officialMcpBinary, officialMcpHint } from "./lib/official-mcp.ts";
 import type { SearchBackend } from "./lib/search-backends.ts";
 import { createAnswerer, profileRoute } from "./lib/answer.ts";
@@ -532,7 +540,52 @@ export const inject = ["tools", "subprocess", "web", "systemPrompt", "settings"]
 interface SettingsFace {
   readonly settings: {
     configure: (presentation: { auto?: boolean }, owner?: Context["fiber"]) => () => void;
+    /**
+     * 读已注册命名空间的现值。
+     *
+     * 加这一位是为了跟上官方「设置 → 常规」里的语言偏好：它存在 settings 的 `locale` 命名空间，
+     * 跨命名空间读在宿主上只有 describe() 一条路。窄写成「有 ns / 有 value 的行」而不是引
+     * `@deepseek-ai/dsh-settings` 的 `SettingsDescriptor`：那会把这个包变成运行期类型依赖，
+     * 而这里只用到两个字段。
+     */
+    describe: () => readonly { readonly ns: string; readonly value?: unknown }[];
   };
+}
+
+/**
+ * 读一遍已注册命名空间的现值；读不到就是空表。
+ *
+ * `describe` 只是一次读表，抛错时按「没有偏好」处理 —— 语言只是文案，不该有让整次装配
+ * 失败的权力。
+ *
+ * @param host - 已通过宿主服务守卫的宿主上下文
+ * @returns 命名空间行（读失败时是空表）
+ */
+function settingsRowsOf(
+  host: SettingsFace,
+): readonly { readonly ns: string; readonly value?: unknown }[] {
+  try {
+    return host.settings.describe();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 按官方 locale 偏好取本次装配的模型可见文案。
+ *
+ * 与 `dsh-zvec-grep` / `dsh-ocr-review` 同一条路：用户在「设置 → 常规」里改语言，下一次装配
+ * 就换一份文案，本包不另开自己的语言设置项。读不到（未装 client-locale、条目未投影、
+ * describe 抛错）时落回中文默认——那是改造前的行为，不会因为读偏好失败而让插件装不起来。
+ *
+ * @param host - 已通过宿主服务守卫的宿主上下文
+ * @returns 当前语言的文案表
+ */
+function localeMessagesOf(host: SettingsFace): ScraplingMessages {
+  const preference = settingsRowsOf(host).find(
+    (row) => row.ns === LOCALE_SETTINGS_NAMESPACE,
+  )?.value;
+  return messagesFor(MESSAGES, resolveLocalePreference(preference));
 }
 
 /** 每工具开关的**快照**。 */
@@ -584,48 +637,52 @@ export function snapshotFlags(config: Config): ToolFlags {
   };
 }
 
+/** 指引文案在 :type:`ScraplingMessages` 上的键名。 */
+type GuidanceKey =
+  | "guidanceFetch"
+  | "guidanceExtract"
+  | "guidanceLocate"
+  | "guidanceLinks"
+  | "guidanceRender"
+  | "guidanceCaptureXhr"
+  | "guidanceNetwork"
+  | "guidanceSession"
+  | "guidanceSessionState"
+  | "guidanceCrawl"
+  | "guidanceAnswer"
+  | "guidanceSessionRead"
+  | "guidanceSessionActions"
+  | "guidanceDownload"
+  | "guidanceScreenshot";
+
 /**
- * 每个工具一段「什么时候换到它」的指引。
+ * 每个工具一段「什么时候换到它」的指引：开关 → 文案表里的那一条。
  *
- * 键与 :type:`ToolFlags` 同构，于是 `Record<keyof ToolFlags, string>` 让「加了一个工具却
- * 忘了写指引」变成编译错误 —— 这份对应关系以前只靠注释维持。
+ * 键与 :type:`ToolFlags` 同构，于是 `Record<keyof ToolFlags, GuidanceKey>` 让「加了一个工具
+ * 却忘了写指引」变成编译错误 —— 这份对应关系以前只靠注释维持。文案正文住在
+ * `lib/messages.ts`（跟随宿主语言），这里只留对应关系。
  *
  * **一行只准点自己那组工具的全名**（别的开关下的工具用「静态抓取」「浏览器抓取」这类说法带过）。
  * :func:`guidanceFor` 按「这句话点名的工具此刻是不是真注册着」决定说不说，所以跨组的点名会让
  * 一段本来还有用的指引跟着别组一起消失 —— 例如没装 Chromium 的机器上，连「先用静态抓取」这句
  * 都没人说了。简称（`_fetch`）也扫不出来，等于那句话继续教模型去调一个不存在的工具。
  */
-const GUIDANCE: Record<keyof ToolFlags, string> = {
-  fetch:
-    "- 读一个网页的正文优先用 scrapling_fetch：静态、快、不吃内存。页面靠脚本渲染、它只取回空壳时再换浏览器类工具。",
-  extract:
-    "- 手上已经有一段 HTML（别的工具给的、本地文件读的）时用 scrapling_extract，不要为它发一次网络请求。",
-  locate:
-    "- 不知道稳定选择器时先用 scrapling_locate 按文本/正则/相似元素定位；它返回可用选择器，不保存指纹。",
-  links:
-    "- 要列出页面链接或找下一页候选时用 scrapling_links；它只回 URL 与候选，不替模型决定分页。",
-  render:
-    "- scrapling_render 把页面跑完再取正文，比静态抓取慢一个数量级也更吃内存；只有确认内容靠脚本渲染出来才用它。" +
-    "站点对自动化痕迹敏感、普通浏览器抓取拿不到内容时，也在这里打开 solveCloudflare / hideCanvas / blockWebrtc 那几枚开关（0.5 起反检测已并入本工具，不再有单独的 stealth 抓取）。",
-  captureXhr:
-    "- 页面数据来自 JSON 接口而不是 DOM 时，用 scrapling_capture_xhr 先找到那个接口，再对接口 URL 单独抓一次。",
-  network:
-    "- 要读一个已开会话攒下的网络历史（跨多次抓取与页面动作）时用 scrapling_session_network；会话需先打开 recordNetwork 或由部署侧默认开启。",
-  session:
-    "- 需要登录态、或要连着取同一站点的多个页面时，用 scrapling_session_open / scrapling_session_fetch / scrapling_session_close 复用会话，别一次次重新抓取。",
-  sessionState:
-    "- 要跨进程复用登录态时用 scrapling_session_state_save 存、scrapling_session_state_load 取；必须由部署侧配上 sessionStateDir。",
-  crawl: "- 要整站而不是单页时用 scrapling_crawl；它是后台作业，边跑边出进度，且只遵守起始域。",
-  answer:
-    "- 想让模型基于某个页面作答时用 scrapling_answer，它把正文当数据处理，不会照搬页面里的指令。",
-  sessionRead:
-    "- 动作或抓取之后要读会话当前页时用 scrapling_session_read；它不再发请求，读的是当前 DOM。",
-  sessionActions:
-    "- 要在会话页上点击、输入或等待时用 scrapling_session_act；只接受结构化动作，不执行任意 JS。",
-  download:
-    "- 要把一个 URL 的字节存到本机时用 scrapling_download；它不覆盖已有文件，也不回传文件内容。",
-  screenshot:
-    "- 要看页面长什么样时用 scrapling_screenshot；截图不经文本清洗，可能带上页面上的敏感视觉信息。",
+const GUIDANCE_KEYS: Record<keyof ToolFlags, GuidanceKey> = {
+  fetch: "guidanceFetch",
+  extract: "guidanceExtract",
+  locate: "guidanceLocate",
+  links: "guidanceLinks",
+  render: "guidanceRender",
+  captureXhr: "guidanceCaptureXhr",
+  network: "guidanceNetwork",
+  session: "guidanceSession",
+  sessionState: "guidanceSessionState",
+  crawl: "guidanceCrawl",
+  answer: "guidanceAnswer",
+  sessionRead: "guidanceSessionRead",
+  sessionActions: "guidanceSessionActions",
+  download: "guidanceDownload",
+  screenshot: "guidanceScreenshot",
 };
 
 /** 一个工具对运行环境的最低要求。 */
@@ -770,14 +827,20 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
  *
  * @param flags - 每工具开关的快照
  * @param isAvailable - 这个 scope 看不看得见那个工具
+ * @param messages - 当前语言的文案表（指引正文从它取）
  * @returns 拼好的指引文本；一句都不剩时为空串（上游据此把整段视作没有内容）
  */
-export function guidanceFor(flags: ToolFlags, isAvailable: (tool: string) => boolean): string {
-  // 摊成按键可选的表再取：`Object.entries(GUIDANCE)` 给的是 string 键，而这张表的完整性
-  // 已经由 `Record<keyof ToolFlags, string>` 在编译期钉住了，这里只需要把值取出来。
+export function guidanceFor(
+  flags: ToolFlags,
+  isAvailable: (tool: string) => boolean,
+  messages: ScraplingMessages,
+): string {
+  // 摊成按键可选的表再取：`Object.entries(GUIDANCE_KEYS)` 给的是 string 键，而这张表的完整性
+  // 已经由 `Record<keyof ToolFlags, GuidanceKey>` 在编译期钉住了，这里只需要把值取出来。
   const enabled: Record<string, boolean | undefined> = { ...flags };
   const lines: string[] = [];
-  for (const [flag, text] of Object.entries(GUIDANCE)) {
+  for (const [flag, key] of Object.entries(GUIDANCE_KEYS)) {
+    const text = messages[key];
     // 同组的工具要**全部**到位：会话那一句点了 open/fetch/close 三个名字，只注册了两个
     // 就等于让模型去调一个不存在的东西。
     const named = TOOL_SPECS.filter((spec) => spec.flag === flag || text.includes(spec.name));
@@ -786,6 +849,26 @@ export function guidanceFor(flags: ToolFlags, isAvailable: (tool: string) => boo
     }
   }
   return lines.join("\n");
+}
+
+/**
+ * 常驻 systemPrompt 段的文本：摘要，外加一句指路句（只在 skill 真注册上时）。
+ *
+ * 指路句说的是「完整指引见 skill `scrapling`」，而 skill 可能根本没注册 —— 精简 profile 里
+ * 没有 `@deepseek-ai/dsh-skill`，一个工具都没注册的降级装配下正文也是空的。那种时候把模型
+ * 指向一个不存在的 skill，它按名去加载只会拿到「没有这个 skill」，比不说更糟。
+ *
+ * 抽成导出的纯函数是为了能直接钉住这两支：`apply` 里那条路径要真把 sidecar 拉起来才走得到
+ * 「skill 注册成功」那一档，而它与文案无关，不必靠环境齐备的集成用例来验。
+ *
+ * @param messages - 当前语言的文案表
+ * @param skillRegistered - 本仓库是否成功注册了虚拟 skill
+ * @returns 常驻段的文本
+ */
+export function usageSummaryOf(messages: ScraplingMessages, skillRegistered: boolean): string {
+  return skillRegistered
+    ? `${messages.usageSummary}\n${messages.skillPointer}`
+    : messages.usageSummary;
 }
 
 /**
@@ -1347,6 +1430,42 @@ export function createUrlGate(config: Config): (url: string) => Promise<string> 
 }
 
 /**
+ * 两个 web provider 共用的热改项读取器。
+ *
+ * 八位 `.volatile()` 的部署项在这里各对应一枚取值函数：设置卡改值**不会重跑 `apply`**
+ * （宿主只把新值提交给已装好的那份配置引用），所以任何在装配时抄下值的写法都会让旋钮
+ * 失效而毫无征兆。抽成具名工厂有两个好处：两个 provider 只有一处口径，且「读取器真的每次
+ * 现取」可以直接对着它测 —— 不必为了覆盖五个箭头去真起一个 sidecar。
+ *
+ * 非 volatile 的部署值（各后端端点、renderTopN）不在这里：它们改值本来就要重装，传字面量
+ * 就够了；混进来反而让调用点看不出哪些是热改位。
+ *
+ * @param config - 已解析的设置
+ * @returns 八位热改项各自的读取器
+ */
+export function providerReadersOf(config: Config): {
+  backend: () => SearchBackend;
+  apiKey: () => string;
+  braveApiKey: () => string;
+  serperApiKey: () => string;
+  searxngEndpoint: () => string;
+  publicFallback: () => boolean;
+  maxOutputBytes: () => number;
+  timeoutMs: () => number;
+} {
+  return {
+    backend: () => config.searchBackend.get(),
+    apiKey: () => config.tavilyApiKey.get(),
+    braveApiKey: () => config.braveApiKey.get(),
+    serperApiKey: () => config.serperApiKey.get(),
+    searxngEndpoint: () => config.searxngEndpoint.get(),
+    publicFallback: () => config.searchPublicFallback.get(),
+    maxOutputBytes: () => config.fetchMaxOutputChars.get(),
+    timeoutMs: () => config.fetchTimeoutMs.get(),
+  };
+}
+
+/**
  * 把本插件注册成 ctx.web 的 fetch provider，让内置 web_fetch 由 Scrapling 执行。
  *
  * 抽出来是为了让 apply() 保持可读。开关默认开（真接管内置 web_fetch），但部署侧仍要再配一次
@@ -1358,10 +1477,13 @@ export function createUrlGate(config: Config): (url: string) => Promise<string> 
  * @param config - 已解析的设置
  */
 function registerFetchProvider(ctx: Context, sidecar: SidecarClient, config: Config): void {
+  const readers = providerReadersOf(config);
   const provider = createWebFetchProvider({
     sidecar,
-    maxOutputBytes: config.fetchMaxOutputChars.get(),
-    timeoutMs: config.fetchTimeoutMs.get(),
+    // 传读取器而不是当下的值：`fetchMaxOutputChars` 与 `fetchTimeoutMs` 都是 volatile 位，
+    // 抄进闭包的值在设置卡改完就永远停在旧值（`apply` 不会重跑）。
+    maxOutputBytes: readers.maxOutputBytes,
+    timeoutMs: readers.timeoutMs,
   });
   if (!provider.available()) {
     ctx.logger.warn("[dsh-scrapling] 跳过注册 fetch provider：sidecar 尚未可用");
@@ -1390,23 +1512,16 @@ function searchProviderOf(
   sidecar: SidecarClient,
   urlGate: (url: string) => Promise<string>,
 ): WebSearchProvider {
-  const backend = config.searchBackend.get();
   return createWebSearchProvider({
     sidecar,
-    backend,
-    apiKey: config.tavilyApiKey.get(),
-    braveApiKey: config.braveApiKey.get(),
-    serperApiKey: config.serperApiKey.get(),
+    // 八位热改项一律传读取器，与非热改的部署值分开写（见 providerReadersOf）。
+    ...providerReadersOf(config),
     apiEndpoint: config.tavilyApiEndpoint,
     bingEndpoint: config.bingEndpoint,
     braveEndpoint: BRAVE_SEARCH_ENDPOINT,
     serperEndpoint: SERPER_SEARCH_ENDPOINT,
     duckduckgoEndpoint: config.duckduckgoEndpoint,
-    searxngEndpoint: config.searxngEndpoint.get(),
-    publicFallback: config.searchPublicFallback.get(),
     renderTopN: config.searchRenderTopN,
-    maxOutputBytes: config.fetchMaxOutputChars.get(),
-    timeoutMs: config.fetchTimeoutMs.get(),
     urlGate,
   });
 }
@@ -1432,6 +1547,13 @@ export interface SurfaceArgs {
   readonly depsFor: (spec: ToolSpec) => ToolDeps;
   readonly search: WebSearchProvider;
   readonly env: NodeJS.ProcessEnv;
+  /**
+   * 当前语言的文案表。
+   *
+   * 可选而不是必填：MCP 这一面在测试里被单独装配，而它只用到搜索工具那几条文案 ——
+   * 真装配路径（`apply`）一定给，测试不给时按中文默认走。
+   */
+  readonly messages?: ScraplingMessages | undefined;
 }
 
 /** 宿主 mcpManager 只在 web-app bundle 装配（CLI/headless 取不到）。可选服务一律 ctx.get 取。 */
@@ -1495,7 +1617,10 @@ export async function startMcpSurface(args: SurfaceArgs): Promise<McpServerHandl
       });
     }
   }
-  const entries = mcpToolEntries(tools, search.available() ? mcpSearchTool(search) : undefined);
+  const entries = mcpToolEntries(
+    tools,
+    search.available() ? mcpSearchTool(search, args.messages ?? MESSAGES.zh) : undefined,
+  );
   const token = (env[MCP_TOKEN_ENV] ?? "").trim();
   const handle = await startMcpServer({
     port: config.mcpPort,
@@ -1762,6 +1887,59 @@ function warnScraplingMissing(ctx: Context, plan: ToolPlan, python: PythonChoice
  * @param ctx - 宿主上下文
  * @param config - 已由 schemastery 填满默认值的配置
  */
+/**
+ * 注册常驻的 systemPrompt 指引段。
+ *
+ * 指引段按**装配时**的开关与「这个 scope 真注册着哪些工具」现取文本：设置卡关掉某个工具，
+ * 或这台机器没装 Chromium（`planTools` 把 render / capture_xhr 跳过了），下一次装配就没有那
+ * 一段 —— README 里「关掉某个工具时它的 system prompt 指引段一并消失」说的就是这里。
+ * 只判开关不够：降级路径上一个工具都没注册，而模型仍会读到一串点了就报 UNKNOWN_TOOL 的建议。
+ *
+ * placement 借 `TOOL_WEB_FETCH`：本插件正是内置 `web_fetch` 的那一套替代/补充品，读的人
+ * 应当在自己的抓取工具旁边看到它，而不是在 prompt 末尾。
+ *
+ * 常驻的只是**摘要**：全文在 `registerGuidanceSkill` 注册的那枚虚拟 skill 里。摘要仍按
+ * 「一个工具都没注册就整段消失」这同一条判据收口，所以降级装配读不到任何一段文字 —— 那正是
+ * 这条判据原本要防的。
+ *
+ * 单独成函数是因为 `apply` 已经顶到 `max-lines-per-function` 的上限，而这一段自成一体：
+ * 它只读配置快照、文案表与 skill 注册结果，不参与装配的其余部分。
+ *
+ * @param ctx - 装配上下文（要 `tools` / `systemPrompt` / `effect`）
+ * @param config - 本插件配置（每工具开关从它现取快照）
+ * @param messages - 当前语言的文案表
+ * @param skillRegistered - 指引全文那枚 skill 是否注册成功（决定要不要加指路句）
+ */
+function registerUsageSection(
+  ctx: Context & SettingsFace,
+  config: Config,
+  messages: ScraplingMessages,
+  skillRegistered: boolean,
+): void {
+  ctx.effect(
+    () =>
+      ctx.systemPrompt.section({
+        name: "scrapling-usage",
+        order: ctx.systemPrompt.getSectionOrder("TOOL_WEB_FETCH"),
+        // 装配上下文带步骤准入时按准入视图判（受限子代理/条件工具在这一档显形），
+        // 没有准入（rc 线或非步骤装配）时退回注册表 + scope 的既有判据。
+        text: ({ scope, toolSet }) => {
+          const anyVisible =
+            guidanceFor(
+              snapshotFlags(config),
+              (tool) =>
+                toolSet === undefined
+                  ? ctx.tools.get(tool, scope) !== undefined
+                  : toolSet.view(scope).has(tool),
+              messages,
+            ).length > 0;
+          return anyVisible ? usageSummaryOf(messages, skillRegistered) : "";
+        },
+      }),
+    "scrapling: system prompt guidance",
+  );
+}
+
 export async function apply(ctx: Context & SettingsFace, config: Config): Promise<void> {
   // 登记「本页由自带卡片编辑」。`auto: false` 是告诉宿主别再自动生成一份通用表单 ——
   // 自动那份会把整表字段摊成没有分组、没有说明的长列表，而真正在编辑这张卡的
@@ -1865,6 +2043,9 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
   const answerProvider = config.answerProvider.get().trim();
   const answerModel = config.answerModel.get().trim();
   const defaultSelection = profileRoute(ctx.get("agentDefaultModel"));
+  // 文案在装配期解析一次：模型可见面在插件装好之后不会再变，而用户改语言会触发重装。
+  // 它要排在 createAnswerer 之前 —— 问答的系统提示与回执正文都从这一份取。
+  const localeMessages = localeMessagesOf(ctx);
   const answer = createAnswerer({
     ctx,
     override:
@@ -1873,6 +2054,7 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
         : undefined,
     fallback: defaultSelection,
     maxTokens: config.answerMaxTokens.get(),
+    messages: localeMessages,
   });
   const baseSettings = baseSettingsOf(config, dataDir);
   const searchProvider = searchProviderOf(config, sidecar, urlGate);
@@ -1881,34 +2063,36 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
   const depsFor = (spec: ToolSpec): ToolDeps => ({
     sidecar,
     settings: { ...baseSettings, maxOutputBytes: outputBudgetOf(config, spec.name) },
+    messages: localeMessages,
     startCrawlJob: startJob,
     answer,
     attachments,
   });
-  await registerSurface({ ctx, config, plan, depsFor, search: searchProvider, env: process.env });
+  await registerSurface({
+    ctx,
+    config,
+    plan,
+    depsFor,
+    search: searchProvider,
+    env: process.env,
+    messages: localeMessages,
+  });
 
-  // 指引段按**装配时**的开关与「这个 scope 真注册着哪些工具」现取文本：设置卡关掉某个工具，
-  // 或这台机器没装 Chromium（planTools 把 render / capture_xhr 跳过了），下一次装配就没有那
-  // 一段 —— README 里「关掉某个工具时它的 system prompt 指引段一并消失」说的就是这里。
-  // 只判开关不够：降级路径上一个工具都没注册，而模型仍会读到一串点了就报 UNKNOWN_TOOL 的建议。
-  // placement 借 TOOL_WEB_FETCH：本插件正是内置 web_fetch 的那一套替代/补充品，读的人
-  // 应当在自己的抓取工具旁边看到它，而不是在 prompt 末尾。
-  ctx.effect(
-    () =>
-      ctx.systemPrompt.section({
-        name: "scrapling-usage",
-        order: ctx.systemPrompt.getSectionOrder("TOOL_WEB_FETCH"),
-        // 装配上下文带步骤准入时按准入视图判（受限子代理/条件工具在这一档显形），
-        // 没有准入（rc 线或非步骤装配）时退回注册表 + scope 的既有判据。
-        text: ({ scope, toolSet }) =>
-          guidanceFor(snapshotFlags(config), (tool) =>
-            toolSet === undefined
-              ? ctx.tools.get(tool, scope) !== undefined
-              : toolSet.view(scope).has(tool),
-          ),
-      }),
-    "scrapling: system prompt guidance",
+  // 每工具一句的完整指引（全开 15 条、中文 2.3KB / 英文 2.9KB）注册成虚拟 skill：常驻
+  // systemPrompt 每种会话都要背它，而「什么时候换到哪个工具」只在真动手抓取时才需要。
+  // 正文在这里按 plan.ready 算好 —— 指的是**装配时真会注册的工具**，所以没装浏览器的机器
+  // 上那枚 skill 里也不会出现 render / capture_xhr 那几句（与摘要段共用同一条判据）。
+  //
+  // 返回值决定常驻段要不要加那句「完整指引见 skill」：skill 服务没装载（精简 profile）
+  // 或一个工具都没注册时它不注册，此时指路句会把模型指向一个不存在的 skill。
+  const skillRegistered = registerGuidanceSkill(
+    ctx,
+    guidanceFor(snapshotFlags(config), (tool) => plan.ready.includes(tool), localeMessages),
+    localeMessages.skillDescription,
   );
+
+  // 指引段按**装配时**的开关与「这个 scope 真注册着哪些工具」现取文本（细节见 registerUsageSection）。
+  registerUsageSection(ctx, config, localeMessages, skillRegistered);
 
   if (config.provideWebFetch.get()) {
     registerFetchProvider(ctx, sidecar, config);

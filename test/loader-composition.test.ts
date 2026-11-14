@@ -532,10 +532,13 @@ describe("经真实 Loader 装载本插件", () => {
     await expect(guidanceOf(requireLoaded(loaded).ctx)).resolves.toBe("");
   });
 
-  it("把某个工具注册进真实 ToolRuntime 之后，真装配的指引只多出那一句", async () => {
+  it("把某个工具注册进真实 ToolRuntime 之后，真装配的常驻段就从空变成摘要", async () => {
     // 正面保底：上一条只看得到「为空」，而「恒为空」与「按注册状态现取」在那条断言里长得
     // 一样。这里把判据交给真实服务 —— 接线接错（问错服务、漏掉装配的 scope、或拿我们自己
     // 攒的名字表）都会让这一段永远出不来，这条就会红。
+    //
+    // 常驻段现在只有**摘要**：逐工具那 15 句注册成虚拟 skill 了（见 test/host.test.ts 与
+    // test/skill.test.ts），所以判据是「有没有任何一段可说」，摘要刻意不点名任何工具。
     // 这条会往容器里注册工具，所以它自己 load 一份：与「无工具时指引为空」共用一份容器时，
     // 那条断言就依赖用例顺序与串行执行，一旦并发或调整顺序会因这里的残留随机变红，而报错
     // （指引不为空）指不出真正的原因。
@@ -558,15 +561,13 @@ describe("经真实 Loader 装载本插件", () => {
       execute: async () => ({ ok: true }),
     });
     try {
-      // 前提要看得见：这份容器自己没注册任何 scrapling 工具，注册之后才只多出那一句。
+      // 前提要看得见：这份容器自己没注册任何 scrapling 工具，注册之后那段才出现。
       expect(own.tools).toStrictEqual([]);
       const text = await guidanceOf(own.ctx);
-      expect(text).toContain("scrapling_fetch");
-      // 这一份配置里默认开着 render/network/session/state，但它们没注册，所以那几句不该出现；
-      // crawl/answer 同理 —— 只有 fetch 这一条真被注册进容器。
+      expect(text.length).toBeGreaterThan(0);
+      // 摘要不点名任何工具：点名是 skill 正文的职责（它按 plan.ready 现算，只会点到真注册了的）。
+      expect(text).not.toContain("scrapling_fetch");
       expect(text).not.toContain("scrapling_render");
-      expect(text).not.toContain("scrapling_session_open");
-      expect(text).not.toContain("scrapling_crawl");
     } finally {
       dispose();
       await own.dispose();

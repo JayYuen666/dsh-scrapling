@@ -12,7 +12,7 @@
   <a href="https://github.com/JayYuen666/dsh-scrapling/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-scrapling/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.1-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.2-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -80,7 +80,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 Remove with `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`. The package is on the public npm registry, so installation needs no credentials and no scoped-registry line.
 
 - **Requires Node.js `>= 24.9`.** This is an ESM-only package, and the build entry points (`build-client.ts`, `build-host.ts`, `build-cli.ts`) are executed by `node` directly, so the floor has to sit where TypeScript type stripping is on by default (Node 22.18 up). The number itself is the host floor: `0.2.2` hosts declare Node `>= 24.9.0`, and a host below it never starts.
-- **Requires host `dsh` at the `0.2.2-rc.1` line or later.** The requirement the host actually reads is `engines.dsh` (`^0.2.2-rc.1`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against every released host version inside the window at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
+- **Requires host `dsh` at the `0.2.2-rc.2` line or later.** The requirement the host actually reads is `engines.dsh` (`^0.2.2-rc.2`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against every released host version inside the window at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
 - **Requires Python 3.14+ with Scrapling installed** — named by `pythonBin`, or found by the fixed chain in `lib/runtime.ts` (managed runtime under `dataDir/runtime`, then the repository's `_env/.venv`, then `PATH`). In an installed package the `_env/.venv` leg does not exist, so after `setup --feature core --apply` the interpreter is that managed Python and otherwise the `python3` on your `PATH` (`python` on Windows); whichever one is chosen is logged at load time, and a missing Scrapling reports an error carrying the install line to copy.
 
 ```sh
@@ -123,7 +123,7 @@ dsh-scrapling setup --status
    - That command is the only accepted "it is in the layer stack" signal, and it is **not read-only** — it rewrites the profile's root assembly file. Read layer lines from stdout **and** check stderr separately: an unmatched patch target appears only on stderr, so the exit code alone proves nothing. Accept both `# == <layer>` and `# == <layer>, patched by <path>`.
 2. **The startup log names the interpreter and the plan.** One line prints the probed capabilities and how many of the tools registered; the chosen interpreter path is logged at load. An interpreter that starts but lacks Scrapling is named in the log together with the pip line to copy.
 3. **The settings card renders.** The plugin detail page carries the **scrapling** card with every user-editable field grouped by purpose; toggling a value enables Save, and the write returns 200.
-4. **A tool round-trip.** Ask the model to fetch a JavaScript-heavy page: the result row renders in the chat through the official tool-call view. On a machine without a browser the render / capture_xhr tools are absent from the model's tool list and their prompt guidance is gone too — that absence is the conditional registration working, not a failure.
+4. **A tool round-trip.** Ask the model to fetch a JavaScript-heavy page: the result row renders in the chat through the official tool-call view. On a machine without a browser the render / capture_xhr tools are absent from the model's tool list and their guidance is gone from the skill body too — that absence is the conditional registration working, not a failure.
 
 ## <img src="https://api.iconify.design/lucide/circle-slash.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> What it does not provide
 
@@ -138,7 +138,7 @@ dsh-scrapling setup --status
 - The client half registers two surfaces: the settings card (on the `plugins.bundle.config` slot, keyed by the bundle package name — the host dispatches `entryKey: pkg.name`, so the card renders on this package's detail page) and one result row per tool on `tool.call.toolview`, drawn with the official tool-call view props.
 - The settings namespace is the entry id `scrapling`; precedence is settings-card value > registration-line `config:` > schema default. Setting a field back to its default saves a **clear-override**, not a write of the same value, so a later default change still reaches you.
 - Gate policy and the sidecar environment are snapshotted once when the plugin is applied — **settings changes take effect on the next start**.
-- Disabling a tool also removes its system-prompt guidance: the guidance is re-read at each prompt assembly against the tools that scope can actually see, so a machine without a browser loses the render / capture_xhr lines and a sidecar that never came up loses all of them. The section is placed next to the built-in `web_fetch` guidance.
+- Disabling a tool also removes its guidance, in two layers: the **resident section is a single summary** (cross-tool selection rules, naming no specific tool), while the fifteen per-tool lines are registered as a virtual skill `scrapling`. Both are re-read at each prompt assembly against the tools that scope can actually see — a machine without a browser loses the render / capture_xhr lines from the skill body, and a sidecar that never came up gets **neither the section nor the skill** (registering an empty skill would only put a catalog entry that opens to nothing). Without the host's skill service (a trimmed profile) the plugin still composes normally, it just lacks that skill and the summary drops its "full guidance lives in the skill" pointer. The section is placed next to the built-in `web_fetch` guidance.
 - `scrapling_crawl` registers its own job kind, so `job_list` labels its jobs as crawls rather than shell jobs.
 
 ## <img src="https://api.iconify.design/lucide/globe.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> The tools
@@ -428,4 +428,4 @@ pnpm run test:py   # end-to-end check of the Python sidecar
 
 MIT. Source at [github.com/JayYuen666/dsh-scrapling](https://github.com/JayYuen666/dsh-scrapling). Issues go to that repository's tracker.
 
-This package ships no third-party source code — Scrapling and the browser engines are runtime dependencies. The third-party content in the package is the icon (Tabler Icons) and the `zod` code inlined into the single-file CLI bundle; the host-side client bundle keeps `zod` external. [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) records that boundary.
+This package ships no third-party source code — Scrapling and the browser engines are runtime dependencies. The third-party content in the package is the icon (the official Scrapling mark, BSD 3-Clause) and the `zod` code inlined into the single-file CLI bundle; the host-side client bundle keeps `zod` external. [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) records that boundary.

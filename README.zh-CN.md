@@ -12,7 +12,7 @@
   <a href="https://github.com/JayYuen666/dsh-scrapling/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-scrapling/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.1-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.2-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -80,7 +80,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`。包在公共 npm registry 上，安装不需要凭据，也不需要 scoped-registry 配置行。
 
 - **需要 Node.js `>= 24.9`。** 本包是 ESM-only，且构建入口（`build-client.ts`、`build-host.ts`、`build-cli.ts`）由 `node` 直接执行，所以下限必须落在 TypeScript 类型剥离默认开启的那批版本上（Node 22.18 起）。数字本身取自宿主：`0.2.2` 系列宿主声明 Node `>= 24.9.0`，低于它的宿主根本起不来。
-- **需要宿主 `dsh` 处在 `0.2.2-rc.1` 或更新的 `0.2.2` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.2-rc.1`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
+- **需要宿主 `dsh` 处在 `0.2.2-rc.2` 或更新的 `0.2.2` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.2-rc.2`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
 - **需要 Python 3.14+ 且装好 Scrapling** —— 由 `pythonBin` 指定，或按 `lib/runtime.ts` 的固定链找到：`dataDir/runtime` 下的托管 runtime → 仓内 `_env/.venv` → `PATH`。装出去的包里没有 `_env/.venv` 这一档，所以跑过 `setup --feature core --apply` 的机器用的是那支托管解释器，没装过就是你 `PATH` 上的 `python3`（Windows 上是 `python`）；选中哪一支会在装载时写进日志，缺 Scrapling 时报错里带着可直接照抄的安装命令。
 
 ```sh
@@ -123,7 +123,7 @@ dsh-scrapling setup --status
    - 这条命令是唯一被认的「它在层栈里」信号，而且它**不是只读的** —— 会把 profile 的根装配文件重写一遍。层行从 stdout 读，stderr **单独**查：未命中的 patch 目标只出现在 stderr，只看退出码证明不了任何事。`# == <层>` 与 `# == <层>, patched by <路径>` 两种形态都要认。
 2. **启动日志点名解释器与注册计划。** 有一行打印探测到的能力与注册了几个工具；选中的解释器路径在装载时写进日志。解释器起得来但没装 Scrapling 时，日志点名解释器路径，并附可直接照抄的 pip 命令。
 3. **设置卡渲染。** 插件详情页上有 **scrapling** 卡，全部用户可改字段按用途分组；改一个值后保存按钮亮起，写入返回 200。
-4. **一次工具往返。** 让模型抓一个重 JS 的页面：结果行经官方 tool-call 视图渲染在会话里。没有浏览器的机器上，render / capture_xhr 不在模型的工具列表里，对应的提示指引也一并消失 —— 那是条件注册在起作用，不是故障。
+4. **一次工具往返。** 让模型抓一个重 JS 的页面：结果行经官方 tool-call 视图渲染在会话里。没有浏览器的机器上，render / capture_xhr 不在模型的工具列表里，对应的指引也一并消失（skill 正文里没有那几句）—— 那是条件注册在起作用，不是故障。
 
 ## <img src="https://api.iconify.design/lucide/circle-slash.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它不提供什么
 
@@ -138,7 +138,7 @@ dsh-scrapling setup --status
 - client 半注册两处：设置卡（坐在 `plugins.bundle.config` 槽上，键是 bundle 包名 —— 宿主按 `entryKey: pkg.name` 派发，所以卡画在本包的详情页上），以及每个工具在 `tool.call.toolview` 上的一行结果，用官方 tool-call 视图 props 画。
 - 设置命名空间就是条目 id `scrapling`；优先级为 设置卡现值 > 注册行 `config:` > schema 默认值。把一项改回默认值保存的是**清除覆盖**而不是写入同一个值，将来默认值变了你这一项也会跟着变。
 - 闸门策略与 sidecar 环境在插件 `apply()` 时取一次快照 —— **设置卡的改动要等下次启动才生效**。
-- 关掉某个工具时，它的 system prompt 指引段也一并消失：指引每次装配都按「那个 scope 真注册着哪些工具」现取，没装浏览器的机器少掉 render / capture_xhr 那几句，sidecar 没起来的机器一句都没有。指引段排在内置 `web_fetch` 指引旁边。
+- 关掉某个工具时，它的指引也一并消失，但分两层看：**常驻段只有一段摘要**（跨工具的选型规则，不点名具体工具），而逐工具那十五句全文注册成一枚虚拟 skill `scrapling`。两侧都按「那个 scope 真注册着哪些工具」现取 —— 没装浏览器的机器上 skill 正文里没有 render / capture_xhr 那几句，sidecar 没起来的机器**既没有常驻段也不注册 skill**（正文为空时注册一枚点开什么都没有的条目只会污染模型的 skill 目录）。宿主没有 skill 服务（精简 profile）时插件照常装配，只是少了这枚 skill，常驻段也不追加那句「完整指引见 skill」。常驻段排在内置 `web_fetch` 指引旁边。
 - `scrapling_crawl` 登记自己的作业类型，`job_list` 因此把它的作业标成爬虫而不是 shell 作业。
 
 ## <img src="https://api.iconify.design/lucide/globe.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 工具一览
@@ -428,4 +428,4 @@ pnpm run test:py   # Python sidecar 的端到端验证
 
 MIT。源码在 [github.com/JayYuen666/dsh-scrapling](https://github.com/JayYuen666/dsh-scrapling)，issue 走该仓库的 tracker。
 
-本包不随包分发第三方源码 —— Scrapling 与浏览器引擎都是运行期依赖。随包的第三方内容是图标（Tabler Icons）与 CLI 单文件产物内联的 `zod`；host 侧 client 产物外置 zod。[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) 记录这条边界。
+本包不随包分发第三方源码 —— Scrapling 与浏览器引擎都是运行期依赖。随包的第三方内容是图标（Scrapling 官方标记，BSD 3-Clause）与 CLI 单文件产物内联的 `zod`；host 侧 client 产物外置 zod。[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) 记录这条边界。

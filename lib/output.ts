@@ -9,9 +9,13 @@
 //
 // 截断切点必须落在安全位置：官方的 `TextRetainer` 处理了代理对，直接 `slice` 会在切点
 // 留下孤立高代理 —— 那种文本进会话日志后会让后续 Messages 请求整体失败（dsh PR #4827）。
+//
+// 模型可见的句子一律从 `messages` 取：这一层也是模型可见面的一部分，硬编中文等于英文
+// 部署里正文是英文、页脚却仍是中文。
 
 import { formatRetentionNotice, TextRetainer } from "@deepseek-ai/dsh-output-retention";
 
+import type { ScraplingMessages } from "./messages.ts";
 import type {
   AnswerToolResult,
   BrowserResult,
@@ -22,20 +26,6 @@ import type {
   SelectResult,
 } from "./tools.ts";
 
-/** 被截断时告诉模型怎么把内容再拿回来。 */
-const SELECT_TRUNCATION_HINT = "结果被截断：请减小 limit，或提高 maxContentChars 后再取。";
-
-/**
- * 正文被截断时给模型的找回指引。
- *
- * 单一来源：`capText` 页脚里的恢复建议（tools.ts 以 `RECOVERY_HINT` 之名传入）与
- * 渲染层在「只有 `truncated` 标记、没有页脚」时的回落提示都用这一句，两处不会各写一套说法。
- */
-export const CONTENT_RECOVERY_HINT = "要拿被省略的部分，请用 cssSelector 收窄范围，或分多次抓取。";
-
-/** 对端报过截断、而本地封顶没再截时的回落页脚：先说事实，再给同一条出路。 */
-const CONTENT_TRUNCATION_HINT = `正文被截断：${CONTENT_RECOVERY_HINT}`;
-
 /**
  * 结果正文的尾巴：对端 notice 优先，其次截断提示；两者都没有就返回空串。
  *
@@ -43,14 +33,10 @@ const CONTENT_TRUNCATION_HINT = `正文被截断：${CONTENT_RECOVERY_HINT}`;
  *
  * @param notice - 对端给的人读说明
  * @param truncated - 结果是否被截断
- * @param hint - 截断提示；缺省是按选择结果给的
+ * @param hint - 截断提示，由调用方按语言给
  * @returns 追加到正文后的尾巴
  */
-function tailOf(
-  notice: string | undefined,
-  truncated: boolean,
-  hint = SELECT_TRUNCATION_HINT,
-): string {
+function tailOf(notice: string | undefined, truncated: boolean, hint: string): string {
   if (notice !== undefined && notice.length > 0) {
     return notice;
   }
@@ -144,9 +130,10 @@ export function capText(text: string, budgetBytes: number, recovery: string): Ca
  * 渲染 locate 结果。
  *
  * @param value - locate 结果
+ * @param messages - 当前语言的文案
  * @returns 模型侧文本
  */
-function renderLocate(value: LocateResult): string {
+function renderLocate(value: LocateResult, messages: ScraplingMessages): string {
   const body =
     value.matches.length === 0
       ? "no matches"
@@ -185,7 +172,7 @@ function renderLocate(value: LocateResult): string {
             return lines.join("\n");
           })
           .join("\n");
-  const tail = tailOf(value.notice, value.truncated);
+  const tail = tailOf(value.notice, value.truncated, messages.selectTruncationHint);
   return tail.length > 0 ? `${body}\n\n${tail}` : body;
 }
 
@@ -193,15 +180,16 @@ function renderLocate(value: LocateResult): string {
  * 渲染 links 结果。
  *
  * @param value - links 结果
+ * @param messages - 当前语言的文案
  * @returns 模型侧文本
  */
-function renderLinks(value: LinksResult): string {
+function renderLinks(value: LinksResult, messages: ScraplingMessages): string {
   const lines = value.links.map((item) => item.url);
   for (const candidate of value.nextCandidates) {
     lines.push(`next: ${candidate.text} -> ${candidate.url} (${candidate.reason})`);
   }
   const body = lines.length === 0 ? "no links" : lines.join("\n");
-  return value.truncated ? `${body}\n\n${SELECT_TRUNCATION_HINT}` : body;
+  return value.truncated ? `${body}\n\n${messages.selectTruncationHint}` : body;
 }
 
 /**
@@ -212,9 +200,10 @@ function renderLinks(value: LinksResult): string {
  * 造出永远走不到的死分支。
  *
  * @param value - 投影出的结果值
+ * @param messages - 当前语言的文案
  * @returns 模型侧文本
  */
-function renderFetch(value: FetchResult): string {
+function renderFetch(value: FetchResult, messages: ScraplingMessages): string {
   const body = `Fetched ${value.url} (HTTP ${value.statusCode})\n\n${value.content}`;
   const metadata =
     value.metadata === undefined || Object.keys(value.metadata).length === 0
@@ -225,7 +214,7 @@ function renderFetch(value: FetchResult): string {
   const withMetadata = `${body}${metadata}`;
   // 对端的 `maxContentChars` 截断只体现在 `truncated` 这一位上（`toFetchResult` 交回的 notice
   // 恒为空串），本地预算没再截时 notice 也是空串——只读 notice 就等于把这一份正文报成完整。
-  const tail = tailOf(value.notice, value.truncated, CONTENT_TRUNCATION_HINT);
+  const tail = tailOf(value.notice, value.truncated, messages.contentTruncationHint);
   return tail.length > 0 ? `${withMetadata}\n\n${tail}` : withMetadata;
 }
 
@@ -236,9 +225,10 @@ function renderFetch(value: FetchResult): string {
  * `value` 保证每项都在；写「万一不是数组」的兜底只会造出永远走不到的死分支。
  *
  * @param value - 投影出的结果值
+ * @param messages - 当前语言的文案
  * @returns 模型侧文本
  */
-function renderMatches(value: SelectResult): string {
+function renderMatches(value: SelectResult, messages: ScraplingMessages): string {
   let body: string;
   if (value.rows) {
     body =
@@ -257,7 +247,7 @@ function renderMatches(value: SelectResult): string {
       })
       .join("\n");
   }
-  const tail = tailOf(value.notice, value.truncated);
+  const tail = tailOf(value.notice, value.truncated, messages.selectTruncationHint);
   return tail.length > 0 ? `${body}\n\n${tail}` : body;
 }
 
@@ -298,10 +288,15 @@ function networkLines(matches: readonly NetworkEntry[]): string[] {
  *
  * @param value - 浏览器抓取载荷
  * @param networkBudgetBytes - 网络历史那一段的字节预算（与正文同一档）
+ * @param messages - 当前语言的文案
  * @returns 模型侧文本
  */
-function renderBrowser(value: BrowserResult, networkBudgetBytes: number): string {
-  const body = renderFetch(value);
+function renderBrowser(
+  value: BrowserResult,
+  networkBudgetBytes: number,
+  messages: ScraplingMessages,
+): string {
+  const body = renderFetch(value, messages);
   const captured = value.xhr;
   if (captured === undefined) {
     return body;
@@ -316,7 +311,7 @@ function renderBrowser(value: BrowserResult, networkBudgetBytes: number): string
   const section = capText(
     networkLines(captured).join("\n"),
     networkBudgetBytes,
-    "网络历史整体被截断：完整的条目请用 scrapling_capture_xhr / scrapling_session_network 的 limit 与游标分页读。",
+    messages.networkTruncationHint,
   );
   const footer = section.notice.length > 0 ? `\n\n${section.notice}` : "";
   return `${body}\n\nCaptured XHR/fetch:\n${section.text}${footer}`;
@@ -326,11 +321,12 @@ function renderBrowser(value: BrowserResult, networkBudgetBytes: number): string
  * 把问答结果渲染成模型看的文本。
  *
  * @param value - 问答结果
+ * @param messages - 当前语言的文案
  * @returns 模型侧文本
  */
-function renderAnswer(value: AnswerToolResult): string {
+function renderAnswer(value: AnswerToolResult, messages: ScraplingMessages): string {
   const head = `Answer to "${value.url}" (HTTP ${value.statusCode}, via ${value.provider}/${value.model}):`;
-  const tail = tailOf(value.notice, value.truncated, CONTENT_TRUNCATION_HINT);
+  const tail = tailOf(value.notice, value.truncated, messages.contentTruncationHint);
   return `${head}\n\n${value.answer}${tail.length > 0 ? `\n\n${tail}` : ""}`;
 }
 

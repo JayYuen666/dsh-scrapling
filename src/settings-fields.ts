@@ -663,6 +663,7 @@ type BuiltInLang = "zh" | "en";
 /** 设置卡自身的文案：按钮、状态行与读屏提示。字段标签不在这里 —— 它们由字段表摊出来。 */
 const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = {
   zh: {
+    navLabel: "scrapling 抓取",
     save: "保存",
     saving: "保存中…",
     undo: "撤销",
@@ -702,6 +703,7 @@ const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = 
     "runtime.pack.mcp": "MCP（未验证）",
   },
   en: {
+    navLabel: "scrapling fetch",
     save: "Save",
     saving: "Saving…",
     undo: "Undo",

@@ -21,6 +21,7 @@ import type { AnswerResult } from "../lib/answer.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
 import { MCP_TOKEN_ENV } from "../lib/mcp-contract.ts";
+import { MESSAGES } from "../lib/messages.ts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
@@ -35,11 +36,13 @@ import {
   name,
   outputBudgetOf,
   planTools,
+  providerReadersOf,
   resolveDataDir,
   resolvePythonBin,
   snapshotFlags,
   startMcpSurface,
   TOOL_SPECS,
+  usageSummaryOf,
 } from "../host.ts";
 import type { Config as ConfigType, ToolFlags, ToolPlan } from "../host.ts";
 import type { Volatile } from "@deepseek-ai/cordis";
@@ -154,21 +157,34 @@ function volatileRef(key: string): Volatile<unknown> {
   return ref as unknown as Volatile<unknown>;
 }
 
+/** 设置服务 `describe()` 交回的一行：命名空间名加它当前的取值。 */
+interface SettingRow {
+  readonly ns: string;
+  readonly value?: unknown;
+}
+
 /**
  * 假 ctx 里的 settings 面。
  *
  * 本插件在 apply 开头登记一次页面策略（`auto: false`，意思是「这一页由自带卡片编辑」，
  * 别再自动生成一份通用表单）。记下收到的值供断言，返回一个空 disposer，与真实服务同形。
  *
+ * `rows` 是 `describe()` 的读数：默认空表等价于「没装官方 locale 插件 / 条目没被投影」，
+ * 也就是改造前的状态；要验语言偏好的用例自己塞一行 `locale` 进去。
+ *
  * @param registrations - 收到的 `auto` 值会推进来
+ * @param rows - `describe()` 要回的命名空间行
  * @returns 可直接挂进假 ctx 的对象
  */
-function settingsStub(registrations: string[] = []): unknown {
+function settingsStub(registrations: string[] = [], rows: readonly SettingRow[] = []): unknown {
   return {
     configure: (presentation: { auto?: boolean }): (() => void) => {
       registrations.push(String(presentation.auto));
       return (): void => undefined;
     },
+    // 宿主把「设置 → 常规」里的语言偏好放在 `locale` 命名空间，跨命名空间读只有这一条路。
+    // 缺省空表等价于「没装官方 locale 插件」—— 那正是改造前所有用例的状态。
+    describe: (): readonly SettingRow[] => rows,
   };
 }
 
@@ -184,6 +200,13 @@ interface PromptRecord {
 /** 步骤准入的读取接口（官方 `ResolvedToolSet.view` 的结构投影）。 */
 interface ToolSetFace {
   readonly view: (scope: object | undefined) => Map<string, unknown>;
+}
+
+/** 注册上去的一枚虚拟 skill（判据面：名字、目录说明、正文三样）。 */
+interface RegisteredSkill {
+  readonly name: string;
+  readonly description: string;
+  readonly content: string;
 }
 
 /**
@@ -361,6 +384,23 @@ const LOOPBACK_ALLOWLIST = "127.0.0.1,localhost";
 
 /** 用例里统一的假作业 id。 */
 const CRAWL_JOB_ID = "scrapling-1";
+
+/**
+ * 汉字本体：用来判「英文那份文案里还剩不剩中文」。
+ *
+ * 只收汉字区段，不含中文标点 —— 英文文案里合法出现的 U+2014／U+2026 不在这一类里，
+ * 而全角标点（U+FF00 起）也没有理由出现在英文里，所以一并算进来会更严；但 `〔〕`
+ * 是协议记号，会被它误伤，故不收 U+3000 段。
+ */
+const HAN_RESIDUE = /[\u3400-\u4DBF\u4E00-\u9FFF\uFF00-\uFFEF]/u;
+
+/**
+ * 指路句里点名的 skill 名（带反引号，就是模型在正文里看到的那四个字符）。
+ *
+ * 单列成常量是因为它在几条断言里都要逐字比对：写成三份字面量时，哪天 skill 改了名而只改了
+ * 一处，另外两处仍会「通过」—— 那种绿说明的是字面量之间彼此相等，不是它们都对得上实现。
+ */
+const SKILL_POINTER = "`scrapling`";
 
 describe("插件元信息", () => {
   it("插件 id 与 cordis.patch.yml 的 id 一致（设置命名空间由此决定）", () => {
@@ -584,14 +624,16 @@ describe("system prompt 指引段", () => {
   it("全开且工具都在时每一段指引都在，只开一条时就只剩一条", () => {
     // 判据是**行数与开关数一一对应**，而不是逐行文本内容：指引写的是给人读的话，措辞会变，
     // 而「关掉一个工具就少一段」这个不变式不会变。
-    expect(guidanceFor(ALL_ON, EVERYWHERE).split("\n")).toHaveLength(Object.keys(ALL_ON).length);
-    const onlyFetch = guidanceFor({ ...ALL_OFF, fetch: true }, EVERYWHERE);
+    expect(guidanceFor(ALL_ON, EVERYWHERE, MESSAGES.zh).split("\n")).toHaveLength(
+      Object.keys(ALL_ON).length,
+    );
+    const onlyFetch = guidanceFor({ ...ALL_OFF, fetch: true }, EVERYWHERE, MESSAGES.zh);
     expect(onlyFetch.split("\n")).toHaveLength(1);
     expect(onlyFetch).toContain("scrapling_fetch");
   });
 
   it("全关时文本是空串（README 说的「一并消失」就是这个形状）", () => {
-    expect(guidanceFor(ALL_OFF, EVERYWHERE)).toBe("");
+    expect(guidanceFor(ALL_OFF, EVERYWHERE, MESSAGES.zh)).toBe("");
   });
 
   it("开关开着但工具没注册时，那句指引也不说（这是同一个不变式的另一半）", () => {
@@ -599,13 +641,15 @@ describe("system prompt 指引段", () => {
     // Python 起不来（failFastOnMissingPython=false）时**一个都不注册**。只看开关就会给模型
     // 一串点了就报 UNKNOWN_TOOL 的建议 —— 与「少一段指引」是同一种故障的两个方向。
     for (const spec of TOOL_SPECS) {
-      const text = guidanceFor(ALL_ON, exceptTool(spec.name));
+      const text = guidanceFor(ALL_ON, exceptTool(spec.name), MESSAGES.zh);
       expect(text, `${spec.name} 没注册时不该被点名（这是那条降级路径的真实后果）`).not.toContain(
         spec.name,
       );
     }
     // 反向保底：全注册时每一句都在 —— 少了这条，「恒为空串」的实现也能骗过上面那一组断言。
-    expect(guidanceFor(ALL_ON, EVERYWHERE).split("\n")).toHaveLength(Object.keys(ALL_ON).length);
+    expect(guidanceFor(ALL_ON, EVERYWHERE, MESSAGES.zh).split("\n")).toHaveLength(
+      Object.keys(ALL_ON).length,
+    );
   });
 
   it("指引段按**装配时**的开关与注册状态现取文本，而不是注册那一刻定死", async () => {
@@ -613,6 +657,10 @@ describe("system prompt 指引段", () => {
     // 注册那一刻算好的死字符串 —— 否则设置卡关掉工具，指引不会跟着消失；③ 那段文本问的是
     // ctx.tools.get(名字, 装配 scope)，而不是我们自己攒的注册表；④ ctx.effect 的工厂被宿主
     // 调用过，disposer 真的产出（上游规则「注册即 effect」要求回收路径被验证）。
+    //
+    // 常驻段现在只有**摘要**（每工具一句的全文注册成 skill `scrapling` 了，见 test/skill.test.ts），
+    // 所以这里的判据是「有没有任何一段可说」而不是「哪几句在」：摘要按一刀切收口，逐工具的
+    // 点名交给 skill 正文（它按 plan.ready 现算，天然只会点到真注册了的工具）。
     const sections: PromptRecord[] = [];
     const factories: (() => unknown)[] = [];
     const tools = toolsStub();
@@ -663,19 +711,16 @@ describe("system prompt 指引段", () => {
     expect(tools.names).toStrictEqual([]);
     expect(read()).toBe("");
 
-    // 注册了几条，指引就只说开关开着的那几条：crawl / network 这两条的开关被显式关掉了，
-    // 所以即便有人把它们的工具塞进注册表也不该出现（开关那一半仍然管着）。
-    tools.names.push(
-      "scrapling_fetch",
-      "scrapling_render",
-      "scrapling_crawl",
-      "scrapling_session_network",
-    );
+    // 只把**开关关着**的那几条塞进注册表：开关那一半仍然管着，一段都不该出现。摘要是一整段
+    // 文字，只能整段说或整段不说，所以这一格的判据就是「仍然为空」。
+    tools.names.push("scrapling_crawl", "scrapling_session_network");
+    expect(read()).toBe("");
+
+    // 注册了开关开着的一条，摘要就该出现（全文仍在 skill 里，所以常驻段不再逐工具点名）。
+    tools.names.push("scrapling_fetch", "scrapling_render");
     const text = read();
-    expect(text).toContain("scrapling_fetch");
-    expect(text).toContain("scrapling_render");
-    expect(text).not.toContain("scrapling_crawl");
-    expect(text).not.toContain("scrapling_session_network");
+    expect(text.length).toBeGreaterThan(0);
+    expect(text).not.toContain("scrapling_fetch");
 
     // 装配上下文带步骤准入时按准入视图判（受限子代理/条件工具在这一档显形），
     // 且把装配 scope 原样交给 view——换一个作用域就是另一份准入。
@@ -691,13 +736,168 @@ describe("system prompt 指引段", () => {
       typeof section?.text === "function"
         ? section.text({ scope, toolSet: admitted(["scrapling_fetch"]) })
         : "";
-    expect(restricted).toContain("scrapling_fetch");
-    expect(restricted).not.toContain("scrapling_render");
+    // 准入视图里只剩 fetch：摘要仍该出现（它按「有没有任何一段可说」一刀切）。
+    expect(restricted.length).toBeGreaterThan(0);
+    // 反过来把 fetch 从准入里拿掉（只剩开关关着的两条），摘要也跟着消失 —— 这是同一条
+    // 判据的另一半，少了它「恒输出摘要」的实现也能骗过上面那半。
+    const closed =
+      typeof section?.text === "function"
+        ? section.text({ scope, toolSet: admitted(["scrapling_crawl"]) })
+        : "";
+    expect(closed).toBe("");
     expect(scopes.length).toBeGreaterThan(0);
     expect(
       scopes.every((entry) => entry === scope),
       "每次查准入都用同一个装配 scope",
     ).toBe(true);
+  });
+});
+
+/**
+ * 跑一次**降级**装配（解释器起不来 ⇒ 一个工具都不注册），把两处模型可见文案取回来。
+ *
+ * 降级不影响这条判据：指引段问的是 `ctx.tools.get(名字, scope)`，夹具让它对任何工具名都
+ * 答「在」，于是文本只由开关与文案表决定 —— 正是要验的那两位。`effect` 这里**真的执行**
+ * 工厂：apply 把若干清理函数与那一段 system prompt 都登记成 effect，不执行就取不到段。
+ *
+ * 这一档同时钉住另一件事：**一个工具都没注册时 skill 不注册**（正文为空 ⇒ `registerGuidanceSkill`
+ * 返回 false），于是常驻段里也不会出现「见 skill」那句指路话 —— 指路句指向的 skill 不存在时
+ * 比不说更糟。
+ *
+ * @param settings - 假 ctx 的 settings 面（`describe()` 的读数由它给）
+ * @param overrides - 额外覆盖的配置项
+ * @returns 常驻摘要段、注册上去的 skill（这一档恒为 undefined）、注册次数
+ */
+async function guidanceUnder(
+  settings: unknown,
+  overrides: Record<string, unknown> = {},
+): Promise<{ readonly text: string; readonly skills: readonly RegisteredSkill[] }> {
+  const sections: PromptRecord[] = [];
+  const recorded: RegisteredSkill[] = [];
+  const skillsService = {
+    register: (skill: RegisteredSkill): (() => void) => {
+      recorded.push(skill);
+      return (): void => undefined;
+    },
+  };
+  const ctx = {
+    // 只有 skills 这一个服务在：其余（jobs / attachments / agentDefaultModel）缺席，
+    // 与真实的降级装配同形。
+    get: (service: string): unknown => (service === "skills" ? skillsService : undefined),
+    subprocess: {
+      resolveExecutable: async (): Promise<string> => {
+        throw new Error(INTERPRETER_UNUSABLE);
+      },
+      spawn: (): never => {
+        throw new Error(SHOULD_NOT_REACHED);
+      },
+    },
+    logger: {
+      info: (): void => undefined,
+      warn: (): void => undefined,
+      debug: (): void => undefined,
+    },
+    settings,
+    systemPrompt: promptStub(sections),
+    // 每个工具名都答「在」：这一格验的是文案，不是注册计划。
+    tools: { get: (): unknown => ({ name: "stub" }) },
+    effect: (factory: () => unknown): void => {
+      factory();
+    },
+  } as unknown as never;
+  // 显式空 dataDir：避开这台机器 ~/.dsh-scrapling 里的托管 runtime。
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), "dsh-locale-"));
+  try {
+    await apply(
+      ctx,
+      makeConfig({ pythonBin: "", failFastOnMissingPython: false, dataDir, ...overrides }),
+    );
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+  const section = sections.at(-1);
+  return {
+    text: typeof section?.text === "function" ? section.text({}) : "",
+    skills: recorded,
+  };
+}
+
+describe("host 侧文案跟随官方 locale 偏好", () => {
+  it("locale 命名空间没注册时按中文默认（改造前的行为不变）", async () => {
+    const { text } = await guidanceUnder(settingsStub());
+    expect(text.length, "指引段整段为空，这条判据会空转").toBeGreaterThan(0);
+    expect(text).toMatch(HAN_RESIDUE);
+  });
+
+  it("偏好 en 时常驻摘要换成英文", async () => {
+    const { text } = await guidanceUnder(
+      settingsStub([], [{ ns: "locale", value: { preference: "en" } }]),
+      {
+        allowBrowserActions: true,
+        allowFileDownloads: true,
+      },
+    );
+    // 反向钉子：换成英文之后中文不能再出现，否则「只翻了一部分」也会绿。
+    expect(text).not.toMatch(HAN_RESIDUE);
+    // 摘要刻意不点名工具：它按「有没有任何一段可说」一刀切，而各工具能不能注册取决于
+    // 运行环境；点名是 skill 正文的职责（见下一条）。
+    expect(text).not.toContain("scrapling_fetch");
+  });
+
+  it("英文栏的十五条指引一条不漏，且逐条都不残留中文", () => {
+    // skill 正文就是 `guidanceFor(全开, 全部可见, messages)` 的产物，它在真装配里按
+    // `plan.ready` 现算、随语言表切换。这里直接打那一层：把 19 个工具都拉起来要真 sidecar，
+    // 而这条验的是**文案**，与注册环境无关。
+    const en = guidanceFor(ALL_ON, EVERYWHERE, MESSAGES.en);
+    expect(en.split("\n"), "全开时该有十五条指引").toHaveLength(Object.keys(ALL_ON).length);
+    expect(en).not.toMatch(HAN_RESIDUE);
+    expect(en).toContain("scrapling_fetch");
+    // 反向钉子：中文那一份必须真的含汉字，否则上面那句「不残留中文」在恒空实现下也会绿。
+    expect(guidanceFor(ALL_ON, EVERYWHERE, MESSAGES.zh)).toMatch(HAN_RESIDUE);
+  });
+
+  it("指路句只在 skill 真注册上时才追加（否则指向一个不存在的 skill）", () => {
+    const withSkill = usageSummaryOf(MESSAGES.en, true);
+    expect(withSkill).toContain(SKILL_POINTER);
+    expect(withSkill.split("\n")).toHaveLength(5);
+    const without = usageSummaryOf(MESSAGES.en, false);
+    expect(without).not.toContain(SKILL_POINTER);
+    expect(without).toBe(MESSAGES.en.usageSummary);
+    expect(without.split("\n")).toHaveLength(4);
+  });
+
+  it("降级装配（一个工具都没注册）时不注册空 skill，常驻段也不带指路句", async () => {
+    const { text, skills } = await guidanceUnder(settingsStub());
+    // 摘要仍要说（它讲的是跨工具的选型规则，与这个机器上装没装浏览器无关）。
+    expect(text.length).toBeGreaterThan(0);
+    expect(skills, "正文为空时注册一枚点开什么都没有的 skill 只会污染模型目录").toStrictEqual([]);
+    expect(text).not.toContain(SKILL_POINTER);
+    expect(text).toBe(MESSAGES.zh.usageSummary);
+  });
+
+  it("偏好写成 en-US 时也落到英文（只取主语言子标签）", async () => {
+    const { text } = await guidanceUnder(
+      settingsStub([], [{ ns: "locale", value: { preference: "en-US" } }]),
+    );
+    expect(text).not.toMatch(HAN_RESIDUE);
+  });
+
+  it("describe 抛错时落回中文，且不打断整次装配", async () => {
+    // 语言只是文案，读不到偏好不该有让插件装不起来的权力。
+    const { text } = await guidanceUnder({
+      configure: (): (() => void) => (): void => undefined,
+      describe: (): never => {
+        throw new Error("settings service is not ready");
+      },
+    });
+    expect(text).toMatch(HAN_RESIDUE);
+  });
+
+  it("偏好取到的是垃圾值时落回中文（不按垃圾值崩）", async () => {
+    const { text } = await guidanceUnder(
+      settingsStub([], [{ ns: "locale", value: { preference: 42 } }]),
+    );
+    expect(text).toMatch(HAN_RESIDUE);
   });
 });
 
@@ -1895,6 +2095,75 @@ describe("爬虫作业的取消与失败", () => {
   );
 });
 
+describe("两个 web provider 的热改项读取器", () => {
+  it("八位读取器每次都取当下的值，而不是装配时的快照", () => {
+    // 判据是「同一个读取器对象，两次调用之间改配置」。抄了值的实现第二次仍回旧值，
+    // 而生产里的症状是「设置卡拧了旋钮、运行行为一点没变」，回包与日志都看不出异常。
+    const holder = {
+      backend: "tavily" as const,
+      apiKey: "",
+      braveApiKey: "",
+      serperApiKey: "",
+      searxngEndpoint: "",
+      publicFallback: false,
+      maxOutputBytes: 200_000,
+      timeoutMs: 120_000,
+    };
+    const config = makeConfig({});
+    Object.assign(config, {
+      searchBackend: { get: () => holder.backend },
+      tavilyApiKey: { get: () => holder.apiKey },
+      braveApiKey: { get: () => holder.braveApiKey },
+      serperApiKey: { get: () => holder.serperApiKey },
+      searxngEndpoint: { get: () => holder.searxngEndpoint },
+      searchPublicFallback: { get: () => holder.publicFallback },
+      fetchMaxOutputChars: { get: () => holder.maxOutputBytes },
+      fetchTimeoutMs: { get: () => holder.timeoutMs },
+    });
+    const readers = providerReadersOf(config);
+    expect([
+      readers.backend(),
+      readers.apiKey(),
+      readers.braveApiKey(),
+      readers.serperApiKey(),
+      readers.searxngEndpoint(),
+      readers.publicFallback(),
+      readers.maxOutputBytes(),
+      readers.timeoutMs(),
+    ]).toStrictEqual(["tavily", "", "", "", "", false, 200_000, 120_000]);
+
+    Object.assign(holder, {
+      backend: "searxng",
+      apiKey: "tvly-live",
+      braveApiKey: "brave-live",
+      serperApiKey: "serper-live",
+      searxngEndpoint: "https://searx.test",
+      publicFallback: true,
+      maxOutputBytes: 4000,
+      timeoutMs: 30_000,
+    });
+    expect([
+      readers.backend(),
+      readers.apiKey(),
+      readers.braveApiKey(),
+      readers.serperApiKey(),
+      readers.searxngEndpoint(),
+      readers.publicFallback(),
+      readers.maxOutputBytes(),
+      readers.timeoutMs(),
+    ]).toStrictEqual([
+      "searxng",
+      "tvly-live",
+      "brave-live",
+      "serper-live",
+      "https://searx.test",
+      true,
+      4000,
+      30_000,
+    ]);
+  });
+});
+
 describe("出站 URL 闸门（Host 侧 SSRF 防线）", () => {
   /** 公网地址字面量：走 IP 直连分支，不需要 DNS，测试因此不碰网络。 */
   const PUBLIC = "http://93.184.216.34/page";
@@ -2276,7 +2545,9 @@ type Disposer = () => unknown;
 const STUB_DEPS = (): never =>
   ({
     sidecar: { call: async () => ({}) } as never,
-    settings: {} as never,
+    // settings.timeoutMs 不能省：注册级墙钟是它加上余量算出来的，缺了会得到 NaN，
+    // defineTool 当场抛 `timeoutMs must be a positive finite number`。
+    settings: { timeoutMs: 120_000 } as never,
     startCrawlJob: async () => "crawl-0000000000000000",
     answer: async () => ({}) as never,
     attachments: undefined,

@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { SEARCH_PROVIDER_ID, createWebSearchProvider } from "../lib/search-provider.ts";
 import type { SearchProviderDeps } from "../lib/search-provider.ts";
+import type { SearchBackend } from "../lib/search-backends.ts";
 import type { SidecarClient } from "../lib/sidecar.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
 
@@ -16,6 +17,8 @@ const SEARCH_FAILED = "SCRAPLING_SEARCH_FAILED";
 const DISCOVER = "search.discover";
 const API_ENDPOINT = "https://api.tavily.test/search";
 const BING_ENDPOINT = "https://bing.test/search";
+/** SearXNG 自建实例地址：几处用例都要它，值只写一次。 */
+const SEARX_ENDPOINT = "https://searx.test";
 
 /** 三把后端 key 的替身值：既配上、又要求只下发自家那一把，值只在这里写一次。 */
 const BRAVE_KEY = "brave-key";
@@ -81,8 +84,36 @@ function makeSidecar(options: SidecarOptions = {}): SidecarClient {
   } as unknown as SidecarClient;
 }
 
-function deps(over?: Partial<SearchProviderDeps>): SearchProviderDeps {
-  return {
+/**
+ * 用例侧的依赖形态：热改项写成**普通值**，由 {@link deps} 统一包成读取器。
+ *
+ * 单独定这一层是因为 `SearchProviderDeps` 现在有八位读取器（见 lib/config-reader.ts 的
+ * 说明），四十多处调用点若都手写 `() => x` 只会让断言里的值淹没在类型噪音里；而「读取器
+ * 真的每次现取」这件事由专门那条用例钉住，不靠每个调用点重复表态。
+ */
+type PlainDeps = Omit<
+  SearchProviderDeps,
+  | "backend"
+  | "apiKey"
+  | "braveApiKey"
+  | "serperApiKey"
+  | "searxngEndpoint"
+  | "publicFallback"
+  | "maxOutputBytes"
+  | "timeoutMs"
+> & {
+  readonly backend: SearchBackend;
+  readonly apiKey: string;
+  readonly braveApiKey: string;
+  readonly serperApiKey: string;
+  readonly searxngEndpoint: string;
+  readonly publicFallback: boolean;
+  readonly maxOutputBytes: number;
+  readonly timeoutMs: number;
+};
+
+function deps(over?: Partial<PlainDeps>): SearchProviderDeps {
+  const plain: PlainDeps = {
     sidecar: makeSidecar(),
     backend: "bing",
     apiKey: "",
@@ -101,6 +132,17 @@ function deps(over?: Partial<SearchProviderDeps>): SearchProviderDeps {
     // 闸门是必填依赖：默认给一枚全放行的，用例要判否时用 blockList/passGate 覆盖。
     urlGate: async (url: string): Promise<string | undefined> => url,
     ...over,
+  };
+  return {
+    ...plain,
+    backend: () => plain.backend,
+    apiKey: () => plain.apiKey,
+    braveApiKey: () => plain.braveApiKey,
+    serperApiKey: () => plain.serperApiKey,
+    searxngEndpoint: () => plain.searxngEndpoint,
+    publicFallback: () => plain.publicFallback,
+    maxOutputBytes: () => plain.maxOutputBytes,
+    timeoutMs: () => plain.timeoutMs,
   };
 }
 
@@ -175,7 +217,7 @@ describe("search provider 可用性", () => {
     expect(createWebSearchProvider(deps({ backend: "auto" })).available()).toBe(false);
     expect(
       createWebSearchProvider(
-        deps({ backend: "auto", searxngEndpoint: "https://searx.test" }),
+        deps({ backend: "auto", searxngEndpoint: SEARX_ENDPOINT }),
       ).available(),
     ).toBe(true);
     expect(createWebSearchProvider(deps({ backend: "auto", apiKey: "tvly-x" })).available()).toBe(
@@ -190,6 +232,164 @@ describe("search provider 可用性", () => {
     for (const backend of ["tavily", "brave", "serper", "bing", "duckduckgo", "searxng"] as const) {
       expect(createWebSearchProvider(deps({ backend, apiKey: "" })).available()).toBe(true);
     }
+  });
+});
+
+/**
+ * 调 provider 的 `ready()`。
+ *
+ * `WebSearchProvider.ready` 在官方类型上是**可选方法**（不实现就等于「总是可用」），所以
+ * 直接 `provider.ready(...)` 会被类型层判成可能 undefined。本包的 provider 必须实现它 ——
+ * 这条断言就是这个契约本身：漏了实现时用例在调用点就红，而不是默默落到「总是 ready」。
+ *
+ * @param provider - 被测 provider
+ * @param llmProvider - 宿主会传进来的模型路线 id
+ * @returns provider 给出的可用结论
+ */
+async function readyOf(
+  provider: ReturnType<typeof createWebSearchProvider>,
+  llmProvider?: string,
+): Promise<boolean> {
+  if (provider.ready === undefined) {
+    throw new Error("本包的 search provider 必须实现 ready()：宿主拿它决定 web_search 露不露面");
+  }
+  // 上一条判空把可选方法收窄成必在，所以这里直接调；拆成中间变量会让
+  // typescript/unbound-method 报「可能丢 this」。
+  return provider.ready(llmProvider);
+}
+
+/**
+ * `ready()` 与 `available()` 是两套判据（见 lib/search-provider.ts 里 ready 的 doc）：
+ * available 答「本 provider 进不进候选」，显式后端恒 true；ready 答「这一条请求路线发得出
+ * 凭据吗」，而宿主拿它给内置 `web_search` 装 when 门 —— 答 false 时那个工具整个不出现在
+ * 模型面前。两者混在一起写，症状是「设置了没配好的后端，web_search 还在、每调必失败」。
+ */
+describe("search provider 的 ready()：内置 web_search 要不要露面", () => {
+  it("sidecar 没握手时 ready 为 false —— 与 available 同一道前提", async () => {
+    const dead = Object.assign(makeSidecar(), { alive: false });
+    const deadProvider = createWebSearchProvider(deps({ sidecar: dead }));
+    await expect(readyOf(deadProvider)).resolves.toBe(false);
+    const noCaps = Object.assign(makeSidecar(), { capabilities: undefined });
+    const noCapsProvider = createWebSearchProvider(deps({ sidecar: noCaps }));
+    await expect(readyOf(noCapsProvider)).resolves.toBe(false);
+  });
+
+  it("auto 且一条发现路径都没配时 ready 为 false", async () => {
+    // 这正是「装好了插件、什么都没配」的默认态：web_search 不该出现在模型面前，否则模型
+    // 每调一次都吃 SEARCH_AUTH 或 SEARCH_BACKEND_MISSING，而它没有任何办法自救。
+    const provider = createWebSearchProvider(deps({ backend: "auto" }));
+    await expect(readyOf(provider, undefined)).resolves.toBe(false);
+    await expect(readyOf(provider, "deepseek")).resolves.toBe(false);
+  });
+
+  it("auto 下三种发现路径各自把 ready 打开", async () => {
+    const byTavily = createWebSearchProvider(deps({ backend: "auto", apiKey: TAVILY_KEY }));
+    await expect(readyOf(byTavily, undefined)).resolves.toBe(true);
+    const bySearxng = createWebSearchProvider(
+      deps({ backend: "auto", searxngEndpoint: SEARX_ENDPOINT }),
+    );
+    await expect(readyOf(bySearxng, undefined)).resolves.toBe(true);
+    const byPublicFallback = createWebSearchProvider(
+      deps({ backend: "auto", publicFallback: true }),
+    );
+    await expect(readyOf(byPublicFallback, undefined)).resolves.toBe(true);
+  });
+
+  it("显式后端只认自己那把 key：选 tavily 而只有 brave 的 key 时 ready 为 false", async () => {
+    // 与 selectKey 同一条规则的两面：这里不判的话，选 tavily 却只有 brave key 的部署会
+    // 一直露着 web_search，每次调用都 401。
+    const wrongKey = createWebSearchProvider(deps({ backend: "tavily", braveApiKey: BRAVE_KEY }));
+    await expect(readyOf(wrongKey, undefined)).resolves.toBe(false);
+    const rightKey = createWebSearchProvider(deps({ backend: "tavily", apiKey: TAVILY_KEY }));
+    await expect(readyOf(rightKey, undefined)).resolves.toBe(true);
+  });
+
+  it("公开端点与配齐凭据的后端 ready 为 true", async () => {
+    const providers = [
+      createWebSearchProvider(deps({ backend: "bing" })),
+      createWebSearchProvider(deps({ backend: "duckduckgo" })),
+      createWebSearchProvider(deps({ backend: "brave", braveApiKey: BRAVE_KEY })),
+      createWebSearchProvider(deps({ backend: "serper", serperApiKey: SERPER_KEY })),
+      createWebSearchProvider(deps({ backend: "searxng", searxngEndpoint: SEARX_ENDPOINT })),
+    ];
+    const verdicts = await Promise.all(providers.map((provider) => readyOf(provider)));
+    expect(verdicts).toStrictEqual([true, true, true, true, true]);
+  });
+
+  it("后端名是名单外的旧值或拼错时按保守侧处理：不露面", async () => {
+    // 配置是**运行期**读出来的：profile patch 里留着上版本的后端名、或手改 settings 写了
+    // 拼错的值，都会走到凭据判据的 default 分支。这一档若顺手 return true，等于替用户
+    // 打开一条他没配过的发现路径 —— 而那条路径在 search() 里又会以未知名失败。
+    const unknownBackend = createWebSearchProvider(
+      deps({ backend: "nope" as unknown as SearchBackend, apiKey: TAVILY_KEY }),
+    );
+    await expect(readyOf(unknownBackend)).resolves.toBe(false);
+  });
+
+  it("ready 只查配置、不发任何 sidecar 调用（契约明写不得发网络请求）", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({ calls });
+    const provider = createWebSearchProvider(
+      deps({ sidecar, backend: "tavily", apiKey: TAVILY_KEY }),
+    );
+    await expect(readyOf(provider, undefined)).resolves.toBe(true);
+    await expect(readyOf(provider, "deepseek")).resolves.toBe(true);
+    expect(calls).toStrictEqual([]);
+  });
+});
+
+/**
+ * 热改项每次现取。
+ *
+ * `.volatile()` 的位改值不重跑 `apply`，而 provider 是装配期建好的那一枚 —— 装配时把值抄进
+ * 闭包，卡上拧了旋钮运行行为一点不变，回包形状照旧、日志照旧。这条用例把「同一个 provider
+ * 实例，两次调用之间改配置」当判据：抄了值的实现第二次仍按旧值走。
+ */
+describe("reading 热改配置", () => {
+  it("同一个 provider 第二次搜到时用的是新配置：读取器不是装配时的快照", async () => {
+    const calls: SidecarCall[] = [];
+    let timeoutMs = 30_000;
+    let maxOutputBytes = 1000;
+    let backend = "tavily";
+    let apiKey = "";
+    const sidecar = makeSidecar({ calls, hits: [] });
+    const provider = createWebSearchProvider({
+      ...deps({ sidecar, renderTopN: 0 }),
+      backend: () => backend as SearchBackend,
+      apiKey: () => apiKey,
+      maxOutputBytes: () => maxOutputBytes,
+      timeoutMs: () => timeoutMs,
+    });
+
+    await provider.search({ query: "first" });
+    timeoutMs = 45_000;
+    maxOutputBytes = 2000;
+    backend = "bing";
+    apiKey = TAVILY_KEY;
+    await provider.search({ query: "second" });
+
+    const discover = calls.filter((call) => call.method === DISCOVER);
+    expect(discover).toHaveLength(2);
+    expect(discover[0]?.params["timeoutSeconds"]).toBe(30);
+    expect(discover[1]?.params["timeoutSeconds"]).toBe(45);
+    expect(discover[0]?.params["backend"]).toBe("tavily");
+    expect(discover[1]?.params["backend"]).toBe("bing");
+    expect(discover[0]?.params["apiKey"]).toBe("");
+    expect(discover[1]?.params["apiKey"]).toBe(TAVILY_KEY);
+  });
+
+  it("ready() 与 available() 都读当下的值：卡上补了 key 立刻不再隐身", async () => {
+    const holder = { apiKey: "" };
+    // 覆盖必须发生在 deps() **之后**：那个 helper 会把传进去的值再包一层读取器，
+    // 先传读取器会让它变成「返回一个函数」的读取器，长度判据拿到 0。
+    const provider = createWebSearchProvider({
+      ...deps({ backend: "auto" }),
+      apiKey: () => holder.apiKey,
+    });
+    await expect(readyOf(provider, undefined)).resolves.toBe(false);
+    holder.apiKey = TAVILY_KEY;
+    await expect(readyOf(provider, undefined)).resolves.toBe(true);
+    expect(provider.available()).toBe(true);
   });
 });
 

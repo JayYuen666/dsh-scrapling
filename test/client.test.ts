@@ -7,7 +7,12 @@ import { describe, expect, it } from "vitest";
 import { TOOL_SPECS } from "../host.ts";
 import type { ToolCallViewProps } from "@deepseek-ai/dsh-client-ui-tool/client";
 import { apply, buildRow, inject, readArgs, resultMetaOf, ROW_TOOLS } from "../src/client-entry.ts";
-import { BUNDLE_PACKAGE_NAME, LOCALE_NS, SETTINGS_ENTRY_ID } from "../src/settings-fields.ts";
+import {
+  BUNDLE_PACKAGE_NAME,
+  LOCALE_NS,
+  SETTINGS_ENTRY_ID,
+  localeDictionaries,
+} from "../src/settings-fields.ts";
 
 /** 测试里反复用到的示例地址。 */
 const SAMPLE = "https://example.test/a";
@@ -288,6 +293,12 @@ describe("resultMetaOf", () => {
 
 const BUNDLE_CONFIG_SLOT = "plugins.bundle.config";
 const TOOLVIEW_SLOT = "tool.call.toolview";
+/** 设置页一级分区与它的导航图标：两个槽名独立声明（不引实现里的常量），改名时这条才红得住。 */
+const SECTION_SLOT = "settings.section";
+const SECTION_ICON_SLOT = "settings.section.icon";
+/** 分区 id 与位次的期望值：同样独立写死，实现里那两份常量漂了这里就红。 */
+const EXPECTED_SECTION_ID = "dsh-scrapling";
+const EXPECTED_SECTION_ORDER = 30;
 
 /**
  * 替身里渲染器的登记键。
@@ -323,9 +334,30 @@ const SERVICE_NAMES = ["slots", "locale", "configForms"];
  *
  * @param names - 本包声明注入的服务名
  */
+/** 一次 `slots.register` 的登记面：四种槽位（keyed / list）用到哪几位就记哪几位。 */
+interface SlotRegistration {
+  readonly name: string;
+  readonly key?: string;
+  readonly id?: string;
+  readonly order?: number;
+  readonly label?: () => string;
+  readonly locale?: string;
+  readonly inject?: () => unknown;
+}
+
+/**
+ * 造一份客户端上下文替身。
+ *
+ * 只把**声明过 inject 的服务**摆在 ctx 上：没声明的那几个留一个会抛的 getter，抛的串与宿主
+ * 逐字相同（`cannot get property "<name>" without inject`）。这样「inject 清单漏一位」在
+ * Node 下就是当场抛错，而不是等到浏览器里整块界面静默不出现。
+ *
+ * @param names - 本包声明注入的服务名
+ * @returns 替身与它记下的登记面
+ */
 function harness(names: readonly string[] = ["slots", "configForms", "locale"]): {
   ctx: unknown;
-  registered: { name: string; key?: string; locale?: string }[];
+  registered: SlotRegistration[];
   renderers: Map<string, (props: unknown) => unknown>;
   dictionaries: { ns: string; locale: string }[];
   asked: string[];
@@ -333,7 +365,7 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
   effectDisposers: (() => void)[];
 } {
   const effectDisposers: (() => void)[] = [];
-  const registered: { name: string; key?: string; locale?: string }[] = [];
+  const registered: SlotRegistration[] = [];
   const disposed: string[] = [];
   const dictionaries: { ns: string; locale: string }[] = [];
   const asked: string[] = [];
@@ -382,7 +414,15 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
         register();
       },
       register: (
-        options: { name: string; key?: string; locale?: string },
+        options: {
+          name: string;
+          key?: string;
+          id?: string;
+          order?: number;
+          label?: () => string;
+          locale?: string;
+          inject?: () => unknown;
+        },
         render: (props: never) => unknown,
       ): (() => void) => {
         registered.push(options);
@@ -444,7 +484,7 @@ function harness(names: readonly string[] = ["slots", "configForms", "locale"]):
  */
 function applyWith(names: readonly string[] = ["slots", "configForms", "locale"]): {
   ctx: unknown;
-  registered: { name: string; key?: string; locale?: string }[];
+  registered: SlotRegistration[];
   renderers: Map<string, (props: unknown) => unknown>;
   dictionaries: { ns: string; locale: string }[];
   asked: string[];
@@ -498,6 +538,63 @@ describe("apply", () => {
     expect(card).toStrictEqual([
       { name: BUNDLE_CONFIG_SLOT, key: BUNDLE_PACKAGE_NAME, locale: LOCALE_NS },
     ]);
+  });
+
+  it("设置页一级分区与它的导航图标都注册了，id 与位次对得上宿主那套约定", async () => {
+    const { registered } = applyWith();
+    const section = registered.filter((entry) => entry.name === SECTION_SLOT);
+    expect(section).toHaveLength(1);
+    const [only] = section;
+    if (only === undefined) {
+      throw new Error("分区没有注册");
+    }
+    expect(only.id).toBe(EXPECTED_SECTION_ID);
+    expect(only.order).toBe(EXPECTED_SECTION_ORDER);
+    expect(only.locale).toBe(LOCALE_NS);
+    // `label` 是函数而不是字符串：宿主每次读导航行重新求值，切语言时这一行跟着变。
+    expect(only.label).toBeTypeOf("function");
+    expect(only.inject).toBeTypeOf("function");
+    // 图标的 id 必须与分区 id 逐字相同：对不上时宿主一条都不渲染，症状是分区在、图标是默认齿轮。
+    const icon = registered.filter((entry) => entry.name === SECTION_ICON_SLOT);
+    expect(icon).toStrictEqual([
+      { name: SECTION_ICON_SLOT, id: EXPECTED_SECTION_ID, order: EXPECTED_SECTION_ORDER },
+    ]);
+  });
+
+  it("同一位次与 id 在两条注册里同源：改一处漏另一处的症状是「图标永远不出现」", async () => {
+    const { registered } = applyWith();
+    const section = registered.find((entry) => entry.name === SECTION_SLOT);
+    const icon = registered.find((entry) => entry.name === SECTION_ICON_SLOT);
+    expect(icon?.id).toBe(section?.id);
+    expect(icon?.order).toBe(section?.order);
+  });
+
+  it("导航名走本包字典的 navLabel 键，两语都有", async () => {
+    const { registered } = applyWith();
+    const section = registered.find((entry) => entry.name === SECTION_SLOT);
+    const label = section?.label;
+    if (label === undefined) {
+      throw new Error("分区没有注册 label");
+    }
+    // 替身的 bind 把键名原样交回，所以这里读到的就是键。
+    expect(label()).toBe("navLabel");
+    const dictionaries = localeDictionaries();
+    expect(dictionaries.zh["navLabel"]?.length ?? 0).toBeGreaterThan(0);
+    expect(dictionaries.en["navLabel"]?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  it("分区里渲染的是完整的设置卡（view 显式给 page，否则卡片早退成空表单）", async () => {
+    const { renderers } = applyWith();
+    const render = renderers.get(rendererKey(SECTION_SLOT, ""));
+    if (render === undefined) {
+      throw new Error("分区没有注册");
+    }
+    const element = render({ close: (): void => undefined }) as {
+      props: { className?: string; children?: { props: { view?: string } } };
+    };
+    expect(element.props.className).toBe("dsh-scrapling-page");
+    // 这一条是分区与详情页唯一的形状差异：owner props 里没有 view，卡片却必须拿到 page。
+    expect(element.props.children?.props.view).toBe("page");
   });
 
   it("取值走本包的设置命名空间 —— bundle 页的 owner props 里没有 form", async () => {
@@ -598,7 +695,8 @@ describe("apply", () => {
     const first = registered.length;
     // 先钉「第一次确实登记满了」：一次都没注册时（标记没复位、claimApply 认为已应用过），
     // 下面那句「长度没变」照样成立 —— 那是最严重的坏形状，不能被当成幂等。
-    expect(first).toBe(ROW_TOOLS.length + 1);
+    // +3 = 设置卡 + 设置页一级分区 + 导航图标（本包在客户端一共贡献这四个面）。
+    expect(first).toBe(ROW_TOOLS.length + 3);
     apply(ctx as never);
     expect(registered).toHaveLength(first);
   });

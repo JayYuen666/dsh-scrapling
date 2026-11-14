@@ -380,22 +380,24 @@ async function driveAllTools(): Promise<Record<string, ToolObservation>> {
   const search = recordingSidecar({
     "search.discover": { backend: "bing", hits: [] },
   });
+  // 热改项按契约传读取器（见 lib/config-reader.ts）；这里只要「发得出一次检索」，
+  // 所以一律给常量读取器。
   await createWebSearchProvider({
     sidecar: search.client,
-    backend: "bing",
-    apiKey: "",
-    braveApiKey: "",
-    serperApiKey: "",
+    backend: () => "bing",
+    apiKey: () => "",
+    braveApiKey: () => "",
+    serperApiKey: () => "",
     apiEndpoint: "https://api.tavily.com/search",
     bingEndpoint: "https://www.bing.com/search",
     braveEndpoint: "https://api.search.brave.com/res/v1/web/search",
     serperEndpoint: "https://google.serper.dev/search",
     duckduckgoEndpoint: "https://html.duckduckgo.com/html/",
-    searxngEndpoint: "",
-    publicFallback: false,
+    searxngEndpoint: () => "",
+    publicFallback: () => false,
     renderTopN: 0,
-    maxOutputBytes: 4000,
-    timeoutMs: 30_000,
+    maxOutputBytes: () => 4000,
+    timeoutMs: () => 30_000,
     urlGate: async (url: string): Promise<string | undefined> => url,
   }).search({ query: "probe" });
   out["web_search provider"] = { calls: search.calls, declared: [] };

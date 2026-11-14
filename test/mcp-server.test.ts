@@ -10,6 +10,7 @@ import type { NetworkInterfaceInfo } from "node:os";
 import { Server } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MCP_TOKEN_ENV } from "../lib/mcp-contract.ts";
+import { MESSAGES } from "../lib/messages.ts";
 import {
   allowedEndpoints,
   createMcpImageSink,
@@ -459,7 +460,7 @@ describe("projectBlocks", () => {
 });
 
 function toolFor(payload: unknown): ToolDefinition {
-  return mcpSearchTool({ available: () => true, search: async () => payload });
+  return mcpSearchTool({ available: () => true, search: async () => payload }, MESSAGES.zh);
 }
 
 describe("boundPort", () => {
@@ -531,7 +532,10 @@ describe("mcpSearchTool", () => {
   });
 
   it("非对象的结果也走得通（render 与 normalize 各自兜一层）", async () => {
-    const definition = mcpSearchTool({ available: () => true, search: async () => null });
+    const definition = mcpSearchTool(
+      { available: () => true, search: async () => null },
+      MESSAGES.zh,
+    );
     const value = (await definition.execute({ query: "q", maxResults: 3 }, exec)) as {
       count: number;
       content: string;

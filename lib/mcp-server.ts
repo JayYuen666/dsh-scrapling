@@ -18,6 +18,7 @@ import {
 import type { AddressInfo } from "node:net";
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from "node:http";
 import { jsonOf } from "./browser-tools.ts";
+import type { ScraplingMessages } from "./messages.ts";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolDefinition, ToolRunContext } from "@deepseek-ai/dsh-tools";
 
@@ -90,7 +91,7 @@ export interface McpServerHandle {
 }
 
 /** MCP server 自述的版本；由 test/publish-manifest.test.ts 钉成 package.json 同值。 */
-export const MCP_SERVER_VERSION = "0.1.12";
+export const MCP_SERVER_VERSION = "0.1.13";
 
 const RAW_PREFIX = "scrapling_";
 
@@ -220,10 +221,25 @@ export function projectBlocks(blocks: readonly unknown[], sink?: McpImageSink): 
   });
 }
 
-const SEARCH_PARAMETERS = {
-  query: { type: "string", required: true, description: "要检索的词。" },
-  maxResults: { type: "integer", description: "返回来源的条数上限；不给就用部署设置的那一档。" },
-} as const;
+/**
+ * MCP search 的参数表。
+ *
+ * 与 native 侧同样做成工厂：文案跟着语言走。写成「箭头函数 + `as const`」而不是标返回
+ * 类型的普通函数 —— 标宽返回类型（`ParameterSchemaSpec`）会让 `defineTool` 推不出每一格
+ * 的 `type` 字面量，标窄类型又得把七种节点类型手抄一遍；箭头函数配 `as const` 两件事都
+ * 不用做，`allowDirectConstAssertionInArrowFunctions` 也正是为这种写法开的。
+ *
+ * @param messages - 当前语言的文案表
+ * @returns 参数表
+ */
+const searchParameters = (messages: ScraplingMessages) =>
+  ({
+    query: { type: "string", required: true, description: messages.mcpSearchQueryDescription },
+    maxResults: {
+      type: "integer",
+      description: messages.mcpSearchMaxResultsDescription,
+    },
+  }) as const;
 
 const SEARCH_OUTPUT_SCHEMA = {
   type: "object",
@@ -278,7 +294,7 @@ function normalizeSearch(query: string, raw: unknown): SearchValue {
   };
 }
 
-function renderSearch(value: SearchValue): string {
+function renderSearch(value: SearchValue, messages: ScraplingMessages): string {
   const lines: string[] = [`scrapling search: ${value.query}`];
   if (value.sources.length === 0) {
     lines.push("(no sources passed the URL gate)");
@@ -291,7 +307,7 @@ function renderSearch(value: SearchValue): string {
     }
   }
   if (value.truncated) {
-    lines.push("(结果被上限截断)");
+    lines.push(messages.mcpSearchTruncatedNote);
   }
   return lines.join("\n");
 }
@@ -303,14 +319,19 @@ function renderSearch(value: SearchValue): string {
  * 同一个发现层端成一枚工具（spec §5.4）。来源已经过同一道 URL 闸门，被拦下的不会成为
  * 可引用的来源。
  */
-export function mcpSearchTool(provider: McpSearchSurface): ToolDefinition {
+export function mcpSearchTool(
+  provider: McpSearchSurface,
+  messages: ScraplingMessages,
+): ToolDefinition {
   return defineTool({
     name: "search",
-    description: "用本插件的搜索发现层检索一次，返回可引用的来源与已渲染正文。",
-    parameters: SEARCH_PARAMETERS,
+    description: messages.mcpSearchToolDescription,
+    parameters: searchParameters(messages),
     output: {
       schema: SEARCH_OUTPUT_SCHEMA,
-      render: (_args: unknown, value: SearchValue) => [{ type: "text", text: renderSearch(value) }],
+      render: (_args: unknown, value: SearchValue) => [
+        { type: "text", text: renderSearch(value, messages) },
+      ],
     },
     async execute(args: { query: string; maxResults?: number }, exec: ToolRunContext) {
       const { maxResults, query } = args;

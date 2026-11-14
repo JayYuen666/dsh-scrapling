@@ -11,17 +11,18 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ToolArgsError } from "@deepseek-ai/dsh-tools";
+import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
 import { pageToText, rowToText } from "../lib/crawl-output.ts";
 import { anySignal, drainCrawl } from "../lib/crawl-support.ts";
 import {
   capText,
-  CONTENT_RECOVERY_HINT,
   FALLBACK_BUDGET_BYTES,
   renderAnswer,
   renderBrowser,
   renderFetch,
 } from "../lib/output.ts";
-import { CRAWL_MODE_PARAMS } from "../lib/tool-params.ts";
+import { crawlModeParamTable } from "../lib/tool-params.ts";
+import { MESSAGES } from "../lib/messages.ts";
 import {
   createAnswerTool,
   createCaptureXhrTool,
@@ -38,6 +39,7 @@ import {
   createSessionOpenTool,
   createSessionStateLoadTool,
   createSessionStateSaveTool,
+  toolTimeoutOf,
 } from "../lib/tools.ts";
 import type { CrawlJobRunner, CrawlJobStarter, CrawlSink, ToolSettings } from "../lib/tools.ts";
 import {
@@ -295,6 +297,173 @@ function sessionTypeParam(browser: boolean): { enum?: string[]; description?: st
 /** 测试里统一用的假作业 id（`scrapling-<hex>` 形态的一枚具体样本）。 */
 const SAMPLE_JOB_ID = "scrapling-1";
 
+describe("工具级墙钟比内层请求超时多一份余量", () => {
+  // 判据来自宿主的执行顺序，不是偏好：`@deepseek-ai/dsh-tool-call-timeout-policy` 在
+  // `tools/execute` 外面套截止（读 `ctx.tools.get(name)?.timeoutMs`），起点早于本包
+  // 每次 sidecar 请求自己那道同长的截止。两者取同一个数时永远是宿主先到期，本包那条
+  // 带出路说明的 SidecarError（BROWSER_TIMEOUT / REQUEST_TIMEOUT 之类）根本没机会说话，
+  // 模型只读到一句 `tool call timed out after Nms`。
+  const MARGIN_MS = 60_000;
+
+  it("toolTimeoutOf 恰好是内层超时 + 一分钟", () => {
+    // 期望值独立写死：内层 30_000 → 工具级 90_000。
+    expect(toolTimeoutOf(SETTINGS)).toBe(30_000 + MARGIN_MS);
+    // 不同内层值也要跟着走（不是某个常量的别名）。
+    expect(toolTimeoutOf({ ...SETTINGS, timeoutMs: 120_000 })).toBe(120_000 + MARGIN_MS);
+  });
+
+  it("每一个工具的注册项都严格大于它自己用到的内层超时", () => {
+    const fake = fakeSidecar({});
+    Object.defineProperty(fake.client, "capabilities", {
+      value: { scrapling: true, static: true, extract: true, browser: true, writeMethods: false },
+      configurable: true,
+    });
+    const deps = {
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+      attachments: { saveImage: async (): Promise<Record<string, unknown>> => ({}) },
+    };
+    // 期望表独立写死（不从实现派生）：18 个工厂 → 工具名。工具面多一个少一个这里就红。
+    const builders = new Map<string, (built: typeof deps) => ToolDefinition>([
+      ["scrapling_fetch", createFetchTool],
+      ["scrapling_extract", createExtractTool],
+      ["scrapling_locate", createLocateTool],
+      ["scrapling_links", createLinksTool],
+      ["scrapling_render", createRenderTool],
+      ["scrapling_capture_xhr", createCaptureXhrTool],
+      ["scrapling_answer", createAnswerTool],
+      ["scrapling_session_open", createSessionOpenTool],
+      ["scrapling_session_fetch", createSessionFetchTool],
+      ["scrapling_session_network", createSessionNetworkTool],
+      ["scrapling_session_state_save", createSessionStateSaveTool],
+      ["scrapling_session_state_load", createSessionStateLoadTool],
+      ["scrapling_session_list", createSessionListTool],
+      ["scrapling_session_close", createSessionCloseTool],
+      ["scrapling_crawl", createCrawlTool],
+      ["scrapling_session_read", createSessionReadTool],
+      ["scrapling_session_act", createSessionActTool],
+      ["scrapling_download", createDownloadTool],
+      ["scrapling_screenshot", createScreenshotTool],
+    ]);
+    for (const [name, build] of builders) {
+      const tool = build(deps);
+      expect(tool.name, "工厂交回的工具名对不上").toBe(name);
+      const declared = tool.timeoutMs;
+      expect(declared, `${name} 没声明 timeoutMs`).toBeTypeOf("number");
+      expect(declared ?? 0, `${name} 的工具级墙钟没有超过内层超时，宿主会先掐断`).toBeGreaterThan(
+        SETTINGS.timeoutMs,
+      );
+    }
+  });
+});
+
+describe("每个工具都声明调用态卡片（不留默认卡片）", () => {
+  // 判据是「工具在时间线上能不能一眼认出来」：不声明 presentCall 就落到宿主默认卡片
+  //（标题是工具名、没有类别图标），19 个工具在时间线上会长得一模一样。类别必须各自
+  // 对路——抓取类给 fetch、检索类给 search、只读本地寄存器给 read、动作类给 other。
+  const KINDS = new Map<string, string>([
+    ["scrapling_fetch", "fetch"],
+    ["scrapling_extract", "search"],
+    ["scrapling_locate", "search"],
+    ["scrapling_links", "search"],
+    ["scrapling_render", "fetch"],
+    ["scrapling_capture_xhr", "fetch"],
+    ["scrapling_answer", "fetch"],
+    ["scrapling_session_open", "other"],
+    ["scrapling_session_fetch", "fetch"],
+    ["scrapling_session_network", "search"],
+    ["scrapling_session_state_save", "search"],
+    ["scrapling_session_state_load", "search"],
+    ["scrapling_session_list", "read"],
+    ["scrapling_session_close", "other"],
+    ["scrapling_crawl", "search"],
+    ["scrapling_session_read", "fetch"],
+    ["scrapling_session_act", "search"],
+    ["scrapling_download", "fetch"],
+    ["scrapling_screenshot", "fetch"],
+  ]);
+
+  // 每个工具一份**能通过参数校验的最小入参**：`defineTool` 的 presentCall 包装在校验失败时
+  // 直接交回 undefined（宿主按「无视图」处理），所以这里传 `{}` 只能证明「有校验」，证不到
+  // 卡片本身画得出来。期望表独立写死，不从各工具的参数表反推。
+  const HOME = "https://example.com";
+  const MINIMAL_ARGS = new Map<string, Record<string, unknown>>([
+    ["scrapling_fetch", { url: HOME }],
+    ["scrapling_extract", { html: "<p>x</p>", selector: "p" }],
+    ["scrapling_locate", { html: "<p>x</p>" }],
+    ["scrapling_links", { html: "<a href='/x'>x</a>" }],
+    ["scrapling_render", { url: HOME }],
+    ["scrapling_capture_xhr", { url: HOME }],
+    ["scrapling_answer", { url: HOME, question: "what" }],
+    ["scrapling_session_open", { sessionType: "static" }],
+    ["scrapling_session_fetch", { sessionId: "s1", url: HOME }],
+    ["scrapling_session_network", { sessionId: "s1" }],
+    ["scrapling_session_state_save", { sessionId: "s1", name: "n" }],
+    ["scrapling_session_state_load", { sessionId: "s1", name: "n" }],
+    ["scrapling_session_list", {}],
+    ["scrapling_session_close", { sessionId: "s1" }],
+    ["scrapling_crawl", { url: HOME }],
+    ["scrapling_session_read", { sessionId: "s1" }],
+    ["scrapling_session_act", { sessionId: "s1", actions: [{ kind: "click", selector: "#go" }] }],
+    ["scrapling_download", { url: `${HOME}/a.bin` }],
+    ["scrapling_screenshot", { sessionId: "s1" }],
+  ]);
+
+  it("19 个工具的卡片类别各自对路，且标题在入参最小时也不空", () => {
+    const fake = fakeSidecar({});
+    Object.defineProperty(fake.client, "capabilities", {
+      value: { scrapling: true, static: true, extract: true, browser: true, writeMethods: false },
+      configurable: true,
+    });
+    const deps = {
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+      attachments: { saveImage: async (): Promise<Record<string, unknown>> => ({}) },
+    };
+    const built = [
+      createFetchTool,
+      createExtractTool,
+      createLocateTool,
+      createLinksTool,
+      createRenderTool,
+      createCaptureXhrTool,
+      createAnswerTool,
+      createSessionOpenTool,
+      createSessionFetchTool,
+      createSessionNetworkTool,
+      createSessionStateSaveTool,
+      createSessionStateLoadTool,
+      createSessionListTool,
+      createSessionCloseTool,
+      createCrawlTool,
+      createSessionReadTool,
+      createSessionActTool,
+      createDownloadTool,
+      createScreenshotTool,
+    ].map((build) => build(deps));
+    for (const tool of built) {
+      const args = MINIMAL_ARGS.get(tool.name) ?? {};
+      // 只在可选调用里用 `tool.presentCall`：单独取出来当值（传给 expect、先存变量）会被 lint
+      // 判成 unbound method。官方实现是纯函数、不读 this，这里的调用形态正好也不需要绑定。
+      const view = tool.presentCall?.(args);
+      // 收窄到 generic 那一支才读 kind/title：ToolCallView 是 card 判别的联合，
+      // 另外两支（terminal / diff）没有这两个字段。
+      expect(view?.card, `${tool.name} 的卡片种类`).toBe("generic");
+      if (view?.card !== "generic") {
+        throw new Error(`${tool.name} 的卡片不是 generic`);
+      }
+      expect(view.kind, `${tool.name} 的卡片类别对不上`).toBe(KINDS.get(tool.name));
+      expect(view.title.length, `${tool.name} 的标题不许为空`).toBeGreaterThan(0);
+    }
+    // 反向钉子：工具面多一个少一个这里就红。
+    expect(built.map((tool) => tool.name).toSorted()).toStrictEqual([...KINDS.keys()].toSorted());
+  });
+});
+
 describe("代理区判定的上下界（截断那条用例的判据本身）", () => {
   // 那两条区间只是 `截断点不会留下孤立代理码元` 的工具；工具自己错了不会让那条用例红
   // （它对两半都要求 false），所以区间边界要单独钉住。
@@ -428,43 +597,43 @@ describe("正文截断标记的渲染", () => {
   it("fetch 只有 truncated 标记、没有页脚时也告诉模型正文不完整", () => {
     // Python 侧按 maxContentChars 截过时 notice 恒为空串（toFetchResult 写死 ""），
     // 只读 notice 就等于把这份正文报成完整。
-    const text = renderFetch(fetchOf(true, ""));
+    const text = renderFetch(fetchOf(true, ""), MESSAGES.zh);
     expect(text).toContain("正文被截断：");
-    expect(text).toContain(CONTENT_RECOVERY_HINT);
+    expect(text).toContain(MESSAGES.zh.contentRecoveryHint);
   });
 
   it("fetch 的 notice 在场时以 notice 为准，不重复给回落提示", () => {
-    const text = renderFetch(fetchOf(true, "body 截断：省了 12 字节"));
+    const text = renderFetch(fetchOf(true, "body 截断：省了 12 字节"), MESSAGES.zh);
     expect(text).toContain("body 截断：省了 12 字节");
     expect(text).not.toContain("正文被截断：");
   });
 
   it("fetch 没截断就不加任何尾巴", () => {
-    const text = renderFetch(fetchOf(false, ""));
+    const text = renderFetch(fetchOf(false, ""), MESSAGES.zh);
     expect(text.endsWith("正文")).toBe(true);
   });
 
   it("answer 只有 truncated 标记时也补一条截断说明", () => {
-    const text = renderAnswer(answerOf(true, ""));
+    const text = renderAnswer(answerOf(true, ""), MESSAGES.zh);
     expect(text).toContain("正文被截断：");
-    expect(text).toContain(CONTENT_RECOVERY_HINT);
+    expect(text).toContain(MESSAGES.zh.contentRecoveryHint);
   });
 
   it("answer 的 notice 与截断标记同时在场时只留 notice", () => {
-    const text = renderAnswer(answerOf(true, "对端的说明"));
+    const text = renderAnswer(answerOf(true, "对端的说明"), MESSAGES.zh);
     expect(text).toContain("对端的说明");
     expect(text).not.toContain("正文被截断：");
   });
 
   it("answer 没截断就不加尾巴", () => {
-    expect(renderAnswer(answerOf(false, "")).endsWith("结论")).toBe(true);
+    expect(renderAnswer(answerOf(false, ""), MESSAGES.zh).endsWith("结论")).toBe(true);
   });
 });
 
 describe("网络历史的封顶", () => {
   it("条目再多也把网络段压在预算内，并留下被截断的说明", () => {
     // 判据不取自实现：条数放大百倍，回执字节数与渲染出的条目数都不许跟着涨。
-    const many = renderBrowser(browserOf(2000), 500);
+    const many = renderBrowser(browserOf(2000), 500, MESSAGES.zh);
     const bytes = Buffer.byteLength(many, "utf8");
     expect(bytes).toBeLessThanOrEqual(1024);
     expect((many.match(/- \[id /gu) ?? []).length).toBeLessThan(40);
@@ -472,13 +641,13 @@ describe("网络历史的封顶", () => {
   });
 
   it("网络段在预算内时不加页脚", () => {
-    const text = renderBrowser(browserOf(1), 8192);
+    const text = renderBrowser(browserOf(1), 8192, MESSAGES.zh);
     expect(text).toContain("Captured XHR/fetch:");
     expect(text).not.toContain("网络历史整体被截断");
   });
 
   it("schema 里没有 xhr 的工具只回正文", () => {
-    expect(renderBrowser(browserOf(0, false), 500).endsWith("正文")).toBe(true);
+    expect(renderBrowser(browserOf(0, false), 500, MESSAGES.zh).endsWith("正文")).toBe(true);
   });
 });
 
@@ -622,7 +791,8 @@ describe("scrapling_fetch", () => {
       startCrawlJob: fakeJobStarter,
       answer: fakeAnswer,
     });
-    expect(tool.timeoutMs).toBe(SETTINGS.timeoutMs);
+    // 注册级墙钟是内层超时 + 余量（见「工具级墙钟比内层请求超时多一份余量」）。
+    expect(tool.timeoutMs).toBe(toolTimeoutOf(SETTINGS));
     // 这份夹具把 allowWriteMethods 开着，但这一次调用是 GET：并发判定是**按参数**问的，
     // 读的那一次照旧可并发。写请求那一支在下面 `scrapling_fetch 的写方法闸门` 里钉。
     expect(tool.isConcurrencySafe?.({ url: SAMPLE_URL })).toBe(true);
@@ -1006,7 +1176,7 @@ describe("scrapling_extract", () => {
   });
 
   it("crawl 的 mode 面收 shopify，并原样上线", async () => {
-    expect(CRAWL_MODE_PARAMS.mode.enum).toContain("shopify");
+    expect(crawlModeParamTable(MESSAGES.zh).mode.enum).toContain("shopify");
     const fake = fakeSidecar({ crawlId: "c-1" });
     const tool = createCrawlTool({
       sidecar: fake.client,
@@ -1160,7 +1330,8 @@ describe("scrapling_extract", () => {
       title: ".price",
       kind: "search",
     });
-    expect(tool.timeoutMs).toBe(SETTINGS.timeoutMs);
+    // 注册级墙钟是内层超时 + 余量（见「工具级墙钟比内层请求超时多一份余量」）。
+    expect(tool.timeoutMs).toBe(toolTimeoutOf(SETTINGS));
     expect(tool.isConcurrencySafe?.({ html: "", selector: ".price" })).toBe(true);
   });
 
@@ -1630,7 +1801,8 @@ describe("scrapling_locate / scrapling_links", () => {
       kind: "search",
     });
     expect(tool.isConcurrencySafe?.({ html: "", selector: "P1" })).toBe(true);
-    expect(tool.timeoutMs).toBe(SETTINGS.timeoutMs);
+    // 注册级墙钟是内层超时 + 余量（见「工具级墙钟比内层请求超时多一份余量」）。
+    expect(tool.timeoutMs).toBe(toolTimeoutOf(SETTINGS));
 
     await tool.execute({ html: LOCATE_HTML, selector: "P1" }, exec);
     expect(fake.calls[1]?.params).toMatchObject({
@@ -1699,10 +1871,12 @@ describe("scrapling_locate / scrapling_links", () => {
     expect(tool.presentCall?.({ html: LOCATE_HTML, query: "P1", selector: "#main" })).toStrictEqual(
       { card: "generic", title: "P1", kind: "search" },
     );
-    // 两个查询目标都没有时标题兜底成空串：卡片只回显模型给的参数，不替它编查询词。
+    // 两个查询目标都没有时标题兜底成工具名——**不是空串**：空标题在时间线上就是一行空白，
+    // 而宿主的「无视图 → 用工具名当标题」那条兜底只在 presentCall 缺席或返回 undefined 时生效，
+    // 返回 `title: ""` 的卡片不会被它救回来。工具名不是编出来的查询词，它只说明这是哪一步。
     expect(tool.presentCall?.({ html: LOCATE_HTML })).toStrictEqual({
       card: "generic",
-      title: "",
+      title: "locate",
       kind: "search",
     });
   });
@@ -1798,7 +1972,8 @@ describe("scrapling_locate / scrapling_links", () => {
       kind: "search",
     });
     expect(tool.isConcurrencySafe?.({ html: LINK_HTML })).toBe(true);
-    expect(tool.timeoutMs).toBe(SETTINGS.timeoutMs);
+    // 注册级墙钟是内层超时 + 余量（见「工具级墙钟比内层请求超时多一份余量」）。
+    expect(tool.timeoutMs).toBe(toolTimeoutOf(SETTINGS));
 
     await tool.execute({ html: LINK_HTML }, exec);
     expect(fake.calls[1]?.params).toMatchObject({
@@ -3759,7 +3934,8 @@ describe("会话工具", () => {
         answer: fakeAnswer,
       });
       expect(tool.isConcurrencySafe?.({})).toBe(false);
-      expect(tool.timeoutMs).toBe(SETTINGS.timeoutMs);
+      // 注册级墙钟是内层超时 + 余量（见「工具级墙钟比内层请求超时多一份余量」）。
+      expect(tool.timeoutMs).toBe(toolTimeoutOf(SETTINGS));
     }
     const list = createSessionListTool({
       sidecar: fakeSidecar({}).client,
@@ -4027,13 +4203,15 @@ describe("浏览器会话读/动作/媒体工具", () => {
       useBrowser: false,
     });
     const view = { path: "/tmp/x", bytes: 1, sha256: "s", contentType: "", status: 200 };
-    expect(
-      (
-        tool.output.render({ url: SAMPLE_URL }, view) as {
-          text: string;
-        }[]
-      )[0]?.text,
-    ).toContain("(unknown)");
+    const rendered = (
+      tool.output.render({ url: SAMPLE_URL }, view) as {
+        text: string;
+      }[]
+    )[0]?.text;
+    expect(rendered).toContain("(unknown)");
+    // 存下来的文件是用户在文件管理器里打开的成品，不是喂回模型的正文：回执必须点出交付
+    // 路径（present），否则模型把它当一条日志读完就算完，用户永远找不到那个文件。
+    expect(rendered).toContain("present");
     expect(tool.output.presentationMeta?.({ url: SAMPLE_URL }, view)).toStrictEqual({
       url: "/tmp/x",
       statusCode: 200,

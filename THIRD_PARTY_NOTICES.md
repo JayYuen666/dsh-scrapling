@@ -10,21 +10,57 @@ Scrapling 及浏览器引擎都是**运行期依赖**——本包调用它们暴
 `Convertor._strip_noise_tags` 与 `Convertor._sanitize_for_ai` 是上游的私有下划线方法，不在上游文档
 里（见「机制与接口来源」）。它们不由本包分发，许可文本也随各自的包走，本文件不重复。
 
-随包分发的第三方内容有两处：**图标**（`icon.svg`）与**CLI 单文件产物内联的 zod**
-（`bin/dsh-scrapling.mjs`）。两者都是 MIT，且本包在下方保留各自的版权与许可声明。
+随包分发的第三方内容有两处：**图标**（`icon.svg`，Scrapling 官方标记，BSD 3-Clause）与
+**CLI 单文件产物内联的 zod**（`bin/dsh-scrapling.mjs`，MIT）。本包在下方保留各自的版权与
+许可声明。
 
-## 图标：Tabler Icons
+## 图标：Scrapling 官方标记
 
-- 上游项目：`Tabler Icons`
-- 上游仓库：https://github.com/tabler/tabler-icons
-- 上游许可：MIT，Copyright (c) Paweł Kuna
-- 取用图标：`spider`
-- 来源：https://icones.js.org/icons/tabler/spider
+- 上游项目：`Scrapling`
+- 上游仓库：https://github.com/D4Vinci/Scrapling
+- 上游资源：https://scrapling.readthedocs.io/zh-cn/latest/assets/logo.png（486×480 PNG，带 alpha）
+- 上游许可：BSD 3-Clause，Copyright (c) 2024 Karim shoair
 
-`icon.svg` 中的形状路径取自该图标的 `spider`。改动有三处：把 `<g>` 上的 `currentColor` 换成本包
-插件图标主色 `#658EFF`；把外层 `<g>` 与画布尺寸对齐本族插件统一的 `36×36` / `viewBox 0 0 24 24`
-规格；以及把腹部与头部两条路径各复制一份，加上 `fill="#54ECE7"`、`opacity=".2"` 与同色 `stroke`
-作底衬。三份源路径的 `d` 数据与上游一致，未作改动；底衬复用同一条 `d`，只是多了填充与描边颜色。
+`icon.svg` 的图形**全部来自这张官方标记**：形状与 alpha 通道逐像素同源，没有重新绘制的部分。
+本包只做了一件渲染期的事——把官方图拆成「本体」与「高光」两张遮罩分别上色：本体取
+`currentColor`（跟随 DSH 导航行的前景色，深色主题为浅色、浅色主题为深色），高光保留官方绿
+（`#B3FB2A`，取自官方图的眼睛与吸盘）。这样两种主题下都与官方标记一致，而形状本身一个像素
+都没改。同一份遮罩字节也内联在 `client.js` 里，作为设置页导航图标的 `mask-image`。
+
+BSD 3-Clause 允许再分发与修改，唯一的实质义务是保留版权声明与本许可条件——也就是这一节。
+以下是许可正文：
+
+```text
+BSD 3-Clause License
+
+Copyright (c) 2024, Karim shoair
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
 
 ## CLI 单文件产物内联的 zod
 

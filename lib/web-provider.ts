@@ -24,6 +24,7 @@ import type {
   WebFetchResult,
 } from "@deepseek-ai/dsh-web";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import type { Reader } from "./config-reader.ts";
 import { capText } from "./output.ts";
 import { SidecarError } from "./sidecar-error.ts";
 import type { SidecarClient } from "./sidecar.ts";
@@ -37,16 +38,19 @@ export interface WebProviderDeps {
   /** 已握手的 sidecar 客户端。 */
   readonly sidecar: SidecarClient;
   /**
-   * 单次抓取的输出上限。
+   * 单次抓取的输出上限（**读取器**，见 {@link Reader}）。
    *
    * 同一个数有两个去处：作为 `maxContentChars` 发给 sidecar（字符），以及作为
    * `capText` 的字节预算（见 lib/output.ts 说明为什么最终统一处理按字节）。这与本仓各工具
    * 走的是同一条规则，代价是非 ASCII 页面在字节预算下会被裁得更早 —— 但预算必须真的
    * 统一处理，只标一个 truncated 而把超长正文原样放行等于没有预算。
+   *
+   * 为什么是读取器而不是数值：`fetchMaxOutputChars` 在设置卡上是 `.volatile()` 的，
+   * 改值不会重跑 `apply`，装配时抄进闭包的那一份会永远停在旧值。
    */
-  readonly maxOutputBytes: number;
-  /** 单次抓取的协同超时（毫秒）。 */
-  readonly timeoutMs: number;
+  readonly maxOutputBytes: Reader<number>;
+  /** 单次抓取的协同超时（毫秒）。同样因为 `fetchTimeoutMs` 是 volatile，传读取器。 */
+  readonly timeoutMs: Reader<number>;
 }
 
 /** 本 provider 在 ctx.web 里的 id。 */
@@ -172,6 +176,11 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
      */
     async fetch(request: WebFetchRequest, signal?: AbortSignal): Promise<WebFetchResult> {
       const extractionType = "markdown";
+      // 一笔抓取只取一次快照：发给 sidecar 的字符上限、协议层超时、以及最后按字节裁剪的
+      // 预算必须是同一刻的三个值，否则「回包说裁到 200k 字符、本地却按另一个预算再裁一次」
+      // 这种自相矛盾的结果会成为可能。
+      const maxOutputBytes = deps.maxOutputBytes();
+      const timeoutMs = deps.timeoutMs();
       let raw: unknown;
       try {
         raw = await sidecar.call(
@@ -181,10 +190,10 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
             cssSelector: null,
             extractionType,
             mainContentOnly: true,
-            maxContentChars: deps.maxOutputBytes,
+            maxContentChars: maxOutputBytes,
           },
           // exactOptionalPropertyTypes 下不能直接透传可选的 signal。
-          { ...(signal === undefined ? {} : { signal }), timeoutMs: deps.timeoutMs },
+          { ...(signal === undefined ? {} : { signal }), timeoutMs },
         );
       } catch (error: unknown) {
         // 取消不是故障：sidecar 在 signal 中止时抛的是 SIDECAR_ABORTED，包成抓取失败
@@ -210,7 +219,7 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
       // 真正裁剪而不仅是标一个 truncated：超长正文原样返回的话，它会照样进上下文与会话
       // 日志，而 truncated: true 反而让调用方以为已经裁过了。与本仓各工具同一统一处理
       // （lib/output.ts 的 capText，按字节头尾截断）。
-      const capped = capText(payload.content, deps.maxOutputBytes, RECOVERY_HINT);
+      const capped = capText(payload.content, maxOutputBytes, RECOVERY_HINT);
       // 两种截断都算：sidecar 自己截的，和我们自己按预算截的 ——
       // 对调用方而言语义一样，都是「正文没拿全」。宿主把这一位翻成它自己的那句
       // 截断告知（`packages/web/tool-web/src/fetch.ts` 的 TRUNCATION_FOOTER），所以

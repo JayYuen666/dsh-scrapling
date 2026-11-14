@@ -1,6 +1,6 @@
 {
   "name": "@jayyuen66/dsh-scrapling",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Scrapling 网页抓取插件（dsh）：静态/浏览器抓取 + CSS/XPath 结构化抽取 + 选择器自愈 + capture_xhr 与会话网络历史 + 登录态存取 + Spider 爬虫，由常驻 Python 进程驱动。",
   "keywords": [
     "dsh",
@@ -126,6 +126,7 @@
     "@deepseek-ai/dsh-session": "0.2.2-rc.2",
     "@deepseek-ai/dsh-settings": "0.2.2-rc.2",
     "@deepseek-ai/dsh-shell": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-skill": "0.2.2-rc.2",
     "@deepseek-ai/dsh-subprocess": "0.2.2-rc.2",
     "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.2",
     "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.2",
@@ -153,15 +154,19 @@
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": "^0.2.2-rc.1",
-    "@deepseek-ai/dsh-output-retention": "^0.2.2-rc.1",
-    "@deepseek-ai/dsh-tools": "^0.2.2-rc.1",
-    "@deepseek-ai/dsh-typert-protocol": "^0.2.2-rc.1",
-    "@deepseek-ai/dsh-web": "^0.2.2-rc.1",
+    "@deepseek-ai/dsh": "^0.2.2-rc.2",
+    "@deepseek-ai/dsh-error": "^0.2.2-rc.2",
+    "@deepseek-ai/dsh-output-retention": "^0.2.2-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.2-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.2-rc.2",
+    "@deepseek-ai/dsh-web": "^0.2.2-rc.2",
     "@deepseek-ai/schemastery": "^3.19.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-error": {
       "optional": true
     },
     "@deepseek-ai/dsh-tools": {
@@ -170,7 +175,7 @@
   },
   "icon": "icon.svg",
   "engines": {
-    "dsh": "^0.2.2-rc.1",
+    "dsh": "^0.2.2-rc.2",
     "node": ">=24.9.0"
   },
   "dsh": {

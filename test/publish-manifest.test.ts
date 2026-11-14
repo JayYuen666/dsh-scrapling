@@ -620,6 +620,26 @@ describe("构建产物可载入", () => {
     );
   });
 
+  it("harnessError 在产物里是外部引用（内联会让 instanceof 恒为 false）", async () => {
+    // 上一条判的是「没有内联痕迹」，它靠 `@module` JSDoc 认包，是启发式：一份被压缩掉
+    // 注释的内联副本能躲过它。这一条是正相判据 —— 直接问产物有没有按**包名**引用
+    // `@deepseek-ai/dsh-error`。
+    //
+    // 为什么这一位是承重的：`lib/sidecar-error.ts` 的 `SidecarError extends HarnessError`，
+    // 而宿主 `packages/core/tools/src/pipeline.ts#errorInfo` 用
+    // `error instanceof HarnessError` 决定要不要把 `{ name, code }` 写进工具失败的
+    // `ToolFailure.info`。类身份按模块实例算：`dsh-error` 声明在 **peer**（构建期外部化）
+    // 时本包与宿主共享同一份；一旦被挪回 devDependencies，rolldown 会把整包内联，
+    // 于是本包继承的是产物里那个另一个类，宿主的 `instanceof` 恒为 false ——
+    // 错误码整块静默消失，而源码、单测、类型检查一路绿。
+    const code = await readFile(path.join(pkgDir, "host.js"), "utf8");
+    const specifiers = new Set(
+      Array.from(code.matchAll(/\bfrom\s*"(?<spec>[^"]+)"/gu), (found) => found.groups?.["spec"]),
+    );
+    // 判据本体是那个 Set；失败时 diff 会直接把产物里的说明符清单摆出来，够定位。
+    expect(specifiers.has("@deepseek-ai/dsh-error")).toBe(true);
+  });
+
   it("产物里的真实逻辑还能跑（压缩改形状时这条会红）", async () => {
     // 产物是压缩过的：标识符改名、注释被去掉。只断言「导出一个叫 apply 的函数」太弱，
     // 压缩把内部逻辑改坏它照样绿。这里让**产物自己**跑一遍注册计划：登记表里的每个工具、

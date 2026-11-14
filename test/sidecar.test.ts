@@ -257,6 +257,31 @@ describe("错误类的参数位（SidecarError）", () => {
     expect(withCause.details).toStrictEqual({ index: 3 });
     expect(withCause.cause).toBe("raw");
   });
+
+  it("是宿主的 HarnessError 子类，code 由父类持有（宿主靠 instanceof 认出它）", async () => {
+    // 这一格是「错误码到得了模型面前」的唯一判据。宿主的
+    // `packages/core/tools/src/pipeline.ts#errorInfo` 判的是
+    // `error instanceof HarnessError`，判不中就整块丢掉 `ToolFailure.info`——
+    // 本类自带的 code 会静默消失，而界面上只看得到一句 message。
+    //
+    // 断言用的 `HarnessError` 必须来自**宿主那份模块**：若哪天有人把
+    // `@deepseek-ai/dsh-error` 从 peer 挪回 devDependencies，构建会把它内联进
+    // host.js，于是本文件 import 到的是产物里那个另一个类，`instanceof` 恒为 false ——
+    // 这条用例会立刻红，正是它要守的东西。
+    const { HarnessError } = (await import("@deepseek-ai/dsh-error")) as {
+      HarnessError: new (
+        message: string,
+        code: string,
+        options?: ErrorOptions,
+      ) => Error & { readonly code: string };
+    };
+    const error = new SidecarError("URL_BLOCKED", "拒了", { url: "https://x" });
+    expect(error).toBeInstanceOf(HarnessError);
+    expect(error.code).toBe("URL_BLOCKED");
+    // name 是本类自己的：宿主记录 `{ name, code }` 时 name 取这个名字，而不是 "HarnessError"。
+    expect(error.name).toBe("SidecarError");
+    expect(error.message).toBe("拒了");
+  });
 });
 
 describe("parseCapabilities", () => {

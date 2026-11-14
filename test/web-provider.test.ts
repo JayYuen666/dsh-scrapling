@@ -22,6 +22,17 @@ function stubSidecar(): SidecarClient {
 }
 
 /**
+ * 用例侧的依赖形态：两个热改预算写成普通值，由 {@link makeDeps} 包成读取器。
+ *
+ * 读取器本身由 `预算读取器` 那条用例专门钉住（同一个 provider 两次抓取之间改值，第二次要
+ * 看到新值），所以这里不必每处手写 `() => 4000`。
+ */
+type PlainDeps = Omit<WebProviderDeps, "maxOutputBytes" | "timeoutMs"> & {
+  readonly maxOutputBytes: number;
+  readonly timeoutMs: number;
+};
+
+/**
  * 一份用例依赖：sidecar 与两个预算值每次都是新的。
  *
  * 原先这是模块级共享的 `const DEPS`，而 `available` 那组用 `Object.defineProperty` 反复改写
@@ -31,9 +42,22 @@ function stubSidecar(): SidecarClient {
  * @param overrides - 要替换的位（通常只换 sidecar）
  * @returns 供 `createWebFetchProvider` 用的依赖
  */
-function makeDeps(overrides: Partial<WebProviderDeps> = {}): WebProviderDeps {
-  return { sidecar: stubSidecar(), maxOutputBytes: 4000, timeoutMs: 30_000, ...overrides };
+function makeDeps(overrides: Partial<PlainDeps> = {}): WebProviderDeps {
+  const plain: PlainDeps = {
+    sidecar: stubSidecar(),
+    maxOutputBytes: 4000,
+    timeoutMs: 30_000,
+    ...overrides,
+  };
+  return {
+    ...plain,
+    maxOutputBytes: () => plain.maxOutputBytes,
+    timeoutMs: () => plain.timeoutMs,
+  };
 }
+
+/** 用例里要读默认预算时用它，免得把「读取器」这件事泄漏到断言表达式里。 */
+const DEFAULT_MAX_OUTPUT_BYTES = 4000;
 
 /** 握手后的能力表：`scrapling` 那一档可按用例需要改。 */
 function capabilities(scrapling = true): Record<string, unknown> {
@@ -184,7 +208,7 @@ describe("fetch", () => {
     });
     const result = await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
     expect(Buffer.byteLength(result.body.content, "utf8")).toBeLessThanOrEqual(
-      makeDeps().maxOutputBytes,
+      DEFAULT_MAX_OUTPUT_BYTES,
     );
     expect(result.body.content.length).toBeLessThan(9000);
   });
@@ -204,7 +228,7 @@ describe("fetch", () => {
     const result = await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({ url: "u" });
     expect(result.truncated).toBe(true);
     expect(Buffer.byteLength(result.body.content, "utf8")).toBeLessThanOrEqual(
-      makeDeps().maxOutputBytes,
+      DEFAULT_MAX_OUTPUT_BYTES,
     );
   });
 
@@ -354,8 +378,44 @@ describe("fetch", () => {
     expect(sent).toHaveLength(1);
     const record = sent[0] as { params: Record<string, unknown>; opts: Record<string, unknown> };
     expect(record.params["url"]).toBe("https://a.test/");
-    expect(record.params["maxContentChars"]).toBe(deps.maxOutputBytes);
-    expect(record.opts["timeoutMs"]).toBe(deps.timeoutMs);
+    expect(record.params["maxContentChars"]).toBe(DEFAULT_MAX_OUTPUT_BYTES);
+    expect(record.opts["timeoutMs"]).toBe(30_000);
+  });
+
+  it("预算与超时是读取器：同一个 provider 两次抓取之间改值，第二次按新值走", async () => {
+    // `fetchMaxOutputChars` / `fetchTimeoutMs` 都是 volatile 位，改值不重跑 apply。装配时把
+    // 值抄进闭包的实现在这条用例上第二次仍然发旧值 —— 而生产里的症状是「卡上拧了旋钮、
+    // 抓回来的正文还是按老预算裁的」，回包形状照旧，看不出任何异常。
+    const sent: { params: Record<string, unknown>; opts: Record<string, unknown> }[] = [];
+    const client = fakeSidecar({
+      call: async (
+        _method: string,
+        params: unknown,
+        opts?: Record<string, unknown>,
+      ): Promise<unknown> => {
+        sent.push({ params: params as Record<string, unknown>, opts: opts! });
+        return { url: "u", status: 200, content: "x", truncated: false };
+      },
+    });
+    let budget = 4000;
+    let timeout = 30_000;
+    const provider = createWebFetchProvider({
+      ...makeDeps(),
+      sidecar: client,
+      maxOutputBytes: () => budget,
+      timeoutMs: () => timeout,
+    });
+
+    await provider.fetch({ url: "u" });
+    budget = 9000;
+    timeout = 45_000;
+    await provider.fetch({ url: "u" });
+
+    expect(sent).toHaveLength(2);
+    expect(sent[0]?.params["maxContentChars"]).toBe(4000);
+    expect(sent[0]?.opts["timeoutMs"]).toBe(30_000);
+    expect(sent[1]?.params["maxContentChars"]).toBe(9000);
+    expect(sent[1]?.opts["timeoutMs"]).toBe(45_000);
   });
 
   it("sidecar 抛错时包成带 code 的 WebError，并把 sidecar 的码带进消息", async () => {

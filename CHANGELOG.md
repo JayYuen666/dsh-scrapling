@@ -6,6 +6,35 @@
 标准六类之外的小节（本仓的 `Boundaries` 收各版本的验证范围与能力边界，即哪些平台/档位真跑过、
 哪些只到本地夹具为止）。
 
+## 0.1.13
+
+模型可见面全量双语化（中文仍是默认，跟随宿主 locale 偏好切英文）；工具选型的完整指引从常驻提示词搬进按需加载的虚拟 skill；search provider 补上 `ready()`、两个 web provider 的可热改项改成取值函数；十九个工具补调用态卡片与工具级墙钟；设置页多出一级分区与官方标记。
+
+### Added
+
+- **模型可见面的英文**：新增 `lib/messages.ts`，`ScraplingMessages` 227 键双语（工具描述、参数说明、十五条抓取指引、问答系统提示与六条回执、截断提示、MCP search 四句）。`ToolDeps` 多一个可选 `messages`，`messagesOf(deps)` 落回中文；`host.ts` 的 `localeMessagesOf` 读官方 locale 命名空间的偏好，装配期解析一次并注入全部工具、问答与 MCP 面。此前这些文本全部硬编中文——非中文模型读到的说明与报错是另一种语言。八张工具参数表与五张共享参数表随之从 `as const` 常量改成箭头函数 + `as const`（标宽返回类型会让 `defineTool` 推不出 `ParameterSchemaSpec`）。
+- **虚拟 skill `scrapling`**：十五条逐工具指引的**全文**经 `ctx.skills.register()` 注册，常驻 system prompt 只留一段跨工具摘要（`usageSummary`）。中文全文 2324 B 缩到常驻 505 B、英文 2869 B 缩到 699 B。正文按 `plan.ready` 现算：没装浏览器的机器那枚 skill 里不会出现 render / capture_xhr 那几句。指路句（`skillPointer`）只在 skill 真注册上时才追加——精简 profile 没有 `dsh-skill` 时把模型指向一个不存在的 skill 比不说更糟。
+- **search provider 的 `ready()`**：按官方契约实现 `ready(llmProvider)`，只查配置不发网络——没有可用凭据时返回 false，宿主的内置 `web_search` 因此整个不出现，而不是出现后每次调用都报鉴权错。凭据判据与 `available()` 刻意分成两套：`available()` 答「本 provider 进不进 `ctx.web` 的候选」（显式指定后端时恒 true，key 缺了留给 `search()` 报 `SEARCH_AUTH`，用户才知道补哪一项），`ready()` 答「内置工具要不要露给模型」。`auto` 看全部三条发现路径，名单外的旧后端名取保守侧 false。`fetch` 侧不加 `ready()`——官方 fetch provider 也没有，它没有凭据可判。
+- **调用态卡片**：十九个工具全部声明 `presentCall`，标题取入参里已有的值、取不到回落工具名。三个会话工具（`session_open` / `session_list` / `session_close`）此前落默认卡片，与检索类工具在时间线上分不出来。
+- **工具级墙钟**：每处注册的 `timeoutMs` 改成 `toolTimeoutOf(settings)` = 部署的 `timeoutMs` + 60 秒余量（17 处）。此前注册级与内层取同一个数，而宿主的截止在 `execute` 之前就装好、起点更早 ⇒ 永远是宿主先到期，本包带出路说明的 `SidecarError`（`BROWSER_TIMEOUT` / `REQUEST_TIMEOUT`）没机会说话。
+- **设置页一级分区与官方标记**：`settings.section` 注册 `id: "dsh-scrapling"`、`order: 30`（排在宿主既有的 account/general/models/plugins/agent-presets 之后），`settings.section.icon` 用同一 id 挂官方章鱼标记。图标是把官方图按「绿色高光 / 其余」拆成两张 alpha 遮罩叠出来的：本体走 `currentColor` 跟主题、眼睛与吸盘保留官方的 `#B3FB2A`，形状零改动。`plugins.bundle.config` 那一份保留，插件详情页与设置页两处显示同一张卡片；分区里显式传 `view: "page"` —— 不传时卡片会早退成空表单且不报错。
+
+### Changed
+
+- **可热改的部署项改成取值函数**：`SearchProviderDeps` / `WebProviderDeps` 里的后端名、四把 key、searxng 端点、publicFallback、输出预算与超时全部改成 `Reader<T> = () => T`（新增 `lib/config-reader.ts`），`host.ts` 抽出 `providerReadersOf(config)` 一处构造。原因：这些字段在设置卡上是 `.volatile()` 的，改值不会重跑 `apply`，装配时抄进闭包的那一份会永远停在旧值。一次操作只取一次快照，同一笔请求内不会出现「协议层按 30 秒等、回执里写 45 秒」。
+- **下载回执补提示**：`scrapling_download` 的文本多一句 `downloadSavedHint`（文件落在哪、下一步通常是什么），不再只是一行字节数与 sha256。
+- **宿主开发基线抬到 `0.2.2-rc.2`**：`devDependencies` 整组 `@deepseek-ai/dsh-*` 抬到 `0.2.2-rc.2` 并补 `@deepseek-ai/dsh-skill`；`peerDependencies` 与 `engines.dsh` 的支持窗口由 `^0.2.2-rc.1` 收到 `^0.2.2-rc.2`；`@deepseek-ai/dsh-error` 由 devDependency 改为 optional peer（`SidecarError` 继承宿主的 `HarnessError`，`instanceof` 要的是同一份类身份，内联成第二份就等于没有错误码）。
+- **两份 README 与两份 DETAIL 的指引段叙述同步**：从「关掉某个工具时它的 system prompt 指引段一并消失」改成「常驻只有一段跨工具摘要、逐工具十五句在虚拟 skill 里」，并说明侧车没起来时既不注册 skill 也没有常驻段。
+
+### Fixed
+
+- **`MCP_SERVER_VERSION` 与包版本同步**到 `0.1.13`。
+
+### Boundaries
+
+- 英文面只覆盖模型可见的文案（工具描述、参数说明、指引、回执、截断提示）。装配期日志、配置错误提示与 CLI 输出仍是中文：它们给部署者看，不进模型上下文。
+- `ctx.skills` 是可选服务。精简 profile（没装 `dsh-skill`）下插件照常装配、工具照常可用，只是十五条指引按需加载不了，常驻段也不会出现指路句。
+
 ## 0.1.12
 
 设置卡的下拉候选与说明浮层不再漂到浏览器最左边；shared 抬到 `^0.2.8`（含运行时几何自检），CI 的 action 钉版升到最新。`MCP_SERVER_VERSION` 随包版本同步。

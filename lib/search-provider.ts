@@ -22,6 +22,7 @@ import type {
   WebSearchSource,
 } from "@deepseek-ai/dsh-web";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import type { Reader } from "./config-reader.ts";
 import type { SearchBackend } from "./search-backends.ts";
 import type { SidecarClient } from "./sidecar.ts";
 import { SidecarError } from "./sidecar-error.ts";
@@ -53,39 +54,53 @@ export interface SearchProviderDeps {
   /**
    * 发现后端：auto 依次尝试配了 key 的 API 后端与 SearXNG，两者都没有时按
    * {@link SearchProviderDeps.publicFallback} 决定是否回落到公共引擎。
+   *
+   * 读取器：`searchBackend` 是可热改的部署项。
    */
-  readonly backend: SearchBackend;
-  /** Tavily / Brave / Serper 各自的 API key；空串表示没配。 */
-  readonly apiKey: string;
-  readonly braveApiKey: string;
-  readonly serperApiKey: string;
-  /** 各后端的端点（测试或部署覆盖）。 */
+  readonly backend: Reader<SearchBackend>;
+  /** Tavily / Brave / Serper 各自的 API key；空串表示没配。三者都是读取器。 */
+  readonly apiKey: Reader<string>;
+  readonly braveApiKey: Reader<string>;
+  readonly serperApiKey: Reader<string>;
+  /**
+   * 各后端的端点（测试或部署覆盖）。
+   *
+   * 这几位**不是**读取器：它们不在设置卡上，装配后不会变。只有 `searxngEndpoint` 例外
+   * —— 它是用户要在卡上填的部署项，所以单独做成读取器。
+   */
   readonly apiEndpoint: string;
   readonly bingEndpoint: string;
   readonly braveEndpoint: string;
   readonly serperEndpoint: string;
   readonly duckduckgoEndpoint: string;
-  /** SearXNG 实例地址；空串表示这条后端不可用。 */
-  readonly searxngEndpoint: string;
+  /** SearXNG 实例地址；空串表示这条后端不可用。读取器。 */
+  readonly searxngEndpoint: Reader<string>;
   /**
    * auto 后端是否允许回落到公共引擎（DuckDuckGo → Bing）。
    *
    * 默认 false（spec D10）：公共引擎会把查询词发给第三方，属于要部署方明确同意的行为。
    * 显式把 backend 设成公共引擎时这一项不参与判断 —— 那已经是明确选择。
+   *
+   * 读取器：卡上可以随时打开它。
    */
-  readonly publicFallback: boolean;
-  /** 搜索结果里前几条要真的抓下来渲染。 */
+  readonly publicFallback: Reader<boolean>;
+  /** 搜索结果里前几条要真的抓下来渲染。不在卡上，装配后不变。 */
   readonly renderTopN: number;
-  /** 单次抓取的字节预算。 */
-  readonly maxOutputBytes: number;
+  /**
+   * 单次抓取的字节预算。读取器：`fetchMaxOutputChars` 是可热改的部署项，且它与
+   * `dsh-scrapling_fetch` 等工具共用同一枚设置。
+   */
+  readonly maxOutputBytes: Reader<number>;
   /**
    * 每一次 sidecar 调用的超时（毫秒）：发现一次、逐条渲染的各次都吃这一位，
    * 所以一次 `search` 的自身上界约为 `(1 + renderTopN) × timeoutMs`。
    *
    * 整次工具调用的上界不在本层：宿主把同一枚设置（`fetchTimeoutMs`）声明在
    * `ToolDefinition.timeoutMs` 上，由它负责取消整笔调用。
+   *
+   * 读取器：`fetchTimeoutMs` 是可热改的部署项。
    */
-  readonly timeoutMs: number;
+  readonly timeoutMs: Reader<number>;
   /**
    * 出站 URL 的准入闸门；与 sidecar 用的是同一个实现（Host 侧那道 SSRF 防线）。
    *
@@ -160,13 +175,14 @@ function absolutize(raw: string, endpoint: string): string {
 
 /** 每条后端只认自己那把 key；拼错后端名不会把 Tavily 的 key 递给 Brave。 */
 function selectKey(deps: SearchProviderDeps): string {
-  if (deps.backend === "brave") {
-    return deps.braveApiKey;
+  const backend = deps.backend();
+  if (backend === "brave") {
+    return deps.braveApiKey();
   }
-  if (deps.backend === "serper") {
-    return deps.serperApiKey;
+  if (backend === "serper") {
+    return deps.serperApiKey();
   }
-  return deps.apiKey;
+  return deps.apiKey();
 }
 
 /**
@@ -198,7 +214,7 @@ function endpointOf(deps: SearchProviderDeps, backend: string): string {
       return deps.duckduckgoEndpoint;
     }
     case "searxng": {
-      return deps.searxngEndpoint;
+      return deps.searxngEndpoint();
     }
     default: {
       return "";
@@ -224,11 +240,15 @@ async function discover(
   maxResults: number,
   signal: AbortSignal | undefined,
 ): Promise<{ hits: ParsedSearchHit[]; base: string }> {
+  // 一次操作只取一次快照：下面的 JSON 与协议层超时必须是同一刻的值，边发边取会让
+  // 「timeoutSeconds 说 30 秒、协议层却等 120 秒」这种自相矛盾的回包成为可能。
+  const backend = deps.backend();
+  const timeoutMs = deps.timeoutMs();
   try {
     const raw = await deps.sidecar.call(
       "search.discover",
       {
-        backend: deps.backend,
+        backend,
         query,
         maxResults,
         apiKey: selectKey(deps),
@@ -237,17 +257,16 @@ async function discover(
         braveEndpoint: deps.braveEndpoint,
         serperEndpoint: deps.serperEndpoint,
         duckduckgoEndpoint: deps.duckduckgoEndpoint,
-        searxngEndpoint: deps.searxngEndpoint,
-        publicFallback: deps.publicFallback,
-        timeoutSeconds: deps.timeoutMs / 1000,
+        searxngEndpoint: deps.searxngEndpoint(),
+        publicFallback: deps.publicFallback(),
+        timeoutSeconds: timeoutMs / 1000,
       },
-      { ...(signal === undefined ? {} : { signal }), timeoutMs: deps.timeoutMs },
+      { ...(signal === undefined ? {} : { signal }), timeoutMs },
     );
-    const backend =
-      isRecord(raw) && typeof raw["backend"] === "string" ? raw["backend"] : deps.backend;
+    const reported = isRecord(raw) && typeof raw["backend"] === "string" ? raw["backend"] : backend;
     return {
       hits: hitsOf(raw),
-      base: endpointOf(deps, backend),
+      base: endpointOf(deps, reported),
     };
   } catch (error: unknown) {
     if (signal?.aborted === true) {
@@ -310,6 +329,53 @@ type SourceOutcome =
   | { readonly kind: "ok"; readonly source: WebSearchSource }
   | { readonly kind: "unparsable" }
   | { readonly kind: "rejected" };
+
+/**
+ * 这个后端此刻配没配齐它能用的凭据。
+ *
+ * 与 {@link selectKey} 是同一条规则的两面：`selectKey` 答「该把这个后端的哪把 key 发出去」，
+ * 这里答「那把 key 在不在」。两者分开写是因为 `selectKey` 的缺省分支回的是 Tavily 的 key
+ * （`tavily` 与 `auto` 都落它），而 `auto` 的凭据判据要看**所有**可能的发现路径。
+ *
+ * 公开端点（Bing、DuckDuckGo）不需要凭据，恒 true —— 它们要的是
+ * {@link SearchProviderDeps.publicFallback} 那种部署方的表态，而不是 key。
+ *
+ * @param deps - provider 依赖
+ * @param backend - 当下选中的后端
+ * @returns 发得出一次检索时为 true
+ */
+function hasCredentialFor(deps: SearchProviderDeps, backend: SearchBackend): boolean {
+  switch (backend) {
+    case "auto": {
+      // auto 会依次试 Tavily、SearXNG，都不行再看 publicFallback（与 py/search.py 一致）。
+      return deps.apiKey().length > 0 || deps.searxngEndpoint().length > 0 || deps.publicFallback();
+    }
+    case "tavily": {
+      return deps.apiKey().length > 0;
+    }
+    case "brave": {
+      return deps.braveApiKey().length > 0;
+    }
+    case "serper": {
+      return deps.serperApiKey().length > 0;
+    }
+    case "searxng": {
+      return deps.searxngEndpoint().length > 0;
+    }
+    case "bing":
+    case "duckduckgo": {
+      // 公开端点，没有凭据可配。
+      return true;
+    }
+    default: {
+      // 类型上是封闭联合，但**配置是运行期读出来的**：profile patch 里留着旧版本的后端名、
+      // 或用户手改 settings 写了拼错的值，都会走到这里（`lib/cli.ts` 的
+      // `isSearchBackend` 只在 CLI 那条路上收窄，插件装配路径没有第二道门）。这一档取
+      // 保守侧：不露面。当成公开端点等于替用户打开一条他没配过的发现路径。
+      return false;
+    }
+  }
+}
 
 /**
  * 把一条命中归一成可引用的 source。
@@ -376,6 +442,9 @@ async function fetchContent(
   signal: AbortSignal | undefined,
 ): Promise<FetchOutcome> {
   try {
+    // 同一笔抓取里「发给 sidecar 的字符上限」与「协议层超时」取同一刻的快照。
+    const maxContentChars = deps.maxOutputBytes();
+    const timeoutMs = deps.timeoutMs();
     const raw: unknown = await deps.sidecar.call(
       deps.sidecar.capabilities?.browser === true ? "render" : "fetch",
       {
@@ -385,9 +454,9 @@ async function fetchContent(
         mainContentOnly: true,
         headless: true,
         networkIdle: false,
-        maxContentChars: deps.maxOutputBytes,
+        maxContentChars,
       },
-      { ...(signal === undefined ? {} : { signal }), timeoutMs: deps.timeoutMs },
+      { ...(signal === undefined ? {} : { signal }), timeoutMs },
     );
     if (!isRecord(raw)) {
       // 三种「读不到」分开点名：协议违例（回包不是对象、正文不是字符串）是 sidecar 或
@@ -460,16 +529,44 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
       if (!(deps.sidecar.alive && deps.sidecar.capabilities?.scrapling === true)) {
         return false;
       }
-      if (deps.backend !== "auto") {
+      if (deps.backend() !== "auto") {
         // 显式后端：key 缺了也要让 search() 报 SEARCH_AUTH，用户才知道补哪一项；
         // 在这里静默退回“不可用”就等于把配置错误伪装成 provider 不存在。
         return true;
       }
       // auto：只有存在一条真正的发现路径才算可用。公共引擎不是默认路径 —— 它要
-      // searchPublicFallback 明确打开，否则查询词会被悄悄发给第三方（spec D10）。
+      // publicFallback 明确打开，否则查询词会被悄悄发给第三方（spec D10）。
       // 判据与 py/search.py 的 auto 解析保持一致：auto 只看 Tavily key 与 SearXNG
       // 端点，brave/serper 的 key 属于显式选择那些后端的场景。
-      return deps.apiKey.length > 0 || deps.searxngEndpoint.length > 0 || deps.publicFallback;
+      return deps.apiKey().length > 0 || deps.searxngEndpoint().length > 0 || deps.publicFallback();
+    },
+
+    /**
+     * 内置 `web_search` 要不要露给模型。
+     *
+     * 与 {@link createWebSearchProvider} 里的 `available()` 是**两套判据**，别合并：
+     * - `available()` 答「本 provider 该不该进 ctx.web 的候选」，显式后端恒 true（key 缺了
+     *   要留给 search() 报 SEARCH_AUTH）；
+     * - `ready()` 答「这一条请求路线发得出凭据吗」，而宿主拿它给 `web_search` 装
+     *   `when` 门 —— 答 false 时那个工具**整个不出现在模型面前**（`dsh-tool-web` 的
+     *   `{ when: ({ modelSelection }) => ctx.web.searchReady(modelSelection.provider) }`）。
+     *   谁都没配却照样把 web_search 露出来，模型只会撞一次 SEARCH_AUTH，然后整轮都
+     *   不知道这个能力其实没配好。
+     *
+     * 按官方 `dsh-web-search-deepseek` 的做法，这里只查配置、不发网络请求。
+     *
+     * @param _llmProvider - 宿主传进来的模型路线 id；本 provider 的凭据与模型无关，忽略它
+     * @returns 当前配置下是否发得出一次检索
+     */
+    // 返回 Promise 的函数被要求声明 async，而这一位真的没有可等待的操作：契约明写
+    // ready() 只查配置、不得发网络请求。两条 lint 在这里互相顶住，取「声明 async、
+    // 关掉 require-await」这一侧 —— 反过来写成非 async + Promise.resolve 会撞
+    // typescript/promise-function-async，同样要一行豁免，而 async 写法与宿主其余
+    // provider 的形状一致。
+    // oxlint-disable-next-line typescript/require-await -- ready 是同步判配置，async 没有可等待的操作
+    async ready(_llmProvider: string | undefined): Promise<boolean> {
+      const reachable = deps.sidecar.alive && deps.sidecar.capabilities?.scrapling === true;
+      return reachable && hasCredentialFor(deps, deps.backend());
     },
 
     /**

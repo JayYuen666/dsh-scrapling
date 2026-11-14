@@ -6,6 +6,7 @@ import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { capText } from "./output.ts";
 import { callSidecar, SidecarError } from "./sidecar.ts";
 import { callNumber } from "./tool-params.ts";
+import { messagesOf, toolTimeoutOf } from "./tools.ts";
 import type { ToolDeps } from "./tools.ts";
 
 /** 宿主 attachment 服服务的最小类型；截图工具只调这一项。 */
@@ -16,8 +17,6 @@ export interface AttachmentSaver {
     name?: string;
   }) => Promise<Record<string, unknown>>;
 }
-
-const RECOVERY_HINT = "要拿被省略的部分，请用 cssSelector 收窄范围，或分多次读取。";
 
 /**
  * 标准 base64 的形态：四位一组，尾部允许一枚或两枚 `=`。
@@ -97,17 +96,26 @@ function actionTimeoutMs(value: unknown, deadlineMs: number): number {
 /** 读会话当前页。 */
 export function createSessionReadTool(deps: ToolDeps): ToolDefinition {
   const { sidecar, settings } = deps;
+  const messages = messagesOf(deps);
   return defineTool({
     name: "scrapling_session_read",
-    description:
-      "读浏览器会话当前页的正文，不再发一次网络请求。适合在动作之后确认页面状态；" +
-      "还没打开页面的会话会报 NO_CURRENT_PAGE。",
+    description: messages.sessionReadToolDescription,
     parameters: {
-      sessionId: { type: "string", required: true, description: "浏览器会话 id。" },
-      extractionType: { type: "string", description: "输出形态：markdown（默认）/ html / text。" },
-      cssSelector: { type: "string", description: "只取匹配的部分；留空取整页。" },
-      mainContentOnly: { type: "boolean", description: "只保留 body 内容，默认 true。" },
-      includeMetadata: { type: "boolean", description: "回传安全响应元数据。" },
+      sessionId: {
+        type: "string",
+        required: true,
+        description: messages.sessionReadSessionIdDescription,
+      },
+      extractionType: { type: "string", description: messages.extractionTypeDescription },
+      cssSelector: { type: "string", description: messages.sessionReadCssSelectorDescription },
+      mainContentOnly: {
+        type: "boolean",
+        description: messages.sessionReadMainContentOnlyDescription,
+      },
+      includeMetadata: {
+        type: "boolean",
+        description: messages.sessionReadIncludeMetadataDescription,
+      },
     },
     output: {
       schema: {
@@ -130,7 +138,7 @@ export function createSessionReadTool(deps: ToolDeps): ToolDefinition {
       ],
       presentationMeta: (_args, value) => ({ url: value.url, truncated: value.truncated }),
     },
-    timeoutMs: settings.timeoutMs,
+    timeoutMs: toolTimeoutOf(settings),
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext) {
       const raw = await callSidecar(
@@ -150,7 +158,7 @@ export function createSessionReadTool(deps: ToolDeps): ToolDefinition {
         throw new SidecarError("SIDECAR_REQUEST_FAILED", "session.read returned a non-object");
       }
       const content = textOf(raw, "content");
-      const capped = capText(content, settings.maxOutputBytes, RECOVERY_HINT);
+      const capped = capText(content, settings.maxOutputBytes, messages.contentRecoveryHint);
       const rawNotice = raw["notice"];
       const notice = [typeof rawNotice === "string" ? rawNotice : "", capped.notice]
         .filter((part) => part.length > 0)
@@ -172,17 +180,20 @@ export function createSessionReadTool(deps: ToolDeps): ToolDefinition {
 /** 在会话当前页上执行结构化动作。 */
 export function createSessionActTool(deps: ToolDeps): ToolDefinition {
   const { sidecar, settings } = deps;
+  const messages = messagesOf(deps);
   return defineTool({
     name: "scrapling_session_act",
-    description:
-      "在已开会话的当前页上按顺序执行结构化动作（点击、输入、等待等）。" +
-      "只接受白名单动作，不执行任意 JavaScript；首个失败会点名动作序号。",
+    description: messages.sessionActToolDescription,
     parameters: {
-      sessionId: { type: "string", required: true, description: "浏览器会话 id。" },
-      actions: { type: "json", required: true, description: "动作数组，按顺序执行。" },
-      slowly: { type: "boolean", description: "每个动作之间等 100ms。" },
-      maxActions: { type: "integer", description: "最多多少个动作，默认 20，上限 50。" },
-      timeoutMs: { type: "integer", description: "单个动作的超时（毫秒），不超过本次调用的超时。" },
+      sessionId: {
+        type: "string",
+        required: true,
+        description: messages.sessionReadSessionIdDescription,
+      },
+      actions: { type: "json", required: true, description: messages.sessionActActionsDescription },
+      slowly: { type: "boolean", description: messages.sessionActSlowlyDescription },
+      maxActions: { type: "integer", description: messages.sessionActMaxActionsDescription },
+      timeoutMs: { type: "integer", description: messages.sessionActTimeoutMsDescription },
     },
     output: {
       schema: {
@@ -202,7 +213,7 @@ export function createSessionActTool(deps: ToolDeps): ToolDefinition {
       ],
       presentationMeta: (_args, value) => ({ count: value.completed }),
     },
-    timeoutMs: settings.timeoutMs,
+    timeoutMs: toolTimeoutOf(settings),
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext) {
       const raw = await callSidecar(
@@ -230,19 +241,18 @@ export function createSessionActTool(deps: ToolDeps): ToolDefinition {
 /** 下载一个 URL 到 dataDir/downloads。 */
 export function createDownloadTool(deps: ToolDeps): ToolDefinition {
   const { sidecar, settings } = deps;
+  const messages = messagesOf(deps);
   return defineTool({
     name: "scrapling_download",
-    description:
-      "把一个 URL 的字节写进插件的下载目录，返回路径、大小与 sha256。" +
-      "不覆盖已有文件；不返回文件内容。",
+    description: messages.downloadToolDescription,
     parameters: {
-      url: { type: "string", required: true, description: "要下载的 HTTP(S) URL。" },
-      filename: { type: "string", description: "保存的文件名；留空从 URL 推导。" },
-      maxBytes: { type: "integer", description: "本次下载的字节上限。" },
-      headers: { type: "json", description: "请求头（对象）。" },
-      cookies: { type: "json", description: "Cookie 键值对（对象）。" },
-      impersonate: { type: "string", description: "TLS 指纹伪装目标。" },
-      useBrowser: { type: "boolean", description: "用真实浏览器取字节，默认 false。" },
+      url: { type: "string", required: true, description: messages.downloadUrlDescription },
+      filename: { type: "string", description: messages.downloadFilenameDescription },
+      maxBytes: { type: "integer", description: messages.downloadMaxBytesDescription },
+      headers: { type: "json", description: messages.downloadHeadersDescription },
+      cookies: { type: "json", description: messages.downloadCookiesDescription },
+      impersonate: { type: "string", description: messages.downloadImpersonateDescription },
+      useBrowser: { type: "boolean", description: messages.downloadUseBrowserDescription },
     },
     output: {
       schema: {
@@ -259,12 +269,12 @@ export function createDownloadTool(deps: ToolDeps): ToolDefinition {
       render: (_args, value) => [
         {
           type: "text",
-          text: `saved ${value.bytes}B to ${value.path}\nsha256: ${value.sha256}\ncontent-type: ${value.contentType || "(unknown)"} (HTTP ${value.status})`,
+          text: `saved ${value.bytes}B to ${value.path}\nsha256: ${value.sha256}\ncontent-type: ${value.contentType || "(unknown)"} (HTTP ${value.status})\n${messages.downloadSavedHint}`,
         },
       ],
       presentationMeta: (_args, value) => ({ url: value.path, statusCode: value.status }),
     },
-    timeoutMs: settings.timeoutMs,
+    timeoutMs: toolTimeoutOf(settings),
     isConcurrencySafe: () => true,
     async execute(args, exec: ToolRunContext) {
       // downloadMaxBytes 是部署侧的天花板，maxBytes 是模型可提的参数：后者只能在前者之内。
@@ -308,18 +318,25 @@ export function createDownloadTool(deps: ToolDeps): ToolDefinition {
 /** 截会话当前页，并把字节交给宿主 attachment。 */
 export function createScreenshotTool(deps: ToolDeps): ToolDefinition {
   const { sidecar, settings, attachments } = deps;
+  const messages = messagesOf(deps);
   return defineTool({
     name: "scrapling_screenshot",
-    description:
-      "对已开会话的当前页或页内单个元素截图，作为图片附件返回。" +
-      "截图不经文本清洗，可能包含页面上的敏感视觉信息。",
+    description: messages.screenshotToolDescription,
     parameters: {
-      sessionId: { type: "string", required: true, description: "浏览器会话 id。" },
-      imageType: { type: "string", enum: ["png", "jpeg"], description: "图片格式，默认 png。" },
-      fullPage: { type: "boolean", description: "截整页，默认 false。" },
-      quality: { type: "integer", description: "JPEG 质量 1–100；PNG 不可用。" },
-      selector: { type: "string", description: "只截这一个元素；与 fullPage 互斥。" },
-      timeoutMs: { type: "integer", description: "截图超时（毫秒），不超过本次调用的超时。" },
+      sessionId: {
+        type: "string",
+        required: true,
+        description: messages.sessionReadSessionIdDescription,
+      },
+      imageType: {
+        type: "string",
+        enum: ["png", "jpeg"],
+        description: messages.screenshotImageTypeDescription,
+      },
+      fullPage: { type: "boolean", description: messages.screenshotFullPageDescription },
+      quality: { type: "integer", description: messages.screenshotQualityDescription },
+      selector: { type: "string", description: messages.screenshotSelectorDescription },
+      timeoutMs: { type: "integer", description: messages.screenshotTimeoutMsDescription },
     },
     output: {
       schema: {
@@ -345,7 +362,7 @@ export function createScreenshotTool(deps: ToolDeps): ToolDefinition {
       ],
       presentationMeta: (_args, value) => ({ url: value.url }),
     },
-    timeoutMs: settings.timeoutMs,
+    timeoutMs: toolTimeoutOf(settings),
     isConcurrencySafe: () => false,
     async execute(args, exec: ToolRunContext) {
       if (attachments === undefined) {

@@ -7,7 +7,7 @@
 卡上五十个取值按用途分组，多数每次调用现读，改完下一次调用就生效。另有几项只在装配时读一次，改完要让插件重新装配——重启宿主即可。这几项是：十五个工具开关、`provideWebFetch` / `provideWebSearch` 以及与它们一起被检索 provider 快照的 `searchBackend`、各家 key、`searxngEndpoint`、`fetchMaxOutputChars`、`fetchTimeoutMs`，再加上 `pythonBin`、`failFastOnMissingPython` 与 `dataDir`。
 
 - **运行环境** — `pythonBin`（留空）决定用哪个解释器：显式路径优先，其次托管的能力包安装，再次本包的开发 venv，最后落回 PATH 上的 `python3`（Windows 上是 `python`）。托管那一档只在 macOS arm64 上尝试——有已验能力包的就这一个平台——其余平台从显式路径直接跳到 venv 与 PATH。每次都会播报选中的是哪一支。`failFastOnMissingPython`（默认开）让 sidecar 起不来时直接拒绝装载；而解释器起得来但没装 Scrapling 时，一律降级成「工具不可用」并在日志里点名路径。`dataDir` 是 sidecar 状态的位置。
-- **工具开关** — 十五个（fetch、extract、locate、links、render、capture XHR、会话网络历史、session、登录态、crawl、answer、session read、页面动作、download、screenshot）。关掉一个就是模型看不见它，连对应的提示词段落一起撤掉。
+- **工具开关** — 十五个（fetch、extract、locate、links、render、capture XHR、会话网络历史、session、登录态、crawl、answer、session read、页面动作、download、screenshot）。关掉一个就是模型看不见它，它那句指引也跟着从 skill 正文里消失；常驻 system prompt 里只留一段跨工具的选型摘要（不点名具体工具），全文按装配时真注册了哪些工具现算后注册成虚拟 skill `scrapling`。
 - **抽取与输出** — `extractionType`（markdown/html/text）、`mainContentOnly`、`stripInlineImages`（默认开），以及各工具的输出预算：`fetchMaxOutputChars`、`extractMaxOutputChars`、`renderMaxOutputChars` 默认 200000，`xhrMaxOutputChars` 默认 120000。宿主侧按 UTF-8 **字节**裁剪，同一个数值交给 sidecar 时叫 `maxContentChars`，那边按**字符**截——两处谁更紧就按谁收。`crawlMaxItems`（1000）管的是页数，不是输出大小。
 - **浏览器** — `headless`（默认开）、`networkIdle`（默认关）、`blockAds`（默认开，约 3500 个域名）、`pierceShadow`（默认关）、`waitSelectorState`。
 - **超时与回收** — `fetchTimeoutMs`（120000）、`sidecarHandshakeTimeoutMs`（30000）、`sidecarGraceMs`（5000）。
