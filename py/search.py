@@ -17,6 +17,16 @@ DEFAULT_DUCKDUCKGO_ENDPOINT = "https://html.duckduckgo.com/html/"
 BACKENDS = ("auto", "tavily", "bing", "brave", "serper", "duckduckgo", "searxng")
 DEFAULT_SEARCH_RESULTS = 8
 DEFAULT_SEARCH_TIMEOUT_SECONDS = 30.0
+# Brave Web Search API 的 `count` 与 Tavily 的 `max_results` 都是 1..20（上游文档口径）。
+# 上层 `lib/search-provider.ts` 的 MAX_SOURCES 是 100，会把这个值一路放到 100 ——
+# 那两条后端拿到 100 只会判参数错，回执里看不到「被夹到 20」这件事。
+BRAVE_MAX_COUNT = 20
+TAVILY_MAX_RESULTS = 20
+# 每条后端自己只发一次请求，重试交给协议层（`lib/search-provider.ts` 的 timeoutMs 是
+# 整次调用的预算）。上游 Fetcher 默认 retries=3、retry_delay=1，一次慢后端最坏要花
+# `3 × timeout + 2s`，比协议层先到期的超时还长 —— 于是 SEARCH_TIMEOUT 永远走不到，
+# 模型看到的是一条含义更模糊的协议层超时。显式传 1 让两层的预算对齐。
+SEARCH_RETRIES = 1
 
 
 class SearchError(ValueError):
@@ -53,6 +63,15 @@ def _endpoint(value: Any, default: str, field: str) -> str:
 
 def _status_error(status: int, backend: str) -> SearchError | None:
     if status in (401, 403):
+        # SearXNG 没有 API key 这回事：它的 401/403 几乎总是「实例没开 json 输出格式」
+        # （`search.formats` 默认只有 html）。对这条后端说「检查 API key」会把人指到
+        # 一个根本不存在的配置项上。
+        if backend == "searxng":
+            return SearchError(
+                "SEARCH_AUTH",
+                "searxng answered 401/403; most instances ship with the json format disabled — "
+                "enable it in the instance's settings.yml (search.formats: [html, json])",
+            )
         return SearchError(
             "SEARCH_AUTH",
             f"{backend} rejected the credentials; check the configured API key",
@@ -80,38 +99,27 @@ def _tavily(args: dict[str, Any], query: str, limit: int, timeout: float) -> dic
             json={
                 "api_key": key,
                 "query": query,
-                "max_results": limit,
+                "max_results": min(limit, TAVILY_MAX_RESULTS),
                 "search_depth": "basic",
             },
             timeout=timeout,
+            retries=SEARCH_RETRIES,
         )
     except Exception as error:  # noqa: BLE001 —— 只翻译成带码的失败，不回显请求体
         raise _translate(error, "tavily") from None
     failed = _status_error(int(getattr(response, "status", 0)), "tavily")
     if failed is not None:
         raise failed
-    try:
-        payload = response.json()
-    except Exception as error:
-        raise SearchError("SEARCH_FAILED", "tavily answered with invalid JSON") from error
-    results = payload.get("results") if isinstance(payload, dict) else None
-    hits: list[dict[str, str]] = []
-    if isinstance(results, list):
-        for item in results[:limit]:
-            if not isinstance(item, dict):
-                continue
-            url = item.get("url")
-            if not isinstance(url, str) or not url:
-                continue
-            title = item.get("title")
-            content = item.get("content")
-            hits.append(
-                {
-                    "url": url,
-                    "title": title if isinstance(title, str) else "",
-                    "snippet": content if isinstance(content, str) else "",
-                }
-            )
+    payload = _json_body(response, "tavily")
+    # 走与另外五条后端同一个收集器：`{}`（没有 results 键）与 `{"results": "x"}` 都收成空表，
+    # 而非对象回包已经在 _json_body 那里判成 SEARCH_FAILED 了。
+    hits = _collect(
+        payload.get("results"),
+        limit=limit,
+        url_key="url",
+        title_key="title",
+        snippet_key="content",
+    )
     return {"backend": "tavily", "hits": hits}
 
 
@@ -120,7 +128,7 @@ def _bing(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict[
     from scrapling.fetchers import Fetcher
 
     try:
-        response = Fetcher.get(endpoint, params={"q": query}, timeout=timeout)
+        response = Fetcher.get(endpoint, params={"q": query}, timeout=timeout, retries=SEARCH_RETRIES)
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "bing") from None
     failed = _status_error(int(getattr(response, "status", 0)), "bing")
@@ -223,12 +231,15 @@ def _brave(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict
     endpoint = _endpoint(args.get("braveEndpoint"), DEFAULT_BRAVE_ENDPOINT, "braveEndpoint")
     from scrapling.fetchers import Fetcher
 
+    # Brave 的 `count` 上限是 20（文档口径）。传更大的值不会报错，只会被上游截断，
+    # 回执里少掉的那几条看不出原因 —— 这里夹到上限，超出的部分由调用方自己翻页。
     try:
         response = Fetcher.get(
             endpoint,
-            params={"q": query, "count": limit},
+            params={"q": query, "count": min(limit, BRAVE_MAX_COUNT)},
             headers={"X-Subscription-Token": key, "Accept": "application/json"},
             timeout=timeout,
+            retries=SEARCH_RETRIES,
         )
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "brave") from None
@@ -257,6 +268,7 @@ def _serper(args: dict[str, Any], query: str, limit: int, timeout: float) -> dic
             json={"q": query, "num": limit},
             headers={"X-API-KEY": key, "Content-Type": "application/json"},
             timeout=timeout,
+            retries=SEARCH_RETRIES,
         )
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "serper") from None
@@ -298,7 +310,7 @@ def _duckduckgo(args: dict[str, Any], query: str, limit: int, timeout: float) ->
     from scrapling.fetchers import Fetcher
 
     try:
-        response = Fetcher.get(endpoint, params={"q": query}, timeout=timeout)
+        response = Fetcher.get(endpoint, params={"q": query}, timeout=timeout, retries=SEARCH_RETRIES)
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "duckduckgo") from None
     failed = _status_error(int(getattr(response, "status", 0)), "duckduckgo")
@@ -344,7 +356,7 @@ def _searxng(args: dict[str, Any], query: str, limit: int, timeout: float) -> di
     from scrapling.fetchers import Fetcher
 
     try:
-        response = Fetcher.get(url, params={"q": query, "format": "json"}, timeout=timeout)
+        response = Fetcher.get(url, params={"q": query, "format": "json"}, timeout=timeout, retries=SEARCH_RETRIES)
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "searxng") from None
     failed = _status_error(int(getattr(response, "status", 0)), "searxng")

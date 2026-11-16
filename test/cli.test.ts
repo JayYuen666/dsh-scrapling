@@ -87,7 +87,7 @@ const SEARCH_WITHOUT_KEY = [
 function readyCoreData(dataDir: string): void {
   const bin = path.join(dataDir, "runtime", "venv", "bin");
   mkdirSync(bin, { recursive: true });
-  writeFileSync(path.join(bin, "python3"), "#!/bin/sh\n");
+  writeFileSync(path.join(bin, "python3"), "#!/bin/sh\n", { mode: 0o755 });
   writeFileSync(
     path.join(dataDir, "runtime", "state.json"),
     JSON.stringify({ packs: { core: "ready" } }),
@@ -341,6 +341,37 @@ describe("runCli", () => {
     const status = parseStatus(lines);
     expect(status.profile.pythonBin).toBe(configured);
     expect(status.runtime.via).toBe("configured");
+  });
+
+  it("--status 遇到相对路径时按 CLI 的 cwd 展开，并说明宿主可能落在别处", async () => {
+    // 宿主用 path.resolve 按**它自己**的 cwd 展开，CLI 的 cwd 不是同一个；CLI 修不了这个
+    // 差别，但必须按一个确定的基准展开（否则每次调用的读法随 cwd 漂），并在输出里点明。
+    const { deps, lines, dataDir } = harness();
+    const profile = profileDir(
+      dataDir,
+      `- id: scrapling\n  name: "@jayyuen66/dsh-scrapling"\n  config:\n    pythonBin: venv/bin/python\n`,
+    );
+    await expect(runCli([SETUP, STATUS, PROFILE, profile], deps)).resolves.toBe(0);
+    const status = parseStatus(lines);
+    // profile 段报的是**原始文本**（用户写下的那一份），展开值只用于解析。
+    expect(status.profile.pythonBin).toBe("venv/bin/python");
+    expect(status.profile.note ?? "").toContain("相对路径");
+    expect(status.runtime.via).toBe("configured");
+    expect(status.runtime.pythonPath).toBe(path.resolve("venv/bin/python"));
+  });
+
+  it("--status 遇到裸命令名时不当路径展开", async () => {
+    // path.resolve("python3") 会变成 <cwd>/python3 —— 那是另一个东西，解析链找的是 PATH。
+    const { deps, lines, dataDir } = harness();
+    const profile = profileDir(
+      dataDir,
+      `- id: scrapling\n  name: "@jayyuen66/dsh-scrapling"\n  config:\n    pythonBin: python3\n`,
+    );
+    await expect(runCli([SETUP, STATUS, PROFILE, profile], deps)).resolves.toBe(0);
+    const status = parseStatus(lines);
+    expect(status.profile.pythonBin).toBe("python3");
+    expect(status.profile.note ?? "").not.toContain("相对路径");
+    expect(status.runtime.pythonPath).not.toBe(path.resolve("python3"));
   });
 
   it("--feature core --apply 交给 installer 的包安装入口", async () => {
@@ -617,6 +648,29 @@ describe("runCli", () => {
     const text = lines.join("\n");
     expect(text).toContain("WEB_PROVIDER_CONFIGURED_UNAVAILABLE");
     expect(text).toContain("setup --feature core --apply");
+  });
+
+  it("searchProvider 指向本插件而能力包被标成 blocked 时，doctor 不把用户支去重装", async () => {
+    const { deps, lines, dataDir } = harness();
+    // 平台在 runCli 期间临时改成 linux：packStates 见 installerSupported() 为假就无条件全报
+    // blocked，而这与「没装」是两件事 —— 那些平台上 resolveRuntime 仍能回落 PATH 的 python3。
+    const restore = mockPlatform("linux", "x64");
+    try {
+      const profile = profileDir(
+        dataDir,
+        `${CLEAN_MCP_ENTRY}${WEB_POINTS_HERE}${SEARCH_WITH_KEY}`,
+        PINNED_CLIENT,
+      );
+      await expect(runCli([DOCTOR, MODE, MCP, PROFILE, profile], deps)).resolves.toBe(1);
+    } finally {
+      restore();
+    }
+    const text = lines.join("\n");
+    expect(text).toContain("WEB_PROVIDER_CONFIGURED_UNAVAILABLE");
+    expect(text).toContain("blocked");
+    // 关键：不能出现那条在这台机器上永远修不好的命令。
+    expect(text).not.toContain("setup --feature core --apply");
+    expect(text).toContain("pythonBin");
   });
 
   it("能力包与后端都就绪时 doctor 打绿", async () => {

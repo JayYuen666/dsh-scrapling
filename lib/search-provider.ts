@@ -124,17 +124,57 @@ export interface ParsedSearchHit {
 }
 
 /**
+ * 取回包里的诊断说明（`note`）；没有就给 undefined。
+ *
+ * 只有两条**抓 HTML** 的后端会写它：Bing 的 `li.b_algo` 与 DuckDuckGo 的
+ * `div.result` 都拿不到时，那句「页面布局可能变了」/「可能弹了验证码」是**唯一**
+ * 能说清「为什么一条都没有」的东西 —— API 类后端没有这一层，它们的空表就是真空。
+ * 不读它的话，抓版式坏了与「这个词真没有结果」在模型眼里长得一模一样。
+ *
+ * 形参收的是**已确认为对象的回包**，不是 `unknown`：调用点只有 `hitsOf` 通过之后那一处，
+ * 而 `hitsOf` 对非对象回包已经抛了。收成 `unknown` 就要在这里再判一次形状 —— 那一支永远
+ * 走不到（不可达的分支既测不了也不该写）。
+ *
+ * @param payload - sidecar 的 result（`hitsOf` 已确认为对象）
+ * @returns 非空字符串才算有说明
+ */
+function noteOf(payload: Record<string, unknown>): string | undefined {
+  const { note } = payload;
+  return typeof note === "string" && note.length > 0 ? note : undefined;
+}
+
+/**
+ * 把 sidecar 的回包收成对象，形状不对就抛。
+ *
+ * `hitsOf` 与 `noteOf` 都要读这个回包，形状校验因此在**一处**做完再分下去：两处各判一次
+ * 的话，后面那一处的那一支要么永远走不到（前一处已经抛了），要么两处判据会各写一份。
+ *
+ * @param payload - sidecar 的 result
+ * @returns 同一个回包，收窄成对象
+ * @throws WebError - 回包不是对象（协议声明的一定是）
+ */
+function payloadOf(payload: unknown): Record<string, unknown> {
+  if (!isRecord(payload)) {
+    throw new WebError(
+      `search discovery returned ${typeof payload} instead of an object`,
+      "SCRAPLING_SEARCH_FAILED",
+    );
+  }
+  return payload;
+}
+
+/**
  * 从 sidecar 的 `search.discover` 回包里挑出可用条目。
  *
  * 条目是对象、url 是非空字符串才算数。**URL 的安全判定不在这里做** —— 真正去读它们时
  * sidecar 的 URL 闸门会逐条判，放在解析层等于把一份安全策略复制一遍。
  *
- * @param payload - sidecar 的 result
+ * @param payload - sidecar 的 result（`payloadOf` 已确认为对象）
  * @returns 命中的条目
- * @throws WebError - 回包形状不是协议声明的那一个
+ * @throws WebError - 回包里没有 `hits` 数组
  */
-function hitsOf(payload: unknown): ParsedSearchHit[] {
-  if (!isRecord(payload) || !Array.isArray(payload["hits"])) {
+function hitsOf(payload: Record<string, unknown>): ParsedSearchHit[] {
+  if (!Array.isArray(payload["hits"])) {
     throw new WebError("search discovery returned no hits array", "SCRAPLING_SEARCH_FAILED");
   }
   return payload["hits"].flatMap((item) => {
@@ -239,7 +279,7 @@ async function discover(
   query: string,
   maxResults: number,
   signal: AbortSignal | undefined,
-): Promise<{ hits: ParsedSearchHit[]; base: string }> {
+): Promise<{ hits: ParsedSearchHit[]; base: string; note: string | undefined }> {
   // 一次操作只取一次快照：下面的 JSON 与协议层超时必须是同一刻的值，边发边取会让
   // 「timeoutSeconds 说 30 秒、协议层却等 120 秒」这种自相矛盾的回包成为可能。
   const backend = deps.backend();
@@ -263,10 +303,12 @@ async function discover(
       },
       { ...(signal === undefined ? {} : { signal }), timeoutMs },
     );
-    const reported = isRecord(raw) && typeof raw["backend"] === "string" ? raw["backend"] : backend;
+    const payload = payloadOf(raw);
+    const reported = typeof payload["backend"] === "string" ? payload["backend"] : backend;
     return {
-      hits: hitsOf(raw),
+      hits: hitsOf(payload),
       base: endpointOf(deps, reported),
+      note: noteOf(payload),
     };
   } catch (error: unknown) {
     if (signal?.aborted === true) {
@@ -586,7 +628,15 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
       }
       const maxResults = boundResults(request.maxResults);
 
-      const { hits, base } = await discover(deps, query, maxResults, signal);
+      const { hits, base, note } = await discover(deps, query, maxResults, signal);
+      // 抓 HTML 的后端（Bing / DuckDuckGo）一条都没抓到时，会带一句说明：是版式变了，
+      // 还是弹了验证码。这句说明此前被整条链路丢掉 —— 回包照样是「成功但没有任何
+      // sources」，模型读到的是一次干净的「搜不到」，而真正的原因（抓取层坏了）永远
+      // 看不到。带说明就当失败报出来：说明本身是后端给的原因，不是本包编的。
+      // API 类后端没有这一层，它们的空表就是真空，仍按空搜索回。
+      if (hits.length === 0 && note !== undefined) {
+        throw new WebError(note, "SCRAPLING_SEARCH_FAILED");
+      }
       // sources 也要过准入闸门：搜索后端的回包是外部输入，它尽可以回一条内网地址；
       // 不过闸的话，那条地址就原样出现在模型眼前，而本包对同一地址的抓取会被拦下。
       // 候选先截到 MAX_SOURCES 再过闸 —— 闸门每条一次 DNS，封顶必须落在过闸之前。

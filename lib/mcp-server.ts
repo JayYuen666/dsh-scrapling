@@ -91,7 +91,7 @@ export interface McpServerHandle {
 }
 
 /** MCP server 自述的版本；由 test/publish-manifest.test.ts 钉成 package.json 同值。 */
-export const MCP_SERVER_VERSION = "0.1.13";
+export const MCP_SERVER_VERSION = "0.1.14";
 
 const RAW_PREFIX = "scrapling_";
 
@@ -528,6 +528,8 @@ export function allowedEndpoints(host: string, port: number): McpAllowedEndpoint
 }
 
 async function listenOn(http: HttpServer, port: number, host: string): Promise<number> {
+  // node 的 http server 只有回调：listen 的成功/失败是两个事件，没有可 await 的位置。
+  // oxlint-disable-next-line promise/avoid-new
   return new Promise<number>((resolve, reject) => {
     http.once("error", (error: NodeJS.ErrnoException) => {
       reject(listenFailure(error, port, host));
@@ -539,6 +541,8 @@ async function listenOn(http: HttpServer, port: number, host: string): Promise<n
 }
 
 async function settled(http: HttpServer): Promise<void> {
+  // close 是回调式收尾，同样只能先拿住 resolve。
+  // oxlint-disable-next-line promise/avoid-new
   return new Promise<void>((resolve) => {
     http.close(() => {
       resolve();

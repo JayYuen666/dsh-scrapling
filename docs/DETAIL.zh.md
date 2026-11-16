@@ -4,9 +4,9 @@
 
 ## 设置卡上改的是什么
 
-卡上五十个取值按用途分组，多数每次调用现读，改完下一次调用就生效。另有几项只在装配时读一次，改完要让插件重新装配——重启宿主即可。这几项是：十五个工具开关、`provideWebFetch` / `provideWebSearch` 以及与它们一起被检索 provider 快照的 `searchBackend`、各家 key、`searxngEndpoint`、`fetchMaxOutputChars`、`fetchTimeoutMs`，再加上 `pythonBin`、`failFastOnMissingPython` 与 `dataDir`。
+卡上五十个取值按用途分组。每次调用现读的那些，改完下一次调用就生效：抽取类（`extractionType`、`mainContentOnly`、`stripInlineImages`）、浏览器类（`headless`、`networkIdle`、`blockAds`、`pierceShadow`、`waitSelectorState`）、四个输出预算、`crawlMaxItems`、`fetchTimeoutMs`、问答路由（`answerProvider` / `answerModel` / `answerMaxTokens`），以及搜索侧（`searchBackend`、各家 key、`searxngEndpoint`、`searchPublicFallback`）。只在装配时读一次、改完要让插件重新装配（重启宿主即可）的是：十五个工具开关、`provideWebFetch` / `provideWebSearch`、`pythonBin`、`failFastOnMissingPython`、`dataDir`、`sidecarHandshakeTimeoutMs` / `sidecarGraceMs`，以及闸门与 sidecar 进程环境那几项（`proxyUrl`、`proxyBypass`、`allowedHosts`、`nat64Prefixes`、`syntheticDnsRanges`）。
 
-- **运行环境** — `pythonBin`（留空）决定用哪个解释器：显式路径优先，其次托管的能力包安装，再次本包的开发 venv，最后落回 PATH 上的 `python3`（Windows 上是 `python`）。托管那一档只在 macOS arm64 上尝试——有已验能力包的就这一个平台——其余平台从显式路径直接跳到 venv 与 PATH。每次都会播报选中的是哪一支。`failFastOnMissingPython`（默认开）让 sidecar 起不来时直接拒绝装载；而解释器起得来但没装 Scrapling 时，一律降级成「工具不可用」并在日志里点名路径。`dataDir` 是 sidecar 状态的位置。
+- **运行环境** — `pythonBin`（留空）决定用哪个解释器：显式路径优先，其次托管能力包装出来的那个 **venv**（`dataDir/runtime/venv`，所有 wheel 都在里面），再次 `dataDir/runtime/python/<版本>` 下的裸托管 CPython（装了一半的机器），然后是本包的开发 venv，最后落回 PATH 上的 `python3`（Windows 上是 `python`）。托管那一档只在 macOS arm64 上尝试——有已验能力包的就这一个平台——其余平台从显式路径直接跳到 venv 与 PATH。每次都会播报选中的是哪一支。`failFastOnMissingPython`（默认开）让 sidecar 起不来时直接拒绝装载；而解释器起得来但没装 Scrapling 时，一律降级成「工具不可用」并在日志里点名路径。`dataDir` 是 sidecar 状态的位置。
 - **工具开关** — 十五个（fetch、extract、locate、links、render、capture XHR、会话网络历史、session、登录态、crawl、answer、session read、页面动作、download、screenshot）。关掉一个就是模型看不见它，它那句指引也跟着从 skill 正文里消失；常驻 system prompt 里只留一段跨工具的选型摘要（不点名具体工具），全文按装配时真注册了哪些工具现算后注册成虚拟 skill `scrapling`。
 - **抽取与输出** — `extractionType`（markdown/html/text）、`mainContentOnly`、`stripInlineImages`（默认开），以及各工具的输出预算：`fetchMaxOutputChars`、`extractMaxOutputChars`、`renderMaxOutputChars` 默认 200000，`xhrMaxOutputChars` 默认 120000。宿主侧按 UTF-8 **字节**裁剪，同一个数值交给 sidecar 时叫 `maxContentChars`，那边按**字符**截——两处谁更紧就按谁收。`crawlMaxItems`（1000）管的是页数，不是输出大小。
 - **浏览器** — `headless`（默认开）、`networkIdle`（默认关）、`blockAds`（默认开，约 3500 个域名）、`pierceShadow`（默认关）、`waitSelectorState`。
@@ -32,10 +32,16 @@
 
 ## 需要外部提供什么
 
-Python 与 Scrapling 有两个来源：`core` 能力包会在 `dataDir` 下装一份托管的 CPython 3.14.9 加 Scrapling 0.5；或者把 `pythonBin` 指向你自己装好的解释器——本插件从不动你的系统解释器。能力包只在 macOS arm64 提供，其他平台上一律拒绝安装（`INSTALL_PACK_BLOCKED`），那时 Python 才真是「由你提供」。Chromium 由 `python -m patchright install chromium` 装。能力包按层作为宿主作业安装——`core`、`browser`、`search`、`media`、`adaptive-redis`、`mcp`；只有 `core` 时插件照用，所以工具这一层本来就可以是不完整的。选中的解释器起得来但里面没 Scrapling 时工具表为空，可照抄的 `pip install` 命令写在**装载时的告警**里（不在工具提示词段落里）——那是「装之前要做的一件事」，不是产物缺陷。搜索后端分三类：Tavily、Brave、Serper 要各自的 key，SearXNG 要实例地址，而 `bing` 与 `duckduckgo` 是公共端点、不要凭据；`auto` 只有在打开 `searchPublicFallback` 之后才会走公共引擎。`adaptiveStorage: redis` 要连得上的 Redis。
+Python 与 Scrapling 有两个来源：`core` 能力包先在 `dataDir/runtime/python/<版本>` 下装一份托管的 CPython 3.14.9，再用它建出 `dataDir/runtime/venv`，Scrapling 0.5 与其余 wheel 全装进那个 venv（sidecar 跑的是 venv 里的解释器，不是裸的那一支）；或者把 `pythonBin` 指向你自己装好的解释器——本插件从不动你的系统解释器。能力包只在 macOS arm64 提供，其他平台上一律拒绝安装（`INSTALL_PACK_BLOCKED`），那时 Python 才真是「由你提供」。Chromium 由 `python -m patchright install chromium` 装。能力包按层作为宿主作业安装——`core`、`browser`、`search`、`media`、`adaptive-redis`、`mcp`；只有 `core` 时插件照用，所以工具这一层本来就可以是不完整的。选中的解释器起得来但里面没 Scrapling 时工具表为空，可照抄的 `pip install` 命令写在**装载时的告警**里（不在工具提示词段落里）——那是「装之前要做的一件事」，不是产物缺陷。搜索后端分三类：Tavily、Brave、Serper 要各自的 key，SearXNG 要实例地址，而 `bing` 与 `duckduckgo` 是公共端点、不要凭据；`auto` 只有在打开 `searchPublicFallback` 之后才会走公共引擎。`adaptiveStorage: redis` 要连得上的 Redis。
 
-失败是被点名的，不是被藏起来的：`SIDECAR_*`、`INSTALL_*`、`SEARCH_AUTH`、`JOBS_UNAVAILABLE`、`SESSION_STATE_DISABLED`、`MCP_PORT_IN_USE` / `MCP_PORT_MISMATCH` / `MCP_MODE_CONFLICT` / `MCP_CLIENT_MISSING`、`OFFICIAL_MCP_DISABLED`、`RISK_NOT_ACCEPTED`。MCP 的 token 只从宿主环境变量 `DSH_SCRAPLING_MCP_TOKEN` 读，绝不写进 profile——那份文件是明文。
+失败是被点名的，不是被藏起来的：`SIDECAR_*`、`INSTALL_*`、`SEARCH_AUTH`、`JOBS_UNAVAILABLE`、`SESSION_STATE_DISABLED`、`MCP_PORT_IN_USE` / `MCP_PORT_MISMATCH` / `MCP_PORT_UNREADABLE` / `MCP_MODE_CONFLICT` / `MCP_CLIENT_MISSING` / `MCP_CLIENT_MANIFEST_BROKEN`、`OFFICIAL_MCP_DISABLED`、`RISK_NOT_ACCEPTED`。MCP 的 token 只从宿主环境变量 `DSH_SCRAPLING_MCP_TOKEN` 读，绝不写进 profile——那份文件是明文。
 
 ## 更完整的说明
 
 sidecar 协议、能力包安装器内部、离线资产与安全模型都写在随包 README（`README.md` / `README.zh-CN.md`）。
+
+## 反馈
+
+欢迎提 issue 和 PR：[https://github.com/JayYuen666/dsh-scrapling/issues](https://github.com/JayYuen666/dsh-scrapling/issues)。
+
+插件启动失败时，请附上 dsh 宿主版本、profile 安装形态和浏览器控制台原文。`missed the module table` 这一行尤其有用：它能直接说明 shared 客户端供应行有没有被物化。

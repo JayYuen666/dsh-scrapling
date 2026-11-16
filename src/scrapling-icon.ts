@@ -2,12 +2,18 @@
 //
 // 为什么是官方图形而不是自绘：用户明确要求三个仓都换成官方标记（rtk 那一轮之后
 // 「如果可以的话，把 scrapling 和 OCR 都替换成官方的吧」）。图形形状与 alpha 完全来自官方
-// 资产；这里只按 DSH 的主题能力把它拆成两层 —— 本体取 \`currentColor\`（跟随导航行的前景色，
+// 资产；这里只按 DSH 的主题能力把它拆成两层 —— 本体取 currentColor（跟随导航行的前景色，
 // 深色主题是浅色、浅色主题是深色），高光保留官方绿，于是两种主题下都与官方图一致。
 //
 // 来源与许可：https://scrapling.readthedocs.io/zh-cn/latest/assets/logo.png，
 // BSD 3-Clause，Copyright (c) 2024 Karim shoair。本文件只内联这两张遮罩位图，
-// 不包含 Scrapling 的任何代码；声明见 \`THIRD_PARTY_NOTICES.md\` 的 “scrapling artwork” 一节。
+// 不包含 Scrapling 的任何代码；声明见 THIRD_PARTY_NOTICES.md 的「图标：Scrapling 官方标记」
+// 一节。
+//
+// **同步义务**：这两张 base64 遮罩与本仓的 icon.svg 是同一份官方美术资源的两份拷贝，而
+// 没有任何 gate 把它们的字节绑在一起（eol-gate.mjs 只校验 icon.svg 的换行符，
+// SCRAPLING_LOGO_BODY_URI 只有 src/client-entry.ts 一个消费点）。上游图形更新时两处会
+// 静默分叉 —— 换图必须同时重新生成这里的遮罩。
 //
 // 为什么拆成数组再 join：data URI 里不能有换行，而单行 7 KB 的字面量会让 diff 变成一堵墙。
 const BODY_BASE64: string = [

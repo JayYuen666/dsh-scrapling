@@ -37,6 +37,20 @@ export const JOB_STATUSES = ["running", "stopping", "completed", "killed", "fail
 
 export type RuntimeJobStatus = (typeof JOB_STATUSES)[number];
 
+/**
+ * 解释器来源的取值域；顺序即 `resolveRuntime` 的解析优先级。
+ *
+ * 与 `PACK_STATES` 同一理由用运行时清单给出：卡片读取器要拿它构造 zod 校验，而宿主与
+ * 卡片是分开发版的两侧 —— 只写类型联合时，新增或改名一个档位既不会有编译期报错，也不会
+ * 被读取器挡住，症状是「宿主解析出了新档位、卡片把它判成非法响应整块不渲染」。
+ *
+ * `managed-venv` 与 `managed` 不是同一件事：前者是装了 wheel 的 venv（工具全在），后者是
+ * 裸托管 CPython（安装器拿它建 venv，里面一个包都没有）。
+ */
+export const PYTHON_VIAS = ["configured", "managed-venv", "managed", "repo", "path"] as const;
+
+export type PythonVia = (typeof PYTHON_VIAS)[number];
+
 export interface RuntimeJobView {
   readonly id: string;
   readonly pack: RuntimePack;
@@ -46,12 +60,28 @@ export interface RuntimeJobView {
 
 export interface RuntimePython {
   readonly path: string;
-  readonly via: string;
+  readonly via: PythonVia;
+  /**
+   * 解释器版本。
+   *
+   * 只有两个托管档位说得准（前者问 venv 自己的 `pyvenv.cfg`，后者抄清单）；其余三档
+   * （显式配置 / 仓内 venv / PATH）一律 `"unknown"` —— 那三档要报准版本就得在每次读状态时
+   * 起一个解释器进程。所以**别把它当成一定可信的值**：卡片只在它不等于 `"unknown"` 时呈现。
+   */
   readonly version: string;
 }
 
 export interface RuntimeStatusResult {
   readonly ok: true;
+  /**
+   * 每个能力包的状态。
+   *
+   * 声明成 `Partial` 是刻意的：宿主读状态失败时会降级成空对象（`packsOrEmpty`），旧版宿主
+   * 也可能压根不认识新版卡片多出来的那个包 —— 两侧分开发版，这是本文件的前提。**卡片必须
+   * 把缺键当成「未安装」，不能当成「正在读取」**：后者永远等不到第二次渲染，而那一行的
+   * 两个按钮又被 `state === null` 一起禁掉，于是新增的包在旧宿主上会显示成一行永远转圈、
+   * 点不动的死行（`src/settings-card.ts` 的 `renderRuntime` 按这条语义取值）。
+   */
   readonly packs: Readonly<Partial<Record<RuntimePack, PackState>>>;
   readonly python: RuntimePython;
   readonly dataDir: string;
@@ -78,9 +108,12 @@ export interface RuntimeRefused {
   /**
    * 给人排障用的诊断原文（宿主侧多为 `String(error)` 或点名的配置问题）。
    *
-   * 卡片会把它原样放进失败区域，所以这一位不承诺本地化，也不承诺精简；新增写点时必须自己
-   * 保证不含凭据——本包的 pip 调用不带 `--index-url`（凭据不会出现在 pip 的报错里），
-   * 托管 venv 的路径则是用户本机自己的信息。
+   * 卡片会把它原样放进失败区域，所以这一位不承诺本地化，也不承诺精简；**新增写点时必须
+   * 自己保证不含凭据**。这里不承诺「本包的命令不会带出凭据」：pip 会继承宿主进程环境里的
+   * `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL`（企业镜像把 token 写在那里是常规做法），**即使
+   * 我们不传 `--index-url`**，它的报错里也会带着那条地址。所以脱敏闸门在
+   * `lib/installer.ts` 的 `safeStderr()`（逐条 stderr 进文案之前过一遍 `redactUrlSecrets`），
+   * 而不是靠「我们不传参数」这个推断。
    */
   readonly error: string;
   readonly status: RuntimeRefusedStatus;
@@ -101,4 +134,17 @@ export function packStateKey(state: PackState): string {
 /** pack 名称的译名键。 */
 export function packLabelKey(pack: RuntimePack): string {
   return `runtime.pack.${pack}`;
+}
+
+/**
+ * 解释器来源的译名键。
+ *
+ * 卡面上直接印 `managed-venv` 这种机器标识，用户读不出「工具全在」与「一只都不在」的差别
+ * —— 而那两支的差别恰好是最要紧的那一档。
+ *
+ * @param via - 来源档位
+ * @returns 译名键
+ */
+export function pythonViaKey(via: PythonVia): string {
+  return `runtime.via.${via}`;
 }

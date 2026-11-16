@@ -16,6 +16,7 @@ import { z } from "zod";
 import {
   JOB_STATUSES,
   PACK_STATES,
+  PYTHON_VIAS,
   REFUSED_STATUSES,
   RUNTIME_PACKS,
   RUNTIME_REMOTE_NAMESPACE,
@@ -93,7 +94,7 @@ const JOB_VIEW_SCHEMA = z.object({
 const STATUS_SCHEMA: z.ZodType<RuntimeStatusResult> = z.object({
   ok: z.literal(true),
   packs: z.partialRecord(RUNTIME_PACK_SCHEMA, PACK_STATE_SCHEMA),
-  python: z.object({ path: z.string(), via: z.string(), version: z.string() }),
+  python: z.object({ path: z.string(), via: z.enum(PYTHON_VIAS), version: z.string() }),
   dataDir: z.string(),
   jobsReady: z.boolean(),
   job: JOB_VIEW_SCHEMA.nullable(),
@@ -128,17 +129,37 @@ function descriptorFor(method: string, parameters: DescriptorParameters): Invoca
   };
 }
 
-/** 带请求件的那一枚入参：装与修共用 `PACK_CODEC`，取消用 `CANCEL_CODEC`。 */
-function requestParameter(codec: TypertCodec): DescriptorParameters {
+/** 带请求件的那一枚入参：装与修共用 `PACK_CODEC`，取消用 `CANCEL_CODEC`。
+ *
+ *  类型参数透传下去而不宽化成裸 `TypertCodec`：宽化之后 `PACK_CODEC` 与 `CANCEL_CODEC`
+ *  在调用点完全可互换，写成 `requestParameter(CANCEL_CODEC)` 装进 `installPack` 也能过编译，
+ *  codec 与请求类型/方法是否配对只剩运行时测试兜底。
+ */
+function requestParameter<Request>(codec: TypertCodec<Request>): DescriptorParameters {
   return [{ name: "request", wire: "request", source: "json", codec }];
+}
+
+/** 每个要带请求件的方法与它的请求类型：codec 与方法配错时在编译期就红。 */
+interface MethodRequest {
+  readonly installPack: RuntimePackRequest;
+  readonly repairPack: RuntimePackRequest;
+  readonly cancelJob: RuntimeCancelRequest;
+}
+
+/** 带请求件的方法那四枚描述符里的一枚。 */
+function requestDescriptor<Method extends keyof MethodRequest>(
+  method: Method,
+  codec: TypertCodec<MethodRequest[Method]>,
+): InvocationDescriptor {
+  return descriptorFor(method, requestParameter(codec));
 }
 
 /** 宿主四个方法的客户端描述符；测试拿它与宿主侧 `remoteMethods()` 对质。 */
 export const RUNTIME_DESCRIPTORS: readonly InvocationDescriptor[] = [
   descriptorFor("status", []),
-  descriptorFor("installPack", requestParameter(PACK_CODEC)),
-  descriptorFor("repairPack", requestParameter(PACK_CODEC)),
-  descriptorFor("cancelJob", requestParameter(CANCEL_CODEC)),
+  requestDescriptor("installPack", PACK_CODEC),
+  requestDescriptor("repairPack", PACK_CODEC),
+  requestDescriptor("cancelJob", CANCEL_CODEC),
 ];
 
 export interface RemoteHost {
@@ -188,11 +209,56 @@ function isNamespace(value: unknown): value is RuntimeNamespace {
  * 只认「对象且带一个布尔 `ok` 位」：`ok` 缺席时后面那句 `result.error.code` 会在读属性上
  * 抛 `Cannot read properties of undefined`，症状是一条没有协议含义的崩溃而不是「回包坏了」。
  *
+ * **失败那一支的形状由 `failureOf` 兜**，不在这里拦：`{ ok: false }`、`{ ok: false, error:
+ * null }`、`{ ok: false, error: { code: 500 } }` 这三类「位置对、形状坏」的回包在运行期真会
+ * 出现（对端可能是另一个版本的插件、可能被中间层改写、也可能自己就是坏的），而它们的正确
+ * 归宿是「带一条占位码的失败回执」（`REMOTE_BAD_ENVELOPE`）而不是「回包格式非法」—— 后者会
+ * 把对端报上来的失败说成客户端这边的解析问题，用户读到的成因而此反过来。类型只在编译期
+ * 成立，这条分工是运行期的判据。
+ *
  * @param value - 网关交回的任意值
  * @returns 是否是这条协议的回包
  */
 function isWireResult(value: unknown): value is RemoteResult<unknown> {
   return isRecord(value) && typeof field(value, "ok") === "boolean";
+}
+
+/**
+ * 把坏回包说成一句能读的话，且**保证这句话本身不会抛**。
+ *
+ * 不用 `JSON.stringify`：回包里有循环引用或 bigint 时它自己抛 `TypeError`，把「对端答了坏包」
+ * 换成 `Converting circular structure to JSON`；回包很大时还会把整份载荷塞进错误文案，而这张
+ * 卡的消费者是 `setFailure(String(error))`，它会原样渲染出来。
+ */
+function describeEnvelope(value: unknown): string {
+  if (!isRecord(value)) {
+    return typeof value;
+  }
+  const keys = Object.keys(value);
+  return keys.length === 0 ? "{}" : `{ ${keys.join(", ")} }`;
+}
+
+/**
+ * 失败回执里那枚错误对象；形状对不上时给出占位码而不是崩在读属性上。
+ *
+ * 走到这里的前提是 `isWireResult` 已经判过 `error` 是对象且 `code` 是字符串，所以本函数只
+ * 补 `message` 一位 —— 但**不假设**它一定在：`RemoteFailure` 的各码对 message 的要求在类型
+ * 上并不统一，缺它时给空串比给 `undefined` 好（后者会被拼成字面量 `undefined`）。
+ *
+ * @param result - 失败那一支的回包（已由 `isWireResult` 收窄）
+ * @returns `code` 与 `message`
+ */
+function failureOf(result: Extract<RemoteResult<unknown>, { readonly ok: false }>): {
+  readonly code: string;
+  readonly message: string;
+} {
+  const raw: unknown = result.error;
+  const code = isRecord(raw) ? field(raw, "code") : undefined;
+  const message = isRecord(raw) ? field(raw, "message") : undefined;
+  return {
+    code: typeof code === "string" && code !== "" ? code : "REMOTE_BAD_ENVELOPE",
+    message: typeof message === "string" ? message : "",
+  };
 }
 
 async function unwrapWire<Value>(
@@ -201,14 +267,17 @@ async function unwrapWire<Value>(
 ): Promise<Value> {
   const result = await call;
   if (!isWireResult(result)) {
-    throw new TypeError(`runtime remote returned a malformed envelope: ${JSON.stringify(result)}`);
+    throw new TypeError(
+      `runtime remote returned a malformed envelope: ${describeEnvelope(result)}`,
+    );
   }
   if (result.ok) {
     return parseOrThrow(schema, result.value);
   }
   // 失败那一支只把码拼进文案：这张卡的唯一消费者是 `setFailure(String(error))`
   // （src/settings-card.ts 的三处 catch），没有人按码分流，所以不再另立一枚错误类。
-  throw new Error(`${result.error.code}: ${result.error.message}`);
+  const failure = failureOf(result);
+  throw new Error(`${failure.code}: ${failure.message}`);
 }
 
 function buildReader(ctx: RemoteHost): RuntimeReader {
@@ -228,6 +297,11 @@ function buildReader(ctx: RemoteHost): RuntimeReader {
     }
     const namespace = ctx.get?.(SERVICE_KEY, false);
     if (!isNamespace(namespace)) {
+      // 挂载已 resolve 但这枚命名空间取不到（网关重启后命名空间被摘掉、服务注册滞后一拍、
+      // 或 `isNamespace` 因方法缺失判假）：**同样清缓存**。不清的话 `mounted` 是一条已
+      // resolve 的 promise，此后每次调用都跳过挂载、复现同一条「未提供」错误，读取器永久
+      // 卡死且无从自愈 —— 用户只能刷新页面。
+      mounted = undefined;
       throw new Error(`${SERVICE_KEY} 未提供：宿主网关没有挂上这枚命名空间`);
     }
     return namespace;

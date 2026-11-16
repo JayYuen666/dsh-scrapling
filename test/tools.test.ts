@@ -22,7 +22,7 @@ import {
   renderFetch,
 } from "../lib/output.ts";
 import { crawlModeParamTable } from "../lib/tool-params.ts";
-import { MESSAGES } from "../lib/messages.ts";
+import { MESSAGES, format } from "../lib/messages.ts";
 import {
   createAnswerTool,
   createCaptureXhrTool,
@@ -602,10 +602,18 @@ describe("正文截断标记的渲染", () => {
     expect(text).toContain(MESSAGES.zh.contentRecoveryHint);
   });
 
-  it("fetch 的 notice 在场时以 notice 为准，不重复给回落提示", () => {
+  it("fetch 的 notice 与截断标记同时在场时两条都给（各自说的是不同的事）", () => {
+    // notice 是「对端留了一句话」（例如自适应选择器失败），truncated 是「结果不完整」。
+    // 只给 notice 会让模型以为正文完整 —— `py/adapters.py` 里这两件事本来就是分开算的。
     const text = renderFetch(fetchOf(true, "body 截断：省了 12 字节"), MESSAGES.zh);
     expect(text).toContain("body 截断：省了 12 字节");
-    expect(text).not.toContain("正文被截断：");
+    expect(text).toContain("正文被截断：");
+  });
+
+  it("notice 里已经含有同一句提示时不再重复", () => {
+    const hint = MESSAGES.zh.contentTruncationHint;
+    const text = renderFetch(fetchOf(true, hint), MESSAGES.zh);
+    expect(text.split(hint).length - 1).toBe(1);
   });
 
   it("fetch 没截断就不加任何尾巴", () => {
@@ -619,10 +627,10 @@ describe("正文截断标记的渲染", () => {
     expect(text).toContain(MESSAGES.zh.contentRecoveryHint);
   });
 
-  it("answer 的 notice 与截断标记同时在场时只留 notice", () => {
+  it("answer 的 notice 与截断标记同时在场时两条都给", () => {
     const text = renderAnswer(answerOf(true, "对端的说明"), MESSAGES.zh);
     expect(text).toContain("对端的说明");
-    expect(text).not.toContain("正文被截断：");
+    expect(text).toContain("正文被截断：");
   });
 
   it("answer 没截断就不加尾巴", () => {
@@ -642,7 +650,7 @@ describe("网络历史的封顶", () => {
 
   it("网络段在预算内时不加页脚", () => {
     const text = renderBrowser(browserOf(1), 8192, MESSAGES.zh);
-    expect(text).toContain("Captured XHR/fetch:");
+    expect(text).toContain(MESSAGES.zh.outputXhrHeading);
     expect(text).not.toContain("网络历史整体被截断");
   });
 
@@ -815,7 +823,10 @@ describe("scrapling_fetch", () => {
         notice: "",
       },
     );
-    expect(JSON.stringify(blocks)).toContain("Fetched http://example.test/ (HTTP 200)");
+    // 期望值取自文案表而不是硬编英文：这一句的正文随语言走，硬编的断言在改语言时会红。
+    expect(JSON.stringify(blocks)).toContain(
+      format(MESSAGES.zh.outputFetchHead, { url: SAMPLE_URL, status: "200" }),
+    );
   });
 
   it("有截断提示时渲染结果把它附在正文后面", () => {
@@ -1288,7 +1299,7 @@ describe("scrapling_extract", () => {
       { html: "", selector: "li" },
       { count: 0, truncated: false, matches: [] },
     );
-    expect(JSON.stringify(empty)).toContain("no matches");
+    expect(JSON.stringify(empty)).toContain(MESSAGES.zh.outputNoMatches);
     const some = tool.output.render(
       { html: "", selector: "li" },
       { count: 1, truncated: false, matches: [{ tag: "li", text: "A" }] },
@@ -1560,7 +1571,7 @@ describe("scrapling_extract", () => {
       { html: "", selector: "p" },
       { count: 0, truncated: false, matches: [], rows: [], notice: "relocated" },
     ) as { text: string }[];
-    expect(rendered[0]?.text).toContain("no rows");
+    expect(rendered[0]?.text).toContain(MESSAGES.zh.outputNoRows);
     expect(rendered[0]?.text).toContain("relocated");
   });
 
@@ -1787,7 +1798,7 @@ describe("scrapling_locate / scrapling_links", () => {
       { html: "", selector: "P1" },
       { count: 0, truncated: false, matches: [], notice: "relocated" },
     ) as { text: string }[];
-    expect(rendered[0]?.text).toContain("no matches");
+    expect(rendered[0]?.text).toContain(MESSAGES.zh.outputNoMatches);
     expect(rendered[0]?.text).toContain("relocated");
     expect(
       tool.output.presentationMeta?.(
@@ -1954,7 +1965,7 @@ describe("scrapling_locate / scrapling_links", () => {
       { html: LINK_HTML },
       { count: 0, truncated: false, links: [], nextCandidates: [] },
     ) as { text: string }[];
-    expect(empty[0]?.text).toBe("no links");
+    expect(empty[0]?.text).toBe(MESSAGES.zh.outputNoLinks);
     expect(
       tool.output.presentationMeta?.(
         { html: LINK_HTML },
@@ -2530,7 +2541,7 @@ describe("scrapling_render", () => {
         notice: "",
       },
     );
-    expect(JSON.stringify(blocks)).not.toContain("Captured XHR");
+    expect(JSON.stringify(blocks)).not.toContain(MESSAGES.zh.outputXhrHeading);
   });
 });
 
@@ -2940,7 +2951,7 @@ describe("scrapling_capture_xhr", () => {
       },
     );
     const text = JSON.stringify(blocks);
-    expect(text).toContain("Captured XHR");
+    expect(text).toContain(MESSAGES.zh.outputXhrHeading);
     expect(text).toContain(SAMPLE_API);
   });
 });
@@ -3345,7 +3356,7 @@ describe("会话工具的渲染", () => {
         sessionId: "s1",
       },
     );
-    expect(JSON.stringify(blocks)).toContain(`Fetched ${SAMPLE_URL}`);
+    expect(JSON.stringify(blocks)).toContain(MESSAGES.zh.outputFetchHead.slice(0, 2));
   });
 
   it("fetch 的投影元数据带 url/status/truncated", () => {
@@ -5275,7 +5286,7 @@ describe("结果投影补全（J4：schema 里声明的面必须在文本里看�
         rows: [],
       },
     ) as { text: string }[];
-    expect(empty[0]?.text).toBe("no rows");
+    expect(empty[0]?.text).toBe(MESSAGES.zh.outputNoRows);
     const filled = tool.output.render(
       { html: "x", fields: {} },
       {
@@ -5342,7 +5353,10 @@ describe("结果投影补全（J4：schema 里声明的面必须在文本里看�
         nextCandidates: [],
       },
     ) as { text: string }[];
-    expect(rendered[0]?.text).toContain("结果被截断");
+    // links 只有 limit 一个旋钮：提示不能提 maxContentChars（它没有那个参数）。
+    expect(rendered[0]?.text).toContain("链接被截断");
+    expect(rendered[0]?.text).toContain("limit");
+    expect(rendered[0]?.text).not.toContain("maxContentChars");
   });
 
   it("capture_xhr 抓到 0 条时给一行可操作提示，而不是只给正文", () => {
@@ -5365,7 +5379,7 @@ describe("结果投影补全（J4：schema 里声明的面必须在文本里看�
         xhr: [],
       },
     ) as { text: string }[];
-    expect(rendered[0]?.text).toContain("Captured no XHR/fetch requests");
+    expect(rendered[0]?.text).toContain(MESSAGES.zh.outputXhrNone);
   });
 
   it("session_network 渲染 id 与 includeHeaders 时的 headers", () => {

@@ -12,11 +12,14 @@
 import { describe, expect, it } from "vitest";
 import { registerGuidanceSkill, SKILL_NAME } from "../lib/skill.ts";
 
-/** 一次 `register` 调用的实参快照（判据面：名字、说明、正文三样各自对得上）。 */
+/** 一次 `register` 调用的实参快照（判据面：名字、说明、正文、来源四样各自对得上）。
+ *  `source` 是宿主 `validateDefinition()` 的必填项：缺了它注册照样成功、目录里也看得见，
+ *  只有模型真去 `skill({ name })` 加载全文才抛「source must be a string」。 */
 interface Recorded {
   readonly name: string;
   readonly description: string;
   readonly content: string;
+  readonly source: string;
 }
 
 /** `register` 的返回值：一枚什么都不做的 disposer。 */
@@ -40,6 +43,22 @@ function fakeSkills(recorded: Recorded[]): { readonly get: (name: string) => unk
 /** `get` 什么都不给的上下文（服务缺席）。 */
 const EMPTY_CTX = { get: (): unknown => undefined };
 
+/** skill 服务的替身：`register` 交回的 disposer 会把自己的名字记进 `disposed`。
+ *  与 `fakeSkills` 分开是因为只有「撤销权交接」那一条要观察 disposer 有没有被调。 */
+function skillsWithDisposer(
+  recorded: Recorded[],
+  disposed: string[],
+): { readonly register: (skill: Recorded) => () => void } {
+  return {
+    register: (skill: Recorded): (() => void) => {
+      recorded.push(skill);
+      return () => {
+        disposed.push(skill.name);
+      };
+    },
+  };
+}
+
 describe("registerGuidanceSkill（指引全文注册成虚拟 skill）", () => {
   it("skill 服务缺席时返回 false 且不抛（精简 profile 没有 dsh-skill）", () => {
     let threw: unknown;
@@ -62,6 +81,7 @@ describe("registerGuidanceSkill（指引全文注册成虚拟 skill）", () => {
       name: SKILL_NAME,
       description: "目录那行说明",
       content: "指引全文",
+      source: "runtime",
     });
   });
 
@@ -95,5 +115,37 @@ describe("registerGuidanceSkill（指引全文注册成虚拟 skill）", () => {
 
   it("服务返回 null 时不抛（宿主退化态）", () => {
     expect(registerGuidanceSkill({ get: (): unknown => null }, "正文", "说明")).toBe(false);
+  });
+
+  it("把注册的撤销权交给调用方的 fiber（卸载后 skill 不留在目录里）", () => {
+    // 宿主的 `skills.register()` 交回一枚 disposer。不把它挂到 fiber 上时，插件卸载/热重载后
+    // skill 仍留在模型目录里 —— 下一次装配再注册同名条目只会被 first-wins 忽略，于是「卸载后
+    // 目录里还在」变成既成事实。本用例钉的是「disposer 真的交出去了」。
+    const recorded: Recorded[] = [];
+    const disposed: string[] = [];
+    const labels: string[] = [];
+    const ctx = {
+      get: (name: string): unknown =>
+        name === "skills" ? skillsWithDisposer(recorded, disposed) : undefined,
+      effect: (execute: () => () => void, label?: string): void => {
+        labels.push(label ?? "");
+        execute()();
+      },
+    };
+    expect(registerGuidanceSkill(ctx, "正文", "说明")).toBe(true);
+    expect(labels).toStrictEqual([`registerSkill(${JSON.stringify(SKILL_NAME)})`]);
+    expect(disposed, "交给 fiber 的那枚 disposer 就是宿主 register 交回的那一枚").toHaveLength(1);
+  });
+
+  it("取服务本身抛错时也不抛，只回 false", () => {
+    // shared 的 `registerSkill` 把 `register` 与 `effect` 各包了 try/catch，但**取服务这一步
+    // 在它之外**：装配期 `ctx.get` 打在正在卸载的 fiber 上会抛。穿出去的后果不是少一枚
+    // skill，而是整条 apply 落 failed、插件装不上。
+    const ctx = {
+      get: (): unknown => {
+        throw new Error("service is being disposed");
+      },
+    };
+    expect(registerGuidanceSkill(ctx, "正文", "说明")).toBe(false);
   });
 });

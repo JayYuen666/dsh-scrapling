@@ -51,6 +51,7 @@
 - [ 已知边界](#-已知边界)
 - [ 常见问题](#-常见问题)
 - [ 开发](#-开发)
+- [ 反馈](#反馈)
 - [ 许可证](#-许可证)
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它做什么
@@ -81,7 +82,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 
 - **需要 Node.js `>= 24.9`。** 本包是 ESM-only，且构建入口（`build-client.ts`、`build-host.ts`、`build-cli.ts`）由 `node` 直接执行，所以下限必须落在 TypeScript 类型剥离默认开启的那批版本上（Node 22.18 起）。数字本身取自宿主：`0.2.2` 系列宿主声明 Node `>= 24.9.0`，低于它的宿主根本起不来。
 - **需要宿主 `dsh` 处在 `0.2.2-rc.2` 或更新的 `0.2.2` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.2-rc.2`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
-- **需要 Python 3.14+ 且装好 Scrapling** —— 由 `pythonBin` 指定，或按 `lib/runtime.ts` 的固定链找到：`dataDir/runtime` 下的托管 runtime → 仓内 `_env/.venv` → `PATH`。装出去的包里没有 `_env/.venv` 这一档，所以跑过 `setup --feature core --apply` 的机器用的是那支托管解释器，没装过就是你 `PATH` 上的 `python3`（Windows 上是 `python`）；选中哪一支会在装载时写进日志，缺 Scrapling 时报错里带着可直接照抄的安装命令。
+- **需要 Python 3.14+ 且装好 Scrapling** —— 由 `pythonBin` 指定，或按 `lib/runtime.ts` 的固定链找到：托管 venv `dataDir/runtime/venv` → 裸托管解释器 `dataDir/runtime/python/<版本>` → 仓内 `_env/.venv` → `PATH`。装出去的包里没有 `_env/.venv` 这一档，所以跑过 `setup --feature core --apply` 的机器用的是那个托管 venv，没装过就是你 `PATH` 上的 `python3`（Windows 上是 `python`）；选中哪一支会在装载时写进日志，缺 Scrapling 时报错里带着可直接照抄的安装命令。托管那两档不能互换：安装器先落一份托管 CPython，再用它建出 `runtime/venv`，所有 wheel（Scrapling、patchright、官方 MCP server）都装在 venv 里 —— 裸解释器里一个包都没有，拿它起 sidecar 会每个 import 都失败，而日志里那行路径看起来完全正常。
 
 ```sh
 pip install "scrapling[rag]>=0.5,<0.6"
@@ -112,7 +113,7 @@ dsh-scrapling setup --status
 - `search`、`media`、`mcp` 与 `adaptive-redis` 都以 `core` 的 venv 为载体：`mcp` 带来 `official-mcp` 模式要的官方 `scrapling-mcp` server（随钉住的 `mcp` 包进来；它的工具集由上游决定，不是本插件的能力），`adaptive-redis` 带来 `adaptiveStorage: redis` 背后的 `redis` 客户端。六个包都可安装；设置卡把每个包报成 `ready`、`missing`、`corrupt` 或 `installing`。
 - `--feature` 默认 dry-run；`--apply` 才写到磁盘。`--repair` 重装且不碰用户数据；`--uninstall <包> [--purge]` 删运行时文件，只有 `--purge` 才连 `elements_storage.db` 与 `downloads/` 一起删。
 - `--offline <目录>` 全程不联网：`<目录>` 里要有 Python 归档（文件名与清单 URL 的最后一段一致，浏览器与 `curl -O` 写到磁盘的 `cpython-3.14.9+…-install_only.tar.gz` 可用，百分号转义那种写法也认），以及一个 `wheels/` 目录（每条钉版一枚 wheel，可用 `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <目录>/wheels` 生成）。Python 归档的哈希校验与联网路径一致，pip 带 `--no-index`；缺归档或缺 wheelhouse 时报 `INSTALL_OFFLINE_ASSETS`，不会悄悄退回联网。
-- `setup --status` 打印一份 JSON：`dataDir`、`profile`、`runtime`、`packs` 与 `state`。带 `--profile <目录>` 时读该 profile 的 `cordis.patch.yml`，按本包条目里的 `pythonBin` 与 `dataDir`（宿主真正在用的那两个设置）解析解释器，`packs` 与 `state` 也改报那份目录——条目里没写 `dataDir` 时这两项回落 CLI 自己的默认目录；不带 `--profile` 时 `profile.path` 为 `null`，输出里有一句说明没读 profile，`runtime` 回落到 CLI 自己的链（托管 runtime → 仓内 `_env/.venv` → PATH `python3`）。要拿 `--status` 和设置卡上的解释器对照，就带上 `--profile`。
+- `setup --status` 打印一份 JSON：`dataDir`、`profile`、`runtime`、`packs` 与 `state`。带 `--profile <目录>` 时读该 profile 的 `cordis.patch.yml`，按本包条目里的 `pythonBin` 与 `dataDir`（宿主真正在用的那两个设置）解析解释器，`packs` 与 `state` 也改报那份目录——条目里没写 `dataDir` 时这两项回落 CLI 自己的默认目录；不带 `--profile` 时 `profile.path` 为 `null`，输出里有一句说明没读 profile，`runtime` 回落到 CLI 自己的链（托管 venv → 裸托管解释器 → 仓内 `_env/.venv` → PATH `python3`）。要拿 `--status` 和设置卡上的解释器对照，就带上 `--profile`。
 - profile 同时有远程读取接口与作业后端时，设置卡能经 `scraplingRuntime` 发起同一套安装/修复/取消；否则显示可照抄的 CLI 命令。
 - `integrationMode` 只在部署配置里；宿主有 `mcpManager`（rc.2 的 web 组合包）时，MCP server 在装载时自动动态注册；`setup --mode` 负责为没有该服务的 CLI/headless profile 打印或写出客户端条目，`doctor` 用来核对一份 profile —— 见 [MCP 模式](#mcp-模式)。`official-mcp` 起的是托管 venv 里的 `scrapling-mcp`，由 `mcp` 能力包装进去（`setup --feature mcp --apply`）。
 - 只验证了 **macOS arm64**。Windows、Linux 与 macOS x64 是 blocked（B1/B2）：所有包都报 `blocked`，安装器直接拒绝，不猜资产路径。
@@ -134,10 +135,10 @@ dsh-scrapling setup --status
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
-- `dsh.bundle.patch` 指向 `cordis.patch.yml`，里面只有一条 `- id: scrapling`，`name` 用**裸包名** —— 宿主只扫裸包名条目的 `dsh.client` 声明。设置卡组件直接打进 `client.js`（只有 `react` / `zod` 外置给宿主模块表），卡片不依赖第二份包被装载。
+- `dsh.bundle.patch` 指向 `cordis.patch.yml`，里面有一条 `- id: dsh-plugin-shared` 供应行（必须保持开启；停用后卡片会失去 shared 组件供应），再加一条 `- id: scrapling`、`name` 用**裸包名** —— 宿主只扫裸包名条目的 `dsh.client` 声明。设置卡组件来自 shared 的客户端行，以 `@jayyuen66/dsh-plugin-shared/client` 外置；宿主模块表提供 `react`、`zod` 与这条 shared 供应。
 - client 半注册两处：设置卡（坐在 `plugins.bundle.config` 槽上，键是 bundle 包名 —— 宿主按 `entryKey: pkg.name` 派发，所以卡画在本包的详情页上），以及每个工具在 `tool.call.toolview` 上的一行结果，用官方 tool-call 视图 props 画。
 - 设置命名空间就是条目 id `scrapling`；优先级为 设置卡现值 > 注册行 `config:` > schema 默认值。把一项改回默认值保存的是**清除覆盖**而不是写入同一个值，将来默认值变了你这一项也会跟着变。
-- 闸门策略与 sidecar 环境在插件 `apply()` 时取一次快照 —— **设置卡的改动要等下次启动才生效**。
+- 卡上多数取值每次调用现读 —— 抽取类与浏览器类旋钮、四个输出预算、`fetchTimeoutMs`、`answerMaxTokens`、问答路由与搜索侧设置 —— **保存后下一次工具调用就生效**。装配时读一次、改完要重启的是：十五个工具开关、`provideWebFetch` / `provideWebSearch`、`pythonBin`、`failFastOnMissingPython`、`dataDir`、`sidecarHandshakeTimeoutMs` / `sidecarGraceMs`，以及闸门与 sidecar 进程环境那几项（`proxyUrl`、`proxyBypass`、`allowedHosts`、`nat64Prefixes`、`syntheticDnsRanges`）。
 - 关掉某个工具时，它的指引也一并消失，但分两层看：**常驻段只有一段摘要**（跨工具的选型规则，不点名具体工具），而逐工具那十五句全文注册成一枚虚拟 skill `scrapling`。两侧都按「那个 scope 真注册着哪些工具」现取 —— 没装浏览器的机器上 skill 正文里没有 render / capture_xhr 那几句，sidecar 没起来的机器**既没有常驻段也不注册 skill**（正文为空时注册一枚点开什么都没有的条目只会污染模型的 skill 目录）。宿主没有 skill 服务（精简 profile）时插件照常装配，只是少了这枚 skill，常驻段也不追加那句「完整指引见 skill」。常驻段排在内置 `web_fetch` 指引旁边。
 - `scrapling_crawl` 登记自己的作业类型，`job_list` 因此把它的作业标成爬虫而不是 shell 作业。
 
@@ -279,12 +280,12 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 
 | 字段 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
-| `pythonBin` | string | `""` | 解释器名或绝对路径。留空时按 `lib/runtime.ts` 的固定链走：`dataDir` 下的托管 runtime（`setup --feature core --apply` 装的就是它）→ 仓内 `_env/.venv`（可用才算，只有源码检出才有）→ `PATH` 上的 `python3`（Windows 上是 `python`） |
+| `pythonBin` | string | `""` | 解释器名或绝对路径。留空时按 `lib/runtime.ts` 的固定链走：托管 venv `dataDir/runtime/venv`（`setup --feature core --apply` 把每个 wheel 都装在这里）→ 裸托管解释器 `dataDir/runtime/python/<版本>`（装了一半的机器）→ 仓内 `_env/.venv`（可用才算，只有源码检出才有）→ `PATH` 上的 `python3`（Windows 上是 `python`） |
 | `failFastOnMissingPython` | boolean | `true` | sidecar 进程起不来（路径错、协议对不上、握手超时）时拒绝加载。解释器起得来但没装 Scrapling 时，无论这枚开关如何都只降级为「工具不可用」，日志点名解释器路径 |
 | `fetchEnabled` / `extractEnabled` / `locateEnabled` / `linksEnabled` / `renderEnabled` / `captureXhrEnabled` / `networkEnabled` / `sessionEnabled` / `sessionStateEnabled` / `crawlEnabled` / `answerEnabled` / `sessionReadEnabled` / `sessionActionsEnabled` / `downloadEnabled` / `screenshotEnabled` | boolean | `true` | 每个工具一枚总闸。`sessionStateEnabled` 管登录态存取那一对，它们还要部署侧配好 `sessionStateDir` |
 | `extractionType` | enum | `markdown` | `markdown` / `html` / `text`；三条路径过同一套反注入清洗，`html` 额外剥事件处理器属性，因此**不是字节级原始 HTML** |
 | `mainContentOnly` | boolean | `true` | 抽取范围 |
-| `*MaxOutputChars` | natural | fetch / extract / render `200000`，xhr `120000` | 各工具的输出封顶。sidecar 先按字符截一次，宿主再按字节预算统一处理 |
+| `*MaxOutputChars` | natural | fetch / extract / render `200000`，xhr `120000` | 各工具的输出封顶。sidecar 先按字符截一次，宿主再按字节预算统一处理。`scrapling_render` 与 `scrapling_capture_xhr` 在正文之外还带一份 XHR 历史，那一段按**同一档预算另外**封顶 —— 所以这类调用的一次回执可达两倍预算 |
 | `crawlMaxItems` | natural | `1000` | 给模型可传的 `maxPages` 封的顶。越界的 `maxPages` 原样透传，让 sidecar 报参数错误，而不是由本包悄悄夹成看起来合法的值 |
 | `stripInlineImages` | boolean | `true` | 剥掉正文里内嵌的 `data:` URI 图片、只留 alt 文本 —— 对模型是纯 token 噪音。代码围栏内的原样保留；不含内联图的页面逐字节不变。剥图发生在封顶**之前**。只有把内联图当**原始数据**读（配色、指纹）时才关 |
 | `headless` / `networkIdle` | boolean | `true` / `false` | 浏览器模式，以及页面是否要等到网络空闲才被读取 |
@@ -354,6 +355,7 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 - **走了代理时，本机解析不出来的主机名不再判否。** 域名由代理解析，而在 DNS 被按地区过滤的网络里，恰恰是这些站点才需要代理。IP 字面量、本地能解析出来的私网答案、单标签主机名（`intranet`、`router`）照旧拒。
 - **走代理时关掉 WebRTC 泄露。** Chromium 的 WebRTC 能绕过 HTTP/SOCKS 代理直接发 UDP，页面里一句 STUN 就能问出访客的真实出口 IP；有代理在就把 `blockWebrtc` 钉成真，不看模型入参。
 - **凭据不会出现在任何日志或能力协商帧里。** 上报只回显 `scheme://host:port`，并用 `source` 标出代理来自 `settings` / `environment` / `system` / `none` 哪一档 —— 用户报「抓不到东西」时，这一栏就是第一眼的答案。填错的代理地址记一行 stderr 并按「未配置」处理，而不是让插件加载失败。
+- **安装器的 stderr 与下载地址也过同一道脱敏闸门。** pip 失败时会把索引地址原样打回 stderr（实测 `WARNING: The index url "ht!tp://user:TOKEN@host/simple" seems invalid` 与 `InvalidURL: … 'https://user:TOKEN@/requests/'` 两种形态都是**明文**），而企业镜像里把 token 写进 `PIP_INDEX_URL` 是常规做法、`spawn` 又会把父进程环境原样传下去。`lib/installer.ts` 的六处 stderr 通路（curl / HTTP 状态 / tar / venv / pip / chromium）与两处下载 URL 统一走 `safeStderr()` → `redactUrlSecrets()`，userinfo 整段替成 `***@`；`lib/url-policy.ts` 的匹配不再锚定行首，句子中间的地址同样认。脱敏只抹凭据、不动诊断原文，失败原因照旧读得出来。
 
 ## <img src="https://api.iconify.design/lucide/shield-alert.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 安全说明
 
@@ -391,6 +393,7 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 - **`scrapling_screenshot` 绕过文本清洗。** 截图拍的是页面在视口里真正渲染出来的东西 —— 包括 token、私信、登录后才可见的数据等从未出现在 DOM 文本里的视觉秘密。截图经宿主 attachment 服务落库，只有该服务挂载时才注册。 交回的是该服务**归一化之后**的引用：声明为 PNG 的字节可能被存成 `image/jpeg` 且尺寸更小，而 `originalDimensions` 记的是页面真正产出的那一份（宿主约定：`@deepseek-ai/dsh-attachment` 的 `saveImage`）。`scrapling_download` 把字节写进 `dataDir/downloads`，绝不覆盖已有文件，`filename` 里带路径成分会被拒绝。
 - **`scrapling_extract`、`scrapling_locate` 与 `scrapling_links` 是离线解析器。** 三者只读调用方给的 HTML，不发网络请求；`scrapling_links` 只在给了 `baseUrl` 时才保留相对链接 —— `baseUrl` 为空时返回空链接，而不是猜绝对地址。三者共用 `extractMaxOutputChars`。
 - **adaptive 重定位是尽力而为。** Scrapling 只保存第一个命中元素；原属性变化后，可能选中一个高度相似的兄弟元素。把重定位结果当作线索并自行核对；`scrapling_locate` 不保存指纹。
+- **TLS 信任源取 certifi，不用裸托管解释器的 OpenSSL 默认库。** 托管 CPython 没有自己的 OpenSSL 配置，macOS 上 `ssl.get_default_verify_paths()` 会落到系统库 `/private/etc/ssl/cert.pem` —— 那份库缺若干公开根：实测 `example.com` 的 SSL.com 链在它下面验不过（`verify error:num=20`），换成 certifi 的 bundle 则干净通过。所以 bridge 只在 `SSL_CERT_FILE` 与 `CURL_CA_BUNDLE` **都没被设过**时才把它们指向 `certifi.where()`，企业 MITM 代理或你自己钉的私有根照旧优先。这一步消掉的症状是：对一类公网站点，`scrapling_fetch` 一律报 `FETCH_FAILED ... unable to get local issuer certificate`。
 - **运行时能力包只在 macOS arm64 上验证过。** Windows、Linux 与 macOS x64 的所有包都报 `blocked`；安装器直接拒绝，不猜资产路径（B1/B2）。
 - **`adaptive-redis` 包是客户端，不是存储引擎。** 上游只发 `SQLiteStorageSystem`；这里的 Redis 后端是本插件的 `py/redis_storage.py`，一个按注册域分桶的 `StorageSystemMixin` 子类。启用它改变的是指纹存哪儿，属于部署决定而不是逐次开关。本插件自己的 MCP server 是另一件事 —— 它跑在宿主进程内，不需要能力包。
 - **Shopify 爬虫模式走店铺的 JSON 接口。** `mode=shopify` 用店铺的 `/collections.json` 与每个集合的 `/products.json`（上游的 `ShopifySpider`），按变体出行 —— `name`（商品名 + 变体名，`Default Title` 不拼）、`price`、`sku`、`stock`（有货为 `null`、缺货为 `0`）、`identifier`、`brand`、`category`、`image_url`、`url`、`barcode`、`old_price`、`description`。它不抓商品 HTML，URL 闸门、robots、间隔与并发与其他爬虫模式同一批旋钮。已在本地测试数据店上验证；真实 Shopify 店铺未跑过（B11）。
@@ -423,6 +426,12 @@ pnpm run test:py   # Python sidecar 的端到端验证
 - 源码全部是 TypeScript。`host.js` 与 `client.js` 是**构建产物**且故意用 `.js`：Node 拒绝为 `node_modules` 里的包剥类型，而 dsh 正是从那里加载本插件的。产物是 ESM-only，`require()` 拿不到它，这是有意的。
 - 钉住发布形态的门：`test/publish-manifest.test.ts`（入口目标都在 `files` 覆盖内、源码不作入口、`dsh-*` 一律精确钉且同版本、没有内联的宿主包正文、注释与文档里没有日期与坏字节）与 `test/readme-parity.test.ts`（两份 README 都写全每个工具与每枚设置卡旋钮，章节结构一致）。
 - 发布走 [`.github/workflows/publish.yml`](./.github/workflows/publish.yml)（手动触发，OIDC trusted publishing + `--provenance`）。
+
+## 反馈
+
+欢迎提 issue 和 PR：[https://github.com/JayYuen666/dsh-scrapling/issues](https://github.com/JayYuen666/dsh-scrapling/issues)。
+
+插件启动失败时，请附上 dsh 宿主版本、profile 安装形态和浏览器控制台原文。`missed the module table` 这一行尤其有用：它能直接说明 shared 客户端供应行有没有被物化。
 
 ## <img src="https://api.iconify.design/lucide/scale.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 许可证
 

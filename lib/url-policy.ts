@@ -18,7 +18,18 @@ import ipaddr from "ipaddr.js";
 
 /** authority 的终点字符与 URL 内嵌凭据形态。 */
 const AUTHORITY_END = /[/?#]/u;
-const URL_USERINFO = /^(?<scheme>[a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/iu;
+/**
+ * `scheme://userinfo@` 的形态；**不锚定行首**。
+ *
+ * 锚定的版本只认「整串就是一个 URL」，而真正会泄漏的地方恰恰是夹在句子中间的 URL：
+ * `pip` 把索引地址原样回显成 `Looking in indexes: https://user:token@mirror/simple`
+ * 与 `WARNING: The index url "…" seems invalid`，`curl` 的同名诊断也是这样。这些行
+ * 进入 `InstallError` 的消息、再进作业输出与模型上下文，锚定正则一个都盖不到。
+ *
+ * scheme 字符集刻意容忍 `!` 这类非法字符：`pip` 在索引地址写坏时把原始串连错一起回显，
+ * 而那正是最需要遮住的一档。多遮一点点 `foo://bar@baz` 的代价远小于漏掉一枚真 token。
+ */
+const URL_USERINFO = /(?<scheme>[a-z][a-z0-9+.!-]*:\/\/)[^\s/?#]*@/giu;
 
 /** 策略判定被拒的原因；用机器可读码，便于测试与错误文案分离。 */
 export type BlockReason =
@@ -550,7 +561,7 @@ export function redactUrlSecrets(input: string): string {
   // 前导空白先去掉再判：`^` 锚点的正则对「  https://user:pw@…」不命中，口令会原样进文案。
   const trimmed = input.trimStart();
   const lead = input.slice(0, input.length - trimmed.length);
-  const masked = trimmed.replace(URL_USERINFO, "$<scheme>***@");
+  const masked = trimmed.replaceAll(URL_USERINFO, "$<scheme>***@");
   if (masked !== trimmed) {
     return `${lead}${masked}`;
   }

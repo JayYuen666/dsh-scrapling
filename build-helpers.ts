@@ -12,9 +12,11 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { rolldown } from "rolldown";
@@ -23,6 +25,15 @@ import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 
 /** CJS 产物的严格模式指令。折进 ModuleLoader 外壳 之后它就不再是函数体的指令前导。 */
 export const STRICT_DIRECTIVE = '"use strict";';
+
+/**
+ * 临时件被判成「没人要的残留」所需的年龄。
+ *
+ * pid 判据之外的第二道：容器里 pid 复用比宿主机快得多，一个被复用的 pid 会让残留看上去
+ * 「还活着」。一次构建里写临时件到改名的间隔是毫秒级，所以十分钟足够长 —— 它比任何一次
+ * 真构建的写盘窗口都大，又比「第二天重跑构建」短。
+ */
+const ABANDONED_SCRATCH_MS = 10 * 60_000;
 
 /**
  * 本文件是不是被 `node build-*.ts` 直接执行，而不是被 import 去内存里构建产物。
@@ -95,6 +106,60 @@ function codeStart(code: string): number {
 }
 
 /**
+ * 产物顶部的一条指令语句：带引号的字面量，可以被空白包着、可以带结尾分号。
+ *
+ * `y`（sticky）让它只在 `lastIndex` 处匹配 —— 读前导时逐条推进，不匹配就停，
+ * 不必自己写「跳空白 / 跳引号 / 跳转义 / 跳分号」那四段循环。
+ */
+const DIRECTIVE_STATEMENT =
+  /\s*(?:"(?<double>(?:[^"\\]|\\.)*)"|'(?<single>(?:[^'\\]|\\.)*)')\s*;?/uy;
+
+/**
+ * 读产物顶部的指令前导：从 `start` 起连续的那些字符串字面量语句。
+ *
+ * @param code - 原始正文
+ * @param start - `codeStart(code)`
+ * @returns 各条指令的字面量内容（按出现顺序）
+ */
+function directivePrologue(code: string, start: number): string[] {
+  const directives: string[] = [];
+  DIRECTIVE_STATEMENT.lastIndex = start;
+  let match = DIRECTIVE_STATEMENT.exec(code);
+  while (match !== null) {
+    const { double, single } = match.groups ?? {};
+    directives.push(double ?? single ?? "");
+    match = DIRECTIVE_STATEMENT.exec(code);
+  }
+  // 最后那次失败匹配会把 lastIndex 留在原地；下一次调用是重新赋值起点，所以不必复位。
+  return directives;
+}
+
+/**
+ * 摘不到指令时，确认产物顶部**没有**一条被埋在别的指令之后的严格模式指令。
+ *
+ * 只认「第一条指令就是 `"use strict"`」是不够的：产物开头若是 `'use client';` 再跟
+ * `"use strict";`（rolldown 保留多条指令，或源码将来加 directive），`hoistStrictDirective`
+ * 里那段正则匹配为 null、原样交回，而调用方（`hoistStrict: true`）随后把 `var module` 排在
+ * 函数体最前 —— 于是**两条**指令一起失去指令位，整份代码静默跑在非严格模式下。这正是本函数
+ * 注释里说要避免的那类失败，而它的症状出现在运行期（某个 `this`、八进制字面量、重复参数名）
+ * 而不是构建期。宁可构建红。
+ *
+ * @param code - 原始正文
+ * @param start - `codeStart(code)`
+ * @throws Error - 指令前导里含 `"use strict"` 但它不是第一条
+ */
+function assertNoBuriedStrictDirective(code: string, start: number): void {
+  const prologue = directivePrologue(code, start);
+  if (!prologue.includes("use strict")) {
+    return;
+  }
+  throw new Error(
+    `[build] 产物顶部的指令前导是 ${JSON.stringify(prologue)}：其中的 "use strict" 不在第一条，` +
+      "摘不出来，折进 外壳 之后会整份跑在非严格模式下。先把严格模式指令放到第一条，或调整外壳。",
+  );
+}
+
+/**
  * 把产物顶部的严格模式指令摘出来。
  *
  * rolldown 的 CJS 产物可能以 `"use strict";` 开头。它一旦被嵌进
@@ -108,12 +173,14 @@ function codeStart(code: string): number {
  *
  * @param code - rolldown 产出的正文
  * @returns 摘掉指令后的正文
+ * @throws Error - 指令前导里含 `"use strict"` 但它不是第一条（摘不出来，折进 外壳 会静默丢严格模式）
  */
 export function hoistStrictDirective(code: string): string {
   const start = codeStart(code);
   const directive = /^(?:"use strict"|'use strict');?/u;
   const match = directive.exec(code.slice(start));
   if (match === null) {
+    assertNoBuriedStrictDirective(code, start);
     return code;
   }
   const [found = ""] = match;
@@ -142,8 +209,15 @@ export function dependencyNames(pkgJson: unknown, field: string): string[] {
   return Object.keys(table);
 }
 
-/** 非裸说明符的开头：相对路径、绝对路径、`node:` 内置、`#` 私有映射、虚拟模块的前缀字节。 */
-const NOT_A_PACKAGE_SPECIFIER = /^(?:[./\\#\0]|node:)/u;
+/**
+ * 非裸说明符的开头：相对路径、绝对路径、`node:` 内置、`#` 私有映射、虚拟模块的前缀字节，
+ * 以及盘符（`C:\x` / `C:/x`）与带 scheme 的 URL（`https://…`、`virtual:foo`）。
+ *
+ * 盘符与 scheme 不在里面时 `packageNameOf` 会把它们当包名段交出去（`C:`、`https:`、`virtual:foo`），
+ * 与上面「不是 npm 裸说明符时是空串」的承诺相反。当前唯一调用方拿依赖表判否，所以行为碰巧对；
+ * 但这个函数被文档描述成可供「白名单外一律外部化」一类调用方使用，伪包名会让那类判据误判。
+ */
+const NOT_A_PACKAGE_SPECIFIER = /^(?:[./\\#\0]|node:|[A-Za-z]:[\\/]|[A-Za-z][A-Za-z0-9+.-]*:)/u;
 
 /**
  * 说明符的包名段：`@scope/pkg/sub` → `@scope/pkg`，`pkg/sub` → `pkg`。
@@ -183,6 +257,70 @@ export function externalizePackages(names: Iterable<string>): (id: string) => bo
 }
 
 /**
+ * 从临时件名里取 pid：`host.js.tmp-<pid>` 或 `host.js.tmp-<pid>-<uuid>`。
+ *
+ * 取不到时交 `NaN`（不是 `undefined`）：这里只有一个返回类型，调用点的判据也就只有一条
+ * `Number.isNaN`，不必再分别处理「没有 pid」与「pid 不是数字」两种空值。
+ *
+ * @param name - 文件名
+ * @returns pid；名字里没有可读的 pid 时是 `NaN`
+ */
+function scratchPidOf(name: string): number {
+  const raw = /\.tmp-(?<pid>\d+)(?:-|$)/u.exec(name)?.groups?.["pid"];
+  return raw === undefined ? Number.NaN : Math.trunc(Number(raw));
+}
+
+/**
+ * 判一个进程还在不在。
+ *
+ * `kill(pid, 0)` 不投递信号，只做存在性与权限检查：`ESRCH` 说明没了，`EPERM` 说明还在
+ * （只是不归我们管）。
+ *
+ * @param pid - 进程号
+ * @returns 是否还活着
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return isRecord(error) && error["code"] === "EPERM";
+  }
+}
+
+/**
+ * 判断一个临时件是不是「没人要的残留」，而不是另一个正在跑的构建手里的那一份。
+ *
+ * 三条判据，任一成立就算残留：文件名里根本没有 pid（老版本留下的、或不是本函数写的）、
+ * pid 已经不在了（同一台机器上 pid 复用窗口远小于构建间隔）、或 mtime 早于
+ * `ABANDONED_SCRATCH_MS`。pid 相同的一律当活件：那是本次构建自己（或同一进程的另一次构建）的。
+ *
+ * @param directory - 临时件所在目录
+ * @param name - 临时件文件名
+ * @returns 是否可以安全删掉
+ */
+function isAbandonedScratch(directory: string, name: string): boolean {
+  const pid = scratchPidOf(name);
+  if (Number.isNaN(pid)) {
+    // 名字里没有可读的 pid：老版本留下的（它们用 `${target}.tmp-${pid}` 之前的形态），
+    // 没有别的办法判它是不是活的，按残留处理。
+    return true;
+  }
+  if (pid === process.pid) {
+    return false;
+  }
+  if (!isProcessAlive(pid)) {
+    return true;
+  }
+  try {
+    return Date.now() - statSync(path.join(directory, name)).mtimeMs > ABANDONED_SCRATCH_MS;
+  } catch {
+    // 读不到 stat：它刚刚被别人删掉或挪走，当作残留（下一次 unlink 会自己再判一次）。
+    return true;
+  }
+}
+
+/**
  * 把产物写到磁盘：先写同目录的临时文件，再改名。
  *
  * 直接覆盖目标文件的话，中断、磁盘写满或进程被杀都会在目标位置留下半截 JS —— 而那正是
@@ -192,9 +330,12 @@ export function externalizePackages(names: Iterable<string>): (id: string) => bo
  * 写到磁盘的同步，真要断电恢复的语义属于数据文件，不属于产物。
  *
  * 写入前先清掉同目录下匹配本产物名的旧残留：进程被 SIGKILL、CI 取消时临时文件留在包根，
- * pid 每次不同，没人回收；它们还可能落进 `files` 漏项的缝里随包发出去。前提是一次构建不与
- * 另一次同 target 的构建并发 —— 真并发时两个构建本来就在争同一个产物文件，清掉对方的临时件
- * 不是新增的那条损害。
+ * pid 每次不同，没人回收；它们还可能落进 `files` 漏项的缝里随包发出去。
+ *
+ * 清理只动**比本次构建更早**的残留（见 `isAbandonedScratch`）：一口气删掉所有匹配项的话，
+ * 两个并行构建会互相拆台 —— 进程 A 刚写完 `${target}.tmp-${pidA}` 准备改名，进程 B 的清理把它
+ * unlink 掉，A 的 `renameSync` 于是抛 ENOENT。那一次构建本来是会成功的（后写者胜），现在直接
+ * 失败，且报错指向 rename 而不是清理。
  *
  * @param target - 产物路径
  * @param text - 产物全文
@@ -204,18 +345,19 @@ export function writeArtifact(target: string, text: string): void {
   const prefix = `${path.basename(target)}.tmp-`;
   try {
     for (const name of readdirSync(directory)) {
-      if (name.startsWith(prefix)) {
+      if (name.startsWith(prefix) && isAbandonedScratch(directory, name)) {
         try {
+          // 残留清不掉不该拦着这次构建：下面写的是新名字，改名才是决定成败的一步。
           unlinkSync(path.join(directory, name));
         } catch {
-          // 残留清不掉不该拦着这次构建：下面写的是新名字，改名才是决定成败的一步。
+          // 同上：忽略。
         }
       }
     }
   } catch {
     // 目录都列不出来时，下面的写入会给出更准确的错误。
   }
-  const scratch = `${target}.tmp-${process.pid}`;
+  const scratch = `${target}.tmp-${process.pid}-${randomUUID()}`;
   try {
     writeFileSync(scratch, text, "utf8");
     renameSync(scratch, target);
@@ -239,16 +381,21 @@ export interface BundleOutputItem {
 }
 
 /**
- * 从 rolldown 的输出里取唯一那个 chunk 的正文，并拒掉其余形态。
+ * 从 rolldown 的输出里取唯一那个 chunk，并拒掉其余形态。
  *
  * 只取第一块等于「其余代码静默消失」：产物照样能构建、过语法检查、装得上，直到某个函数
  * 在运行期变成 undefined 才暴露。资产同理 —— 一个 .css/.png 被引用而产物只写一个 JS
  * 文件时，引用它的代码要等到运行期才炸。
  *
+ * 交回的是**整块**（含 `moduleIds`）而不是正文：调用方要拿它判「宿主包有没有被内联」，
+ * 而那个判据必须跑在这条唯一性校验**之后** —— 反过来的话，`output` 里一个 chunk 都没有
+ * （或只有资产）时，先跑内联判据会拿到 `undefined` 的 `moduleIds`，报出「rolldown 没交回
+ * moduleIds」，把排查引向一个完全无关的方向。
+ *
  * @param output - `bundle.generate()` 的 output
- * @returns chunk 正文
+ * @returns 唯一那个 chunk
  */
-export function singleChunkCode(output: readonly BundleOutputItem[]): string {
+export function singleChunk(output: readonly BundleOutputItem[]): BundleOutputItem {
   const chunks = output.filter((item) => item.type === "chunk");
   const extras = output.filter((item) => item.type !== "chunk");
   if (extras.length > 0) {
@@ -265,10 +412,21 @@ export function singleChunkCode(output: readonly BundleOutputItem[]): string {
         "this build writes a single file and must not split the bundle",
     );
   }
-  if (typeof chunk.code !== "string") {
+  return chunk;
+}
+
+/**
+ * 从 rolldown 的输出里取唯一那个 chunk 的正文。
+ *
+ * @param output - `bundle.generate()` 的 output
+ * @returns chunk 正文
+ */
+export function singleChunkCode(output: readonly BundleOutputItem[]): string {
+  const { code } = singleChunk(output);
+  if (typeof code !== "string") {
     throw new TypeError("rolldown returned a chunk without code");
   }
-  return chunk.code;
+  return code;
 }
 
 /**
@@ -352,8 +510,12 @@ export interface BundlePlan {
 }
 
 /**
- * 「rolldown 打包 → 单 chunk 校验 → 严格模式迁移 → region 路径折叠 → 宿主包内联判据 → 关
+ * 「rolldown 打包 → 单 chunk 校验 → 宿主包内联判据 → 严格模式迁移 → region 路径折叠 → 关
  * bundle」这一段的共同形状。
+ *
+ * 顺序是承重的：唯一性校验必须在最前（`singleChunk` 把 chunk 定形），内联判据随后（它读
+ * `moduleIds`，而那个字段只在那唯一一块上有意义），严格模式迁移与 region 折叠最后
+ * （两者都只改正文）。倒过来时「一个 chunk 都没有」会先报成「rolldown 没交回 moduleIds」。
  *
  * 三个构建脚本原先各写一份，`build-helpers.ts` 头部记的那类单侧修 bug（close 掩盖原始错误、
  * 清理掩盖写入错误、严格模式只认双引号）就是这种形状的直接后果；banner、外壳 与写盘仍归各脚本。
@@ -374,9 +536,14 @@ export async function bundleChunkText(plan: BundlePlan): Promise<string> {
   });
   try {
     const { output } = await bundle.generate({ format: plan.format, minify: plan.minify });
-    const chunk = output.find((item) => item.type === "chunk");
-    assertNoHostPackageInlined(chunk?.moduleIds, plan.label);
-    const code = singleChunkCode(output);
+    // 先定形：唯一性/资产判据跑在内联判据之前。顺序反过来时，`output` 里一个 chunk 都没有的
+    // 情况会先撞上「没交回 moduleIds」，报错指向 rolldown 而不是「got 0 / 多余资产」。
+    const chunk = singleChunk(output);
+    assertNoHostPackageInlined(chunk.moduleIds, plan.label);
+    const { code } = chunk;
+    if (typeof code !== "string") {
+      throw new TypeError("rolldown returned a chunk without code");
+    }
     return canonicalizeRegionPaths(
       plan.hoistStrict ? hoistStrictDirective(code) : code,
       plan.root,

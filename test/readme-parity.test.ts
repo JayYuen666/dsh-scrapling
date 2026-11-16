@@ -16,6 +16,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { TOOL_SPECS } from "../host.ts";
+import { SEARCH_BACKENDS } from "../lib/search-backends.ts";
 
 const pkgDir = path.join(import.meta.dirname, "..");
 const EN = "README.md";
@@ -417,21 +418,17 @@ const NETWORK_ROW = { en: "| Network |", zh: "| 网络 |" } as const;
 describe("隐私表逐条点名搜索后端", () => {
   it("searchBackend 的每个非 auto 取值都出现在两份 README 的网络行里", async () => {
     const { en, zh } = await readPair();
-    const host = await readFile(path.join(pkgDir, HOST), "utf8");
-    const union = /searchBackend: Schema\.union\(\[(?<body>[\s\S]*?)\]\)/u.exec(host)?.groups?.[
-      "body"
-    ];
-    if (union === undefined) {
-      throw new Error(`${HOST} 里找不到 searchBackend 的 Schema.union`);
-    }
-    const backends = Array.from(
-      union.matchAll(/"(?<id>[a-z]+)"/gu),
-      (found) => found.groups?.["id"] ?? "",
-    ).filter((id) => id !== "" && id !== "auto");
+    // 名单从唯一来源取，不再从 host.ts 里正则解析一遍字面量：`host.ts` 的 schema 现在也
+    // 直接读这份数组（`Schema.union(SEARCH_BACKENDS)`），所以「数组加了一项、忘改 schema」
+    // 这条分叉在结构上已经不存在，判据也没必要再维护第二套解析。
+    const backends = SEARCH_BACKENDS.filter((id) => id !== "auto");
+    expect(backends.length, "searchBackend 的取值一条也没有，这条判据没跑到东西").toBeGreaterThan(
+      0,
+    );
     expect(
-      backends.length,
-      "searchBackend 的取值一条也没解析到，这条判据没跑到东西",
-    ).toBeGreaterThan(0);
+      Object.keys(PRIVACY_NAMES).toSorted(),
+      "隐私表登记的名字与 SEARCH_BACKENDS 不是同一组：新增后端要同时登记",
+    ).toStrictEqual(backends.toSorted());
     const named = backends.map((id) => {
       const name = PRIVACY_NAMES[id];
       if (name === undefined) {

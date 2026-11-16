@@ -9,11 +9,41 @@
 // 分母与 files 清单逐份核对，归 coverage-floor.mjs。两侧份数本来就不该相等，别拿这里
 // 的下限去核对那边。
 
-import { readdirSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
 const ROOT = import.meta.dirname;
-const MIN = 6;
+// 下限不再是一个手写的魔术数字：它取 package.json.files 里登记了几份 `py/*.py`，也就是
+// 「随包发布的那几份源文件」。原先写死 6 时，py/ 下有 14 份（10 随包 + 4 用例），删掉 8 份
+// 这条门禁照样绿，而 bandit 只是安静地少扫几份 —— 正是这行下限想防的「量空气」的弱化版。
+// 取登记数之后，少一份随包源文件就红，不需要有人记得回来改这个常量。
+const FALLBACK_MIN = 6;
+
+/**
+ * package.json.files 里登记了几份 `py/*.py`。
+ *
+ * @returns 份数；读不到或形状不对时返回 null（并已写 stderr）
+ */
+function shippedPyCount() {
+  let pkg;
+  try {
+    pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8"));
+  } catch (error) {
+    process.stderr.write(
+      `[face:py] 读不到 package.json（${String(error)}）；下限退回 ${String(FALLBACK_MIN)}\n`,
+    );
+    return null;
+  }
+  const files = pkg?.files;
+  if (!Array.isArray(files)) {
+    process.stderr.write(
+      `[face:py] package.json.files 不是数组；下限退回 ${String(FALLBACK_MIN)}\n`,
+    );
+    return null;
+  }
+  return files.filter((entry) => typeof entry === "string" && /^py\/[\w.-]+\.py$/u.test(entry))
+    .length;
+}
 
 /**
  * 递归数 *.py 份数。
@@ -54,9 +84,26 @@ export function isDirectory(file) {
   }
 }
 
+/** 判一个路径是不是目录，把读不动的成因翻成一句点名的话。
+ *  `isDirectory` 按自己的契约只吞 ENOENT/ENOTDIR，EACCES/EPERM/ELOOP 照抛 —— 那是对的
+ *  （「读不到」不能当成「不存在」），但抛在 main 里就成了一条裸栈，判红文案全丢。
+ *  所以这一层必须接住它并点名：门禁红要红得能读。 */
+function directoryState(file) {
+  try {
+    return { known: true, isDirectory: isDirectory(file), reason: null };
+  } catch (error) {
+    return { known: false, isDirectory: false, reason: String(error) };
+  }
+}
+
 function main() {
   const pyDir = path.join(ROOT, "py");
-  if (!isDirectory(pyDir)) {
+  const pyState = directoryState(pyDir);
+  if (!pyState.known) {
+    process.stderr.write(`[face:py] 判不了 ${pyDir} 是不是目录：${pyState.reason}\n`);
+    return 1;
+  }
+  if (!pyState.isDirectory) {
     process.stderr.write(
       "[face:py] 找不到 py/ 目录：bandit 对着缺失目录会退 0 且零输出，先在这里判红\n",
     );
@@ -69,14 +116,20 @@ function main() {
     process.stderr.write(`[face:py] 读不了 ${pyDir}：${String(error)}\n`);
     return 1;
   }
-  const hasTests = isDirectory(path.join(pyDir, "tests"));
+  const testsState = directoryState(path.join(pyDir, "tests"));
+  if (!testsState.known) {
+    process.stderr.write(`[face:py] 判不了 py/tests/ 是不是目录：${testsState.reason}\n`);
+    return 1;
+  }
+  const hasTests = testsState.isDirectory;
+  const floor = shippedPyCount() ?? FALLBACK_MIN;
   process.stdout.write(
-    `[face:py] bandit 量到的面（递归含 py/tests）：py/ 下 ${String(count)} 份 *.py（下限 ${String(MIN)}），` +
+    `[face:py] bandit 量到的面（递归含 py/tests）：py/ 下 ${String(count)} 份 *.py（下限 ${String(floor)} = 随包发布份数），` +
       `py/tests/ 目录存在：${String(hasTests)}\n`,
   );
-  if (count < MIN) {
+  if (count < floor) {
     process.stderr.write(
-      `py/ 下只找到 ${String(count)} 份 *.py，低于下限 ${String(MIN)}：bandit 的分母已经空了，后面每一段都在量空气\n`,
+      `py/ 下只找到 ${String(count)} 份 *.py，低于随包发布的 ${String(floor)} 份：有源文件被删或挪出了 py/，bandit 的分母已经空了\n`,
     );
     return 1;
   }
@@ -99,17 +152,24 @@ export function invokedAsScript() {
   if (argvPath === undefined) {
     return false;
   }
-  try {
-    const invoked = realpathSync(path.resolve(argvPath));
-    const self = realpathSync(path.resolve(import.meta.filename));
-    return process.platform === "win32"
-      ? invoked.toLowerCase() === self.toLowerCase()
-      : invoked === self;
-  } catch {
-    return false;
-  }
+  const invoked = realpathSync(path.resolve(argvPath));
+  const self = realpathSync(path.resolve(import.meta.filename));
+  return process.platform === "win32"
+    ? invoked.toLowerCase() === self.toLowerCase()
+    : invoked === self;
 }
 
-if (invokedAsScript()) {
+let asScript;
+try {
+  asScript = invokedAsScript();
+} catch (error) {
+  // 判不出「是不是被当脚本调起」时按**是**处理：多跑一次检查的代价远小于静默放行。
+  process.stderr.write(
+    `[face:py] 判不出本次是否被当脚本调起（${String(error)}）；按「是」处理，照常检查。\n`,
+  );
+  asScript = true;
+}
+
+if (asScript) {
   process.exitCode = main();
 }

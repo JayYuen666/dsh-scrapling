@@ -8,9 +8,9 @@
 // 键集一致由 tsc 保证：zh / en 两份都标注同一个 ScraplingMessages 类型，
 // 少键多键都在编译期红。
 //
-// 插值：host 侧没有官方 i18n 面，故本文件自带与卡片同语法的 format()。
-// 只替换 `\w+` 命名的占位符——文案里成对的 `{path, content}` 这类字面花括号
-// （非 \w+ 键）因此天然不会被吃掉。
+// 插值：host 侧没有官方 i18n 面，故本文件自留一个与卡片同语法的 format()，实现借
+// shared 的 `@jayyuen66/dsh-plugin-shared/lib/placeholder`。文案里成对的
+// `{path, content}` 这类字面花括号不会被吃掉——它们不对应任何槽位键，缺值即保留原文。
 //
 // 不在此列的中文（刻意留下，逐条都是数据或读不到的偏好）：
 //   - console.* / ctx.logger 的日志与代码注释（运维面，模型看不到）；
@@ -19,6 +19,7 @@
 //     attached/detached/hidden/visible 等；
 //   - lib/cli.ts 的运维 CLI 输出与 py/bridge.py 的侧端文案（本轮范围之外）。
 import type { MessagesCatalog } from "@jayyuen66/dsh-plugin-shared/lib/locale";
+import { fillPlaceholders } from "@jayyuen66/dsh-plugin-shared/lib/placeholder";
 
 /** 本包 host 侧产出的全部人读文案。 */
 export interface ScraplingMessages {
@@ -307,10 +308,32 @@ export interface ScraplingMessages {
   readonly contentRecoveryHint: string;
   /** 正文被截断（含取回办法）。 */
   readonly contentTruncationHint: string;
+  /** links 结果被截断（只有 limit 一个旋钮）。 */
+  readonly linksTruncationHint: string;
   /** 网络历史整体被截断。 */
   readonly networkTruncationHint: string;
   /** 读 DOM 结果被截断。 */
   readonly readTruncationHint: string;
+
+  // ── 渲染出来的正文框架（lib/output.ts 的 render*）────────────────────
+  // 这些句子原先硬编英文：中文部署下正文是中文、框架句却还是英文，正好违背本文件
+  // 「模型可见的句子一律从 messages 取」那条原则。占位符按 {name} 走同一套插值。
+  /** 选择器/locate 没有任何命中。 */
+  readonly outputNoMatches: string;
+  /** 多字段抽取没有任何记录。 */
+  readonly outputNoRows: string;
+  /** 链接抽取没有任何链接。 */
+  readonly outputNoLinks: string;
+  /** 抓取正文的标题行：`{url}` `{status}`。 */
+  readonly outputFetchHead: string;
+  /** 响应元数据小节标题。 */
+  readonly outputMetadataHeading: string;
+  /** 网络历史小节标题。 */
+  readonly outputXhrHeading: string;
+  /** 没有捕获到任何 XHR/fetch 时的整段说明。 */
+  readonly outputXhrNone: string;
+  /** 问答结果的标题行：`{url}` `{status}` `{provider}` `{model}`。 */
+  readonly outputAnswerHead: string;
 
   // ── MCP server 面（lib/mcp-server.ts）────────────────────────────────
   /** MCP search 工具的一句话说明。 */
@@ -745,9 +768,21 @@ export const MESSAGES: MessagesCatalog<ScraplingMessages> = {
     contentRecoveryHint: "要拿被省略的部分，请用 cssSelector 收窄范围，或分多次抓取。",
     contentTruncationHint:
       "正文被截断：要拿被省略的部分，请用 cssSelector 收窄范围，或分多次抓取。",
+    linksTruncationHint: "链接被截断：请提高 limit 后再取。",
     networkTruncationHint:
       "网络历史整体被截断：完整的条目请用 scrapling_capture_xhr / scrapling_session_network 的 limit 与游标分页读。",
     readTruncationHint: "要拿被省略的部分，请用 cssSelector 收窄范围，或分多次读取。",
+
+    outputNoMatches: "没有命中任何元素",
+    outputNoRows: "没有抽取到任何记录",
+    outputNoLinks: "没有链接",
+    outputFetchHead: "已抓取 {url}（HTTP {status}）",
+    outputMetadataHeading: "响应元数据",
+    outputXhrHeading: "捕获到的 XHR/fetch",
+    outputXhrNone:
+      "没有捕获到任何 XHR/fetch 请求。要么这个页面本来就不发，要么它们是在这次捕获之后才发出的 —— " +
+      "先用 scrapling_render 的 waitMs / waitSelector 等一等，再重新捕获。",
+    outputAnswerHead: '针对 "{url}" 的回答（HTTP {status}，经 {provider}/{model}）：',
 
     mcpSearchToolDescription: "用本插件的搜索发现层检索一次，返回可引用的来源与已渲染正文。",
     mcpSearchQueryDescription: "要检索的词。",
@@ -1187,11 +1222,23 @@ export const MESSAGES: MessagesCatalog<ScraplingMessages> = {
       "To get the omitted part, narrow the range with cssSelector or fetch in several passes.",
     contentTruncationHint:
       "Body was truncated: to get the omitted part, narrow the range with cssSelector or fetch in several passes.",
+    linksTruncationHint: "Links were truncated: raise limit and fetch again.",
     networkTruncationHint:
       "The network history was truncated as a whole: read the complete entries with the limit and cursor pagination of " +
       "scrapling_capture_xhr or scrapling_session_network.",
     readTruncationHint:
       "To get the omitted part, narrow the range with cssSelector or read in several passes.",
+
+    outputNoMatches: "no matches",
+    outputNoRows: "no rows",
+    outputNoLinks: "no links",
+    outputFetchHead: "Fetched {url} (HTTP {status})",
+    outputMetadataHeading: "Metadata",
+    outputXhrHeading: "Captured XHR/fetch",
+    outputXhrNone:
+      "Captured no XHR/fetch requests. The page may issue none, or they may have fired after this capture — " +
+      "try scrapling_render with waitMs / waitSelector first, then capture again.",
+    outputAnswerHead: 'Answer to "{url}" (HTTP {status}, via {provider}/{model}):',
 
     mcpSearchToolDescription:
       "Run one search through this plugin's discovery layer and return citable sources with their rendered bodies.",
@@ -1374,16 +1421,16 @@ export const MESSAGES: MessagesCatalog<ScraplingMessages> = {
 /** format() 的插值参数（调用方负责把值变成文本）。 */
 export type MessageParams = Record<string, string>;
 
-/** 花括号占位符（键限 \w+；`{path, content}` 这类字面花括号不匹配）。 */
-const PLACEHOLDER = /\{(?<key>\w+)\}/gu;
-
 /**
  * host 半的 `{name}` 插值：与卡片侧官方 Translate 同语法（宿主那份实现在
- * dsh-client-locale 里，host 侧没有 i18n 面，只能自带这一小段）。
+ * dsh-client-locale 里，host 侧没有 i18n 面，只能借 shared 的这份）。
+ *
+ * 实现已收进 shared 的 `@jayyuen66/dsh-plugin-shared/lib/placeholder`，语义统一成
+ * 「缺值保留原文」—— 漏传一个参数时原样留着的 `{xxx}` 一眼可见，不会让一句文案悄悄塌掉。
  * @param template - 带 `{name}` 占位符的文案模板。
- * @param params - 占位符 → 已字符串化的值；缺项替换为空串（不抛）。
+ * @param params - 占位符 → 已字符串化的值。
  * @returns 插值后的文本。
  */
 export function format(template: string, params: MessageParams): string {
-  return template.replaceAll(PLACEHOLDER, (_all: string, key: string) => params[key] ?? "");
+  return fillPlaceholders(template, params);
 }

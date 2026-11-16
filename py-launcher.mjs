@@ -94,16 +94,33 @@ function whichLine(root) {
   if (python !== PATH_PYTHON) {
     return `[py] 解释器：${python}`;
   }
-  return `[py] 解释器：PATH 上的 ${PATH_PYTHON}（本仓没有 _env/.venv，在伞根跑 pnpm py:setup）`;
+  // 「没有」与「有但不能用」是两件事：`usable` 也把同名目录、没有可执行位的文件判成不可用
+  // （POSIX 上目录常带可执行位，只看 existsSync 会把空壳 venv 当成好的）。文案若只说
+  // 「没有 _env/.venv」，坏掉的那份就被读成不存在，用户会去重跑一遍 setup 而不是看它是怎么坏的。
+  return `[py] 解释器：PATH 上的 ${PATH_PYTHON}（没有可用的 _env/.venv，在伞根跑 pnpm py:setup）`;
 }
 
+/**
+ * 拆一个 `KEY=VALUE`。
+ *
+ * **不在这一层写 stderr**：调用方（`envFromArg`）才知道该报哪一句，两层各写一次会让一次
+ * 参数错误打出两行（实测 `--env=BOGUS` 曾经同时出现「要写成 KEY=VALUE」与「取值不合法」）。
+ * 两种不合法的成因不同、给出的出路也不同，所以分开报：没有 `=` 是写法错；键以 `-` 开头是
+ * 把启动器旗标当成了环境变量（那种形状下 `--root` 之类会被静默吞掉）。
+ *
+ * @param pair - `KEY=VALUE` 一个整段
+ * @returns `{ env }` 或 `{ reason }`，理由只说明成因，文案由调用方拼
+ */
 function splitEnv(pair) {
   const at = pair.indexOf("=");
   if (at <= 0) {
-    process.stderr.write(`--env 要写成 KEY=VALUE；现在给的是 ${pair}\n`);
-    return null;
+    return { reason: "shape" };
   }
-  return { key: pair.slice(0, at), value: pair.slice(at + 1) };
+  const key = pair.slice(0, at);
+  if (key.startsWith("-")) {
+    return { reason: "flag" };
+  }
+  return { env: { key, value: pair.slice(at + 1) } };
 }
 
 function rootFromArg(argv, index) {
@@ -142,10 +159,15 @@ function envFromArg(argv, index) {
     return null;
   }
   const parsed = splitEnv(pair);
-  if (parsed === null) {
-    return { error: "--env 的取值不合法" };
+  if (parsed.reason === "shape") {
+    return { error: `--env 要写成 KEY=VALUE；现在给的是 ${pair}` };
   }
-  return { env: parsed, step };
+  if (parsed.reason === "flag") {
+    return {
+      error: `--env 的键不能以 - 开头（会被当成旗标）：${pair}。要传旗标请写在 --env 之前`,
+    };
+  }
+  return { env: parsed.env, step };
 }
 
 function takeMode(arg, state) {
@@ -207,7 +229,10 @@ function parseArgs(argv) {
     }
     index += step;
   }
-  return { mode: state.mode, root: state.root, env: state.env, pythonArgs: argv.slice(index) };
+  // `--` 是「启动器旗标到此为止」的分隔符，不是解释器的参数：留在里面会被 python 当成
+  // 脚本路径，报 `can't open file '.../--'`。文件头第 10 行承诺的写法必须真的成立。
+  const pythonArgs = argv[index] === "--" ? argv.slice(index + 1) : argv.slice(index);
+  return { mode: state.mode, root: state.root, env: state.env, pythonArgs };
 }
 
 function reportMode(mode, root) {
@@ -251,6 +276,16 @@ function runPython(root, env, pythonArgs) {
     stdio: "inherit",
     env: { ...process.env, ...env },
   });
+  // 转发终止信号给子进程：`stdio: "inherit"` 让子进程与启动器同属终端的前台进程组，
+  // 交互式 Ctrl-C 内核会同时打给两边；但脚本化场景（CI 的 `kill`、`timeout` 命令、
+  // 宿主的 shell 服务按 pid 发信号）只打到启动器这一个 pid，不转发时 python 会继续跑，
+  // 启动器却先退出 —— 调用方看到「命令结束了」，子进程还在写文件/占端口。
+  // 不监听 SIGKILL：它不可捕获，那种情形只能靠对方的进程组语义。
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(signal, () => {
+      child.kill(signal);
+    });
+  }
   child.on("error", (error) => {
     process.stderr.write(`起不来 ${python}：${error.message}\n`);
     if (process.exitCode === undefined) {
@@ -298,17 +333,24 @@ function invokedAsScript() {
   if (argvPath === undefined) {
     return false;
   }
-  try {
-    const invoked = realpathSync(path.resolve(argvPath));
-    const self = realpathSync(path.resolve(import.meta.filename));
-    // win32 的文件名比较不区分大小写，realpath 的盘符大小写也不保证一致。
-    return WINDOWS ? invoked.toLowerCase() === self.toLowerCase() : invoked === self;
-  } catch {
-    return false;
-  }
+  const invoked = realpathSync(path.resolve(argvPath));
+  const self = realpathSync(path.resolve(import.meta.filename));
+  // win32 的文件名比较不区分大小写，realpath 的盘符大小写也不保证一致。
+  return WINDOWS ? invoked.toLowerCase() === self.toLowerCase() : invoked === self;
 }
 
-if (invokedAsScript()) {
+let asScript;
+try {
+  asScript = invokedAsScript();
+} catch (error) {
+  // 判不出「是不是被当脚本调起」时按**是**处理：多跑一次启动器的代价远小于静默放行。
+  process.stderr.write(
+    `[py-launcher] 判不出本次是否被当脚本调起（${String(error)}）；按「是」处理，照常解析解释器。\n`,
+  );
+  asScript = true;
+}
+
+if (asScript) {
   const status = main(process.argv.slice(2));
   if (status !== null) {
     process.exitCode = status;

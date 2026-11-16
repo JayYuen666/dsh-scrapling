@@ -16,6 +16,7 @@ import type {
   JobView,
 } from "@deepseek-ai/dsh-jobs";
 import { remoteMethods } from "@deepseek-ai/dsh-typert-protocol";
+import { InstallError } from "../lib/installer.ts";
 import { installRuntimeRemote, ScraplingRuntimeService } from "../lib/runtime-remote.ts";
 import type { RuntimeJobs, RuntimeRemoteDeps } from "../lib/runtime-remote.ts";
 import { RUNTIME_PACKS, RUNTIME_REMOTE_NAMESPACE } from "../lib/runtime-shape.ts";
@@ -53,7 +54,7 @@ function writeState(dataDir: string, packs: unknown): void {
 function installCoreFiles(dataDir: string): void {
   const bin = path.join(dataDir, "runtime", "venv", "bin");
   mkdirSync(bin, { recursive: true });
-  writeFileSync(path.join(bin, "python3"), "#!/bin/sh\n");
+  writeFileSync(path.join(bin, "python3"), "#!/bin/sh\n", { mode: 0o755 });
 }
 
 function installBrowserFiles(dataDir: string): void {
@@ -108,6 +109,10 @@ function fakeJobs(
     /** 走完 `run` 再抛：注册环节在作业已经起跑之后才失败的那一档。 */
     startThrowsAfterRun?: boolean;
     killThrows?: boolean;
+    /** `list()` 抛：注册表内部状态读不出来。 */
+    listThrows?: boolean;
+    /** 输出写入与进度更新都抛：环形缓冲读过上限、作业被 kill 收走时的形态。 */
+    writesThrow?: boolean;
   } = {},
 ): FakeJobs {
   const hooks = new Map<string, JobHooks>();
@@ -124,9 +129,15 @@ function fakeJobs(
   const handleOf = (id: string): JobHandle => ({
     id: id as never,
     append: (text: string): void => {
+      if (options.writesThrow === true) {
+        throw new Error("output buffer is gone");
+      }
       outputs.set(id, (outputs.get(id) ?? "") + text);
     },
     updateProgress: (line: string): void => {
+      if (options.writesThrow === true) {
+        throw new Error("output buffer is gone");
+      }
       progress.set(id, [...(progress.get(id) ?? []), line]);
     },
   });
@@ -161,8 +172,11 @@ function fakeJobs(
       });
       return id as never;
     },
-    list: (): JobView[] =>
-      forgotten
+    list: (): JobView[] => {
+      if (options.listThrows === true) {
+        throw new Error("registry store is unreadable");
+      }
+      return forgotten
         ? []
         : Array.from(views.keys(), (id) => ({
             id: id as never,
@@ -171,7 +185,8 @@ function fakeJobs(
             status: views.get(id) ?? "running",
             startedAt: 0,
             output: { total: 0, earliest: 0 },
-          })),
+          }));
+    },
     get: (id: JobId): JobView => {
       if (forgotten) {
         // 宿主对陌生 id 的说法：jobs-local src/index.ts:399-400。
@@ -187,24 +202,37 @@ function fakeJobs(
         label: "runtime",
         status,
         startedAt: 0,
-        output: { total: 0, earliest: 0 },
+        // `total` 是下一块的起始偏移：服务侧拿它算尾窗起点，写死 0 会让「只读尾部」
+        // 这条优化在测试里退化成「从 0 读全量」，把要测的东西测掉。
+        output: { total: (outputs.get(String(id)) ?? "").length, earliest: 0 },
       };
     },
-    readAt: (id: JobId) => {
+    readAt: (id: JobId, from: number) => {
       if (options.readThrows === true) {
         throw new Error("no read");
       }
+      // 与宿主契约一致：返回**与 `[from, total)` 相交的整块**（`chunks` 按偏移序、切点只在块边界），
+      // `next` 是环当前的 `total`。夹具把整份输出当成一块 —— 这正是「一次 append 写了很多字节」
+      // 的形态，也是服务侧即使按尾窗起点读、仍要自己再截一次的原因（块是整块交回的）。
+      // 第一版返回的是从 `from` 处切开的窄块，于是「块比窗口大」这条根本不存在，
+      // `outputOf` 的截尾分支在测试里永远走不到。
       const text = outputs.get(String(id)) ?? "";
+      const overlaps = text.length > 0 && from < text.length;
       return {
-        chunks: [{ at: 0, text }],
-        nextOffset: text.length,
+        chunks: overlaps ? [{ at: 0, text }] : [],
+        next: text.length,
         lossy: false,
-        job: { status: views.get(String(id)) ?? "running" } as JobView,
       };
     },
-    kill: (id: JobId): "requested" => {
+    kill: (id: JobId): "requested" | "already-finished" => {
       if (options.killThrows === true) {
         throw new Error("kill blew up");
+      }
+      // 与宿主一致：对已终态的作业如实回 `already-finished`，且什么都不做
+      // （jobs-local 的 kill 在状态不是 running/stopping 时直接返回这个值）。
+      const current = views.get(String(id)) ?? "running";
+      if (current !== "running" && current !== "stopping") {
+        return "already-finished";
       }
       kills.push(String(id));
       views.set(String(id), "killed");
@@ -213,7 +241,7 @@ function fakeJobs(
     },
   };
   return {
-    registry: options.jobs === false ? undefined : (registry as never),
+    registry: options.jobs === false ? undefined : registry,
     hooks,
     specs,
     views,
@@ -330,6 +358,52 @@ describe("官方 Typert Remote：runtime 服务", () => {
     const status = await serviceOf(ctx).status();
     expect(status.packs.core).toBe("corrupt");
     expect(status.packs.browser).toBe("corrupt");
+  });
+
+  it("state.json 坏成半截 JSON 时读成「都没装」，不让整张卡的安装按钮跟着禁掉", async () => {
+    // `readRuntimeState` 对坏状态文件显式抛 INSTALL_STATE_CORRUPT。让它从 status() 冒出去，
+    // 卡片就收到失败、snapshot 停在 null，而 `src/settings-card.ts` 的
+    // `disabled = busy !== "" || !jobsReady || snapshot === null` 会把四个安装/修复按钮
+    // 全禁掉 —— 恰恰在最需要按它去修的时候不可点。降级成空对象至少还能点安装重来。
+    const dataDir = tempDir();
+    mkdirSync(path.join(dataDir, "runtime"), { recursive: true });
+    writeFileSync(path.join(dataDir, "runtime", MANIFEST_STATE), '{"packs": {"core": ');
+    const ctx = new Context();
+    installRuntimeRemote(ctx, depsOf(dataDir, fakeJobs()));
+    const status = await serviceOf(ctx).status();
+    expect(status.ok).toBe(true);
+    expect(status.packs).toStrictEqual({});
+    expect(status.jobsReady).toBe(true);
+  });
+
+  it("进度写入抛错时安装照旧完成，不被展示面拖成 failed", async () => {
+    // `progress` 回调在 installCapabilityPack 的 await 链里被同步调用，抛出去会一路冒到
+    // `done` 的 catch，把**已经成功**的安装写成 failed。输出环形缓冲读过上限、作业被 kill
+    // 收走都会让 append 抛，那时唯一正确的做法是丢掉这一行的展示。
+    const dataDir = tempDir();
+    const jobs = fakeJobs({ writesThrow: true });
+    const ctx = new Context();
+    installRuntimeRemote(ctx, {
+      ...depsOf(dataDir, jobs),
+      installPackFn: async (pack, options): Promise<void> => {
+        installCoreFiles(dataDir);
+        writeState(dataDir, { core: "ready" });
+        options.onProgress?.(`installing ${pack}`);
+      },
+    });
+    const service = serviceOf(ctx);
+    const started = service.installPack({ pack: CORE });
+    if (!started.ok) {
+      throw new Error(INSTALL_REFUSED);
+    }
+    const hooks = jobs.hooks.get(started.jobId);
+    if (hooks === undefined) {
+      throw new TypeError("job hooks were not recorded");
+    }
+    const outcome = await hooks.done;
+    expect(outcome.status).toBe("completed");
+    const status = await service.status();
+    expect(status.packs.core).toBe("ready");
   });
 
   it("文件齐了就是 ready，解释器按显式配置走", async () => {
@@ -603,6 +677,60 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(service.cancelJob({ jobId: started.jobId })).toMatchObject({ ok: false, status: 503 });
   });
 
+  it("注册表读不出清单时 cancel 报 500，而不是把原始异常甩给卡片", async () => {
+    const jobs = fakeJobs();
+    const realRegistry = jobs.registry;
+    if (realRegistry === undefined) {
+      throw new Error("作业后端没到位");
+    }
+    let broken = false;
+    const ctx = new Context();
+    installRuntimeRemote(
+      ctx,
+      depsOf(tempDir(), jobs, {
+        jobsOf: () => ({
+          ...realRegistry,
+          list: () => {
+            if (broken) {
+              throw new Error("registry store is unreadable");
+            }
+            return realRegistry.list();
+          },
+        }),
+      }),
+    );
+    const service = serviceOf(ctx);
+    const started = service.installPack({ pack: CORE });
+    if (!started.ok) {
+      throw new Error(INSTALL_REFUSED);
+    }
+    broken = true;
+    // 判据是「本包统一的那句 + 500」：让异常直接冒出去的话，卡片拿到的是原始错误串，
+    // 与这张卡其余失败回执的形态不一致。
+    expect(service.cancelJob({ jobId: started.jobId })).toMatchObject({
+      ok: false,
+      status: 500,
+    });
+  });
+
+  it("作业已经结束时 cancel 报 409，不当成取消成功", async () => {
+    const jobs = fakeJobs();
+    const ctx = new Context();
+    installRuntimeRemote(ctx, depsOf(tempDir(), jobs));
+    const service = serviceOf(ctx);
+    const started = service.installPack({ pack: CORE });
+    if (!started.ok) {
+      throw new Error(INSTALL_REFUSED);
+    }
+    // 宿主对终态作业的 kill 回 `already-finished` 且什么都不做（jobs-local 的 kill）。
+    // 把它报成 `{ ok: true }` 会让卡片显示「已取消」，而安装其实以别的结论收场了。
+    jobs.views.set(started.jobId, "completed");
+    const refused = service.cancelJob({ jobId: started.jobId });
+    expect(refused).toMatchObject({ ok: false, status: 409 });
+    // 报完之后这条作业不再被本服务记着：下一次安装不该被一条已结束的作业挡住。
+    expect(service.installPack({ pack: BROWSER }).ok).toBe(true);
+  });
+
   it("state 的 packs 不是对象时按空状态处理", async () => {
     const dataDir = tempDir();
     writeState(dataDir, []);
@@ -651,6 +779,30 @@ describe("官方 Typert Remote：runtime 服务", () => {
     const outcome = await jobs.hooks.get(started.jobId)?.done;
     expect(outcome?.status).toBe("killed");
     expect(outcome?.detail).toContain("cancelled");
+  });
+
+  // 取消的判据有两处：信号被 abort，以及安装器自己抛 `INSTALL_CANCELLED`。后者必须单独
+  // 钉住 —— 只按 `signal.aborted` 判的话，「信号没被 abort 但安装器如实报了取消」会被写成 failed。
+  it("安装器报 INSTALL_CANCELLED 时作业落 killed，不靠信号反推", async () => {
+    const dataDir = tempDir();
+    const jobs = fakeJobs();
+    const ctx = new Context();
+    installRuntimeRemote(
+      ctx,
+      depsOf(dataDir, jobs, {
+        installPackFn: async () => {
+          throw new InstallError("INSTALL_CANCELLED", "install cancelled");
+        },
+      }),
+    );
+    const service = serviceOf(ctx);
+    const started = service.installPack({ pack: CORE });
+    if (!started.ok) {
+      throw new Error(INSTALL_REFUSED);
+    }
+    const outcome = await jobs.hooks.get(started.jobId)?.done;
+    expect(outcome?.status).toBe("killed");
+    expect(outcome?.detail).toBe("cancelled from settings card");
   });
 
   it("作业读数坏掉时 status 不把旧读数当现状", async () => {
@@ -775,6 +927,39 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(status.job?.output.endsWith("TAIL")).toBe(true);
   });
 
+  it("只从尾窗起点读输出，不把整份输出搬一遍", async () => {
+    const jobs = fakeJobs();
+    const realRegistry = jobs.registry;
+    if (realRegistry === undefined) {
+      throw new Error("作业后端没到位");
+    }
+    // 卡片每 2 秒轮询一次，安装是分钟级的：从 0 读等于每次轮询搬一遍整份输出。
+    // 判据落在 readAt 的起点上 —— 只看输出文本的话，从 0 读再截尾结果逐字节相同，
+    // 那条优化整个失效也测不出来。
+    const seen: number[] = [];
+    const ctx = new Context();
+    installRuntimeRemote(ctx, {
+      ...depsOf(tempDir(), jobs),
+      jobsOf: () => ({
+        ...realRegistry,
+        readAt: (id: JobId, from: number) => {
+          seen.push(from);
+          return realRegistry.readAt(id, from);
+        },
+      }),
+    });
+    const service = serviceOf(ctx);
+    const started = service.installPack({ pack: CORE });
+    if (!started.ok) {
+      throw new Error(INSTALL_REFUSED);
+    }
+    jobs.outputs.set(started.jobId, `${"-".repeat(9000)}TAIL`);
+    const status = await service.status();
+    expect(status.job?.output.endsWith("TAIL")).toBe(true);
+    // 9004 个字符（9000 个横线 + TAIL）、尾窗 4000 ⇒ 起点是 5004。
+    expect(seen).toStrictEqual([5004]);
+  });
+
   it("pack 清单覆盖计划里的六个包", () => {
     expect([...RUNTIME_PACKS]).toStrictEqual([
       CORE,
@@ -794,7 +979,7 @@ function namespaceStub(overrides: Record<string, unknown> = {}): Record<string, 
       value: {
         ok: true,
         packs: {},
-        python: { path: "/usr/bin/python3", via: "PATH", version: "3.14" },
+        python: { path: "/usr/bin/python3", via: "path", version: "3.14" },
         dataDir: "/tmp/scrapling",
         jobsReady: true,
         job: null,
@@ -970,6 +1155,65 @@ describe("客户端读取器", () => {
     expect(packParser.parse({ pack: CORE })).toStrictEqual({ pack: CORE });
   });
 
+  it("失败回执没带 error 字段时给出占位码，而不是崩在读属性上", async () => {
+    // `RemoteResult` 的类型把 failure 分支的 `error` 写成必填，但类型只在编译期成立：
+    // 网关另一侧可能是别的版本、可能被中间层改写。直接读 `result.error.code` 会在这种回包上
+    // 抛 `Cannot read properties of undefined`，把「对端答了坏包」伪装成客户端崩溃。
+    const reader = createRuntimeReader(
+      hostOf({ namespace: namespaceStub({ cancelJob: async () => ({ ok: false }) }) }).host,
+    );
+    if (reader === undefined) {
+      throw new TypeError(READER_MISSING);
+    }
+    await expect(reader.cancel("job-1")).rejects.toThrow(/REMOTE_BAD_ENVELOPE/u);
+  });
+
+  it("失败回执的 error 字段是对象但内容不合法时，逐位退回占位值", async () => {
+    // `{ ok: false, error: 有对象 }` 只保证形状像回执，不保证 `code` / `message` 的类型。
+    // 空 code 拼进异常信息会得到一句只剩冒号的话；非字符串 message 更会把 `[object Object]`
+    // 塞给模型。所以两格各自退回占位值，而不是信类型声明。
+    const reader = createRuntimeReader(
+      hostOf({
+        namespace: namespaceStub({
+          cancelJob: async () => ({ ok: false, error: { code: "", message: 42 } }),
+        }),
+      }).host,
+    );
+    if (reader === undefined) {
+      throw new TypeError(READER_MISSING);
+    }
+    await expect(reader.cancel("job-1")).rejects.toThrow(/^REMOTE_BAD_ENVELOPE: $/u);
+  });
+
+  it("命名空间那一拍取不到时也清缓存，下一次调用会重挂而不是永久卡死", async () => {
+    // 挂载 resolve 了但这枚命名空间取不到（网关重启后命名空间被摘掉、服务注册滞后一拍、
+    // 或 `isNamespace` 因方法缺失判假）。不清 `mounted` 的话，此后每次调用都跳过挂载、
+    // 复现同一条「未提供」错误 —— 读取器永久卡死，用户只能刷新页面。
+    let mounts = 0;
+    let namespaceAvailable = false;
+    const host: RemoteHost = {
+      get: (name: string): unknown => {
+        if (name === "remote") {
+          return {
+            $mount: async (): Promise<unknown> => {
+              mounts += 1;
+              return { mounted: true };
+            },
+          };
+        }
+        return namespaceAvailable ? namespaceStub() : null;
+      },
+    };
+    const reader = createRuntimeReader(host);
+    if (reader === undefined) {
+      throw new TypeError(READER_MISSING);
+    }
+    await expect(reader.status()).rejects.toThrow(/未提供/u);
+    namespaceAvailable = true;
+    await expect(reader.status()).resolves.toMatchObject({ job: null });
+    expect(mounts, "第二次调用应当重新走一遍 $mount，而不是复用那条已 resolve 的 promise").toBe(2);
+  });
+
   it("回包不是信封形状时判协议错误，而不是崩在读属性上", async () => {
     // `result.ok` / `result.error.code` 都不做非空检查：网关交回 undefined 或一条字符串时，
     // 症状会变成 `Cannot read properties of undefined`，读不出「哪一侧的协议坏了」。
@@ -980,5 +1224,33 @@ describe("客户端读取器", () => {
     await expect(reader?.status() ?? Promise.reject(new Error("no reader"))).rejects.toThrow(
       /malformed envelope/u,
     );
+  });
+
+  it("坏回包有循环引用时也能把话说完，不换成 JSON.stringify 自己的报错", async () => {
+    // 回包里有循环引用时 `JSON.stringify` 自己抛 `TypeError: Converting circular structure
+    // to JSON`，把「对端答了坏包」的协议语义整个换掉；回包很大时还会把整份载荷塞进错误文案，
+    // 而卡片是 `setFailure(String(error))` 原样渲染。
+    const cyclic: Record<string, unknown> = { ok: "yes" };
+    cyclic["self"] = cyclic;
+    const reader = createRuntimeReader(
+      hostOf({ namespace: namespaceStub({ status: async () => cyclic as never }) }).host,
+    );
+    if (reader === undefined) {
+      throw new TypeError(READER_MISSING);
+    }
+    await expect(reader.status()).rejects.toThrow(/malformed envelope: \{ ok, self \}/u);
+  });
+
+  it("回包是空对象时把话说完（不把整份载荷塞进错误文案）", async () => {
+    // `describeEnvelope` 的 `keys.length === 0` 支：空对象本身没有可列的键，印 `{}` 比印空串
+    // 清楚。这一支与「有键」那支只差 listEnvelope 的一句拼装，但两者都会进
+    // `setFailure(String(error))`，缺了它就只能看到 `malformed envelope: ` 后面什么都没有。
+    const reader = createRuntimeReader(
+      hostOf({ namespace: namespaceStub({ status: async () => ({}) as never }) }).host,
+    );
+    if (reader === undefined) {
+      throw new TypeError(READER_MISSING);
+    }
+    await expect(reader.status()).rejects.toThrow(/malformed envelope: \{\}/u);
   });
 });

@@ -37,21 +37,41 @@ import {
   InstallError,
   packStates,
   readRuntimeState,
-  relocateScripts,
+  rewriteShebangs,
+  runOnce,
   repairCapabilityPack,
   uninstallCapabilityPack,
   withInstallLock,
 } from "../lib/installer.ts";
-import type { InstallerIO, SpawnResult } from "../lib/installer.ts";
+import type { InstallerIO, NativeLock, SpawnResult } from "../lib/installer.ts";
 import { managedPythonPath, runtimeManifest } from "../lib/runtime.ts";
 
 // 还原阶段的 rename 会被单独打开：只有「从 .tmp/venv-previous-* 出发」的那一次失败，
 // 其余文件操作全走真实实现。判的是「还原失败时旧 venv 不被收尾清理删掉」。
-const renameGate = vi.hoisted(() => ({ failRestore: false }));
+const renameGate = vi.hoisted(() => ({ failRestore: false, failCopy: false }));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
+    cp: async (
+      from: Parameters<typeof actual.cp>[0],
+      to: Parameters<typeof actual.cp>[1],
+      options?: Parameters<typeof actual.cp>[2],
+    ) => {
+      // 只打开「数字签名过了、解释器还没落地」的那一次拷贝：判的是暂存目录会被清掉、
+      // 托管位置不留下半份（原先先 rm 再 cp，这一步失败就是两头空）。
+      //
+      // 失败前先真的把目标目录建出来并写一份文件：裸 `throw` 时 cp 一个字节都没写，
+      // 「没有 .new-* 残留」这句话在**清理逻辑整段被删掉**时照样成立（变异实测：去掉 catch
+      // 里那句 rm，这条用例仍然全绿）。半份目录在场，才轮到清理那一支说话。
+      if (renameGate.failCopy && String(to).includes(".new-")) {
+        const staging = String(to);
+        await actual.mkdir(staging, { recursive: true });
+        await actual.writeFile(path.join(staging, "half-copied-python"), "partial\n");
+        throw new Error("simulated copy failure");
+      }
+      await actual.cp(from, to, options);
+    },
     rename: async (
       from: Parameters<typeof actual.rename>[0],
       to: Parameters<typeof actual.rename>[1],
@@ -89,7 +109,7 @@ function drainCreatedDirs(): void {
 async function stagePythonBin(destination: string): Promise<void> {
   const bin = path.join(destination, "python", "bin");
   await mkdir(bin, { recursive: true });
-  await writeFile(path.join(bin, "python3"), "#!/bin/sh\n");
+  await writeFile(path.join(bin, "python3"), "#!/bin/sh\n", { mode: 0o755 });
 }
 
 const MANAGED_PYTHON = "/managed/python3";
@@ -179,7 +199,10 @@ function venvSpawner(calls: string[][], pip: SpawnResult): InstallerIO["spawn"] 
     if (argv.includes("venv")) {
       const target = argv.at(-1) ?? "";
       mkdirSync(path.join(target, "bin"), { recursive: true });
-      writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n");
+      // 真 venv 的解释器是可执行的；这里给 0755，因为 `packStates` 用的判据现在与
+      // `resolveRuntime` 同源（`executable()`：普通文件 + 可执行位）。造一份 0644 的
+      // 假解释器会让「装好了」被读成「没装/坏了」。
+      writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n", { mode: 0o755 });
       return { code: 0, stdout: "", stderr: "" };
     }
     return pip;
@@ -262,6 +285,30 @@ describe("defaultInstallerIO", () => {
     } finally {
       await closeHttpServer(server);
     }
+  });
+
+  // 兜底超时：不结束的子进程必须被掐掉。判据是「拿到回执」而不是「等它自然结束」——
+  // 卡住与失败在界面上是两回事，卡住更难自查（安装界面停在 installing，用户没有出路）。
+  it("子进程不结束时报一条失败回执，而不是永远挂着", async () => {
+    const started = Date.now();
+    const result = await runOnce([process.execPath, "-e", "setInterval(() => {}, 1000);"], {
+      timeoutMs: 200,
+    });
+    expect(result.code).toBeNull();
+    expect(result.stderr).toContain("200ms");
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
+  // 输出封顶：`pip install` 失败时能刷出几 MB，而调用方只取前 400 字符做归因。
+  it("子进程输出超过上限时截尾并留标记", async () => {
+    const result = await runOnce([
+      process.execPath,
+      "-e",
+      "process.stdout.write('x'.repeat(200 * 1024));",
+    ]);
+    expect(result.code).toBe(0);
+    expect(result.stdout.length).toBeLessThan(70 * 1024);
+    expect(result.stdout).toContain("后续内容已丢弃");
   });
 
   it("spawn 收 stdout/stderr 与退出码，extract 解 tar 且坏包报 INSTALL_FAILED", async () => {
@@ -412,7 +459,7 @@ describe("installPython", () => {
       extract: async (_archive, destination) => {
         const bin = path.join(destination, "bin");
         await mkdir(bin, { recursive: true });
-        await writeFile(path.join(bin, "python3"), "#!/bin/sh\n");
+        await writeFile(path.join(bin, "python3"), "#!/bin/sh\n", { mode: 0o755 });
       },
     });
     const result = await installPython(asset, dataDir, io);
@@ -428,7 +475,7 @@ describe("installPython", () => {
       extract: async (_archive, destination) => {
         const bin = path.join(destination, "python", "bin");
         await mkdir(bin, { recursive: true });
-        await writeFile(path.join(bin, "python3.14"), "#!/bin/sh\n");
+        await writeFile(path.join(bin, "python3.14"), "#!/bin/sh\n", { mode: 0o755 });
         await symlink("python3.14", path.join(bin, "python3"));
       },
     });
@@ -437,6 +484,56 @@ describe("installPython", () => {
     expect(info.isSymbolicLink()).toBe(false);
     expect(existsSync(result.pythonPath)).toBe(true);
     expect(existsSync(path.join(dataDir, "runtime", ".tmp"))).toBe(false);
+  });
+
+  // 落盘位置由清单版本决定（`managedPythonPath` 读它），而版本却能从入参来。两者脱钩时
+  // 归档会被解到清单版本的目录、返回值却报另一个版本：版本说一套、文件在另一套，
+  // `ensurePython` 再查清单路径就会重复下载。这条判据把两处钉在一起。
+  it("入参版本与清单不一致时拒绝落盘", async () => {
+    const dataDir = tempDir();
+    const bytes = new TextEncoder().encode("archive");
+    const asset = {
+      ...runtimeManifest.darwinArm64,
+      pythonVersion: "9.9.9",
+      sha256: sha256(bytes),
+    };
+    const io = fakeIO({
+      download: async () => bytes,
+      extract: async (_archive, destination) => {
+        await stagePythonBin(destination);
+      },
+    });
+    const error = await installPython(asset, dataDir, io).catch((error_: unknown) => error_);
+    expect((error as InstallError).code).toBe("INSTALL_FAILED");
+    expect((error as Error).message).toContain("9.9.9");
+    expect(existsSync(managedPythonPath(dataDir))).toBe(false);
+  });
+
+  // 落盘是「先解到暂存名、再 rename 换上去」。拷贝这一步失败时必须把暂存目录清掉：
+  // 留下来的 `.new-*` 是半份解释器，谁也不会再管它，而托管位置仍是上一版（或空着）。
+  it("拷贝失败时清掉暂存目录，托管位置不留半份", async () => {
+    const dataDir = tempDir();
+    const bytes = new TextEncoder().encode("archive");
+    const asset = { ...runtimeManifest.darwinArm64, sha256: sha256(bytes) };
+    const io = fakeIO({
+      download: async () => bytes,
+      extract: async (_archive, destination) => {
+        await stagePythonBin(destination);
+      },
+    });
+    renameGate.failCopy = true;
+    try {
+      const error = await installPython(asset, dataDir, io).catch((error_: unknown) => error_);
+      expect((error as Error).message).toContain("simulated copy failure");
+    } finally {
+      renameGate.failCopy = false;
+    }
+    expect(existsSync(managedPythonPath(dataDir))).toBe(false);
+    // 暂存名是 `<.../runtime/python/<ver>>.new-<uuid>`，所以残留只可能落在 <dataDir>/runtime/python 里。
+    // 这里刻意按目录字面量取、不从 managedPythonPath 数 dirname 层数：层数写错时 dirname 会静默
+    // 返回一个同样合法但不相干的目录（实测写成两级时读的是 <ver> 目录本身，ENOENT 掩盖了判据）。
+    const installRoot = path.join(dataDir, "runtime", "python");
+    expect(readdirSync(installRoot).filter((name) => name.includes(".new-"))).toStrictEqual([]);
   });
 
   it("归档里没有解释器时报 INSTALL_FAILED", async () => {
@@ -571,12 +668,55 @@ describe("installPython", () => {
 });
 
 describe("withInstallLock", () => {
-  it("同一进程可重入：内层不再取同一把锁", async () => {
+  it("同一调用链可重入：内层不再取同一把锁", async () => {
     const dataDir = tempDir();
     const result = await withInstallLock(dataDir, () =>
       withInstallLock(dataDir, async () => "nested"),
     );
     expect(result).toBe("nested");
+  });
+
+  // 重入判据必须是「这条异步链路已持锁」，不能是「进程里有人在持锁」：后者会把并发的
+  // 第二条安装放进来，两条一起改同一份 venv 与 state.json —— 而那正是这把锁要挡的事。
+  it("同进程的并发调用拿不到锁（并发不是重入）", async () => {
+    const dataDir = tempDir();
+    const release = Promise.withResolvers<undefined>();
+    const entered = Promise.withResolvers<undefined>();
+    const holding = withInstallLock(dataDir, async () => {
+      entered.resolve(undefined);
+      await release.promise;
+      return "first";
+    });
+    // 等第一条真的进到锁内（不是睡一个猜出来的时长）：进到 `work` 里就说明 OS 锁已在手。
+    await entered.promise;
+    const second = await withInstallLock(dataDir, async () => "second").catch(
+      (error_: unknown) => error_,
+    );
+    expect((second as InstallError).code).toBe("INSTALL_BUSY");
+    release.resolve(undefined);
+    await expect(holding).resolves.toBe("first");
+  });
+
+  // `lockFd` 抛的是「锁不可读」而不是「锁被占」，句柄那时已经开了：不关就每次失败漏一个 fd，
+  // 反复重试会把进程 fd 用尽，之后所有安装都以 EMFILE 失败，而报错说的是锁不可读。
+  it.skipIf(process.platform === "win32")("加锁失败不漏 fd（反复重试也不会耗尽）", async () => {
+    const dataDir = tempDir();
+    await mkdir(path.join(dataDir, "runtime"), { recursive: true });
+    const lockPath = path.join(dataDir, "runtime", INSTALL_LOCK);
+    const broken: NativeLock = {
+      tryLock: () => {
+        throw new Error("native module exploded");
+      },
+      unlock: (fd) => {
+        void fd;
+      },
+    };
+    const before = readdirSync("/dev/fd").length;
+    // 二十次串够看漏不漏：一次失败漏一个 fd，二十次就是二十个。
+    await Promise.all(
+      Array.from({ length: 20 }, () => acquireLock(lockPath, broken).catch(() => null)),
+    );
+    expect(readdirSync("/dev/fd").length - before).toBeLessThanOrEqual(1);
   });
 
   // spec §11.6：「runtime 目录 0700」。取锁是建 runtime 目录最常见的入口，量这一条即可
@@ -848,6 +988,31 @@ describe("installCore", () => {
 
   // movedAside 之后任何一步失败都不能让用户装好的环境消失或留成半成品：旧 venv 必须搬回来。
   // 这里让 state.json 被目录占住，使 readRuntimeState 在换装完成之后炸在回滚分支上。
+  it("pip 打印的索引地址里的凭据不进错误文案", async () => {
+    // 用户在企业镜像里把 token 写进 PIP_INDEX_URL 是常规做法，而 spawn 把父进程的环境
+    // 原样传下去。pip 失败时会把索引地址打回 stderr —— 实测三种形态里两种是明文
+    // （`WARNING: The index url … seems invalid` 与 `InvalidURL: …`）。这条 stderr 截断
+    // 400 字符后进 InstallError 的消息、再进作业输出与模型上下文，所以闸门要在文案之前。
+    const leaked = [
+      'WARNING: The index url "ht!tp://user:SECRETTOKEN123@mirror.invalid/simple" seems invalid',
+      "pip._vendor.requests.exceptions.InvalidURL: Invalid URL 'https://user:SECRETTOKEN123@/requests/': No host supplied",
+    ].join("\n");
+    const error = await installCore({
+      pythonPath: MANAGED_PYTHON,
+      dataDir: tempDir(),
+      repoRoot: requirementsRepoRoot(),
+      io: fakeIO({
+        spawn: venvSpawner([], { code: 1, stdout: "", stderr: leaked }),
+      }),
+    }).catch((error_: unknown) => error_);
+    const { message, code } = error as InstallError;
+    expect(message).not.toContain("SECRETTOKEN123");
+    expect(message).toContain("***@mirror.invalid");
+    // 脱敏不能把诊断本身抹掉：`INSTALL_FAILED` 那一支把 stderr 原文带下去，失败原因仍要读得出来。
+    expect(message).toContain("seems invalid");
+    expect(code).toBe("INSTALL_FAILED");
+  });
+
   it("换装失败时把旧 venv 还原并清掉半成品", async () => {
     const dataDir = tempDir();
     const runtimeDir = path.join(dataDir, "runtime");
@@ -904,7 +1069,7 @@ describe("installCore", () => {
         if (argv.includes("venv")) {
           const target = argv.at(-1) ?? "";
           mkdirSync(path.join(target, "bin"), { recursive: true });
-          writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n");
+          writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n", { mode: 0o755 });
           return { code: 0, stdout: "", stderr: "" };
         }
         // pip 报成功，却把暂存 venv 弄没了：随后 rename 到最终位置必然失败。
@@ -938,7 +1103,7 @@ describe("installCore", () => {
         if (argv.includes("venv")) {
           const target = argv.at(-1) ?? "";
           mkdirSync(path.join(target, "bin"), { recursive: true });
-          writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n");
+          writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n", { mode: 0o755 });
           return { code: 0, stdout: "", stderr: "" };
         }
         // pip 报成功却把暂存 venv 弄没了：rename(staging, venv) 必然失败，
@@ -1065,7 +1230,7 @@ describe("installCore", () => {
     expect((error as InstallError).code).toBe("INSTALL_HASH_MISMATCH");
   });
 
-  it("relocateScripts 只改指向暂存目录的 shebang，认不出的一律不动", async () => {
+  it("rewriteShebangs 只改指向暂存目录的 shebang，认不出的一律不动", async () => {
     const venv = tempDir();
     const staging = path.join(venv, "..", "staging-dir");
     const bin = path.join(venv, "bin");
@@ -1073,17 +1238,17 @@ describe("installCore", () => {
     writeFileSync(path.join(bin, "moved"), `#!${staging}/bin/python3\nprint(1)\n`);
     writeFileSync(path.join(bin, "keep"), "#!/usr/bin/env python3\nprint(2)\n");
     writeFileSync(path.join(bin, "binfile"), "\u0000\u0001binary");
-    await relocateScripts(venv, staging);
+    await rewriteShebangs(venv, staging, venv);
     expect(readFileSync(path.join(bin, "moved"), "utf8")).toBe(`#!${venv}/bin/python3\nprint(1)\n`);
     expect(readFileSync(path.join(bin, "keep"), "utf8")).toBe("#!/usr/bin/env python3\nprint(2)\n");
     expect(readFileSync(path.join(bin, "binfile"), "utf8")).toBe("\u0000\u0001binary");
 
     // 没有 bin 目录时安静收工；单行 shebang 没有换行也要改对。
-    await expect(relocateScripts(tempDir(), staging)).resolves.toBeUndefined();
+    await expect(rewriteShebangs(tempDir(), staging, tempDir())).resolves.toBeUndefined();
     const single = tempDir();
     mkdirSync(path.join(single, "bin"), { recursive: true });
     writeFileSync(path.join(single, "bin", "only"), `#!${staging}/bin/python3`);
-    await relocateScripts(single, staging);
+    await rewriteShebangs(single, staging, single);
     expect(readFileSync(path.join(single, "bin", "only"), "utf8")).toBe(`#!${single}/bin/python3`);
   });
 
@@ -1104,7 +1269,7 @@ describe("installCore", () => {
       }
       return readFile(file, "utf8");
     };
-    await relocateScripts(venv, staging, readScript);
+    await rewriteShebangs(venv, staging, venv, readScript);
     expect(readFileSync(locked, "utf8")).toContain(staging);
     expect(readFileSync(readable, "utf8")).toContain(`${venv}/bin/python3`);
   });
@@ -1218,13 +1383,13 @@ const REDIS_PACK = "adaptive-redis";
 
 function fakeExecutable(file: string): void {
   mkdirSync(path.dirname(file), { recursive: true });
-  writeFileSync(file, "#!/bin/sh\n");
+  writeFileSync(file, "#!/bin/sh\n", { mode: 0o755 });
 }
 
 function readyCore(dataDir: string): void {
   const bin = path.join(dataDir, "runtime", "venv", "bin");
   mkdirSync(bin, { recursive: true });
-  writeFileSync(path.join(bin, "python3"), "#!/bin/sh\n");
+  writeFileSync(path.join(bin, "python3"), "#!/bin/sh\n", { mode: 0o755 });
 }
 
 function packSpawner(): InstallerIO["spawn"] {
@@ -1232,7 +1397,7 @@ function packSpawner(): InstallerIO["spawn"] {
     if (argv.includes("venv")) {
       const target = argv.at(-1) ?? "";
       mkdirSync(path.join(target, "bin"), { recursive: true });
-      writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n");
+      writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n", { mode: 0o755 });
       return { code: 0, stdout: "", stderr: "" };
     }
     if (argv.includes("patchright")) {
@@ -1435,7 +1600,7 @@ describe("installCapabilityPack", () => {
       io: fakeIO(),
       signal: AbortSignal.abort(),
     }).catch((error_: unknown) => error_);
-    expect((error as InstallError).code).toBe("INSTALL_FAILED");
+    expect((error as InstallError).code).toBe("INSTALL_CANCELLED");
   });
 
   it("repair 与 install 是同一个入口，且能把 corrupt 修成 ready", async () => {

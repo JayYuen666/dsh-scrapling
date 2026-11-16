@@ -119,15 +119,29 @@ describe("client.js 的 ModuleLoader 外壳", () => {
     expect(code).toMatch(/factory: \(require\) => \{\n\s*"use strict";/u);
   });
 
-  it("产物运行期只解析平台模块（其余依赖一律内联）", async () => {
+  it("产物运行期只解析平台模块与 shared 供应行（其余依赖一律内联）", async () => {
     const code = await buildClient();
     const specs = Array.from(
-      code.matchAll(/require\("(?<spec>[^"]+)"\)/gu),
+      code.matchAll(/require\((?<quote>["'`])(?<spec>.*?)\k<quote>\)/gu),
       (match) => match.groups?.["spec"] ?? "",
     );
-    // shared 的客户端代码已收回内联（dsh-ocr-review 仓 issue #2：对它的外部化请求要靠
-    // 另一份包被装载成模块表条目才兑现，传递依赖安装形状下宿主可能不排进启动图）。
-    expect([...new Set(specs)].toSorted()).toStrictEqual(["react", "zod"]);
+    // shared 的客户端行由 patch 的无 id 供应行提供；其余依赖仍内联。
+    expect([...new Set(specs)].toSorted()).toStrictEqual([
+      "@jayyuen66/dsh-plugin-shared/client",
+      "react",
+      "zod",
+    ]);
+  });
+
+  it("外部化清单按包名段覆盖整个 react 家族，而不是只写 react 一项", async () => {
+    const { RUNTIME_EXTERNALS } = await import("../build-client.ts");
+    // 字符串项是精确匹配：只写 "react" 时 react/jsx-runtime 会被内联，宿主与产物各持一份
+    // React 实例（hook 报 Invalid hook call）而构建照样成功退出。清单本身不可能被产物反证
+    // ——产物此刻只 require react 与 zod —— 所以这条断言直接钉清单。
+    expect(RUNTIME_EXTERNALS).toContain("react/jsx-runtime");
+    expect(RUNTIME_EXTERNALS).toContain("react-dom/client");
+    expect(RUNTIME_EXTERNALS).toContain("zod");
+    expect(RUNTIME_EXTERNALS).toContain("@jayyuen66/dsh-plugin-shared");
   });
 
   it("用假 require 执行 factory 后，exports 上是可运行的 apply 与宿主装配清单 inject", async () => {
@@ -165,6 +179,9 @@ function tempPackageWithName(name: unknown): string {
   return tempPackageRoot(JSON.stringify({ name }));
 }
 
+const SCOPED_NAME = "@scope/pkg";
+const PADDED_SCOPED_NAME = ` ${SCOPED_NAME} `;
+
 describe("clientModuleId（外壳 id 的判据）", () => {
   afterAll(() => {
     for (const dir of created) {
@@ -178,8 +195,17 @@ describe("clientModuleId（外壳 id 的判据）", () => {
     }).toThrow(/missing a non-empty `name`/u);
   });
 
-  it("name 两侧的空白去掉之后才是 外壳 id", () => {
-    expect(clientModuleId(tempPackageWithName(" @scope/pkg "))).toBe("@scope/pkg");
+  it("name 两侧带空白时点名，而不是交回一个 trim 过的 id", () => {
+    // 宿主模块表的键取自 package.json 原值：trim 过的 id 在 name 带空白时与它不相等，
+    // 卡片会整块渲染不出来而构建照样成功 —— 属于「把失败推迟到运行期」，所以直接拒。
+    const padded = PADDED_SCOPED_NAME;
+    expect(() => {
+      clientModuleId(tempPackageWithName(padded));
+    }).toThrow(/leading or trailing whitespace/u);
+  });
+
+  it("原样的 name 才是 外壳 id（不 trim，逐字对应宿主的模块表键）", () => {
+    expect(clientModuleId(tempPackageWithName(SCOPED_NAME))).toBe(SCOPED_NAME);
   });
 
   it("name 缺失时点名，而不是回退占位符", () => {

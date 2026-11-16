@@ -142,6 +142,15 @@ describe("officialMcpPlan", () => {
     expect(plan.patch).toContain("- insert:");
     expect(plan.patch).toContain("'@deepseek-ai/dsh-mcp-client'");
     expect(plan.patch).toContain("transport: stdio");
+    // patch 里的 args 必须由 plan.args 派生：两处各写一份字面量时，官方 server 一旦要参数，
+    // 改一处就与另一处漂移，而 patch 才是用户真正应用的那份。
+    expect(plan.patch).toContain(`        args: ${JSON.stringify(plan.args)}`);
+  });
+
+  it("dataDir 不是绝对路径时拒绝：相对路径会被宿主按它自己的 cwd 解析", () => {
+    const error = failure({ dataDir: "relative/data", enabled: true, acceptedRisk: true });
+    expect(error.code).toBe("OFFICIAL_MCP_DATA_DIR");
+    expect(error.message).toContain("relative/data");
   });
 
   it("没开 officialMcpEnabled 时拒绝，并点名缺哪一项", () => {
@@ -216,6 +225,21 @@ describe("官方条目的 command 标量", () => {
     expect(read.command).toBe(plan.command);
   });
 
+  it(String.raw`U+2028 / U+2029 也走转义（YAML 把它们当换行，双引号标量里会被折成空格）`, () => {
+    // 这两枚不属于 \u007F-\u009F，会原样落进双引号标量；而 YAML 1.1 与 js-yaml 的 is_EOL
+    // 把 NEL、LS、PS 都当换行 ⇒ 解析出的 command 与 plan.command 不一致。
+    const separators = String.fromCodePoint(0x20_28) + String.fromCodePoint(0x20_29);
+    const plan = officialMcpPlan({
+      dataDir: `/tmp/ls${separators}ps`,
+      enabled: true,
+      acceptedRisk: true,
+    });
+    const read = readPatch(plan.patch);
+    expect(read.rawCommand).toContain(String.raw`\u2028`);
+    expect(read.rawCommand).toContain(String.raw`\u2029`);
+    expect(read.command).toBe(plan.command);
+  });
+
   it(String.raw`转义集合的四个端点（\u0000、\u001F、\u007F、\u009F）也走转义`, () => {
     // 这四枚是字符类 [\u0000-\u001F\u007F-\u009F] 的边界。只测中间的 \u0001 时，把类别
     // 写成 \u0001-\u001E 这种「少掉端点」的坏法不会有任何用例红；而控制字符即便原样写进
@@ -242,6 +266,13 @@ describe("officialMcpHint", () => {
     const hint = officialMcpHint(true);
     expect(hint).toContain("--accept-risk");
     expect(hint).toContain("browser_evaluate");
+  });
+
+  it("两条指路都带 --profile：漏了它的命令按下去必然落进 OFFICIAL_MCP_DISABLED", () => {
+    // 那条开关只从 profile 的 cordis.patch.yml 读（lib/cli.ts 的 setupMode：不带 --profile 时
+    // enabled 恒 false）。所以指路文案漏 --profile 就是给一条必然失败的命令。
+    expect(officialMcpHint(true)).toContain("setup --profile ");
+    expect(officialMcpHint(false)).toContain("setup --profile ");
   });
 
   it("没开时只指那一枚开关，不提风险细节", () => {

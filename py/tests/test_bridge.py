@@ -125,8 +125,8 @@ passes = 0
 # 下限分两档，档位由「这台机器能不能真起一次浏览器」决定：没有二进制时，依赖浏览器的那几节
 # 整段不参与（实测差 57 条），那不是静默消失。只写一档的后果实测过——该仓 CI 刻意不装浏览器，
 # 于是门禁红在环境上，红完读者先去怀疑代码。两档各自钉死、都只禁下降。
-MIN_CHECKS_WITH_BROWSER = 1052
-MIN_CHECKS_WITHOUT_BROWSER = 969
+MIN_CHECKS_WITH_BROWSER = 1066
+MIN_CHECKS_WITHOUT_BROWSER = 983
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -317,6 +317,11 @@ class Sidecar:
 _SEQ_COUNTER = [0]
 _SEQ_LOCK = threading.Lock()
 
+# 后端上限那两条用例要看到「请求里到底发了什么」：桩回固定载荷时，只有记下这次请求的
+# 查询串/请求体才能判出 count 与 max_results 被夹到了多少。
+_SEEN_LIMITS: list[dict[str, Any]] = []
+_SEEN_LOCK = threading.Lock()
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     """只回 SPA 骨架页；其余路径回一张占位图片；写方法把请求本身回显成 JSON。"""
@@ -377,11 +382,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route == "/bingjunk":
             self._send(BING_JUNK_HTML, "text/html; charset=utf-8")
             return
-        if route == "/brave":
+        if route in ("/brave", "/braveecho"):
+            if route == "/braveecho":
+                with _SEEN_LOCK:
+                    _SEEN_LIMITS.append({"backend": "brave", "query": dict(parse_qsl(self.path.partition("?")[2]))})
             self._send(BRAVE_PAYLOAD, "application/json")
             return
         if route == "/brave401":
             self.send_response(401)
+            self.end_headers()
+            return
+        if route in ("/searxng403", "/searxng403/search"):
+            # SearXNG 的端点一律带 `/search` 尾巴，所以这两条都要认。
+            self.send_response(403)
             self.end_headers()
             return
         if route in ("/searxng", "/searxng/search"):
@@ -445,7 +458,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route == "/api/data":
             self._send(XHR_PAYLOAD, "application/json", {"Set-Cookie": "sid=secret"})
             return
-        if route == "/tavily":
+        if route in ("/tavily", "/tavilyecho"):
+            if route == "/tavilyecho":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length).decode(errors="replace") if length else ""
+                with _SEEN_LOCK:
+                    _SEEN_LIMITS.append({"backend": "tavily", "body": json.loads(raw or "{}")})
             self._send(TAVILY_PAYLOAD, "application/json")
             return
         if route == "/serper":
@@ -1991,8 +2009,10 @@ def run_session_page_units() -> None:
     check("include_metadata 带出 metadata", isinstance(with_meta.get("metadata"), dict), repr(sorted(with_meta)))
     closed_info = _UnitPageInfo(_UnitPage(closed=True))
     closed_pool = _UnitPool([closed_info])
+    # 页已关闭用 PAGE_CLOSED 而不是 PAGE_BUSY：这一页紧接着会被摘出池子，按「retry shortly」
+    # 重试只会拿到 NO_CURRENT_PAGE —— 错误码与重试提示互相打架。
     expect_error(
-        "PAGE_BUSY",
+        "PAGE_CLOSED",
         lambda: session_page.read_current_page(
             _UnitSession(closed_pool),
             extraction_type="text",
@@ -2019,6 +2039,50 @@ def run_session_page_units() -> None:
         repr(run)[:160],
     )
     check("slowly 在动作之间等一拍", "wait_time:100" in actions_page.calls, repr(actions_page.calls))
+
+    # 终页那两项是纯展示字段：最后一条动作关窗或页崩溃时 `title()` 会抛 TargetClosedError，
+    # 而那时动作其实全做成了 —— 不能把整批成果连同一句内部异常一起丢掉。
+    class _VanishingPage(_UnitPage):
+        def title(self) -> str:
+            raise RuntimeError("Target page, context or browser has been closed")
+
+        @property
+        def url(self) -> str:
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    vanished = session_page.run_actions(
+        _UnitSession(_UnitPool([_UnitPageInfo(_VanishingPage())])),
+        actions=[{"type": "wait_time", "ms": 1}],
+        slowly=False,
+        max_actions=5,
+        timeout_ms=1_000,
+    )
+    check(
+        "终页信息读不到时批次照旧报完成数",
+        vanished["completed"] == 1 and vanished["finalUrl"] == "" and vanished["title"] == "",
+        repr(vanished)[:160],
+    )
+
+    # 页在读取中途被关掉：`content()` 抛的是 Playwright 的关闭错误，归成 PAGE_CLOSED 而不是
+    # 漏一个内部异常给宿主。
+    class _ClosingPage(_UnitPage):
+        def content(self) -> str:
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    closing_pool = _UnitPool([_UnitPageInfo(_ClosingPage())])
+    expect_error(
+        "PAGE_CLOSED",
+        lambda: session_page.read_current_page(
+            _UnitSession(closing_pool),
+            extraction_type="text",
+            css_selector=None,
+            main_content_only=False,
+            max_content_chars=1_000,
+            include_metadata=False,
+            strip_inline_images=False,
+        ),
+    )
+    check("读正文失败也要把页还给池子", closing_pool.pages[0].ready is True, repr(closing_pool.pages[0].ready))
     failing_page = _UnitPage()
     failing_page.matches = 0
 
@@ -2063,6 +2127,45 @@ def run_session_page_units() -> None:
     invalid({"type": "move", "target": ""}, "move 的空 target 在预校验拒掉")
     invalid({"type": "press_key", "key": ""}, "press_key 的空 key 在预校验拒掉")
     invalid({"type": "checkbox", "target": "#c", "checked": "false"}, "checkbox 的非布尔 checked 在预校验拒掉")
+    # wait_time 无上界时模型可以要几个小时，把整批动作与 page pool 的槽位一起占死；
+    # 上界 60s 与单条动作的超时同量级。
+    invalid({"type": "wait_time", "ms": 60_001}, "wait_time 超过 60s 在预校验拒掉")
+    # bool 是 int 的子类：`{"x": true}` 会被 `float()` 静默变成 1.0，等于替调用方做了一次带
+    # 副作用的鼠标位移。坐标与滚轮位移都要按「真数字」判。
+    invalid({"type": "move", "x": True, "y": 2}, "move 的 bool 坐标在预校验拒掉")
+    invalid({"type": "wheel", "deltaX": True, "deltaY": 0}, "wheel 的 bool 位移在预校验拒掉")
+    check(
+        "move 的真数字坐标仍然放行",
+        session_page._validate_actions([{"type": "move", "x": 1.5, "y": 2}], 5)[0]["x"] == 1.5,
+    )
+
+    # 摘 dialog 处理器时单条抛错不能挡住 _finish_page（那一句才把页还给池子），
+    # 否则页面永久 PAGE_BUSY、后续请求全被拒。
+    class _RefusingPage(_UnitPage):
+        def remove_listener(self, event: str, handler: Any) -> None:
+            raise RuntimeError("remove_listener 炸了")
+
+    refusing_page = _RefusingPage()
+    # 进批次时页是「被占用」状态（ready=False）；`_finish_page` 在页还开着时调的正是
+    # mark_ready()，所以这一位从 False 翻成 True 就是「收尾真的跑到了」的判据。
+    refusing_info = _UnitPageInfo(refusing_page, ready=False)
+    refusing_pool = _UnitPool([refusing_info])
+    try:
+        session_page.run_actions(
+            _UnitSession(refusing_pool),
+            actions=[{"type": "dialog"}],
+            slowly=False,
+            max_actions=5,
+            timeout_ms=1_000,
+        )
+        finished = True
+        failure = ""
+    except Exception as error:  # noqa: BLE001 —— 断言的是「不该抛」
+        finished = False
+        failure = repr(error)
+    # 新语义：收尾（_finish_page）必定先跑完，失败再一次性上报 —— 不静默吞、也不挡住还页。
+    check("摘 dialog 处理器失败仍然把页还给池子", refusing_info.ready is True, repr(refusing_info.ready))
+    check("失败本身仍然有出口（一次性上报，不静默）", finished is False, failure)
 
     # dialog 处理器在批次结束时必须摘掉：页在共享 pool 里跨请求复用。
     dialog_page = _UnitPage()
@@ -2459,8 +2562,10 @@ def run_media_units() -> None:
                 timeout_ms=900,
             ),
         )
+        # 页已关闭用 PAGE_CLOSED（与 session_page 同一口径）：PAGE_BUSY 的文案是
+        # 「retry shortly」，而这一页紧接着会被摘出池子，重试拿到的是 NO_CURRENT_PAGE。
         expect_error(
-            "PAGE_BUSY",
+            "PAGE_CLOSED",
             lambda: media.screenshot(
                 _UnitSession(_UnitPool([_UnitPageInfo(_UnitPage(closed=True))])),
                 image_type="png",
@@ -2768,6 +2873,14 @@ def run_search_backends(base: str) -> None:
     def discover(**kwargs: Any) -> dict[str, Any]:
         return search.discover({"query": "q", **kwargs})
 
+    def discover_err(**kwargs: Any) -> Exception:
+        """跑一次必须失败的发现，交回异常本身（用来读它的措辞）。"""
+        try:
+            search.discover({"query": "q", **kwargs})
+        except Exception as error:  # noqa: BLE001 —— 断言的是消息，不是异常类型
+            return error
+        raise AssertionError("expected this discovery to fail")
+
     brave = discover(backend="brave", apiKey="k", braveEndpoint=base + "/brave")
     check(
         "brave 取 web.results 并把 description 当 snippet",
@@ -2781,6 +2894,18 @@ def run_search_backends(base: str) -> None:
         "SEARCH_AUTH",
         lambda: discover(backend="brave", apiKey="k", braveEndpoint=base + "/brave401"),
     )
+    # Brave 的 `count` 上限是 20，而上层会把 maxResults 一路放到 100。夹不夹必须看请求本身：
+    # 桩照旧回固定载荷，只有记下来的那次查询串能说明发出去的是 20 还是 100。
+    with _SEEN_LOCK:
+        _SEEN_LIMITS.clear()
+    discover(backend="brave", apiKey="k", maxResults=100, braveEndpoint=base + "/braveecho")
+    with _SEEN_LOCK:
+        clamp = [entry for entry in _SEEN_LIMITS if entry["backend"] == "brave"]
+    check(
+        "brave 的 count 夹到 20，不把 100 发给上游",
+        len(clamp) == 1 and clamp[0]["query"].get("count") == "20",
+        repr(clamp)[:200],
+    )
 
     serper = discover(backend="serper", apiKey="k", serperEndpoint=base + "/serper")
     check(
@@ -2793,6 +2918,15 @@ def run_search_backends(base: str) -> None:
     expect_error(
         "SEARCH_RATE_LIMIT",
         lambda: discover(backend="serper", apiKey="k", serperEndpoint=base + "/serper429"),
+    )
+
+    # SearXNG 没有 API key：它的 401/403 是「实例没开 json 输出」，把它翻成「检查 key」
+    # 会把人指到一个不存在的配置项上。
+    searx_rejected = discover_err(backend="searxng", searxngEndpoint=base + "/searxng403")
+    check(
+        "searxng 的 403 说的是「没开 json 格式」，不是「检查 API key」",
+        "json" in str(searx_rejected) and "API key" not in str(searx_rejected),
+        repr(searx_rejected)[:200],
     )
 
     searx = discover(backend="searxng", searxngEndpoint=base + "/searxng")
@@ -3091,14 +3225,27 @@ def run_extraction_helpers() -> None:
     check("fields 未截断", truncated is False, repr(truncated))
 
     one_row, _ = extraction.collect_fields(nodes[:1], {"name": "h3::text"}, page=page, max_content_chars=10_000)
-    exact_budget = extraction._json_len(one_row[0])
+    # 预算算的是**整份 rows 的序列化体积**，含外层方括号：单行 `{"name": "P1"}` 是 14 个
+    # 字符，套进数组后是 16。期望值直接量那份载荷，不抄实现里的记账方式 —— 按 14 给预算
+    # 时 `[` `]` 就吃掉了两个字符，字段值被裁掉一格，那已经不叫「刚好用尽」。
+    exact_budget = len(json.dumps(one_row, ensure_ascii=False))
+    check("fields 单行载荷量到 16 个字符", exact_budget == 16, repr(exact_budget))
     same, same_truncated = extraction.collect_fields(
         nodes[:1], {"name": "h3::text"}, page=page, max_content_chars=exact_budget
     )
     check(
         "fields 最后一条刚好用尽预算不算截断",
-        same_truncated is False and len(same) == 1,
+        same_truncated is False and same[0]["name"] == "P1",
         repr((same, same_truncated)),
+    )
+
+    short, short_truncated = extraction.collect_fields(
+        nodes[:1], {"name": "h3::text"}, page=page, max_content_chars=exact_budget - 1
+    )
+    check(
+        "fields 少一个字符就裁值、但字段仍是字符串（不降级成 null）",
+        short_truncated is True and isinstance(short[0]["name"], str),
+        repr((short, short_truncated)),
     )
 
     tight, tight_truncated = extraction.collect_fields(
@@ -4656,6 +4803,123 @@ def check_dependency_missing_mapping() -> None:
     )
 
 
+def run_ca_bundle() -> None:
+    """信任源兜底：托管 CPython 的默认 CA 库缺公开根时，用 certifi 的 bundle 顶上。
+
+    为什么这条必须存在：托管 CPython（``runtime/python/<版本>/``）没有自己的 OpenSSL
+    配置，macOS 上 ``ssl.get_default_verify_paths()`` 落到 ``/private/etc/ssl/cert.pem``。
+    实测那份库验不过 example.com 的 SSL.com 链（``openssl s_client`` 报
+    ``verify error:num=20``），于是 ``scrapling_fetch`` 对着一半的公网站点报
+    ``unable to get local issuer certificate`` —— 报错只说「找不到签发者」，看不出是
+    信任源选错了。这里量两件事：**没被指定时兜底生效**、**显式指定时不覆盖**。
+
+    进程内那一半只判函数逻辑：本文件前面几节已经 import 过 bridge，模块级的 ``CA_BUNDLE``
+    是那一次算出来的，拿它当「干净进程的结果」会读到别处的环境。干净进程那一半因此走
+    子进程。
+
+    :returns: 无
+    """
+    inserted = str(PY_DIR) not in sys.path
+    if inserted:
+        sys.path.insert(0, str(PY_DIR))
+    import bridge
+
+    names = ("SSL_CERT_FILE", "CURL_CA_BUNDLE")
+    saved = {name: os.environ.get(name) for name in names}
+    try:
+        os.environ["SSL_CERT_FILE"] = "/explicit/roots.pem"
+        os.environ.pop("CURL_CA_BUNDLE", None)
+        check(
+            "显式指定 CA 包时兜底让路（企业 MITM / 自签根不能被顶掉）",
+            bridge.configure_ca_bundle() is None,
+            repr(bridge.configure_ca_bundle()),
+        )
+        check(
+            "显式给的那枚原样留着",
+            os.environ.get("SSL_CERT_FILE") == "/explicit/roots.pem",
+            repr(os.environ.get("SSL_CERT_FILE")),
+        )
+        # 空值一档：CI／容器常把 SSL_CERT_FILE= 这种空导出带进进程。早退判据以
+        # 「空值算没设」为假时才动手，落值就必须真的写进去 —— 否则函数回了一条兜底
+        # 路径，环境里却一个字节都没改，两条链仍然裸奔。
+        for name in names:
+            os.environ[name] = ""
+        installed = bridge.configure_ca_bundle()
+        check(
+            "空值的两枚变量按没设处理并真的写入环境",
+            installed is not None
+            and os.environ.get("SSL_CERT_FILE") == installed
+            and os.environ.get("CURL_CA_BUNDLE") == installed,
+            repr([installed, os.environ.get("SSL_CERT_FILE"), os.environ.get("CURL_CA_BUNDLE")]),
+        )
+    finally:
+        for name in names:
+            # 先落到局部：`saved[name]` 在 else 分支里 mypy 收不窄，直接下标赋值会报
+            # `str | None` 不可赋给 `str`。这一层不是洁癖 —— 抛掉 None 的那一支才是
+            # 「原样还原」的判据，判据本身不该靠类型断言放过。
+            previous = saved[name]
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
+        if inserted:
+            sys.path.remove(str(PY_DIR))
+
+    # 干净进程：两枚变量都没有时，bridge 导入就应该把 certifi 的 bundle 填进去。
+    probe = (
+        "import sys,os;sys.path.insert(0,{py!r});import bridge;"
+        "print(bridge.CA_BUNDLE or '');print(os.environ.get('SSL_CERT_FILE',''));"
+        "print(os.environ.get('CURL_CA_BUNDLE',''))"
+    ).format(py=str(PY_DIR))
+    clean_env = {key: value for key, value in os.environ.items() if key not in names}
+    clean = subprocess.run(  # noqa: S603  # nosec B603
+        [sys.executable, "-I", "-c", probe],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        env=clean_env,
+    )
+    lines = clean.stdout.splitlines()
+    bundle = lines[0] if lines else ""
+    # 判据要按宿主的路径分隔符读：Windows 上 ``certifi.where()`` 给的是原生路径
+    # （``...\\certifi\\cacert.pem``，``importlib.resources`` 落成 ``Path`` 再 ``str()``），
+    # 写死 ``certifi/cacert.pem`` 后缀在那里恒假 —— 红的是判据的写法，不是兜底没了。
+    # 归一化分隔符之后这条只问「用的是不是 certifi 那份 cacert.pem」。
+    check(
+        "没有任何 CA 变量时兜底到 certifi 的 cacert.pem",
+        bundle.replace("\\", "/").endswith("certifi/cacert.pem"),
+        repr(bundle),
+    )
+    check(
+        "兜底同时喂给 ssl 与 libcurl 两条链",
+        len(lines) > 2 and lines[1] == bundle and lines[2] == bundle,
+        repr(lines)[:200],
+    )
+    check("兜底不改协议帧通道（stdout 只有那三行）", len(lines) == 3, repr(lines)[:200])
+
+    # 反过来：显式给了系统库时，干净进程里桥不上去，那正是这个缺陷的现场。
+    pinned = subprocess.run(  # noqa: S603  # nosec B603
+        [sys.executable, "-I", "-c", probe],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        env={**clean_env, "SSL_CERT_FILE": "/private/etc/ssl/cert.pem"},
+    )
+    pinned_lines = pinned.stdout.splitlines()
+    check(
+        "显式指定后干净进程不再兜底（用户的选择压过默认）",
+        bool(pinned_lines) and pinned_lines[0] == "",
+        repr(pinned_lines)[:200],
+    )
+    check(
+        "显式指定的那枚原样留在环境里",
+        bool(pinned_lines) and pinned_lines[1] == "/private/etc/ssl/cert.pem",
+        repr(pinned_lines)[:200],
+    )
+
+
 def proxy_field(raw: str, field: str) -> object:
     """拆一个代理地址并取出字段；拆不出来就直接报错。
 
@@ -5487,6 +5751,26 @@ def run_network_summary() -> None:
         "普通锚点片段原样不动",
         redacted("http://a.test/page#section-2") == "http://a.test/page#section-2",
     )
+    check(
+        "驼峰写法的参数名同样脱敏（浏览器端 JS 拼接口最常见的形态）",
+        "SECRET1" not in redacted("http://a.test/api?accessToken=SECRET1"),
+        repr(redacted("http://a.test/api?accessToken=SECRET1")),
+    )
+    check(
+        "混合分隔符里的驼峰参数名也脱敏",
+        "SECRET2" not in redacted("http://a.test/api?a=1;refreshToken=SECRET2"),
+        repr(redacted("http://a.test/api?a=1;refreshToken=SECRET2")),
+    )
+    check(
+        "带连字符的参数名按同一套归一规则判（X-Api-Key 与 x_api_key 等价）",
+        "SECRET3" not in redacted("http://a.test/api?X-Api-Key=SECRET3"),
+        repr(redacted("http://a.test/api?X-Api-Key=SECRET3")),
+    )
+    check(
+        "畸形 URL 的兜底也摘掉 authority 里的口令（urlsplit 抛 ValueError 的那一档）",
+        "pass" not in redacted("http://user:pass@[::1/x?token=abc"),
+        repr(redacted("http://user:pass@[::1/x?token=abc")),
+    )
 
     class _Item:
         url = "https://a.test/api?access_token=secret-value&page=3"
@@ -6224,6 +6508,26 @@ def _session_stub(*, broken_state: bool = False) -> type:
     return _Stub
 
 
+def check_redis_decode_contract(redis_module: Any, storage: Any, fake: Any) -> None:
+    """值被弄坏时两条都必须翻成 RedisUnavailable，而不是把 orjson 的异常抛给调用方。
+
+    本类的契约是「存储层故障一律翻成 RedisUnavailable」：漏了这一层，adapters 兜不住，
+    一次坏值会顶成整页抓取失败。合法 JSON 也不等于验证器指纹字典（键被写成标量时
+    ``loads`` 照样成功），形状要在同一处拦下来。
+
+    :param redis_module: 被测的 ``py/redis_storage.py`` 模块（局部 import，故由调用方传入）
+    :param storage: 一份连着替身客户端的存储实例
+    :param fake: 那份替身客户端（``store`` 可直接塞坏值）
+    """
+    for raw, marker in (("not json", "not valid JSON"), ("1", "not a fingerprint object")):
+        fake.store[storage._key(raw)] = raw
+        try:
+            storage.retrieve(raw)
+            check(f"坏值 {raw} 应被拒", False, "放行")
+        except redis_module.RedisUnavailable as error:
+            check(f"坏值 {raw} 翻成 RedisUnavailable", marker in str(error), str(error))
+
+
 def run_redis_storage() -> None:
     """adaptive 指纹库的 Redis 后端：契约、键形状、错误面与真 Redis。"""
     sys.path.insert(0, str(PY_DIR))
@@ -6240,8 +6544,10 @@ def run_redis_storage() -> None:
         def __init__(self) -> None:
             self.store: dict[str, str] = {}
             self.closed = False
+            self.pings = 0
 
         def ping(self) -> bool:
+            self.pings += 1
             return True
 
         def set(self, key: str, value: str) -> None:
@@ -6269,6 +6575,7 @@ def run_redis_storage() -> None:
     restored = storage.retrieve("price")
     check("retrieve 还原指纹字典", isinstance(restored, dict) and "tag" in restored, repr(restored)[:160])
     check("没存过的 identifier 回 None", storage.retrieve("missing") is None, "")
+    check_redis_decode_contract(redis_storage, storage, fake)
     storage.close()
     check("close 关掉客户端", fake.closed is True, "")
 
@@ -6390,15 +6697,32 @@ def run_redis_storage() -> None:
             cast(Any, reuse_a)._client is cast(Any, reuse_b)._client and len(made_clients) == 1,
             str(len(made_clients)),
         )
+        check(
+            "复用命中不再 ping（那份客户端上一次构造已经通过，Redis 不可达时不能每页白等一次超时）",
+            made_clients[0].pings == 1,
+            str(made_clients[0].pings),
+        )
         reuse_a.close()
         reuse_c = redis_storage.RedisStorageSystem("redis://reuse.test:6379/0", "https://c.example.test/3")
         check(
-            "close 之后按原连接串重连，而不是发回已关闭的客户端",
-            cast(Any, reuse_c)._client is not made_clients[0] and len(made_clients) == 2,
-            str(len(made_clients)),
+            "先 close 的那个只放掉自己的使用者名额，兄弟实例仍在用的连接池不关",
+            cast(Any, reuse_c)._client is made_clients[0]
+            and len(made_clients) == 1
+            and made_clients[0].closed is False,
+            f"clients={len(made_clients)} closed={made_clients[0].closed}",
         )
         reuse_b.close()
+        check(
+            "还有使用者时不关客户端",
+            made_clients[0].closed is False,
+            str(made_clients[0].closed),
+        )
         reuse_c.close()
+        check(
+            "最后一个使用者放掉时才真关",
+            made_clients[0].closed is True,
+            str(made_clients[0].closed),
+        )
     finally:
         if saved_recorder is None:
             sys.modules.pop("redis", None)
@@ -7983,6 +8307,9 @@ def main() -> int:
 
     print("\n== 缺可选依赖的归类 ==")
     check_dependency_missing_mapping()
+
+    print("\n== 信任源兜底（托管 CPython 的默认 CA 库缺根）==")
+    run_ca_bundle()
 
     print(f"\n{'=' * 52}")
     print(f"passed {passes}, failed {len(failures)}")

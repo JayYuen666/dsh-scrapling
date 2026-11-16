@@ -2,8 +2,11 @@
 //
 // server 监听的 path、客户端认的 transport 名、profile 条目里的 serverName 与端口默认值，
 // 一旦各写一处，setup 生成的条目就会指向一个 server 没在听的地方，而 doctor 查不出来。
-// 这一份只 `export const`，不 import 任何运行期依赖：CLI 打成单文件时不能把 host.ts 那侧的
-// 宿主 peer 一起拖进去。
+//
+// 本文件只导出**常量与纯函数**，不 import 任何运行期依赖：CLI 打成单文件时不能把 host.ts
+// 那侧的宿主 peer 一起拖进去。放纯函数是允许的（`isMcpMode` / `mcpUrl` /
+// `clientInstallCommand` 就是），只要它们不引外部模块——所以「这里能不能加逻辑」要判的是
+// 有没有 import，不是有没有逻辑。
 
 export const MCP_SERVER_NAME = "scrapling";
 
@@ -51,7 +54,17 @@ export const MCP_DEFAULT_CLIENT_PIN = "0.2.2-rc.2";
  *  的字面版本，doctor 也会在发现不匹配时点名。 */
 const MCP_CLIENT_PIN_VALUES = [MCP_DEFAULT_CLIENT_PIN, "0.2.2-rc.1", "next"] as const;
 export type McpClientPin = (typeof MCP_CLIENT_PIN_VALUES)[number];
-export const MCP_CLIENT_PINS: readonly string[] = MCP_CLIENT_PIN_VALUES;
+
+/**
+ * 运行期白名单：**冻结副本**，不是 `MCP_CLIENT_PIN_VALUES` 的另一个名字。
+ *
+ * 早先直接写 `= MCP_CLIENT_PIN_VALUES`，两者是同一个数组对象，`readonly string[]` 只是
+ * TS 层约束——运行期完全可变。而 `clientInstallCommand` 的放行判据与 `lib/mcp-profile.ts`
+ * 的 doctor 判据都读这份数组：同进程任何一处执行 `MCP_CLIENT_PINS.push("latest")` 就能让
+ * 两边同时放行一个宿主会拒绝装载的钉版，而这正是本文件注释里强调「JS 侧调用者拿不到联合
+ * 类型」所要防的那类误用。所以这里另起一份冻结副本，与 `as const` 元组解耦。
+ */
+export const MCP_CLIENT_PINS: readonly string[] = Object.freeze([...MCP_CLIENT_PIN_VALUES]);
 
 /** 生成的条目里这条 insert 的 id：一个给本插件的 server，一个给官方 server。 */
 export const MCP_CLIENT_ENTRY_ID = "scrapling-mcp";
@@ -71,10 +84,31 @@ export function isMcpMode(value: string): value is McpMode {
  *
  *  IPv6 字面量必须带方括号，否则 `http://::1:39217/mcp` 连主机的分界都没有；
  *  端口在这里也校验一次，避免把越界值拼进一条客户端永远连不上的 URL。
+ *
+ *  `host` 同样校验——它现在在生产路径上只来自常量 {@link MCP_LISTEN_HOST}，但这个函数对外
+ *  承诺「拼出来的串一定可连」，那承诺得对任何入参成立才算数。三种坏形态都拒：
+ *  - 空串 / 纯空白：拼出 `http://:39217/mcp`；
+ *  - 带 `://`：拼出 `http://http://127.0.0.1:39217/mcp`；
+ *  - 方括号不闭合（`[::1`）或带裸 `%`：前者拼出 `http://[::1:39217/mcp`，后者（IPv6 的
+ *    zone id，`fe80::1%eth0`）按 RFC 6874 必须写成 `%25`，裸 `%` 会让 URL 解析直接抛。
  */
 export function mcpUrl(port: number, host: string): string {
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error(`MCP port must be an integer in 1..65535, got ${String(port)}`);
+  }
+  if (host.trim().length === 0) {
+    throw new Error("MCP host must not be blank");
+  }
+  if (host.includes("://")) {
+    throw new Error(`MCP host must be a bare host, got ${JSON.stringify(host)}`);
+  }
+  if (host.startsWith("[") && !host.endsWith("]")) {
+    throw new Error(`MCP host has an unterminated bracket, got ${JSON.stringify(host)}`);
+  }
+  if (host.includes("%")) {
+    throw new Error(
+      `MCP host must percent-encode its zone id as %25 (RFC 6874), got ${JSON.stringify(host)}`,
+    );
   }
   const bracketed = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return `http://${bracketed}:${String(port)}${MCP_PATH}`;

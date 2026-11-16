@@ -264,6 +264,25 @@ describe("pumpFrames", () => {
     expect(errors).toStrictEqual([]);
   });
 
+  it("stop() 调两次只摘与挂一次，不会多贴一个吞错监听", async () => {
+    // 收尾路径上多路 teardown 可能拿到同一个 stop（dispose 与 stream 自己的 close 各来一次）。
+    // 不幂等时每一遍都会执行末尾那句 `on("error", swallowLateError)`：监听器从一份变成 N 份，
+    // 攒到 11 个就是一条 MaxListenersExceededWarning，而「吞错兜底只有一份」这条也跟着不成立。
+    const stream = new Readable({ read: noop });
+    const stop = pumpFrames(stream, noop, collectErrors([]));
+    stop();
+    await vi.waitFor(() => {
+      expect(stream.listenerCount("error")).toBe(1);
+    });
+    stop();
+    stop();
+    // 再等一 tick 让可能多挂的监听器有机会出现，然后按「恰好一个」判。
+    // 用 `vi.waitFor` 而不是自建 Promise：本包禁 `new Promise`（代理器返回值的写法也一并禁）。
+    await vi.waitFor(() => {
+      expect(stream.listenerCount("error"), "第二、三次 stop() 不该再贴吞错监听").toBe(1);
+    });
+  });
+
   it("某一帧回调抛错不耽误同一个 chunk 里后面的帧", async () => {
     const delivered: string[] = [];
     const errors: unknown[] = [];
@@ -339,6 +358,38 @@ describe("frame splitter 上限", () => {
       FRAME_ERROR_KINDS.frameTooLarge,
     );
     expect(splitter.push(`${FRAME_B}\n`)).toStrictEqual([FRAME_B]);
+  });
+});
+
+describe("frame splitter 交给上报口时不丢邻居帧", () => {
+  it("只丢超长那一行，同一个 chunk 里后面的合法帧照常交出来", () => {
+    // 与 Python 侧同解：`handle_raw` 判超长后 emit 一条 BAD_FRAME 并 return True，
+    // 同一批 pending 里后面的帧继续处理。抛异常那条路会把它们一起丢掉。
+    const seen: FrameError[] = [];
+    const splitter = new FrameSplitter((error) => {
+      seen.push(error);
+    });
+    const frames = splitter.push(`${FRAME_A}\n${"x".repeat(MAX_FRAME_CHARS + 1)}\n${FRAME_B}\n`);
+    expect(frames).toStrictEqual([FRAME_A, FRAME_B]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ kind: FRAME_ERROR_KINDS.frameTooLarge });
+  });
+
+  it("无换行的超长残片也不抛，只报一条", () => {
+    const seen: FrameError[] = [];
+    const splitter = new FrameSplitter((error) => {
+      seen.push(error);
+    });
+    expect(splitter.push("x".repeat(MAX_FRAME_CHARS + 1))).toStrictEqual([]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ kind: FRAME_ERROR_KINDS.frameTooLarge });
+  });
+
+  it("只有空白的残片不算一帧", () => {
+    // push 与 flush 两处的「空行过滤」是同一件事，写在两个地方就会改一处漏一处。
+    const splitter = new FrameSplitter();
+    expect(splitter.push("  \t ")).toStrictEqual([]);
+    expect(splitter.flush()).toStrictEqual([]);
   });
 });
 

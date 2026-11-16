@@ -211,6 +211,96 @@ describe("runProbe 的输出判据", () => {
     });
   });
 
+  it("数组元素不是对象时点名下标，而不是让下游报一句与契约无关的 TypeError", async () => {
+    // `calls` 写成 `["foo"]` 能过「是数组」那一层，然后 `report.calls.map((c) => c.site)`
+    // 静默给出 undefined、`c.site.startsWith(...)` 报一句 TypeError —— 那句与契约无关。
+    await withTempDir("dsh-probe-elem-", async (dir) => {
+      const broken: Record<string, unknown> = { ...MINIMAL_REPORT, calls: ["foo"] };
+      const script = fakeProbe(dir, `console.log(${JSON.stringify(JSON.stringify(broken))});\n`);
+      await expect(runProbe({ pythonPath: process.execPath, probePath: script })).rejects.toThrow(
+        /calls\[0\] 应为对象，实际是 string/u,
+      );
+    });
+  });
+
+  it("元素上的字段种类漂移也点名（`site` 要是字符串，不是数字）", async () => {
+    await withTempDir("dsh-probe-elemfield-", async (dir) => {
+      const broken: Record<string, unknown> = {
+        ...MINIMAL_REPORT,
+        calls: [{ site: 1, keys: [] }],
+      };
+      const script = fakeProbe(dir, `console.log(${JSON.stringify(JSON.stringify(broken))});\n`);
+      await expect(runProbe({ pythonPath: process.execPath, probePath: script })).rejects.toThrow(
+        /calls\[0\]\.site 应为字符串，实际是 number/u,
+      );
+    });
+  });
+
+  it("字符串数组里混了非字符串也点名", async () => {
+    await withTempDir("dsh-probe-strings-", async (dir) => {
+      const broken: Record<string, unknown> = { ...MINIMAL_REPORT, methods: ["a", 2] };
+      const script = fakeProbe(dir, `console.log(${JSON.stringify(JSON.stringify(broken))});\n`);
+      await expect(runProbe({ pythonPath: process.execPath, probePath: script })).rejects.toThrow(
+        /methods\[1\] 应为字符串，实际是 number/u,
+      );
+    });
+  });
+
+  it("唯一被下游 toStrictEqual 直接消费的 facts 数组字段也在守卫里（responseInitParams）", async () => {
+    // 这一位漏掉时，「是数组」那层守卫放行、下游 toStrictEqual 拿到 undefined 后说的是
+    // 「契约不一致」—— 而故障是探针根本没输出这个字段。
+    await withTempDir("dsh-probe-factsarr-", async (dir) => {
+      const facts: Record<string, unknown> = { ...MINIMAL_REPORT.facts };
+      Reflect.deleteProperty(facts, "responseInitParams");
+      const broken: Record<string, unknown> = { ...MINIMAL_REPORT, facts };
+      const script = fakeProbe(dir, `console.log(${JSON.stringify(JSON.stringify(broken))});\n`);
+      await expect(runProbe({ pythonPath: process.execPath, probePath: script })).rejects.toThrow(
+        /facts\.responseInitParams 应为数组，实际是 undefined/u,
+      );
+    });
+  });
+
+  it("spiderDefaults 的字段种类漂移会被点名，而不是被读成「契约值不一致」", async () => {
+    // `download_delay: "0"`（字符串）能过「键在不在」那一层，然后下游
+    // `expect("0").toBe(0)` 把排查方向指向契约值 —— 真正的故障是探针类型漂移。
+    await withTempDir("dsh-probe-spiderkind-", async (dir) => {
+      const facts: Record<string, unknown> = {
+        ...MINIMAL_REPORT.facts,
+        spiderDefaults: { ...MINIMAL_REPORT.facts.spiderDefaults, download_delay: "0" },
+      };
+      const broken: Record<string, unknown> = { ...MINIMAL_REPORT, facts };
+      const script = fakeProbe(dir, `console.log(${JSON.stringify(JSON.stringify(broken))});\n`);
+      await expect(runProbe({ pythonPath: process.execPath, probePath: script })).rejects.toThrow(
+        /facts\.spiderDefaults\.download_delay 应为数字，实际是 string/u,
+      );
+    });
+  });
+
+  it("spiderDefaults 唯一的可空位（output_dir）两种形态都收，别的制造不出第三种", async () => {
+    await withTempDir("dsh-probe-spidernull-", async (dir) => {
+      const facts: Record<string, unknown> = {
+        ...MINIMAL_REPORT.facts,
+        spiderDefaults: { ...MINIMAL_REPORT.facts.spiderDefaults, output_dir: null },
+      };
+      const report: Record<string, unknown> = { ...MINIMAL_REPORT, facts };
+      const script = fakeProbe(dir, `console.log(${JSON.stringify(JSON.stringify(report))});\n`);
+      const ok = await runProbe({ pythonPath: process.execPath, probePath: script });
+      expect(ok.facts.spiderDefaults.output_dir).toBeNull();
+      const badFacts: Record<string, unknown> = {
+        ...MINIMAL_REPORT.facts,
+        spiderDefaults: { ...MINIMAL_REPORT.facts.spiderDefaults, output_dir: 7 },
+      };
+      const badReport: Record<string, unknown> = { ...MINIMAL_REPORT, facts: badFacts };
+      const badScript = fakeProbe(
+        dir,
+        `console.log(${JSON.stringify(JSON.stringify(badReport))});\n`,
+      );
+      await expect(
+        runProbe({ pythonPath: process.execPath, probePath: badScript }),
+      ).rejects.toThrow(/facts\.spiderDefaults\.output_dir 应为字符串或 null，实际是 number/u);
+    });
+  });
+
   it("stdout 不是 JSON 时报错带着头几行，而不是整段刷屏", async () => {
     await withTempDir("dsh-probe-nojson-", async (dir) => {
       const script = fakeProbe(dir, 'console.log("INFO first line");');

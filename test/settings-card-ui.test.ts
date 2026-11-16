@@ -429,6 +429,11 @@ function mountCard(props: CardProps): { tree: () => unknown } {
   return { tree: () => runtime.box.tree };
 }
 
+/** 动作入口在本用例里不该被触碰：碰到就抛，而不是回一条没人等的 rejected promise。 */
+async function actionMustNotRun(): Promise<RuntimeActionResult> {
+  throw new Error("本用例不触发安装 / 修复 / 取消");
+}
+
 async function flush(): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<undefined>();
   setTimeout(() => {
@@ -660,6 +665,34 @@ describe("scrapling 设置卡：渲染结构", () => {
     expect(textOf(tree)).toContain(t("runtimeUnavailable"));
     expect(textOf(tree)).toContain("dsh-scrapling setup --feature <pack> --apply");
   });
+
+  it("解释器那一行印人话，不把 managed-venv 这类机器标识摆给用户", async () => {
+    // 卡面原先直接把 `snapshot.python.via` 拼进括号里，于是用户读到的是 `(managed-venv)`。
+    // 那两档的差别恰好最要紧 —— venv 档工具全在、裸托管解释器档一只都不在，可这两个英文
+    // 标识读不出这层意思。断言里刻意同时钉「译名在场」与「原标识不在场」：只钉前者时，
+    // 把 `path (managed-venv)` 改成 `path (managed-venv) managed-venv` 那种半改也会通过。
+    const status = {
+      ok: true,
+      packs: { core: "ready", browser: "missing" },
+      python: { path: "/tmp/runtime/venv/bin/python3", via: "managed-venv", version: "3.14.9" },
+      dataDir: "/tmp/dsh-scrapling-card-test",
+      jobsReady: false,
+      job: null,
+    } satisfies RuntimeStatusResult;
+    const reader: RuntimeReader = {
+      status: () => Promise.resolve(status),
+      install: actionMustNotRun,
+      repair: actionMustNotRun,
+      cancel: actionMustNotRun,
+    };
+    const { form } = formOf({});
+    const card = mountCard({ ...PAGE, t, form, runtime: reader });
+    await flush();
+    const text = textOf(card.tree());
+    expect(text).toContain(t("runtime.via.managed-venv"));
+    expect(text).not.toContain("managed-venv");
+    expect(text).not.toContain("runtime.via.");
+  });
 });
 
 describe("scrapling 设置卡：保存回路", () => {
@@ -724,11 +757,6 @@ describe("scrapling 设置卡：保存回路", () => {
   });
 });
 
-/** 动作入口在本用例里不该被触碰：碰到就抛，而不是回一条没人等的 rejected promise。 */
-async function actionMustNotRun(): Promise<RuntimeActionResult> {
-  throw new Error("本用例不触发安装 / 修复 / 取消");
-}
-
 /**
  * 卡片带 runtime 读取接口时才会开轮询计时器，所以清理回路只在这一组用例里真正跑到。
  */
@@ -746,7 +774,7 @@ describe("scrapling 设置卡：运行时轮询计时器的回收", () => {
     const status = {
       ok: true,
       packs: { core: "ready", browser: "ready" },
-      python: { path: "/usr/bin/python3", via: "PATH", version: "3.14.0" },
+      python: { path: "/usr/bin/python3", via: "path", version: "3.14.0" },
       dataDir: "/tmp/dsh-scrapling-card-test",
       jobsReady: true,
       job: { id: "job-0123456789abcdef", pack: "browser", status: "running", output: "" },

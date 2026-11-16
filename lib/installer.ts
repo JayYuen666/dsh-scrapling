@@ -1,5 +1,6 @@
 // 能力包安装器：只写 dataDir/runtime，不碰系统 Python 与用户 Playwright 缓存。
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { constants } from "node:fs";
@@ -21,8 +22,14 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import type { FileHandle } from "node:fs/promises";
 import type { RuntimeAsset } from "./runtime.ts";
-import { managedPythonPath, runtimeManifest } from "./runtime.ts";
+import {
+  executable,
+  managedPythonPath,
+  managedVenvPythonPath,
+  runtimeManifest,
+} from "./runtime.ts";
 import type { PackState, RuntimePack } from "./runtime-shape.ts";
+import { redactUrlSecrets } from "./url-policy.ts";
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -30,19 +37,36 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 const STATE_FILE = "state.json";
 
-/** 空白切分与 pip 失败措辞。 */
+/** pip 失败输出归类：没有轮子 vs 网络不通。 */
 const PIP_NO_WHEEL = /No matching distribution|Could not find a version/iu;
 const PIP_NETWORK = /Network|Temporary failure|Connection|timed out/iu;
 const STORAGE_DB = "elements_storage.db";
 
-// 只认完整 Chromium 的可执行文件。headless shell 不算：V2 实测它的组件不足，
-// StealthyFetcher 起不来（计划里因此禁用 --only-shell）。macOS 的完整版叫
-// `Google Chrome for Testing`，Linux / Windows 分别是 chrome / chrome.exe。
+/**
+ * 外部命令的 stderr 进文案之前先脱敏。
+ *
+ * 这些 stderr 会进 `InstallError` 的消息、再进作业输出与模型上下文，而它们**会原样回显
+ * 带凭据的地址**：`pip` 打 `Looking in indexes: https://user:token@mirror/simple` 与
+ * `WARNING: The index url "…" seems invalid`，`curl` 打它请求的那条 URL。用户在企业
+ * 镜像里把 token 写进 `PIP_INDEX_URL` 是常规做法，于是失败一次就等于把 token 写进会话日志。
+ *
+ * 闸门放在这里而不是各个调用点：四条 stderr 通路共用同一处，新增一条也不会漏。
+ *
+ * @param text - 命令的原始 stderr
+ * @returns 遮掉 userinfo 之后的文本；没有凭据时原样返回
+ */
+function safeStderr(text: string): string {
+  return redactUrlSecrets(text);
+}
+
 /** 首批只支持 macOS arm64；其他平台没有已验证的 Python/浏览器资产，不猜路径。 */
 function installerSupported(): boolean {
   return process.platform === "darwin" && process.arch === "arm64";
 }
 
+// 只认完整 Chromium 的可执行文件。headless shell 不算：V2 实测它的组件不足，
+// StealthyFetcher 起不来（计划里因此禁用 --only-shell）。macOS 的完整版叫
+// `Google Chrome for Testing`，Linux / Windows 分别是 chrome / chrome.exe。
 const CHROMIUM_MARKERS: ReadonlySet<string> = new Set([
   "Chromium",
   "chrome",
@@ -60,6 +84,7 @@ export type InstallErrorCode =
   | "INSTALL_PACK_BLOCKED"
   | "INSTALL_OFFLINE_ASSETS"
   | "INSTALL_LOCK_UNREADABLE"
+  | "INSTALL_CANCELLED"
   | "INSTALL_STATE_CORRUPT";
 
 export class InstallError extends Error {
@@ -90,10 +115,74 @@ export interface InstallerIO {
   spawn: (argv: readonly string[], options?: { env?: NodeJS.ProcessEnv }) => Promise<SpawnResult>;
 }
 
-async function run(
+/**
+ * 单条子进程的兜底超时。
+ *
+ * 必须存在：`spawn` 起的东西是对端（curl / pip / tar），对端不回包时子进程会一直活着，
+ * `close` 永不来，`run` 的 Promise 永不 resolve —— 安装界面就永久停在 “installing …”，
+ * 用户既看不到失败、也没有退出的路。卡住与失败在界面上是两回事，而卡住更难自查。
+ *
+ * 取值比最慢的正常路径还宽一档（`pip install` 装 scrapling 全家在国内网络下见过几分钟）：
+ * 这里要的是「不会永远挂着」，不是给某个具体步骤定预算。
+ */
+const SPAWN_TIMEOUT_MS = 30 * 60_000;
+
+/** 下载的超时：连接与整体分开给，卡在握手与卡在传输的出路不同。 */
+const DOWNLOAD_CONNECT_TIMEOUT_S = 20;
+const DOWNLOAD_MAX_TIME_S = 900;
+
+/**
+ * 子进程输出留多少。
+ *
+ * `pip install` 失败时能把几 MB 日志刷出来，而调用方只取前 400 字符做归因（`INSTALL_*`
+ * 那几条 message）。不封顶就是「留一整个 MB 的字符串只为截前 400 字符」，同时在长安装里
+ * 白吃内存。封口留一句标记，读日志的人知道后面还有内容被丢掉。
+ */
+const MAX_CAPTURED_OUTPUT = 64 * 1024;
+const OUTPUT_TRUNCATED = "\n[installer] 输出过长，后续内容已丢弃";
+
+/**
+ * 往已收集的输出后面追加一段，超上限就截尾一次并挂标记。
+ *
+ * 判「已经截过」用标记本身，不用长度：分块边界恰好落在上限上时（`pip` 的缓冲常常就是整块
+ * 刷），按长度判会让第一次不多不少等于上限、此后再也不挂标记 —— 日志看起来像「本来就这么多」，
+ * 而真相是后面还有几 MB 被丢了。
+ *
+ * @param previous - 已收集的输出
+ * @param chunk - 新到的一段
+ * @returns 追加后的输出（可能已被截尾并带标记）
+ */
+function appendCapped(previous: string, chunk: string): string {
+  if (previous.endsWith(OUTPUT_TRUNCATED)) {
+    return previous;
+  }
+  const next = previous + chunk;
+  return next.length > MAX_CAPTURED_OUTPUT
+    ? `${next.slice(0, MAX_CAPTURED_OUTPUT)}${OUTPUT_TRUNCATED}`
+    : next;
+}
+
+interface SpawnOptions {
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+}
+
+/**
+ * 起一条子进程并收集输出（带兜底超时与输出封顶）。
+ *
+ * 导出是给单测用的：超时与封顶这两条只能靠真起一个不结束 / 话很多的子进程来判，
+ * 替身里写不出「close 永不来」。生产侧只经 `defaultInstallerIO.spawn` 与
+ * `createCurlDownloader` 用到它。
+ *
+ * @param argv - 命令与参数
+ * @param options - 环境变量与超时
+ * @returns 退出码与两端输出
+ */
+export async function runOnce(
   argv: readonly string[],
-  options: { env?: NodeJS.ProcessEnv } = {},
+  options: SpawnOptions = {},
 ): Promise<SpawnResult> {
+  const timeoutMs = options.timeoutMs ?? SPAWN_TIMEOUT_MS;
   // 子进程只有事件式 API，没有现成 Promise。
   // oxlint-disable-next-line promise/avoid-new
   return new Promise((resolve) => {
@@ -103,20 +192,46 @@ async function run(
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    // 超时句柄与 `finish` 互相引用，所以先留一个可变槽位：`const` 拿不掉
+    // （`finish` 要读它、`setTimeout` 要写它），`let` 又会撞 prefer-const。
+    const deadline: { timer?: ReturnType<typeof setTimeout> } = {};
+    const finish = (result: SpawnResult): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      // 不先判 `!== undefined`：`clearTimeout(undefined)` 本来就是空操作，而那个判断
+      // 只在「超时句柄还没装上就 finish」时才为假 —— 那条路永远不会发生（`spawn` 的
+      // 'error' 也是在下一拍才发），多一个恒真的分支只是给覆盖率留一个假洞。
+      clearTimeout(deadline.timer);
+      resolve(result);
+    };
+    // 超时用 `code: null` 而不是某个退出码：它与「没能执行」走同一条失败分支，调用方
+    // 据此换路或报 INSTALL_NETWORK，不用为「超时」再学一个新码。stderr 里留一句人话，
+    // 否则界面只说「失败」而不说为什么。
+    deadline.timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish({
+        code: null,
+        stdout,
+        stderr: `${stderr}\n[installer] ${String(timeoutMs)}ms 内没有结束，已终止`,
+      });
+    }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
+      stdout = appendCapped(stdout, chunk.toString("utf8"));
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
+      stderr = appendCapped(stderr, chunk.toString("utf8"));
     });
     // spawn 失败（二进制不在、无法执行）只发 'error' 事件，'close' 不保证会来：
     // 不接住它，一次 ENOENT 就是未捕获异常。code null 是「没能执行」的信号，
     // 与「执行了但退出非零」分开，调用方据此决定要不要换一条路。
     child.on("error", (error: Error) => {
-      resolve({ code: null, stdout, stderr: `${stderr}${String(error)}` });
+      finish({ code: null, stdout, stderr: `${stderr}${String(error)}` });
     });
     child.on("close", (code) => {
-      resolve({ code, stdout, stderr });
+      finish({ code, stdout, stderr });
     });
   });
 }
@@ -130,15 +245,24 @@ async function run(
  * spawn 失败（`code` 为 null）才是「curl 不在」的信号；HTTP 层的失败
  * （`--fail` 退非零）如实报 INSTALL_NETWORK，不再重试一遍。
  */
-export function createCurlDownloader(runStep: typeof run): (url: string) => Promise<Uint8Array> {
+export function createCurlDownloader(
+  runStep: typeof runOnce,
+): (url: string) => Promise<Uint8Array> {
   return async (url) => {
     const target = path.join(os.tmpdir(), `dsh-scrapling-dl-${randomUUID()}`);
+    // 两个超时都必须显式给：curl 自己不会超时，对端不回包时它就一直挂着，而 `run` 的
+    // 兜底超时是「别永远挂住」那一道，不是下载该有的等待时间。`--connect-timeout` 管
+    // 握手（DNS / TCP / TLS），`--max-time` 管整段（含慢速传输卡住）。
     const result = await runStep([
       "curl",
       "--fail",
       "--location",
       "--silent",
       "--show-error",
+      "--connect-timeout",
+      String(DOWNLOAD_CONNECT_TIMEOUT_S),
+      "--max-time",
+      String(DOWNLOAD_MAX_TIME_S),
       "--output",
       target,
       url,
@@ -154,26 +278,34 @@ export function createCurlDownloader(runStep: typeof run): (url: string) => Prom
     if (result.code !== null) {
       throw new InstallError(
         "INSTALL_NETWORK",
-        `curl failed for ${url}: ${result.stderr.slice(0, 400)}`,
+        `curl failed for ${redactUrlSecrets(url)}: ${safeStderr(result.stderr).slice(0, 400)}`,
       );
     }
-    const response = await fetch(url);
+    // curl 不在（或它自己超时被杀）时才走到这里。fetch 也要带 signal：它同样会对
+    // 不回包的对端一直等，而这条兜底路径原先一个超时都没有。
+    const response = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_MAX_TIME_S * 1000) });
     if (!response.ok) {
-      throw new InstallError("INSTALL_NETWORK", `${url} answered HTTP ${response.status}`);
+      throw new InstallError(
+        "INSTALL_NETWORK",
+        `${redactUrlSecrets(url)} answered HTTP ${response.status}`,
+      );
     }
     return new Uint8Array(await response.arrayBuffer());
   };
 }
 
 export const defaultInstallerIO: InstallerIO = {
-  download: createCurlDownloader(run),
+  download: createCurlDownloader(runOnce),
   extract: async (archive, destination) => {
-    const result = await run(["tar", "-xzf", archive, "-C", destination]);
+    const result = await runOnce(["tar", "-xzf", archive, "-C", destination]);
     if (result.code !== 0) {
-      throw new InstallError("INSTALL_FAILED", `tar failed: ${result.stderr.slice(0, 400)}`);
+      throw new InstallError(
+        "INSTALL_FAILED",
+        `tar failed: ${safeStderr(result.stderr).slice(0, 400)}`,
+      );
     }
   },
-  spawn: run,
+  spawn: runOnce,
 };
 
 async function exists(file: string): Promise<boolean> {
@@ -254,7 +386,18 @@ export async function acquireLock(
       `cannot open install lock ${lockPath}: ${String(error)}`,
     );
   }
-  if (!lockFd(handle.fd, lock)) {
+  let locked: boolean;
+  try {
+    locked = lockFd(handle.fd, lock);
+  } catch (error) {
+    // `lockFd` 抛的是 INSTALL_LOCK_UNREADABLE（原生模块不可用 / tryLock 自身抛错），
+    // 而不是「锁被占」。句柄已经开在这里了：不关就每次失败漏一个 fd，用户反复重试
+    // 会把进程的 fd 用尽，之后所有安装连带其它文件操作都以 EMFILE 失败 —— 而报错信息
+    // 说的是「锁不可读」，现场完全对不上。
+    await handle.close();
+    throw error;
+  }
+  if (!locked) {
     await handle.close();
     throw new InstallError("INSTALL_BUSY", `another install holds ${lockPath}`);
   }
@@ -268,17 +411,6 @@ export async function acquireLock(
       await handle.close();
     },
   };
-}
-
-/** 本进程已经在锁下跑的工作层数（键是解析后的锁路径）。 */
-const heldLockDepths = new Map<string, number>();
-
-function releaseLockDepth(key: string, held: number): void {
-  if (held <= 1) {
-    heldLockDepths.delete(key);
-    return;
-  }
-  heldLockDepths.set(key, held - 1);
 }
 
 /**
@@ -303,14 +435,30 @@ async function ensureRuntimeDir(dataDir: string): Promise<string> {
 }
 
 /**
+ * 当前异步调用链已经持有的锁（键是解析后的锁路径）。
+ *
+ * 只能用 `AsyncLocalStorage`，不能用进程级的「层数 Map」：层数分不清「同一调用链的嵌套
+ * 重入」与「同进程里的两个并发调用」—— 后者看到层数 > 0 就直接放行，于是两条安装并行改
+ * 同一份 venv 与 state.json，而 OS 锁在那里根本没起到作用。反过来，两个并发调用各自
+ * 结束时的减层还会互相覆盖（外层删键、内层把键写回 1），留下一份永不清空的深度记录，
+ * 此后跨进程互斥静默失效。
+ */
+const heldLockChains = new AsyncLocalStorage<ReadonlySet<string>>();
+
+/**
  * 在安装锁下跑一段工作。
  *
  * 安装、卸载、卸载式清理共用同一把 `runtime/install.lock`：它们改的是同一批文件
  * （venv / state.json / browsers），并发进来就会互相踩。
  *
- * 同一进程可以重入：CLI 的卸载路径先取锁、再叫 `uninstallCapabilityPack`，而后者自己
- * 也要取同一把锁。OS 级锁按 fd 互斥，同一进程再开一个句柄同样拿不到，没有这层记录
- * 就是自己挡住自己，卸载永远报 BUSY。
+ * 同一**调用链**可以重入：CLI 的卸载路径先取锁、再叫 `uninstallCapabilityPack`，而后者
+ * 自己也要取同一把锁。OS 级锁按 fd 互斥，同一进程再开一个句柄同样拿不到，没有这层记录
+ * 就是自己挡住自己，卸载永远报 BUSY。判据是「这条异步链路上是否已经持锁」，而不是
+ * 「进程里有没有人在持锁」—— 后者会把并发的第二条安装放进来。
+ *
+ * @param dataDir - 插件数据目录
+ * @param work - 锁下要做的事
+ * @returns work 的返回值
  */
 export async function withInstallLock<Result>(
   dataDir: string,
@@ -319,23 +467,17 @@ export async function withInstallLock<Result>(
   const runtimeDir = path.join(dataDir, "runtime");
   const lockPath = path.join(runtimeDir, "install.lock");
   const key = path.resolve(lockPath);
-  const depth = heldLockDepths.get(key) ?? 0;
-  // 已经在锁下：只记层数，不再开句柄、不再碰文件锁。
-  if (depth > 0) {
-    heldLockDepths.set(key, depth + 1);
-    try {
-      return await work();
-    } finally {
-      releaseLockDepth(key, depth + 1);
-    }
+  const held = heldLockChains.getStore();
+  // 本调用链已在锁下：只跑工作，不再开句柄、不再碰文件锁。
+  if (held?.has(key) === true) {
+    return work();
   }
   await ensureRuntimeDir(dataDir);
   const handle = await acquireLock(lockPath);
-  heldLockDepths.set(key, 1);
+  const chain = new Set([...(held ?? []), key]);
   try {
-    return await work();
+    return await heldLockChains.run(chain, work);
   } finally {
-    releaseLockDepth(key, 1);
     await handle.release();
   }
 }
@@ -345,14 +487,6 @@ export interface PythonInstallResult {
   version: string;
 }
 
-/**
- * 下载、校验、解压托管 Python。
- *
- * @param asset - 已验资产（含 SHA256）
- * @param dataDir - 数据目录
- * @param io - 安装 IO
- * @returns 托管解释器路径
- */
 /**
  * 离线安装时从资产目录里取 Python 归档。
  *
@@ -394,6 +528,15 @@ async function offlineArchive(assets: string, url: string): Promise<Uint8Array> 
   return new Uint8Array(bytes);
 }
 
+/**
+ * 下载、校验、解压托管 Python。
+ *
+ * @param asset - 已验资产（含 SHA256）；版本必须与清单一致，否则拒绝落盘
+ * @param dataDir - 数据目录
+ * @param io - 安装 IO
+ * @param assets - 离线资产目录，给定时全程不联网
+ * @returns 托管解释器路径与版本
+ */
 export async function installPython(
   asset: RuntimeAsset,
   dataDir: string,
@@ -422,18 +565,41 @@ export async function installPython(
       await mkdir(extractDir, { recursive: true });
       await io.extract(archive, extractDir);
       const layout = path.join(extractDir, "python");
-      const source = (await exists(path.join(layout, "bin", "python3"))) ? layout : extractDir;
+      // 判「归档里有没有解释器」用 `executable` 而不是 `exists`：同名目录也能过 F_OK，
+      // 而它装过去之后 `resolveRuntime` 会拒绝使用 —— 那时报出来的错与「归档不全」无关。
+      const source = executable(path.join(layout, "bin", "python3")) ? layout : extractDir;
+      // 落盘位置与校验都归 `managedPythonPath`（它读的是清单里的版本号）。`asset` 是入参，
+      // 与清单可以脱钩：装了别的版本时归档会被解到**清单版本**的目录，而返回值却报
+      // `asset.pythonVersion` ⇒ 版本说一套、文件在另一套，`ensurePython` 再查清单路径
+      // 就会重复下载并把两个版本混进同一个布局。
+      if (asset.pythonVersion !== runtimeManifest.darwinArm64.pythonVersion) {
+        throw new InstallError(
+          "INSTALL_FAILED",
+          `python asset version ${asset.pythonVersion} is not the manifest version ${runtimeManifest.darwinArm64.pythonVersion}`,
+        );
+      }
       const target = path.dirname(path.dirname(managedPythonPath(dataDir)));
-      await rm(target, { recursive: true, force: true });
       await mkdir(path.dirname(target), { recursive: true });
-      // 必须解引用：python-build-standalone 的 `python3` 是相对软链，原样 cp 会让目标
-      // 指进临时解压目录 —— 那个目录在 finally 里被删，托管解释器当场变成断链（真机 smoke 抓到）。
-      await cp(source, target, { recursive: true, dereference: true });
+      // 先解到同级暂存名、再 rename 换上去：`rm` 之后 `cp` 之前被打断（Ctrl-C / 被杀 /
+      // 磁盘满）会让托管位置空着，而 venv 的 `bin/python3` 是指到这里的符号链接 ——
+      // 断链之后状态页报「没装」、实际上一半文件还在，现场与「从没装过」分不开。
+      // 同一文件系统内的 rename 是原子的：要么旧目录在位，要么新目录在位。
+      const staging = `${target}.new-${randomUUID()}`;
+      try {
+        // 必须解引用：python-build-standalone 的 `python3` 是相对软链，原样 cp 会让目标
+        // 指进临时解压目录 —— 那个目录在 finally 里被删，托管解释器当场变成断链（真机 smoke 抓到）。
+        await cp(source, staging, { recursive: true, dereference: true });
+        await rm(target, { recursive: true, force: true });
+        await rename(staging, target);
+      } catch (error) {
+        await rm(staging, { recursive: true, force: true });
+        throw error;
+      }
       const pythonPath = managedPythonPath(dataDir);
-      if (!(await exists(pythonPath))) {
+      if (!executable(pythonPath)) {
         throw new InstallError("INSTALL_FAILED", "python archive did not contain bin/python3");
       }
-      return { pythonPath, version: asset.pythonVersion };
+      return { pythonPath, version: runtimeManifest.darwinArm64.pythonVersion };
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
       // 只在空了的时候撤掉 .tmp；别的安装可能正占着它。
@@ -511,13 +677,6 @@ async function writeRuntimeState(dataDir: string, state: Record<string, unknown>
 }
 
 /**
- * 建 venv 并安装 core 依赖。
- *
- * 先装进临时 venv，成功后才替换旧 venv —— 中断或失败时旧包仍然可用。
- *
- * @param options - 解释器、数据目录、包根与 IO
- */
-/**
  * 把 venv 里 console script 的 shebang 从暂存路径改到最终路径。
  *
  * pip 写入口脚本时把解释器的**绝对路径**写进 shebang，而这个 venv 先建在
@@ -528,8 +687,16 @@ async function writeRuntimeState(dataDir: string, state: Record<string, unknown>
  *
  * 「读脚本」这一步可以由调用方替换：门禁用它造出读不了的文件（Windows 上 `chmod 000`
  * 并不拦读），而判的是「一个脚本读失败不该拖垮整次安装」，与内核对权限的反应无关。
+ *
+ * 导出是给单测用的（生产只有 `installCore` 内部这一处调用）：这段逻辑的正确性只能靠
+ * 「暂存路径 → 最终路径」这一对具体目录来判，装到一半的 venv 造不出来。
+ *
+ * @param scanDir - 扫哪个目录下的 `bin/`
+ * @param from - 脚本 shebang 里现存的旧前缀
+ * @param to - 要换成的最终前缀
+ * @param readScript - 读脚本正文（可注入，门禁用它造读不了的样本）
  */
-async function rewriteShebangs(
+export async function rewriteShebangs(
   scanDir: string,
   from: string,
   to: string,
@@ -554,14 +721,6 @@ async function rewriteShebangs(
       await writeFile(file, `#!${to}/${head.slice(stale.length)}${tail}`, "utf8");
     }),
   );
-}
-
-export async function relocateScripts(
-  venv: string,
-  staging: string,
-  readScript: (file: string) => Promise<string> = (file) => readFile(file, "utf8"),
-): Promise<void> {
-  return rewriteShebangs(venv, staging, venv, readScript);
 }
 
 /**
@@ -605,6 +764,13 @@ async function finishCoreInstall(
   }
 }
 
+/**
+ * 建 venv 并安装 core 依赖。
+ *
+ * 先装进临时 venv，成功后才替换旧 venv —— 中断或失败时旧包仍然可用。
+ *
+ * @param options - 解释器、数据目录、包根与 IO
+ */
 export async function installCore(options: {
   pythonPath: string;
   dataDir: string;
@@ -629,7 +795,10 @@ export async function installCore(options: {
     try {
       const created = await io.spawn([options.pythonPath, "-m", "venv", staging]);
       if (created.code !== 0) {
-        throw new InstallError("INSTALL_FAILED", `venv failed: ${created.stderr.slice(0, 400)}`);
+        throw new InstallError(
+          "INSTALL_FAILED",
+          `venv failed: ${safeStderr(created.stderr).slice(0, 400)}`,
+        );
       }
       const stagingPython = path.join(staging, "bin", "python3");
       const offlineArgs =
@@ -658,7 +827,10 @@ export async function installCore(options: {
         if (PIP_NETWORK.test(text)) {
           throw new InstallError("INSTALL_NETWORK", "pip could not reach the package index");
         }
-        throw new InstallError("INSTALL_FAILED", `pip failed: ${installed.stderr.slice(0, 400)}`);
+        throw new InstallError(
+          "INSTALL_FAILED",
+          `pip failed: ${safeStderr(installed.stderr).slice(0, 400)}`,
+        );
       }
       // 先把 shebang 改在暂存目录里：这一步失败时旧 venv 还一动不动。
       await rewriteShebangs(staging, staging, venv);
@@ -732,7 +904,7 @@ export async function installBrowser(options: {
     if (installed.code !== 0) {
       throw new InstallError(
         "INSTALL_BROWSER_FAILED",
-        `chromium install failed: ${installed.stderr.slice(0, 400)}`,
+        `chromium install failed: ${safeStderr(installed.stderr).slice(0, 400)}`,
       );
     }
     if (!(await hasChromiumUnder(browsersPath))) {
@@ -787,10 +959,7 @@ export async function packStates(
   const state = await readRuntimeState(dataDir);
   const raw = state["packs"];
   const packs: Record<string, unknown> = isPlainRecord(raw) ? raw : {};
-  const core = stateOf(
-    packs["core"],
-    await exists(path.join(dataDir, "runtime", "venv", "bin", "python3")),
-  );
+  const core = stateOf(packs["core"], executable(managedVenvPythonPath(dataDir)));
   const browser = stateOf(packs["browser"], await chromiumInstalled(dataDir));
   const result: Record<RuntimePack, PackState> = {
     core,
@@ -826,9 +995,18 @@ export interface PackUninstallOptions {
   purge: boolean;
 }
 
+/**
+ * 取消信号已经生效就抛。
+ *
+ * 取消用**自己的码**（`INSTALL_CANCELLED`）而不是 `INSTALL_FAILED`：两者在设置卡上
+ * 走的是不同的收场——取消是用户自己点的，界面不该把它报成一次安装失败，调用方
+ * （`lib/runtime-remote.ts`）也不必靠 `signal.aborted` 去反推。
+ *
+ * @param signal - 取消信号
+ */
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) {
-    throw new InstallError("INSTALL_FAILED", "install cancelled");
+    throw new InstallError("INSTALL_CANCELLED", "install cancelled");
   }
 }
 
@@ -841,7 +1019,7 @@ async function ensurePython(
   assets?: string,
 ): Promise<string> {
   const managed = managedPythonPath(dataDir);
-  if (await exists(managed)) {
+  if (executable(managed)) {
     return managed;
   }
   throwIfAborted(signal);
@@ -892,7 +1070,9 @@ export async function installCapabilityPack(
   if (pack === "browser") {
     onProgress?.("installing full chromium");
     // patchright 装在 venv 里，托管 Python 自己没有它 —— 浏览器安装必须走 venv 解释器。
-    const venvPython = path.join(dataDir, "runtime", "venv", "bin", "python3");
+    // 路径复用 `managedVenvPythonPath`：那里带 win32 的 `Scripts/python.exe` 分支，而这里
+    // 手拼的 `bin/python3` 在 Windows 上永远不存在，浏览器包会报一个与真实原因无关的失败。
+    const venvPython = managedVenvPythonPath(dataDir);
     await installBrowser({ pythonPath: venvPython, dataDir, io });
     throwIfAborted(signal);
   }

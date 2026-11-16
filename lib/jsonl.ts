@@ -9,6 +9,7 @@
 import type { Readable } from "node:stream";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { FRAME_ERROR_KINDS, FrameError } from "./frame-error.ts";
+import type { FrameErrorKind } from "./frame-error.ts";
 
 /**
  * 把任意值编码成一帧。
@@ -79,9 +80,32 @@ export function decodeFrame(line: string): Record<string, unknown> {
  */
 export const MAX_FRAME_CHARS = 8 * 1024 * 1024;
 
+/** 判「这一行有没有实质内容」的扫描器，提到模块级：函数里字面量每次调用都会重新编译一遍。 */
+const NOT_BLANK = /\S/u;
+
+/** 一段文本是不是「空行」：只有空白字符就算空。用一次扫描判，不为判空复制整行。 */
+const isBlank = (line: string): boolean => !NOT_BLANK.test(line);
+
 /** 增量切帧器：喂进任意切片的文本，吐出完整的一行。 */
 export class FrameSplitter {
   #buffer = "";
+
+  /**
+   * 超长帧的上报口。
+   *
+   * 给了它，超长就只丢那一行、后面的行照常切出来（与 Python 侧 `handle_raw` 同解：
+   * 它 emit 一条 BAD_FRAME 之后 `return True`，同一批 pending 里后面的合法帧继续处理）；
+   * 不给则退回「抛异常 + 清缓冲」—— 那条路会连同一个 chunk 里**已经切出来的合法帧**
+   * 一起丢掉，只在调用方本来就打算弃掉整条连接时才是对的。
+   */
+  readonly #onOversize: ((error: FrameError) => void) | undefined;
+
+  /**
+   * @param onOversize - 超长帧的上报口；给了就不抛异常，只丢超长那一行
+   */
+  public constructor(onOversize?: (error: FrameError) => void) {
+    this.#onOversize = onOversize;
+  }
 
   /**
    * 喂一段文本进去，把其中完整的行收走。
@@ -89,43 +113,61 @@ export class FrameSplitter {
    * 末尾没换行的残片会留在缓冲里等下一段 —— 这正是「对端分多次 write」时要处理的情况。
    *
    * 残片设上限：没有上限时，对端只要一直吐不带换行的内容，这里就是一个无界增长的字符串，
-   * 整条链路的内存都被它吃光。超限时丢弃残帧并抛 FrameError，由调用方按「对端协议坏了」
-   * 处理 —— 继续无脑攒下去才是真正的故障。
+   * 整条链路的内存都被它吃光。超限时丢弃残帧并抛 FrameError（或经 `onOversize` 上报），
+   * 由调用方按「对端协议坏了」处理 —— 继续无脑攒下去才是真正的故障。
    *
    * @param chunk - 任意长度的文本片段
    * @returns 完整的帧文本列表
-   * @throws FrameError - 残片超过上限时
+   * @throws FrameError - 残片超过上限、且没给 `onOversize` 时
    */
   public push(chunk: string): string[] {
     this.#buffer += chunk;
+    // 一次 split 收完全部完整行，剩下的末段回填缓冲：原先每切一行就 slice 一次剩余缓冲，
+    // 一个 chunk 里有 k 行时拷贝量是 O(k·L)。帧多时（批量回包）那是实打实的 CPU / GC 热点。
+    const parts = this.#buffer.split("\n");
+    // split 的结果至少有一段（空串也算一段），所以 pop 不会回 undefined；
+    // `?? ""` 只是让类型收窄，不是一条能走到的分支。
+    /* v8 ignore next -- split 恒至少返回一段，pop 不会回 undefined */
+    const rest = parts.pop() ?? "";
+    this.#buffer = rest;
     const lines: string[] = [];
-    let newlineAt = this.#buffer.indexOf("\n");
-    while (newlineAt >= 0) {
-      const line = this.#buffer.slice(0, newlineAt);
-      this.#buffer = this.#buffer.slice(newlineAt + 1);
+    for (const line of parts) {
       if (line.length > MAX_FRAME_CHARS) {
         // 超长帧与换行落在同一个 chunk 时，只看残片会漏掉它：切行已经把它移出缓冲区。
-        this.#buffer = "";
-        throw new FrameError(
+        // 不 continue：继续处理同批剩下的行 —— 与 Python 侧同解，丢一帧不丢一批。
+        this.#oversized(
           FRAME_ERROR_KINDS.frameTooLarge,
           `a frame went over ${MAX_FRAME_CHARS} characters`,
         );
-      }
-      if (line.trim().length > 0) {
+      } else if (!isBlank(line)) {
         lines.push(line);
       }
-      newlineAt = this.#buffer.indexOf("\n");
     }
     if (this.#buffer.length > MAX_FRAME_CHARS) {
       this.#buffer = "";
-      // 长度超限按独立的分类抛，而不是「不是合法 JSON」：下游若按 kind 决定丢弃连接或
+      // 长度超限按独立的分类报，而不是「不是合法 JSON」：下游若按 kind 决定丢弃连接或
       // 重试，把限流一类当成对端协议损坏会走向完全相反的行动。
-      throw new FrameError(
+      this.#oversized(
         FRAME_ERROR_KINDS.frameTooLarge,
         `a frame went over ${MAX_FRAME_CHARS} characters without a newline`,
       );
     }
     return lines;
+  }
+
+  /**
+   * 上报一条超长帧：有上报口就交出去（不抛、也不清缓冲里后面那些合法行），没有就抛。
+   *
+   * @param kind - 错误分类
+   * @param message - 错误说明
+   * @throws FrameError - 没有配置 `onOversize` 时
+   */
+  #oversized(kind: FrameErrorKind, message: string): void {
+    const error = new FrameError(kind, message);
+    if (this.#onOversize === undefined) {
+      throw error;
+    }
+    this.#onOversize(error);
   }
 
   /**
@@ -136,9 +178,9 @@ export class FrameSplitter {
    * @returns 残留的帧文本；没有则空数组
    */
   public flush(): string[] {
-    const rest = this.#buffer.trim();
+    const rest = this.#buffer;
     this.#buffer = "";
-    return rest.length > 0 ? [rest] : [];
+    return isBlank(rest) ? [] : [rest.trim()];
   }
 
   /** 丢弃缓冲区里的残片。调用方已经收摊时用，避免残片一直占着内存。 */
@@ -170,7 +212,6 @@ export function pumpFrames(
   onFrame: (line: string) => void,
   onError: (error: unknown) => void = (): void => undefined,
 ): () => void {
-  const splitter = new FrameSplitter();
   // 共享状态放对象里而不是裸 let：stop() 由调用方持有，会在 for 循环**两次迭代之间**
   // 把标志翻掉。用裸 let 时 TS 的控制流分析会把它窄化成 false，于是那句守卫看起来
   // 「永远不成立」被判掉 —— 那是分析器的错觉，不是代码里真的没这个分支。
@@ -184,17 +225,17 @@ export function pumpFrames(
     }
   };
 
+  // 超长帧走 onError 上报，而不是抛出来：抛出去会把同一个 chunk 里**已经切出来的合法帧**
+  // 一起丢掉（帧在一次 push 里成批到达），而 Python 侧对同一种输入是「报一条 BAD_FRAME、
+  // 后面的帧照常处理」。两侧必须同解，否则同一份输入在两侧得到不同的帧序列。
+  const splitter = new FrameSplitter(report);
+
   // `setEncoding("utf8")` 在挂监听器之前就由本函数设好（见下面 stream.setEncoding），所以
   // 'data' 交来的只会是 string；stop() 又会把 data 监听器摘掉，停止后的流进不到这里。
   const handle = (chunk: string): void => {
-    let frames: string[];
-    try {
-      frames = splitter.push(chunk);
-    } catch (error) {
-      report(error);
-      return;
-    }
-    for (const line of frames) {
+    // push 不会抛：超长帧已经由构造时交进去的 report 承接。套一层永远进不去的 catch
+    // 只会给覆盖率留一条假分支。
+    for (const line of splitter.push(chunk)) {
       if (state.stopped) {
         return;
       }
@@ -239,6 +280,12 @@ export function pumpFrames(
   stream.on("error", handleError);
 
   return () => {
+    // 幂等：收尾路径上多路 teardown 可能拿到同一个 stop，第二次进来时那些 off 都是空操作，
+    // 但末尾那句 `on("error", swallowLateError)` 会**每调一次多挂一个**监听器，攒到 11 个
+    // 就是一条 MaxListenersExceededWarning，吞错兜底也从一份变成 N 份。
+    if (state.stopped) {
+      return;
+    }
     state.stopped = true;
     // 三个 handler 一起摘：只摘 data 时，end/error 仍会在 stop() 之后回调，违背
     // 「调用后不再回调」的契约，也会一直持有 splitter 与回调闭包直到流销毁。

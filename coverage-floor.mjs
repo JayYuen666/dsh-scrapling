@@ -63,7 +63,9 @@ export function floorFromScripts(pkg) {
     process.stderr.write("package.json.scripts.coverage:floor 读不到，无法核对两处地板是否一致\n");
     return null;
   }
-  const match = /--fail-under=(?<floor>\d+)/u.exec(command);
+  // coverage.py 支持小数地板（--fail-under=74.5），只截 \d+ 会把 74.5 截成 74，
+  // 于是 “两处一致” 这条校验被悄悄绕过；`--fail-under 74`（空格形式）同样要认。
+  const match = /--fail-under(?:=|\s+)(?<floor>\d+(?:\.\d+)?)/u.exec(command);
   const floor = match?.groups?.floor;
   if (floor === undefined) {
     process.stderr.write("coverage:floor 里没有 --fail-under，无法核对两处地板是否一致\n");
@@ -76,10 +78,19 @@ export function floorFromScripts(pkg) {
  * 磁盘上有、files 里没登记的 py 源文件。
  *
  * @param shipped - files 里登记的条目
- * @returns 漏登记的相对路径
+ * @returns 漏登记的相对路径；py/ 读不到时返回 null（并已写 stderr）
  */
 export function missingFromFiles(shipped) {
-  const onDisk = readdirSync(path.join(ROOT, "py"), { withFileTypes: true })
+  let entries;
+  try {
+    entries = readdirSync(path.join(ROOT, "py"), { withFileTypes: true });
+  } catch (error) {
+    // 读不到 py/ 要判红并点名：让裸 Node 栈冒出去时，“目录读不到”与“覆盖率不达标”
+    // 在 CI 上长得一样。返回 null 由 validateShipped 折成判红。
+    process.stderr.write(`读不到 ${path.join(ROOT, "py")}：${String(error)}\n`);
+    return null;
+  }
+  const onDisk = entries
     .filter((entry) => entry.isFile() && entry.name.endsWith(".py"))
     .map((entry) => `py/${entry.name}`);
   const listed = new Set(shipped);
@@ -124,6 +135,9 @@ function validateShipped(pkg) {
     return null;
   }
   const missing = missingFromFiles(shipped);
+  if (missing === null) {
+    return null;
+  }
   if (missing.length > 0) {
     process.stderr.write(
       `这些 py 源文件在磁盘上却不在 package.json.files 里，不会被本脚本量到：${missing.join(", ")}\n`,
@@ -142,9 +156,11 @@ function failuresOf(shipped, measured) {
       continue;
     }
     const pct = info.summary?.percent_covered;
-    if (typeof pct !== "number" || pct < FLOOR) {
+    // `typeof NaN === "number"` 为真，而 `NaN < FLOOR` 恒假 —— 只判 typeof 会把
+    // “读数缺了/坏了” 当成“通过”。必须用 isFinite 把 NaN 与 Infinity 一起排掉。
+    if (typeof pct !== "number" || !Number.isFinite(pct) || pct < FLOOR) {
       failures.push(
-        `${entry}: ${typeof pct === "number" ? pct.toFixed(2) : "?"}% < ${String(FLOOR)}%`,
+        `${entry}: ${typeof pct === "number" && Number.isFinite(pct) ? pct.toFixed(2) : "?"}% < ${String(FLOOR)}%`,
       );
     }
   }
@@ -186,17 +202,24 @@ export function invokedAsScript() {
   if (argvPath === undefined) {
     return false;
   }
-  try {
-    const invoked = realpathSync(path.resolve(argvPath));
-    const self = realpathSync(path.resolve(import.meta.filename));
-    return process.platform === "win32"
-      ? invoked.toLowerCase() === self.toLowerCase()
-      : invoked === self;
-  } catch {
-    return false;
-  }
+  const invoked = realpathSync(path.resolve(argvPath));
+  const self = realpathSync(path.resolve(import.meta.filename));
+  return process.platform === "win32"
+    ? invoked.toLowerCase() === self.toLowerCase()
+    : invoked === self;
 }
 
-if (invokedAsScript()) {
+let asScript;
+try {
+  asScript = invokedAsScript();
+} catch (error) {
+  // 判不出「是不是被当脚本调起」时按**是**处理：多跑一次检查的代价远小于静默放行。
+  process.stderr.write(
+    `[coverage-floor] 判不出本次是否被当脚本调起（${String(error)}）；按「是」处理，照常检查。\n`,
+  );
+  asScript = true;
+}
+
+if (asScript) {
   process.exitCode = main();
 }

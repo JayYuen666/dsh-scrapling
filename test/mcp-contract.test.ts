@@ -24,6 +24,17 @@ describe("mcpUrl", () => {
       expect(() => mcpUrl(port, "127.0.0.1")).toThrow(/1\.\.65535/u);
     }
   });
+
+  it("主机也校验：空串、带 scheme、方括号不闭合、裸 % 都拒", () => {
+    // 这四种拼出来都不是「客户端连不上」，而是**一条看着像 URL 的坏串**：
+    // `http://:39217/mcp`、`http://http://127.0.0.1:39217/mcp`、`http://[::1:39217/mcp`，
+    // 以及 zone id 未按 RFC 6874 转义（裸 `%`）的那种 —— 最后一条连 WHATWG URL 解析都会抛。
+    expect(() => mcpUrl(39_217, "")).toThrow(/must not be blank/u);
+    expect(() => mcpUrl(39_217, "   ")).toThrow(/must not be blank/u);
+    expect(() => mcpUrl(39_217, "http://127.0.0.1")).toThrow(/bare host/u);
+    expect(() => mcpUrl(39_217, "[::1")).toThrow(/unterminated bracket/u);
+    expect(() => mcpUrl(39_217, "fe80::1%eth0")).toThrow(/%25/u);
+  });
 });
 
 describe("客户端钉版", () => {
@@ -51,6 +62,17 @@ describe("客户端钉版", () => {
     for (const bad of ["latest", "0.2.2-alpha.2", "0.2.2-alpha.3", "0.2.1-rc.5", `^${DEV_LINE}`]) {
       expect(() => clientInstallCommand(bad as never)).toThrow(/unsupported MCP client pin/u);
     }
+  });
+
+  it("放行名单是冻结副本：同进程代码改不动它，两个消费点也就不会一起松口", () => {
+    // 早先 `MCP_CLIENT_PINS = MCP_CLIENT_PIN_VALUES` 是同一个数组对象，`readonly string[]`
+    // 只在 TS 层拦；运行期 push 进去一个 "latest"，`clientInstallCommand` 与 doctor 会同时
+    // 放行一个宿主拒绝装载的钉版。
+    expect(Object.isFrozen(MCP_CLIENT_PINS)).toBe(true);
+    expect(() => {
+      (MCP_CLIENT_PINS as string[]).push("latest");
+    }).toThrow(TypeError);
+    expect(() => clientInstallCommand("latest" as never)).toThrow(/unsupported MCP client pin/u);
   });
 });
 

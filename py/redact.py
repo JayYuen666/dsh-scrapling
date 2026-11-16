@@ -7,12 +7,21 @@ guard 的日志与 adapters 的网络摘要在「给日志、给模型看」之�
 from __future__ import annotations
 
 import re
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 # 畸形 URL（urlsplit 抛 ValueError）上仍要按参数名兜底：解析失败不能等于「整串放行」。
 _QUERY_SECRET_FALLBACK = re.compile(
     r"(?i)([?&;](?:token|key|secret|password|pwd|sig|signature|auth|session)[^=&#]*=)[^&#]*"
 )
+# 兜底路径同样要摘 authority 里的 `user:pass@`：`http://user:pass@[::1/x?token=abc` 这种
+# 括号不闭合的形态会让 urlsplit 抛 ValueError，而它的口令就藏在 authority 段 —— 只处理查询串
+# 等于把口令原样放行。锚在 `//` 上（mailto:/tel: 这类没有 `//`，不会误伤）。
+_AUTHORITY_USERINFO_FALLBACK = re.compile(r"(?<=//)[^\s/?#@]*@")
+# 查询串的两种合法分隔符：`&` 与 `;`（HTML 4 / RFC 1738）。切片时保留分隔符本身，
+# 于是 `split` 的奇数位就是分隔符。
+_QUERY_SEPARATOR = re.compile(r"([&;])")
+# 一段 `name=value`。名字允许空（`?=x` 是畸形但存在），值允许空（`?token=`）。
+_QUERY_PAIR = re.compile(r"(?P<name>[^=]*)=(?P<value>.*)", re.DOTALL)
 # 这些 scheme 的 ``@`` 属于地址本身（mailto/tel 之类），不是 user:pass@host 的 authority。
 _NON_AUTHORITY_SCHEMES = frozenset({"mailto", "tel", "data", "javascript", "urn", "about", "blob"})
 
@@ -54,6 +63,21 @@ _SECRET_QUERY_KEYS = frozenset(
         "token",
     }
 )
+# 参数名判据的归一形态：去掉 `-` 与 `_` 再比对。浏览器端 JS 拼接口时最常写 `accessToken`
+# / `clientSecret` / `idToken`（驼峰），而集合里记的是下划线形式 —— 只做 `strip().lower()`
+# 时 `accessToken`.lower() 是 `accesstoken`，命中不了 `access_token`，凭据于是原样进摘要。
+# 归一方向只有一个：两边都去掉 `-`/`_` 再比，集合与输入用同一套规则。
+_SECRET_QUERY_KEYS_FLAT = frozenset(key.replace("-", "").replace("_", "") for key in _SECRET_QUERY_KEYS)
+
+
+def _is_secret_query_key(name: str) -> bool:
+    """判一个查询参数名是否装凭据；`_`/`-`/大小写都不敏感。
+
+    :param name: 参数名（可能带空白与混合大小写）
+    :returns: 命中凭据名单时为真
+    """
+    flat = name.strip().lower().replace("-", "").replace("_", "")
+    return flat in _SECRET_QUERY_KEYS_FLAT
 
 
 def _redacted_query(text: str) -> str:
@@ -67,17 +91,27 @@ def _redacted_query(text: str) -> str:
     """
     if not text:
         return text
-    pairs: list[tuple[str, str]] = []
     changed = False
-    for name, value in parse_qsl(text, keep_blank_values=True):
-        if name.strip().lower() in _SECRET_QUERY_KEYS:
-            pairs.append((name, "<redacted>"))
+    pieces: list[str] = []
+    # **不能只按 `&` 切**：`;` 在 HTML 4 与 RFC 1738 里也是合法的参数分隔符，真实站点至今仍在用
+    # `?a=1;token=…`，而 Python 3.10 起 `parse_qsl` 不再把 `;` 当分隔符 —— 整串于是被读成一个
+    # 名字 `a`、值 `1;token=abc`，参数名判据命中不了，凭据原样进日志。这里自己按 `&` 与 `;` 切、
+    # 逐段判名，分隔符原样保留（重排或替换分隔符会让日志里的 URL 与真实请求对不上）。
+    for position, token in enumerate(_QUERY_SEPARATOR.split(text)):
+        if position % 2 == 1 or not token:
+            pieces.append(token)
+            continue
+        match = _QUERY_PAIR.fullmatch(token)
+        name = match.group("name") if match is not None else token
+        value = match.group("value") if match is not None else None
+        if value is not None and _is_secret_query_key(name):
+            pieces.append(f"{name}=<redacted>")
             changed = True
         else:
-            pairs.append((name, value))
+            pieces.append(token)
     if not changed:
         return text
-    return urlencode(pairs)
+    return "".join(pieces)
 
 
 def _redacted_fragment(fragment: str) -> str:
@@ -112,7 +146,8 @@ def redact_url_secrets(raw: str) -> str:
     try:
         parsed = urlsplit(raw)
     except ValueError:
-        return _QUERY_SECRET_FALLBACK.sub(r"\1<redacted>", raw)
+        without_userinfo = _AUTHORITY_USERINFO_FALLBACK.sub("", raw)
+        return _QUERY_SECRET_FALLBACK.sub(r"\1<redacted>", without_userinfo)
     # 没有 scheme 的 ``user:pass@host:8080`` 会被 urlsplit 读成 scheme='user'、
     # path='pass@host:8080'：netloc 为空，下面按 netloc 摘 userinfo 的那一步什么都不做，
     # 整条代理口令于是原样漏进日志（PROXY_URL 不可用那条日志正是这么来的）。这种形态的

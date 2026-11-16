@@ -18,10 +18,14 @@ resolving before deciding; this probe reuses neither that code nor its assumptio
 
 Why there is a guarded *path* as well as a guarded host: `blocked.invalid` never resolves,
 so an abort for it cannot be told apart from a request that would have died in DNS anyway.
-The only target that proves the handler actually stopped something is one the server can
-see — so `/guarded-…` is served like anything else, and the guard is the only thing between
-the page and that byte. Stage [1] (no guard) must show the hit, stage [2] (guard on) must
-not.
+The same holds for `169.254.169.254` off a cloud host: nothing routes it, so `goto` fails
+on its own with or without the guard. The only target that proves the handler actually
+stopped something is one the server can see — so `/guarded-…` is served like anything
+else, and the guard is the only thing between the page and that byte. Stage [1] (no guard)
+must show the hit, stage [2] (guard on) must not.
+
+阶段 [1]/[2] 也走与 [3]/[4] 同一层捕获：`r.html_content`、`r2.css(...)` 任一处抛错都会
+跳过末尾那份汇总，探针就退化成一份读不出「坏在哪一条」的堆栈。
 """
 
 import ipaddress
@@ -33,7 +37,6 @@ from urllib.parse import urlparse
 
 from scrapling.fetchers import StealthySession
 
-BLOCKED = {"blocked.invalid", "169.254.169.254"}
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 # 探针自定的规则，不是本插件的策略：它只为造出一个「可达但被守卫拒绝」的目标。
 GUARDED_PATH = "/guarded-"
@@ -44,9 +47,14 @@ FAILURES: list[str] = []
 
 
 def host_allowed(host: str) -> bool:
-    """Allow only an allow-listed name or a literal global address; deny everything else."""
-    if host in BLOCKED:
-        return False
+    """Allow only an allow-listed name or a literal global address; deny everything else.
+
+    刻意没有一份「额外拉黑」的名单：`169.254.169.254` 会在这里被拒，拒它的是
+    `is_global` 那条判据（链路本地地址按定义不是 global）；`blocked.invalid` 则落在
+    `ip_address()` 的 ValueError 上。原先有一份 `BLOCKED` 集合把这两个名字单独列出来，
+    但那个分支对任何输入都不改变结果 —— 留着只会让人以为这两个目标被特殊处理过，
+    而这一份文件反复强调的正是「名字 vs 地址」不能混着看。
+    """
     if host in ALLOWED_HOSTS:
         return True
     try:
@@ -118,6 +126,16 @@ def start_stage(title: str) -> None:
     print(f"\n== {title} ==")
 
 
+def stage(title: str, body: Callable[[], None]) -> None:
+    """Run one stage; a raising stage is one recorded failure, not the end of the probe."""
+    start_stage(title)
+    try:
+        body()
+    except Exception as error:  # noqa: BLE001 — 探针要报任何一类意外
+        FAILURES.append(f"{title} 整段抛错")
+        print(f"   OBSERVE-FAIL {type(error).__name__}: {error}")
+
+
 def expect(label: str, ok: Callable[[], bool]) -> None:
     """Print one expectation; `False` is a recorded failure, not just a line."""
     try:
@@ -138,48 +156,67 @@ URL = f"http://127.0.0.1:{PORT}/"
 print(f"local server at {URL}")
 
 try:
-    start_stage("[1] baseline WITHOUT guard (is the guarded target reachable?)")
-    r = browser_fetch(URL, timeout=30000)
-    print(f"   page rendered: {'LOCAL_OK' in r.html_content}")
-    print(f"   guarded hits: {hits['guarded']}")
-    expect("guarded target reaches the server", lambda: hits["guarded"] >= 1)
 
-    start_stage("[2] WITH page_setup guard (does it survive unroute_all?)")
-    r2 = browser_fetch(URL, timeout=30000, page_setup=page_setup)
-    print(f"   handler was invoked (allowed): {seen['allowed']}")
-    print(f"   aborted requests: {seen['aborted']}")
-    print(f"   guarded hits: {hits['guarded']}")
-    print(f"   page still rendered: {'LOCAL_OK' in r2.html_content}")
-    print(f"   title: {r2.css('title::text').get()!r}")
-    # 回调有记录 = 路由还在；可达目标没落到服务端 = 拦的是守卫，不是 DNS。
-    expect("handler still invoked after unroute_all", lambda: len(seen["allowed"]) > 0)
-    expect("guard aborts a reachable target", lambda: hits["guarded"] == 0)
-    expect("guarded host shows up in aborted", lambda: any(GUARDED_PATH in h for h in seen["aborted"]))
+    def baseline() -> None:
+        r = browser_fetch(URL, timeout=30000)
+        print(f"   page rendered: {'LOCAL_OK' in r.html_content}")
+        print(f"   guarded hits: {hits['guarded']}")
+        expect("guarded target reaches the server", lambda: hits["guarded"] >= 1)
 
-    start_stage("[3] guard on the MAIN navigation")
-    blocked_navigation = False
-    try:
-        r3 = browser_fetch("http://169.254.169.254/latest/meta-data/", timeout=10000, page_setup=page_setup)
-        print(f"   NOT blocked -> status={r3.status}")
-    except Exception as error:  # noqa: BLE001
-        blocked_navigation = True
-        print(f"   blocked -> {type(error).__name__}: {str(error)[:100]}")
-    expect("main navigation to a blocked address fails", lambda: blocked_navigation)
+    def with_guard() -> None:
+        r2 = browser_fetch(URL, timeout=30000, page_setup=page_setup)
+        print(f"   handler was invoked (allowed): {seen['allowed']}")
+        print(f"   aborted requests: {seen['aborted']}")
+        print(f"   guarded hits: {hits['guarded']}")
+        print(f"   page still rendered: {'LOCAL_OK' in r2.html_content}")
+        print(f"   title: {r2.css('title::text').get()!r}")
+        # 回调有记录 = 路由还在；可达目标没落到服务端 = 拦的是守卫，不是 DNS。
+        expect("handler still invoked after unroute_all", lambda: len(seen["allowed"]) > 0)
+        expect("guard aborts a reachable target", lambda: hits["guarded"] == 0)
+        expect(
+            "guarded host shows up in aborted",
+            lambda: any(GUARDED_PATH in h for h in seen["aborted"]),
+        )
 
-    start_stage("[4] page_setup errors are swallowed")
+    def blocked_navigation() -> None:
+        state = {"failed": False}
+        try:
+            r3 = browser_fetch("http://169.254.169.254/latest/meta-data/", timeout=10000, page_setup=page_setup)
+            print(f"   NOT blocked -> status={r3.status}")
+        except Exception as error:  # noqa: BLE001
+            state["failed"] = True
+            print(f"   blocked -> {type(error).__name__}: {str(error)[:100]}")
+        expect("main navigation to a blocked address fails", lambda: state["failed"])
+        # 只验「失败了」是**不可证伪**的：这个地址在非云主机上本来就无路由，撤掉守卫
+        # 照样超时抛错。守卫真的拦过它的唯一证据是回调里出现过这个主机 —— `guard()`
+        # 在 abort 之前就把它记进了 `seen["aborted"]`。
+        expect(
+            "the blocked host shows up in aborted (the guard stopped it, not the network)",
+            lambda: any("169.254.169.254" in h for h in seen["aborted"]),
+        )
 
-    def exploding_setup(page: Any) -> None:
-        raise RuntimeError("boom")
+    def exploding_setup_stage() -> None:
+        def exploding_setup(page: Any) -> None:
+            raise RuntimeError("boom")
 
-    returned_despite_error = False
-    try:
-        r4 = browser_fetch(URL, timeout=20000, page_setup=exploding_setup)
-        returned_despite_error = True
-        print(f"   returned normally despite failed setup: status={r4.status}")
-    except Exception as error:  # noqa: BLE001
-        print(f"   raised {type(error).__name__}: {str(error)[:80]}")
-    # 这条要证的正是「守卫自己起不来时不会以异常报告」，所以期望就是它照常返回。
-    expect("page_setup exception does not fail the fetch", lambda: returned_despite_error)
+        state = {"returned": False}
+        try:
+            r4 = browser_fetch(URL, timeout=20000, page_setup=exploding_setup)
+            # 标记必须落在属性访问**之后**：先置 True 的话，`r4` 是 None 或缺 `status`
+            # 时那句 AttributeError 会被同一个 except 吞掉，输出变成自相矛盾的
+            # 「raised …」而期望仍然判 OK —— 一条真实的假通过路径。
+            status = r4.status
+            state["returned"] = True
+            print(f"   returned normally despite failed setup: status={status}")
+        except Exception as error:  # noqa: BLE001
+            print(f"   raised {type(error).__name__}: {str(error)[:80]}")
+        # 这条要证的正是「守卫自己起不来时不会以异常报告」，所以期望就是它照常返回。
+        expect("page_setup exception does not fail the fetch", lambda: state["returned"])
+
+    stage("[1] baseline WITHOUT guard (is the guarded target reachable?)", baseline)
+    stage("[2] WITH page_setup guard (does it survive unroute_all?)", with_guard)
+    stage("[3] guard on the MAIN navigation", blocked_navigation)
+    stage("[4] page_setup errors are swallowed", exploding_setup_stage)
 finally:
     # shutdown() 只管停 serve_forever，监听套接字要 server_close() 才释放；
     # 放在 finally 里是因为前面任何一次 fetch/import 抛错都不能把端口留给下一个进程。

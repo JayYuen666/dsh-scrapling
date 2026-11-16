@@ -258,6 +258,16 @@ describe("错误类的参数位（SidecarError）", () => {
     expect(withCause.cause).toBe("raw");
   });
 
+  it("details 是冻结的快照，调用方事后改原对象改不到这条错误", () => {
+    // `readonly details` 只保护绑定：不冻结时，错误对象在宿主那里是不可变快照
+    // （持久化、日志、模型侧按 code 分流），而这里却跟着调用方手上的对象一起变。
+    const source: Record<string, unknown> = { index: 7 };
+    const error = new SidecarError("ACTION_FAILED", "动作失败", source);
+    source["index"] = 99;
+    expect(error.details).toStrictEqual({ index: 7 });
+    expect(Object.isFrozen(error.details)).toBe(true);
+  });
+
   it("是宿主的 HarnessError 子类，code 由父类持有（宿主靠 instanceof 认出它）", async () => {
     // 这一格是「错误码到得了模型面前」的唯一判据。宿主的
     // `packages/core/tools/src/pipeline.ts#errorInfo` 判的是

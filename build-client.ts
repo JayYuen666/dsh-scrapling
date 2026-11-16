@@ -5,7 +5,9 @@
 // window.__ModuleLoader__.load({ id, factory }) 的 外壳 里。id 取 package.json 的 name，
 // 与 dsh.client 模块表键一致。
 //
-// 同步 fs（readFileSync/writeFileSync）为构建必需，已列入 oxlint.config.ts 的 syncWrites。
+// 同步写盘经 `build-helpers.ts` 的 `writeArtifact`（`writeFileSync` + `renameSync`），本文件
+// 自己既不读也不写 fs —— 仍列在 oxlint.config.ts 的 syncIoScopes 里是因为那颗 helper 与它共用
+// 一份名单（构建脚本的同步 IO 是一件事，不分文件写）。
 //
 // 与 build-host.ts 同理：**源码是 .ts，产物是 .js** —— Node 不肯在 node_modules 里剥离类型，而 dsh 正是在 node_modules 里按包名载入 client.js 的。
 
@@ -22,47 +24,69 @@ import {
 
 const root = import.meta.dirname;
 
-// react 与 zod 按**包名段**外部化：字符串项是精确匹配，只写 "react" 时 react/jsx-runtime
+// react 家族与 zod 按**包名段**外部化：字符串项是精确匹配，只写 "react" 时 react/jsx-runtime
 // 与 react-dom 的任意子路径都会被内联进产物，宿主与产物各持一份 React 实例 —— hook 报
-// Invalid hook call、状态互不可见，而构建照样成功退出。本包目前只 import "react" 与
-// "zod"，但这条判据不该依赖「将来没人改用 JSX 自动运行时」。
+// Invalid hook call、状态互不可见，而构建照样成功退出。清单与 shared 的
+// `REACT_RUNTIME_MODULES` 逐项对齐（那是宿主冻结模块表里实际提供的键），本包目前只 import
+// "react"、"zod" 与 shared 客户端行，这份清单是给「将来有人改用 JSX 自动运行时」留的护栏。
 //
 // 其余裸说明符（node: 前缀与相对路径已由 rolldown 处理，不在此列）不外部化：产物是
-// 浏览器侧的单文件，除宿主提供的 react 与 zod 之外不该在运行期解析任何东西。
+// 浏览器侧的单文件，除宿主提供的这些键（react 家族、zod、shared 客户端行）之外不该在
+// 运行期解析任何东西。
 // zod 是宿主 `PLATFORM_MODULES` 冻结模块表里的一枚；内联会得到第二份 zod 身份。
 //
-// shared 的客户端代码刻意**不**外部化（含其 `./client` 子路径）：外部化的供应方是另一份包
-// 的 client 产物，要靠宿主把那份包装载成模块表条目才兑现；它只作为传递依赖装进 profile 时
-// （`dsh plugin add` 的正常结果），宿主侧可能既不报错也不把它的 client 产物排进启动图，
-// 设置卡的 require("@jayyuen66/dsh-plugin-shared/client") 就在页面启动时落进
+// shared 的客户端行由 cordis.patch.yml 插入的固定 id `dsh-plugin-shared` 供应行装载成模块表条目；
+// package.json 的 dsh.client.external 同步声明这一条，供宿主按依赖边排序。
+// 历史教训：只作为传递依赖安装、宿主没把 shared 排进启动图时，页面启动会落进
 // "missed the module table"（dsh-ocr-review 仓 issue #2，宿主 0.2.2-rc.1 dsh desktop）。
-// 内联之后产物自足，react / zod 仍经模块表取宿主的唯一实例，不产生第二份身份。
-const isExternal = externalizePackages(["react", "zod"]);
+// 本仓现在显式启用供应行，并接受「shared 必须作为 client row 被宿主装载」这一前提。
+export const RUNTIME_EXTERNALS = [
+  "react",
+  "react/jsx-runtime",
+  "react-dom",
+  "react-dom/client",
+  "zod",
+  // 这个清单按「包名段」匹配（externalizePackages 会把子路径归到包名），所以登记裸包名。
+  "@jayyuen66/dsh-plugin-shared",
+];
+const isExternal = externalizePackages(RUNTIME_EXTERNALS);
 
 const nameKey = "name";
 
 /**
  * 外壳 的模块 id：必须与 package.json 的 `name` 逐字相同，宿主才按包名找得到这个模块。
  *
+ * 「逐字」是字面意思，所以这里**不** trim：宿主的模块表键取自 package.json 的原值，拼一个
+ * trim 过的 id 在多数情况下看着一样、在 `name` 带首尾空白时就不相等 —— 那正是把失败推迟到
+ * 运行期（卡片整个不渲染、页面只报 module not found）。带空白的 name 本身就是非法的 npm
+ * 包名，遇到就点名让人去修 package.json，而不是替它猜。
+ *
  * 读与判都放在这里而不是模块顶层：本模块被测试 import 时不该在 import 阶段就抛（那会绕过
- * `main` 的 try/catch 与 `process.exitCode` 统一处理）。导出是为了让「name 缺失或只有空白」这条
- * 判据能被用例直接钉住——构建脚本不在覆盖率分母里，但它是唯一决定 外壳 id 的地方。
+ * `main` 的 try/catch 与 `process.exitCode` 统一处理）。导出是为了让「name 缺失 / 只有空白 /
+ * 带首尾空白」这几条判据能被用例直接钉住——构建脚本不在覆盖率分母里，但它是唯一决定 外壳 id 的地方。
  *
  * @param packageRoot - 包根
- * @returns package.json 里那条非空的 `name`
+ * @returns package.json 里那条原样的非空 `name`
  */
 export function clientModuleId(packageRoot: string): string {
   const pkgJson = readPackageJson(packageRoot);
   const nameRaw = isRecord(pkgJson) ? pkgJson[nameKey] : undefined;
-  // 只判 length > 0 的话，`"name": " "` 会拼出一个 id 带空格的 外壳，宿主按这个键仍然找不到模块，
-  // 而那正是下方注释说要避免的「把失败推迟到运行期」。
-  const trimmed = typeof nameRaw === "string" ? nameRaw.trim() : "";
-  if (trimmed === "") {
+  // 空串与纯空白是「没有名字」，不是「名字带空白」：两者的修法不同（补一个 name / 去掉空白），
+  // 报错要分清，否则读者会以为把空白删掉就完事，实际上 name 还是空的。
+  if (typeof nameRaw !== "string" || nameRaw.trim() === "") {
     throw new Error(
       "package.json is missing a non-empty `name`; client.js needs it verbatim as its module id",
     );
   }
-  return trimmed;
+  if (nameRaw.trim() !== nameRaw) {
+    // 只判 length > 0 时 `" "` 会拼出一个 id 带空格的 外壳；只 trim 又会让 id 与宿主的
+    // 模块表键不相等。两条都是「构建成功、运行期找不到模块」，所以这里直接拒。
+    throw new Error(
+      `package.json's \`name\` has leading or trailing whitespace (${JSON.stringify(nameRaw)}); ` +
+        "client.js needs it verbatim as its module id, and a trimmed id would not match the host's module table key",
+    );
+  }
+  return nameRaw;
 }
 
 /**
@@ -109,14 +133,18 @@ async function main(): Promise<void> {
   console.info("client.js written:", out.length, "chars");
 }
 
-if (invokedDirectly(import.meta.filename, import.meta.url)) {
-  // 这里用顶层 await：node/no-top-level-await 与本文件原本该满足的
-  // unicorn/prefer-top-level-await 互斥，已在 oxlint.config.ts 里按「对侧互斥」
-  // 记录了关掉哪一条。构建脚本只由 node 直接执行，不进 bundler 的 require(esm) 路径。
-  try {
+try {
+  if (invokedDirectly(import.meta.filename, import.meta.url)) {
+    // 这里用顶层 await：node/no-top-level-await 与本文件原本该满足的
+    // unicorn/prefer-top-level-await 互斥，已在 oxlint.config.ts 里按「对侧互斥」
+    // 记录了关掉哪一条。构建脚本只由 node 直接执行，不进 bundler 的 require(esm) 路径。
+    //
+    // 入口判定被包在 try 里：invokedDirectly 在入口路径解析失败时是**主动抛错**的（它
+    // 拒绝猜），放在 try 之外就会以顶层未捕获异常结束进程 —— 打整段堆栈、用 Node 自己的
+    // 默认退出码，与本文件其它失败路径的 `console.error` + `process.exitCode = 1` 不同形。
     await main();
-  } catch (error) {
-    console.error(error);
-    process.exitCode = 1;
   }
+} catch (error) {
+  console.error(error);
+  process.exitCode = 1;
 }

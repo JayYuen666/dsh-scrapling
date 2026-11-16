@@ -11,10 +11,9 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
-const LOCAL_PYTHON =
-  process.platform === "win32"
-    ? path.join(REPO_ROOT, "_env", ".venv", "Scripts", "python.exe")
-    : path.join(REPO_ROOT, "_env", ".venv", "bin", "python");
+// 解释器路径从 test/python-bin.ts 取，不在这里重拼 `_env/.venv/...`：那套布局由
+// `lib/runtime.ts` 的 `repoPythonPath` 定义，第二份手写的拷贝会在改布局时静默漂移。
+const { LOCAL_PYTHON } = await import("../python-bin.ts");
 const BRIDGE = path.join(REPO_ROOT, "py", "bridge.py");
 const available = existsSync(LOCAL_PYTHON) && existsSync(BRIDGE);
 

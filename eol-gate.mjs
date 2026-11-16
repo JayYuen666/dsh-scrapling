@@ -84,10 +84,13 @@ export function indexOffenders(rows) {
     const tab = row.indexOf("\t");
     const file = tab === -1 ? "" : row.slice(tab + 1);
     const status = tab === -1 ? "" : row.slice(0, tab).trimStart().split(/\s+/u)[0];
+    // `i/none` 是「索引内容里一条换行都没有」——空文件、或单行且无结尾换行的源码文件。
+    // 这类文件不可能是 CRLF，把它判成 offender 会让门禁对正常文件报红。
     if (
       file.length > 0 &&
       SOURCE_SUFFIXES.some((suffix) => file.endsWith(suffix)) &&
-      status !== "i/lf"
+      status !== "i/lf" &&
+      status !== "i/none"
     ) {
       offenders.push(`${status} ${file}`);
     }
@@ -131,6 +134,23 @@ function isDirectory(file) {
  * @param dir - 目录
  * @returns 条目
  */
+/**
+ * 是不是普通文件。只吞「不存在 / 不是文件」，其余错误照抛。
+ *
+ * @param file - 路径
+ * @returns 是否文件
+ */
+function isFile(file) {
+  try {
+    return statSync(file).isFile();
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+      return false;
+    }
+    throw error;
+  }
+}
+
 function readdirSorted(dir) {
   return readdirSync(dir, { withFileTypes: true }).toSorted((left, right) =>
     left.name < right.name ? -1 : 1,
@@ -151,8 +171,14 @@ function walk(dir) {
       if (!SKIPPED_DIRS.has(entry.name)) {
         found.push(...walk(full));
       }
-    } else if (entry.isFile() && !entry.name.endsWith(".lock")) {
-      found.push({ file: path.relative(ROOT, full), text: readFileSync(full, "utf8") });
+    } else if (entry.isFile()) {
+      try {
+        found.push({ file: path.relative(ROOT, full), text: readFileSync(full, "utf8") });
+      } catch (error) {
+        // 遍历期间被删、权限不足、或是 FIFO/设备文件：点名并跳过这一份，而不是带着裸栈退出
+        // （裸栈会把「这一份读不到」伪装成「门禁脚本坏了」）。
+        process.stderr.write(`[eol-gate] 读不到 ${full}，跳过这一份：${String(error)}\n`);
+      }
     }
   }
   return found;
@@ -166,6 +192,22 @@ function walk(dir) {
  */
 export function missingRules(attributes) {
   return CONTRACT_RULES.filter((rule) => !attributes.split(/\r?\n/u).includes(rule));
+}
+
+/**
+ * 这个目录是不是一个 git 检出（决定 git 那两条判据能不能跑）。
+ *
+ * `.git` 在普通克隆里是目录，在 `git worktree add` 与子模块里是**文件**（内容是
+ * `gitdir: …`）。只判目录会让这两种形状静默跳过 git 那两条判据、只跑字节判 —— 假绿。
+ *
+ * @returns 有 `.git`（目录或文件）时为 true
+ */
+function insideGitCheckout() {
+  const gitPath = path.join(ROOT, ".git");
+  if (isDirectory(gitPath)) {
+    return true;
+  }
+  return isFile(gitPath);
 }
 
 function main() {
@@ -183,16 +225,26 @@ function main() {
     process.stderr.write(`[eol-gate] .gitattributes 缺规则：${missing.join(" / ")}\n`);
     return 1;
   }
-  const insideRepo = isDirectory(path.join(ROOT, ".git"));
-  if (insideRepo) {
-    const out = execFileSync(
-      "git",
-      ["check-attr", "eol", "--", ...CONTRACT_EOL.map((item) => item.file)],
-      {
-        cwd: ROOT,
-        encoding: "utf8",
-      },
-    );
+  if (insideGitCheckout()) {
+    let out;
+    try {
+      out = execFileSync(
+        "git",
+        ["check-attr", "eol", "--", ...CONTRACT_EOL.map((item) => item.file)],
+        {
+          cwd: ROOT,
+          encoding: "utf8",
+          // 默认 maxBuffer 是 1 MiB：`--eol`/`check-attr` 在超大仓上会撞它，撞了是 maxBuffer
+          // 错误而不是判据，翻出来的字读不出成因。
+          maxBuffer: 32 * 1024 * 1024,
+        },
+      );
+    } catch (error) {
+      process.stderr.write(
+        `[eol-gate] git check-attr 跑不起来（没装 git / 仓结构损坏 / 输出超限）：${String(error)}\n`,
+      );
+      return 1;
+    }
     const resolved = parseCheckAttr(out);
     const wrong = CONTRACT_EOL.filter((item) => resolved[item.file] !== item.eol).map(
       (item) => `${item.file}: 期望 ${item.eol}，实得 ${String(resolved[item.file])}`,
@@ -201,9 +253,18 @@ function main() {
       process.stderr.write(`[eol-gate] git 解析出的行尾与契约不符：\n  ${wrong.join("\n  ")}\n`);
       return 1;
     }
-    const rows = execFileSync("git", ["ls-files", "--eol"], { cwd: ROOT, encoding: "utf8" }).split(
-      /\r?\n/u,
-    );
+    let listing;
+    try {
+      listing = execFileSync("git", ["ls-files", "--eol"], {
+        cwd: ROOT,
+        encoding: "utf8",
+        maxBuffer: 32 * 1024 * 1024,
+      });
+    } catch (error) {
+      process.stderr.write(`[eol-gate] git ls-files --eol 跑不起来：${String(error)}\n`);
+      return 1;
+    }
+    const rows = listing.split(/\r?\n/u);
     const listed = rows.filter((row) => row.length > 0);
     if (listed.length === 0) {
       process.stderr.write("[eol-gate] git ls-files --eol 零行：这一判没量到任何东西，不能当过\n");

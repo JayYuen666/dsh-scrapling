@@ -11,7 +11,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Config as configSchema } from "../host.ts";
 import { FALLBACK_BUDGET_BYTES } from "../lib/output.ts";
-import { PACK_STATES, RUNTIME_PACKS, packLabelKey, packStateKey } from "../lib/runtime-shape.ts";
+import {
+  PACK_STATES,
+  PYTHON_VIAS,
+  RUNTIME_PACKS,
+  packLabelKey,
+  packStateKey,
+  pythonViaKey,
+} from "../lib/runtime-shape.ts";
 import {
   BUNDLE_PACKAGE_NAME,
   LOCALE_NS,
@@ -192,15 +199,17 @@ describe("locale 字典", () => {
     expect(Object.keys(dicts.zh).toSorted()).toStrictEqual(Object.keys(dicts.en).toSorted());
   });
 
-  it("每个能力包的名称与每种包状态都配了中英文案", () => {
+  it("每个能力包的名称、每种包状态与每种解释器来源都配了中英文案", () => {
     // 判据是「键在位且非空」：只写 `.not.toBe("")` 时缺键拿到 undefined 照样通过，门禁对着
     // 真正缺文案的那一档永远通过（变异实测：给 PACK_STATES 加一个没配译名的状态，旧写法不红）。
     //
     // 状态清单取自 lib/runtime-shape.ts 的运行时值域：加一个状态而没配译名，这条会点名是哪一个，
-    // 而不是等卡片把 `runtime.state.<新值>` 原样露在界面上。
+    // 而不是等卡片把 `runtime.state.<新值>` 原样露在界面上。解释器来源同理 —— 卡面原先直接印
+    // `managed-venv` 这种机器标识，用户读不出「工具全在」与「一只都不在」的差别。
     const labels = [
       ...RUNTIME_PACKS.map((pack) => packLabelKey(pack)),
       ...PACK_STATES.map((state) => packStateKey(state)),
+      ...PYTHON_VIAS.map((via) => pythonViaKey(via)),
     ];
     // 先证明这条有的判：值域一旦被清空，下面的 missingLabels 就只是在判一张空表。
     expect(labels.length).toBeGreaterThan(0);
@@ -462,28 +471,29 @@ describe("buildOps", () => {
 });
 
 describe("样式挂载", () => {
-  it("首次挂载注入一段 style，并交出摘掉它的函数", () => {
+  it("首次挂载注入共享与自有各一段 style，并交出摘掉它们的函数", () => {
     const doc = fakeDocument(false);
     const dispose = installStyles(doc);
-    expect(doc.appended).toHaveLength(1);
-    expect(doc.appended[0]?.id).toBe("dsh-scrapling-settings-css");
+    expect(doc.appended.map((tag) => tag.id)).toStrictEqual([
+      "dsh-card-ui-css",
+      "dsh-scrapling-settings-css",
+    ]);
+    const [shared, own] = doc.appended;
     dispose();
-    // 判「摘掉的就是刚注入的那一枚」，不判长度：假 document 里每个 tag 的 remove 都只把
-    // 自己 push 进 removed，无论 dispose 关的是谁，长度都是 1。
-    expect(doc.removed).toStrictEqual([doc.appended[0]]);
+    // installStyles 先摘自有样式，再释放共享样式；顺序是 disposer 的实现契约。
+    expect(doc.removed).toStrictEqual([own, shared]);
   });
 
-  it("同一 id 注入两次只留一段：摘除函数也不该把第二段的活抢过来", () => {
-    // 这就是 installStyle 注释里「重复调用是空操作」那一支：第二次得从文档里认回第一段，
-    // 而不是再叠一份 CSS 规则。
+  it("同一 id 注入两次只留一套：第二个 disposer 不抢第一个的活", () => {
     const doc = fakeDocument(false);
     const first = installStyles(doc);
     const second = installStyles(doc);
-    expect(doc.appended).toHaveLength(1);
+    expect(doc.appended).toHaveLength(2);
+    const [shared, own] = doc.appended;
     second();
     expect(doc.removed).toStrictEqual([]);
     first();
-    expect(doc.removed).toStrictEqual([doc.appended[0]]);
+    expect(doc.removed).toStrictEqual([own, shared]);
   });
 
   it("已经在文档里就跳过，不重复注入，摘除函数也不该动别人的东西", () => {

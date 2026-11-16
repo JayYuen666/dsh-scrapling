@@ -263,19 +263,17 @@ jobs:
           path: /tmp/pkg/**/*.tgz
           retention-days: 7
           if-no-files-found: error
-      - name: 干净目录安装 tarball（显式带上 optional 宿主 peer）
+      - name: 干净目录安装 tarball（peer 由默认安装语义解析）
         run: |
           set -euo pipefail
           tarball="$(find /tmp/pkg -name '*.tgz' -print -quit)"
-          # dsh-tools 是 optional peer：npm 不会自动装 optional peer，但 host.js 在运行期
-          # 按值 import 它。探测脚本要显式补上它才验得到入口。版本取 tarball 声明里那条 peer
-          # 范围（peerDependencies 的字面取值），由 npm 在窗口内解析出当下最新的一格——这一步
-          # 因此跟着 registry 的最新发布走，不是按精确钉版装。
-          host_tools="$(node -e 'const p=require("./package.json"); process.stdout.write(p.peerDependencies["@deepseek-ai/dsh-tools"])')"
+          # host.js 在运行期按值 import @deepseek-ai/dsh-error 与 dsh-tools，这两枚必须是
+          # **非 optional** peer，npm 才会在装 tarball 时把它们一起装上。这里刻意只装 tarball、
+          # 不显式补装任何宿主包：多装一枚就把「peer 被标回 optional」的回归盖住了 ——
+          # 那正是 0.1.14 修的形态（装得上、import 时 ERR_MODULE_NOT_FOUND）。
           mkdir -p /tmp/probe && cd /tmp/probe
           npm init -y >/dev/null
-          # 不传 --legacy-peer-deps：非 optional 的 peer 仍由默认安装语义解析。
-          npm install "$tarball" "@deepseek-ai/dsh-tools@$host_tools" --no-audit --no-fund
+          npm install "$tarball" --no-audit --no-fund
       - name: 装载探针（入口形状 + bundle patch 随包 + py 侧随包）
         run: |
           # 单引号是刻意的：脚本体里有 JS 模板串，交给 shell 展开就坏了。

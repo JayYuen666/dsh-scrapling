@@ -161,6 +161,34 @@ export function toolTimeoutOf(settings: ToolSettings): number {
   return settings.timeoutMs + TOOL_TIMEOUT_MARGIN_MS;
 }
 
+/**
+ * 把注册级墙钟挂成**活属性**，让 `fetchTimeoutMs` 改完不必重启也生效。
+ *
+ * `defineTool` 把 `options.timeoutMs` 一次性拷进产物对象，属性本身可写；宿主
+ * `dsh-tool-call-timeout-policy` 每次 `tools/execute` 都现读
+ * `ctx.tools.get(name, agent)?.timeoutMs`。所以在这里挂一个 getter，读一次现算一次，
+ * 注册级截止就跟着 volatile 引用走了 —— 只改 `toolTimeoutOf(settings)` 是没用的，
+ * 那次求值发生在装配时。
+ *
+ * getter 数量与属性名必须与 `defineTool` 交出来的对象形状一致（`enumerable` + `configurable`），
+ * 否则 `{...tool}`、`Object.keys` 这类读法会看不见它。
+ *
+ * @param tool - `defineTool` 交出来的工具定义
+ * @param settings - 活视图（属性每次读都现取引用）
+ * @returns 同一枚工具定义（原地挂 getter，便于链式书写）
+ */
+export function bindLiveTimeout<Tool extends ToolDefinition>(
+  tool: Tool,
+  settings: ToolSettings,
+): Tool {
+  Object.defineProperty(tool, "timeoutMs", {
+    enumerable: true,
+    configurable: true,
+    get: () => toolTimeoutOf(settings),
+  });
+  return tool;
+}
+
 /** CSS 选择器的等待状态；与 Playwright 的同名概念一致。 */
 export type WaitSelectorState = "attached" | "detached" | "hidden" | "visible";
 

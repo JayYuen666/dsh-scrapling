@@ -15,6 +15,7 @@
 
 import { formatRetentionNotice, TextRetainer } from "@deepseek-ai/dsh-output-retention";
 
+import { format } from "./messages.ts";
 import type { ScraplingMessages } from "./messages.ts";
 import type {
   AnswerToolResult,
@@ -37,10 +38,14 @@ import type {
  * @returns 追加到正文后的尾巴
  */
 function tailOf(notice: string | undefined, truncated: boolean, hint: string): string {
-  if (notice !== undefined && notice.length > 0) {
-    return notice;
+  const said = notice !== undefined && notice.length > 0 ? [notice] : [];
+  // 对端给了 notice 与「结果被截断」是**独立**的两件事：选择器自适应失败会写 notice，
+  // 而 truncated 由条数/字节另算，两者能同时为真（`py/adapters.py` 里就是分开算的）。
+  // 早返回会让模型只知道对端留了句话、不知道结果被截过。
+  if (truncated && !said.some((line) => line.includes(hint))) {
+    said.push(hint);
   }
-  return truncated ? hint : "";
+  return said.join("\n\n");
 }
 
 /** 一次封顶的结果。 */
@@ -57,9 +62,10 @@ export interface CappedText {
  * 预算非法（非有限数或不足 1）时的兜底。
  *
  * 兜底而不是「不封顶」：本函数存在的理由就是别让超大正文整份进会话日志与模型上下文，
- * 预算坏了时静默放行等于把唯一的闸门拆掉。取值与设置卡上各「输出上限」字段的默认值
- * 同一档，这一档由 test/settings-card.test.ts 的门禁核住（改了这里而没改 schema 默认值，
- * 那条用例会点名两个数不一致）。
+ * 预算坏了时静默放行等于把唯一的闸门拆掉。取值与设置卡上 fetch / extract / render 这
+ * **三枚**「输出上限」的默认值同一档 —— 不是四枚：`xhrMaxOutputChars` 是 120_000，
+ * 预算非法时被撑到这一档等于把它放宽。这一档由 test/settings-card.test.ts 的门禁核住
+ * （改了这里而没改 schema 默认值，那条用例会点名两个数不一致）。
  */
 export const FALLBACK_BUDGET_BYTES = 200_000;
 
@@ -90,7 +96,12 @@ function normalizeBudget(budgetBytes: number): number {
  * @param recovery - 恢复建议；告诉模型怎么把被省略的内容再拿回来
  * @returns 截断后的正文与页脚
  */
-export function capText(text: string, budgetBytes: number, recovery: string): CappedText {
+export function capText(
+  text: string,
+  budgetBytes: number,
+  recovery: string,
+  scope: "body" | "network" = "body",
+): CappedText {
   const budget = normalizeBudget(budgetBytes);
   const size = Buffer.byteLength(text, "utf8");
   if (size <= budget) {
@@ -114,7 +125,7 @@ export function capText(text: string, budgetBytes: number, recovery: string): Ca
   }
   const notice = formatRetentionNotice(
     {
-      scope: "body",
+      scope,
       strategy: "headTail",
       unit: "bytes",
       limit: { head: headBytes, tail: tailBytes },
@@ -136,7 +147,7 @@ export function capText(text: string, budgetBytes: number, recovery: string): Ca
 function renderLocate(value: LocateResult, messages: ScraplingMessages): string {
   const body =
     value.matches.length === 0
-      ? "no matches"
+      ? messages.outputNoMatches
       : value.matches
           .map((item) => {
             const lines = [
@@ -188,8 +199,10 @@ function renderLinks(value: LinksResult, messages: ScraplingMessages): string {
   for (const candidate of value.nextCandidates) {
     lines.push(`next: ${candidate.text} -> ${candidate.url} (${candidate.reason})`);
   }
-  const body = lines.length === 0 ? "no links" : lines.join("\n");
-  return value.truncated ? `${body}\n\n${messages.selectTruncationHint}` : body;
+  const body = lines.length === 0 ? messages.outputNoLinks : lines.join("\n");
+  // links 的截断只来自 `limit`：它没有 maxContentChars 这个参数，照搬选择器那条文案会让
+  // 模型去调一个不存在的键。
+  return value.truncated ? `${body}\n\n${messages.linksTruncationHint}` : body;
 }
 
 /**
@@ -204,11 +217,15 @@ function renderLinks(value: LinksResult, messages: ScraplingMessages): string {
  * @returns 模型侧文本
  */
 function renderFetch(value: FetchResult, messages: ScraplingMessages): string {
-  const body = `Fetched ${value.url} (HTTP ${value.statusCode})\n\n${value.content}`;
+  const head = format(messages.outputFetchHead, {
+    url: value.url,
+    status: String(value.statusCode),
+  });
+  const body = `${head}\n\n${value.content}`;
   const metadata =
     value.metadata === undefined || Object.keys(value.metadata).length === 0
       ? ""
-      : `\n\nMetadata:\n${Object.entries(value.metadata)
+      : `\n\n${messages.outputMetadataHeading}:\n${Object.entries(value.metadata)
           .map(([key, item]) => `${key}: ${typeof item === "string" ? item : JSON.stringify(item)}`)
           .join("\n")}`;
   const withMetadata = `${body}${metadata}`;
@@ -232,14 +249,21 @@ function renderMatches(value: SelectResult, messages: ScraplingMessages): string
   let body: string;
   if (value.rows) {
     body =
-      value.rows.length === 0 ? "no rows" : value.rows.map((row) => JSON.stringify(row)).join("\n");
+      value.rows.length === 0
+        ? messages.outputNoRows
+        : value.rows.map((row) => JSON.stringify(row)).join("\n");
   } else if (value.matches.length === 0) {
-    body = "no matches";
+    body = messages.outputNoMatches;
   } else {
     body = value.matches
       .map((item) => {
         const picked = item.value ?? item.text ?? "";
-        const attrs = item.attributes ? ` ${JSON.stringify(item.attributes)}` : "";
+        // 与非空判定对齐（`renderLocate` 用的也是键数）：Python 侧在 includeAttributes
+        // 为真时无条件带上 attributes，空对象是可达的，真值判定会渲染出一行 ` {}`。
+        const attrs =
+          item.attributes !== undefined && Object.keys(item.attributes).length > 0
+            ? ` ${JSON.stringify(item.attributes)}`
+            : "";
         // includeHtml 且没给 attribute 时 Python 会单独写一份 outerHTML。不渲染它，
         // includeHtml 在模型侧就是个空操作 —— schema 声明了却永远看不到。
         const html = item.html === undefined ? "" : `\n  html: ${item.html}`;
@@ -286,6 +310,11 @@ function networkLines(matches: readonly NetworkEntry[]): string[] {
  * 对端（`limit` / `body_chars`），叠起来的字节数与那份预算无关。不封这一段，工具回执
  * 就能整段绕过输出上限，且没有任何说明。
  *
+ * **两段各自按同一档预算封顶**，所以单次回执的字节上限是两倍预算，不是一倍。这是刻意的：
+ * 网络历史是**另一份**信息（正文里一条都不含），用「剩余预算」封它会在正文本身就用满
+ * 预算时把它压成零 —— 而那恰好是最需要看网络请求的时刻。这一条也写在两份 README 的
+ * 输出封顶一节里，改这里要同步改文档。
+ *
  * @param value - 浏览器抓取载荷
  * @param networkBudgetBytes - 网络历史那一段的字节预算（与正文同一档）
  * @param messages - 当前语言的文案
@@ -302,19 +331,16 @@ function renderBrowser(
     return body;
   }
   if (captured.length === 0) {
-    return (
-      `${body}\n\nCaptured no XHR/fetch requests. ` +
-      "The page may issue none, or they may have fired after this capture — " +
-      "try scrapling_render with waitMs / waitSelector first, then capture again."
-    );
+    return `${body}\n\n${messages.outputXhrNone}`;
   }
   const section = capText(
     networkLines(captured).join("\n"),
     networkBudgetBytes,
     messages.networkTruncationHint,
+    "network",
   );
   const footer = section.notice.length > 0 ? `\n\n${section.notice}` : "";
-  return `${body}\n\nCaptured XHR/fetch:\n${section.text}${footer}`;
+  return `${body}\n\n${messages.outputXhrHeading}:\n${section.text}${footer}`;
 }
 
 /**
@@ -325,7 +351,12 @@ function renderBrowser(
  * @returns 模型侧文本
  */
 function renderAnswer(value: AnswerToolResult, messages: ScraplingMessages): string {
-  const head = `Answer to "${value.url}" (HTTP ${value.statusCode}, via ${value.provider}/${value.model}):`;
+  const head = format(messages.outputAnswerHead, {
+    url: value.url,
+    status: String(value.statusCode),
+    provider: value.provider,
+    model: value.model,
+  });
   const tail = tailOf(value.notice, value.truncated, messages.contentTruncationHint);
   return `${head}\n\n${value.answer}${tail.length > 0 ? `\n\n${tail}` : ""}`;
 }

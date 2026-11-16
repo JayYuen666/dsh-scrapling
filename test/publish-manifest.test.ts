@@ -78,6 +78,7 @@ interface Manifest {
   readonly dependencies?: Record<string, string>;
   readonly devDependencies?: Record<string, string>;
   readonly peerDependencies?: Record<string, string>;
+  readonly peerDependenciesMeta?: Record<string, { readonly optional?: boolean }>;
 }
 
 /** 一条 `files` 模式的两种形态。 */
@@ -518,6 +519,32 @@ describe("发布形态", () => {
 /** 宿主 dsh 家族的包名前缀（本组三条判据都要按它筛，收常量）。 */
 const DSH_PREFIX = "@deepseek-ai/dsh-";
 
+/** 归一到包名：说明符可能带子路径（`@deepseek-ai/dsh-llm/types`）。 */
+function packageNameOf(specifier: string): string {
+  const parts = specifier.split("/");
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : (parts[0] ?? specifier);
+}
+
+/**
+ * 取产物里**按包名值导入**的宿主包。
+ *
+ * 四种写法都要认：`from "包名"`、纯副作用 `import "包名"`、动态 `import("包名")`、`require("包名")`。
+ * 只认 `from "…"` 会漏掉副作用导入；而这三类漏掉任何一类，本组判据都可能对着一份真缺陷打绿。
+ *
+ * @param text - 产物源码
+ * @returns 去重后的包名集合
+ */
+function valueImportedPackages(text: string): Set<string> {
+  const found = text.matchAll(
+    /(?:\bfrom\s*|(?<![\w$.])import\s*\(?\s*|(?<![\w$.])require\s*\(\s*)["'](?<spec>[^"']+)["']/gu,
+  );
+  return new Set(
+    Array.from(found, (match) => packageNameOf(match.groups?.["spec"] ?? "")).filter((name) =>
+      name.startsWith("@deepseek-ai/"),
+    ),
+  );
+}
+
 describe("宿主依赖的版本形状（升级防线）", () => {
   it("devDependencies 里的 dsh-* 家族一律精确钉，不留任何范围算子", async () => {
     // registry 上的 dist-tag 是实测出来的陷阱：`latest` 可能指向远早于宿主 ABI 的版本。
@@ -561,6 +588,33 @@ describe("宿主依赖的版本形状（升级防线）", () => {
       ([name, range]) => name.startsWith(DSH_PREFIX) && range !== bare,
     );
     expect(offPolicy, "这些 dsh-* peer 与裸 dsh 不是同一条范围").toStrictEqual([]);
+  });
+
+  it("host.js 值导入的宿主包，没有一枚被标成 optional peer", async () => {
+    // 为什么这一位承重：`peerDependenciesMeta` 里的 `optional: true` 在 npm 语义下是「这个 peer
+    // 可以不装」——实测装一个声明了非 optional peer 的 tarball，npm 会把 peer 一起装进来
+    // （`added 5 packages`）；同一份声明改成 optional，干净目录里一条都不装。而 `host.js` 是
+    // **静态入口**，加载期就要解析这些说明符，没有「运行时才用到」这回事。
+    //
+    // 症状：单测、构建、类型检查全绿，故障只在 CI 的 install-probe 里出现，报
+    // `ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-error'`（本仓是
+    // `dsh-error` 与 `dsh-tools` 两枚）。本机也不复现——伞根 node_modules 里有那两份包，把问题盖住了。
+    const code = await readFile(path.join(pkgDir, "host.js"), "utf8");
+    const imported = valueImportedPackages(code);
+    expect(imported.size, "产物里一枚宿主包都没抓到：这道门在空转，判据本身要复核").toBeGreaterThan(
+      0,
+    );
+    const { manifest } = surface;
+    const optional = new Set(
+      Object.entries(manifest.peerDependenciesMeta ?? {})
+        .filter(([, meta]) => meta.optional === true)
+        .map(([name]) => name),
+    );
+    const offenders = [...imported].filter((name) => optional.has(name)).toSorted();
+    expect(
+      offenders,
+      "这些包在产物里是值导入、却标了 optional peer：npm 不会替我们装，装出去就 ERR_MODULE_NOT_FOUND",
+    ).toStrictEqual([]);
   });
 });
 

@@ -10,8 +10,8 @@ catalogs:
       specifier: 0.8.1
       version: 0.8.1
     '@jayyuen66/dsh-plugin-shared':
-      specifier: ^0.2.8
-      version: 0.2.8
+      specifier: ^0.2.10
+      version: 0.2.10
     '@types/node':
       specifier: 26.6.6
       version: 26.6.6
@@ -101,6 +101,9 @@ importers:
 
   .:
     dependencies:
+      '@jayyuen66/dsh-plugin-shared':
+        specifier: 'catalog:'
+        version: 0.2.10(fbe718fb2e85fec215dd480076cb6506)
       '@modelcontextprotocol/sdk':
         specifier: 1.32.2
         version: 1.32.2(zod@4.6.7)
@@ -222,9 +225,6 @@ importers:
       '@e18e/eslint-plugin':
         specifier: 'catalog:'
         version: 0.8.1(oxlint@1.93.0(oxlint-tsgolint@7.0.2006))
-      '@jayyuen66/dsh-plugin-shared':
-        specifier: 'catalog:'
-        version: 0.2.8(fbe718fb2e85fec215dd480076cb6506)
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.6
@@ -618,9 +618,9 @@ packages:
     peerDependencies:
       hono: ^4 || ^5.0.0-0
 
-  '@jayyuen66/dsh-plugin-shared@0.2.8':
-    resolution: {integrity: sha512-3jmqVyYgXy6b2rHpHrKGUFXRvfSYxdfz8xD2k1pQXamf4rcIwV2ZDooEG3TpM8vo3cCR3WIlmxhxSIgBSYHu6A==}
-    engines: {dsh: ^0.2.2-rc.1, node: '>=24.9.0'}
+  '@jayyuen66/dsh-plugin-shared@0.2.10':
+    resolution: {integrity: sha512-cZTf1GzKdtj0ZgI3UwKzgcI3JKsAykOXkyy2Gru2WJLZwNzHtTd/HjW4jpjcagnPcVnrAIIw+FXXf231PQNn2A==}
+    engines: {dsh: ^0.2.2-rc.2, node: '>=24.9.0'}
     peerDependencies:
       '@deepseek-ai/cordis': 4.1.0
       '@deepseek-ai/dsh': 0.2.2-rc.2
@@ -2557,7 +2557,7 @@ snapshots:
     dependencies:
       hono: 4.13.14
 
-  '@jayyuen66/dsh-plugin-shared@0.2.8(fbe718fb2e85fec215dd480076cb6506)':
+  '@jayyuen66/dsh-plugin-shared@0.2.10(fbe718fb2e85fec215dd480076cb6506)':
     dependencies:
       '@deepseek-ai/dsh-fs-patch': 0.2.2-rc.2(@deepseek-ai/cordis@4.1.0)
       '@deepseek-ai/dsh-output-retention': 0.2.2-rc.2(@deepseek-ai/cordis@4.1.0)

@@ -457,6 +457,8 @@ export class SidecarClient {
    * @returns 握手帧
    */
   async #waitForReady(timeoutMs: number): Promise<Record<string, unknown>> {
+    // 握手帧只会在未来某刻从流上到达：除先把 resolve/reject 拿到手，没有别的写法。
+    // oxlint-disable-next-line promise/avoid-new
     return new Promise((resolve, reject) => {
       const waiter: ReadyWaiter = { resolve: noop, reject: noop };
       const timer = setTimeout(() => {
@@ -640,6 +642,8 @@ export class SidecarClient {
     // 的超时，而 timeoutMs 为 null 的爬虫请求会永久留在 #pending 里。
     const frame = `${encodeFrame({ id, method, params: outgoing })}\n`;
 
+    // 请求/响应的本质是 deferred：靠 id 把响应接回去，只能事先拿住 resolve/reject。
+    // oxlint-disable-next-line promise/avoid-new
     const settled = new Promise<unknown>((resolve, reject) => {
       const entry: Pending = { resolve, reject, timer: undefined, detachAbort: undefined };
       // 先落表再挂中止钩子。顺序反了的话，「信号进来时就已中止」这条同步路径会先跑完
@@ -740,6 +744,8 @@ export class SidecarClient {
         () => true,
       );
       let timer: NodeJS.Timeout | undefined;
+      // 宽限期等的是 setTimeout：同样只能先把 resolve 拿到手。
+      // oxlint-disable-next-line promise/avoid-new
       const grace = new Promise<boolean>((resolve) => {
         timer = setTimeout(() => {
           resolve(false);

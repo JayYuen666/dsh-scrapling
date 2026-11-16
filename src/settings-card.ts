@@ -28,7 +28,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { z } from "zod";
-import { RUNTIME_PACKS, packLabelKey, packStateKey } from "../lib/runtime-shape.ts";
+import { RUNTIME_PACKS, packLabelKey, packStateKey, pythonViaKey } from "../lib/runtime-shape.ts";
 import type {
   PackState,
   RuntimeJobView,
@@ -39,7 +39,6 @@ import type { RuntimeReader } from "./runtime-reader.ts";
 import { SETTINGS_FIELDS, SETTINGS_GROUPS } from "./settings-fields.ts";
 import type { FieldSpec, GroupSpec } from "./settings-fields.ts";
 import {
-  CARD_UI_CSS,
   CardForm,
   Field,
   SaveBar,
@@ -48,6 +47,7 @@ import {
   StatusBar,
   TextField,
   ToggleField,
+  ensureCardUiCss,
   splitHint,
 } from "@jayyuen66/dsh-plugin-shared/client";
 
@@ -362,7 +362,12 @@ export function installStyle(doc: DocumentFace, id: string, css: string): () => 
  * @returns 摘掉本次注入的样式
  */
 export function installStyles(doc: DocumentFace): () => void {
-  return installStyle(doc, "dsh-scrapling-settings-css", `${CARD_CSS}\n${CARD_UI_CSS}`);
+  const disposeShared = ensureCardUiCss(doc);
+  const disposeOwn = installStyle(doc, "dsh-scrapling-settings-css", CARD_CSS);
+  return (): void => {
+    disposeOwn();
+    disposeShared();
+  };
 }
 
 /**
@@ -834,7 +839,7 @@ function renderRuntime(props: {
       : createElement(
           "p",
           { className: STATUS_CLASS },
-          `${t("runtimePython")}: ${snapshot.python.path} (${snapshot.python.via})`,
+          `${t("runtimePython")}: ${snapshot.python.path} (${t(pythonViaKey(snapshot.python.via))})`,
           createElement("br"),
           `${t("runtimeDataDir")}: ${snapshot.dataDir}`,
         );
@@ -854,10 +859,16 @@ function renderRuntime(props: {
       ? null
       : createElement("pre", { className: "dss-job" }, job.output);
   const disabled = busy !== "" || !jobsReady || snapshot === null;
+  // 缺键按「未安装」呈现，**不是**「正在读取」：`snapshot` 非空而某个包缺键，成因只有两种
+  // ——宿主读状态失败后退成空对象（`lib/runtime-remote.ts` 的 `packsOrEmpty` 降级），或
+  // 新版卡片配旧版宿主（两边分开发版，这是 `lib/runtime-shape.ts` 的前提）。两种情况下
+  // 「正在读取」都是假话：它永远等不到第二次渲染，而那一行的两个按钮又被 `state === null`
+  // 一起禁掉 —— 用户看到的是一行永远转圈、点不动的死行。按「未安装」呈现则把安装按钮留在
+  // 可点状态，而安装器自己会处理坏状态文件。
   const rows = RUNTIME_PACKS.map((pack) =>
     renderPackRow({
       pack,
-      state: snapshot?.packs[pack] ?? null,
+      state: snapshot === null ? null : (snapshot.packs[pack] ?? "missing"),
       t,
       disabled,
       running,

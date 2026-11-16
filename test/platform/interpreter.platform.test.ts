@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveRuntime } from "../../lib/runtime.ts";
+import { LOCAL_PYTHON } from "../python-bin.ts";
 
 describe("解释器解析的两条实现", () => {
   it("空仓根（无 venv）下两条实现都落到 PATH 档；POSIX 名字一致为 python3", () => {
@@ -32,11 +33,9 @@ describe("解释器解析的两条实现", () => {
   it("本仓 venv 在位时两条实现都选中它（venv 分支对表）", () => {
     const repoRoot = path.resolve(import.meta.dirname, "../..");
     const runtime = resolveRuntime({ pythonBin: "", dataDir: "", repoRoot });
-    const venvPython =
-      process.platform === "win32"
-        ? path.join(repoRoot, "_env", ".venv", "Scripts", "python.exe")
-        : path.join(repoRoot, "_env", ".venv", "bin", "python");
-    if (existsSync(venvPython)) {
+    // venv 布局不在这里重拼第二遍：`test/python-bin.ts` 的 `LOCAL_PYTHON` 就是
+    // `repoPythonPath(REPO)` 的结果，手写的 `_env/.venv/...` 会在改布局时静默漂移。
+    if (existsSync(LOCAL_PYTHON)) {
       assert.equal(runtime.via, "repo");
     }
   });

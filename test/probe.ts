@@ -9,6 +9,7 @@
 
 import path from "node:path";
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
@@ -16,6 +17,9 @@ import { LOCAL_PYTHON } from "./python-bin.ts";
 
 const REPO = path.resolve(import.meta.dirname, "..");
 const PROBE = path.join(REPO, "py", "tests", "contract_probe.py");
+
+/** POSIX 上才有进程组语义：超时保护要能连子孙一起收掉。 */
+const POSIX = process.platform !== "win32";
 
 /** 探针记录的一个调用点：站点名与它实际发出的键。 */
 export interface ProbeCall {
@@ -202,7 +206,9 @@ function tailCollector(limitBytes: number): TailCollector {
       const [last] = state.parts;
       if (last !== undefined && last.length > limitBytes) {
         // 单段就超上限：留它的尾巴，否则上一轮的 shift 一次也轮不到它。
-        state.parts[0] = last.subarray(last.length - limitBytes);
+        // 必须复制而不是 subarray：视图仍钉着整段原始 chunk 的 ArrayBuffer，
+        // 那个 chunk 有多大，进程就还占着多大 ——「最多留 limitBytes」只对长度成立。
+        state.parts[0] = Buffer.from(last.subarray(last.length - limitBytes));
         state.size = limitBytes;
       }
     },
@@ -211,11 +217,28 @@ function tailCollector(limitBytes: number): TailCollector {
 }
 
 /**
+ * 报错文案里单行最多留多少字符。
+ *
+ * 行数上限管不住这里：探针的结论本身就是**单独一行**（`contract_probe.py` 最后一句是
+ * `print(json.dumps(...))`，无换行），所以输出不是 JSON 时，「头 40 行」正好是至多 8 MiB 的
+ * 一整行。报错文案有界是这份文件自己的取向（`tailCollector` 的字节预算、`STDERR_TAIL_LINES`
+ * 的行数都是同一件事），单行也得有界。
+ */
+const MAX_LINE_CHARS = 2000;
+
+/** 把一行裁到 `MAX_LINE_CHARS`，被裁时留个记号。 */
+function clipLine(line: string): string {
+  return line.length <= MAX_LINE_CHARS
+    ? line
+    : `${line.slice(0, MAX_LINE_CHARS)}…（这一行还有 ${String(line.length - MAX_LINE_CHARS)} 个字符）`;
+}
+
+/**
  * 取一段文本的末尾 `limit` 行。
  *
  * 按行而不是按字符截：`slice(-4000)` 会把代理对切成半个（页面正文、上游异常消息里都
  * 可能出现），而日志本来就读得成行。行数上限只管报错文案，内存那一头由 `tailCollector`
- * 的字节预算管。
+ * 的字节预算管；每行长度另由 `clipLine` 封顶。
  *
  * @param text - 整段文本
  * @param limit - 保留末尾多少行
@@ -223,12 +246,19 @@ function tailCollector(limitBytes: number): TailCollector {
  */
 function tailLines(text: string, limit: number): string {
   const lines = text.split("\n");
-  return lines.slice(-limit).join("\n");
+  return lines
+    .slice(-limit)
+    .map((line) => clipLine(line))
+    .join("\n");
 }
 
-/** 取一段文本的开头 `limit` 行。 */
+/** 取一段文本的开头 `limit` 行（每行长度同样由 `clipLine` 封顶）。 */
 function headLines(text: string, limit: number): string {
-  return text.split("\n").slice(0, limit).join("\n");
+  return text
+    .split("\n")
+    .slice(0, limit)
+    .map((line) => clipLine(line))
+    .join("\n");
 }
 
 /** 报告顶层那几项必须是数组。 */
@@ -249,6 +279,7 @@ const FACTS_ARRAY_FIELDS = [
   "convertorPrivates",
   "noiseTagsActuallyStripped",
   "storageInitParams",
+  "responseInitParams",
   "spiderAttrs",
   "sessionManagerAddParams",
   "crawlHooks",
@@ -275,6 +306,40 @@ const SPIDER_DEFAULT_FIELDS = [
   "main_content_only",
 ] as const;
 
+/** `output_dir` 是唯一可空的一位，它的种类记号单独命名（三处引用同一个字面量不算重复）。 */
+const NULLABLE_STRING = "string|null";
+
+/** Spider 基类默认值里每个键应有的种类。 */
+const SPIDER_DEFAULT_KINDS: Record<
+  (typeof SPIDER_DEFAULT_FIELDS)[number],
+  ValueKind | typeof NULLABLE_STRING
+> = {
+  robots_txt_obey: "boolean",
+  autothrottle_enabled: "boolean",
+  download_delay: "number",
+  concurrent_requests: "number",
+  max_pages: "number",
+  output_dir: NULLABLE_STRING,
+  main_content_only: "boolean",
+};
+
+/**
+ * 报告里那些「元素是对象、对象上还有固定字段」的数组。
+ *
+ * 顶层数组守卫只管到「它是个数组」：`calls` 写成 `["foo"]` 或 `[{"site":1}]` 都能过，
+ * 然后下游 `test/contract-scrapling.test.ts` 报一句 `call.site.startsWith is not a function`
+ * —— 那是与契约无关的 TypeError，正是本函数注释说要避免的形态。
+ */
+const REPORT_ELEMENT_FIELDS = {
+  calls: { site: "string", keys: "array" },
+  violations: { site: "string", keys: "array", expected: "string" },
+  silentAtSessionFetch: { site: "string", keys: "array", honorableAtOpen: "array" },
+  stealthInvariants: { site: "string" },
+} as const satisfies Record<string, Record<string, ValueKind>>;
+
+/** 元素是纯字符串的那些数组：`fetchLevelKeysDrift` 与 `methods`。 */
+const REPORT_STRING_ARRAYS = ["fetchLevelKeysDrift", "methods"] as const;
+
 /** 给报错用的类型名：array 与 null 在 `typeof` 下都说不出真相。 */
 function kindOf(value: unknown): string {
   if (value === null) {
@@ -283,20 +348,35 @@ function kindOf(value: unknown): string {
   return Array.isArray(value) ? "array" : typeof value;
 }
 
+/** 校验里能用到的形状种类。`array` 与 `null` 在 `typeof` 下都说不出真相，所以它们单列。 */
+type ValueKind = "array" | "boolean" | "number" | "object" | "string";
+
 /** 期望的形状种类与它的中文名，只用于报错文案。 */
-const KIND_LABELS: Record<string, string> = { array: "数组", number: "数字", object: "对象" };
+const KIND_LABELS: Record<ValueKind, string> = {
+  array: "数组",
+  boolean: "布尔值",
+  number: "数字",
+  object: "对象",
+  string: "字符串",
+};
 
 /** `value` 是不是那个种类：`array` 与 `null` 在 `typeof` 下都说不出真相，所以按种类分派。 */
-function matchesKind(value: unknown, expect: "array" | "number" | "object"): boolean {
+function matchesKind(value: unknown, expect: ValueKind): boolean {
   switch (expect) {
     case "array": {
       return Array.isArray(value);
+    }
+    case "boolean": {
+      return typeof value === "boolean";
     }
     case "number": {
       return typeof value === "number";
     }
     case "object": {
       return isRecord(value);
+    }
+    case "string": {
+      return typeof value === "string";
     }
     default: {
       return false;
@@ -315,7 +395,7 @@ function matchesKind(value: unknown, expect: "array" | "number" | "object"): boo
 function requireKind(
   owner: Record<string, unknown>,
   name: string,
-  expect: "array" | "number" | "object",
+  expect: ValueKind,
   prefix = "",
 ): void {
   const value = owner[name];
@@ -323,6 +403,66 @@ function requireKind(
     throw new Error(
       `探针报告的 ${prefix}${name} 应为${KIND_LABELS[expect]}，实际是 ${kindOf(value)}：契约对表与线路对表都判不了`,
     );
+  }
+}
+
+/**
+ * 要求 `owner[name]` 是字符串数组。
+ *
+ * @param owner - 被检查的对象
+ * @param name - 字段名
+ * @param prefix - 报错文案里的路径前缀
+ */
+function requireStringArray(owner: Record<string, unknown>, name: string, prefix = ""): void {
+  const value = owner[name];
+  if (!Array.isArray(value)) {
+    throw new TypeError(
+      `探针报告的 ${prefix}${name} 应为数组，实际是 ${kindOf(value)}：契约对表与线路对表都判不了`,
+    );
+  }
+  for (const [index, entry] of value.entries()) {
+    if (typeof entry !== "string") {
+      throw new TypeError(
+        `探针报告的 ${prefix}${name}[${String(index)}] 应为字符串，实际是 ${kindOf(entry)}`,
+      );
+    }
+  }
+}
+
+/**
+ * 要求 `owner[name]` 是对象数组，且每个元素上那几个字段种类对得上。
+ *
+ * @param owner - 被检查的对象
+ * @param name - 字段名
+ * @param fields - 元素上每个键应有的种类
+ */
+function requireObjectArray(
+  owner: Record<string, unknown>,
+  name: string,
+  fields: Record<string, ValueKind>,
+): void {
+  const value = owner[name];
+  if (!Array.isArray(value)) {
+    throw new TypeError(
+      `探针报告的 ${name} 应为数组，实际是 ${kindOf(value)}：契约对表与线路对表都判不了`,
+    );
+  }
+  for (const [index, entry] of value.entries()) {
+    if (!isRecord(entry)) {
+      throw new Error(
+        `探针报告的 ${name}[${String(index)}] 应为对象，实际是 ${kindOf(entry)}：` +
+          "下游要按字段读它，一个标量会让断言报出与契约无关的 TypeError",
+      );
+    }
+    for (const [field, expect] of Object.entries(fields)) {
+      const got = entry[field];
+      if (!matchesKind(got, expect)) {
+        throw new Error(
+          `探针报告的 ${name}[${String(index)}].${field} 应为${KIND_LABELS[expect]}，` +
+            `实际是 ${kindOf(got)}`,
+        );
+      }
+    }
   }
 }
 
@@ -355,6 +495,42 @@ function requireRecordValues(
 }
 
 /**
+ * 要求 `facts.spiderDefaults` 是对象，且七个键的种类都对得上。
+ *
+ * 只判「键在不在」不够：`download_delay: "0"` / `robots_txt_obey: 0` / `main_content_only: null`
+ * 都能过，然后下游 `test/contract-scrapling.test.ts` 报 `expect("0").toBe(0)` —— 那句话把它
+ * 指向「契约值不一致」，而真正的故障是探针的字段类型漂移了。
+ *
+ * @param spiderDefaults - `facts.spiderDefaults` 的原始值
+ * @throws 点名缺哪个键、哪个键的种类不对
+ */
+function requireSpiderDefaults(spiderDefaults: unknown): void {
+  if (!isRecord(spiderDefaults)) {
+    throw new Error(`探针报告的 facts.spiderDefaults 应为对象，实际是 ${kindOf(spiderDefaults)}`);
+  }
+  for (const field of SPIDER_DEFAULT_FIELDS) {
+    if (!(field in spiderDefaults)) {
+      throw new Error(`探针报告的 facts.spiderDefaults 少了 ${field}`);
+    }
+  }
+  for (const field of SPIDER_DEFAULT_FIELDS) {
+    const expect = SPIDER_DEFAULT_KINDS[field];
+    const got = spiderDefaults[field];
+    const ok =
+      expect === NULLABLE_STRING
+        ? typeof got === "string" || got === null
+        : matchesKind(got, expect);
+    if (!ok) {
+      const label = expect === NULLABLE_STRING ? "字符串或 null" : KIND_LABELS[expect];
+      throw new Error(
+        `探针报告的 facts.spiderDefaults.${field} 应为${label}，实际是 ${kindOf(got)}：` +
+          "下游把它与契约值直接比，种类漂移会被报成契约不一致",
+      );
+    }
+  }
+}
+
+/**
  * 校验探针回的结构确实是 `ProbeReport` 承诺的那张表。
  *
  * 为什么要有这一段：`JSON.parse(text) as ProbeReport` 只是类型欺骗。探针改了字段名、少了
@@ -373,6 +549,12 @@ export function assertProbeReport(parsed: unknown): ProbeReport {
   for (const field of REPORT_ARRAY_FIELDS) {
     requireKind(parsed, field, "array");
   }
+  for (const [field, fields] of Object.entries(REPORT_ELEMENT_FIELDS)) {
+    requireObjectArray(parsed, field, fields);
+  }
+  for (const field of REPORT_STRING_ARRAYS) {
+    requireStringArray(parsed, field);
+  }
   requireRecordValues(parsed, "checked", "number");
   requireRecordValues(parsed, "reads", "array");
   const facts: Record<string, unknown> = {};
@@ -386,16 +568,32 @@ export function assertProbeReport(parsed: unknown): ProbeReport {
   for (const field of FACTS_NUMBER_FIELDS) {
     requireKind(facts, field, "number", "facts.");
   }
-  const { spiderDefaults } = facts;
-  if (!isRecord(spiderDefaults)) {
-    throw new Error(`探针报告的 facts.spiderDefaults 应为对象，实际是 ${kindOf(spiderDefaults)}`);
-  }
-  for (const field of SPIDER_DEFAULT_FIELDS) {
-    if (!(field in spiderDefaults)) {
-      throw new Error(`探针报告的 facts.spiderDefaults 少了 ${field}`);
-    }
-  }
+  requireSpiderDefaults(facts["spiderDefaults"]);
   return parsed as unknown as ProbeReport;
+}
+
+/**
+ * 连子孙一起收掉。
+ *
+ * 探针内部会按本仓参数**真造一次** stealth 会话（`contract_probe.py` 的 `facts()` 走
+ * `_launch_args("browser.render")`），那会拉起 patchright / chromium 一篮子孙进程。只对直接
+ * 子进程发信号的话，父进程死了它们不收 —— CI 上留下的是一台常驻浏览器，下一次作业连
+ * profile 目录都要撞锁。所以 `spawn` 时 `detached` 开一个进程组，这里对 `-pid` 整组发。
+ *
+ * 组已经没了、或平台不支持进程组（win32）时退回只杀直接子进程 —— 少杀总比什么都不做强。
+ *
+ * @param child - 被监视的子进程
+ */
+function killTree(child: ChildProcess): void {
+  if (!POSIX || child.pid === undefined) {
+    child.kill("SIGKILL");
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
 }
 
 /**
@@ -426,7 +624,14 @@ export async function runProbe(options: ProbeOptions = {}): Promise<ProbeReport>
   if (!existsSync(probe)) {
     throw new Error(`缺少探针脚本：${probe} 不存在。它随仓库发布，不该缺席。`);
   }
-  const child = spawn(python, [probe], { cwd: REPO, stdio: ["ignore", "pipe", "pipe"] });
+  // `detached` 只为一件事：给探针开一个独立的进程组，超时保护才能连它拉起的浏览器
+  // 子孙一起收掉（见 `killTree`）。不加 `stdio: "ignore"` 之外的处理，也不 unref ——
+  // 我们照常等它的 close。
+  const child = spawn(python, [probe], {
+    cwd: REPO,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: POSIX,
+  });
   // `once(child, "close")` 会临时挂一个 error 监听，并在敲定时把包括 error 在内的监听全摘掉。
   // close 之后进程销毁阶段再冒一次 error（或 error 与 close 的到达次序有先后差），就没有
   // 接收者了：Node 会把它抛成未处理异常、崩掉整个测试进程，那句报错与探针无关，最难归因。
@@ -456,7 +661,7 @@ export async function runProbe(options: ProbeOptions = {}): Promise<ProbeReport>
   const watchdogState = { fired: false };
   const watchdog = setTimeout(() => {
     watchdogState.fired = true;
-    child.kill("SIGKILL");
+    killTree(child);
   }, options.timeoutMs ?? PROBE_TIMEOUT_MS);
   watchdog.unref();
   let code: number | null;
@@ -466,6 +671,9 @@ export async function runProbe(options: ProbeOptions = {}): Promise<ProbeReport>
   } catch (spawnError) {
     // 启动失败只来 `error` 事件、永远不来 `close`（实测 EACCES：error 先到，close 的 once
     // 直接以同一个错误拒绝）。把它包成一句点名解释器的话，否则用户读到的是一句裸 EACCES。
+    // 先摘定时器再抛：unref() 只保证它不按住事件循环，不等于它已被回收 —— 留着的那个
+    // 到点后还会对一个没起来的 child 发信号。
+    clearTimeout(watchdog);
     throw new Error(
       `探针起不来：${python}（${spawnError instanceof Error ? spawnError.message : String(spawnError)}）。\n` +
         "存在性已经判过，这类失败通常是可执行位或权限问题，不是缺少 Scrapling。",
@@ -474,7 +682,10 @@ export async function runProbe(options: ProbeOptions = {}): Promise<ProbeReport>
   }
   clearTimeout(watchdog);
   const stderr = (): string => tailLines(stderrTail.text(), STDERR_TAIL_LINES);
-  if (watchdogState.fired) {
+  // 判据要两件一起：定时器跑过，**并且**进程确实是它打死的。子进程在预算到点的同一刻自己
+  // 正常退出（`code === 0`、`signal === null`）而 `close` 还没派发时，只看 `fired` 会把一次
+  // 成功的探针报成「超过 Xms 没写完结论，已用 SIGKILL 终止」。
+  if (watchdogState.fired && (signal !== null || code !== 0)) {
     // 先超时保护再谈退出码：被 SIGKILL 打死的进程也走 `code !== 0` 那一支，而那句话说它是
     // 「自己崩了」，与「挂住到预算」是两种排查方向。
     throw new Error(

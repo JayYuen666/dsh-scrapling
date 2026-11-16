@@ -41,15 +41,31 @@ def _json_value_within(value: Any, room: int) -> tuple[Any, int, bool]:
     """把值收进 room 的 JSON 预算；返回 (值, 实际长度, 是否被裁)。
 
     字符串按序列化长度收缩；其它形态（列表、对象）没有便宜的收缩方式，超预算时
-    降级为 null —— 留着整段会让调用方拿到的载荷远超 maxContentChars。
+    降级为 null —— 留着整段会让调用方拿到的载荷远超 max_content_chars。
+
+    返回的 ``size`` 是**实际会占的长度**，即使它大于 ``room``：降级成 ``null`` 也要花
+    4 个字符，把这个长度报成 0 会让调用方以为预算还富余。
     """
     size = _json_len(value)
     if size <= room:
         return value, size, False
-    if isinstance(value, str) and room >= _json_len(""):
-        fitted = _fit_text(value, room)
+    if isinstance(value, str):
+        # 预算连一对引号都放不下时 `_fit_text` 自己会回空串：文本字段被裁之后仍是字符串，
+        # 不降级成 null —— 模型读到的 null 是「这个字段没有值」，而这里的实情是
+        # 「值被预算咬掉了」，两者用同一个记号就分不开了。
+        fitted = _fit_text(value, max(0, room))
         return fitted, _json_len(fitted), True
     return None, _json_len(None), True
+
+
+def _row_overhead(names: list[str]) -> int:
+    """一行里与取值无关的那部分 JSON 长度：键名、引号、冒号、大括号与逗号。
+
+    预算若只累加各字段**值**的长度，每行的键名与标点都不计入 —— 字段名越长、字段越多、
+    行数越多，真实返回体超出 max_content_chars 越多，而 ``_json_len`` 的注释写着
+    「与模型看到的形状一致」。这里把骨架单独算一次，由调用方逐行计入。
+    """
+    return _json_len(dict.fromkeys(names, None)) - len(names) * _json_len(None)
 
 
 def _resolve_url(page: Any, value: str) -> str:
@@ -188,7 +204,12 @@ def field_value(
     page: Any,
     resolve_urls: bool = False,
 ) -> Any:
-    """取一个字段的值；缺失给 None，all=true 时给列表。"""
+    """取一个字段的值；缺失给 None，all=true 时给列表。
+
+    ``all=true`` 时列表里**不含 None**：attribute 模式下属性缺席的节点会被跳过，所以返回
+    列表的下标与命中节点不是一一对应的。这一位是有意的过滤（缺值的条目留在列表里只会让
+    模型误以为「这一条字段是 null」），要按下标对齐就改用单值模式逐条取。
+    """
     selector, mode, attribute, many = _field_spec(spec)
     found = _select_field_nodes(node, selector)
     if many:
@@ -232,11 +253,20 @@ def collect_fields(
     if not isinstance(fields, dict) or not fields:
         raise ValueError("fields must be a non-empty object")
     rows: list[dict[str, Any]] = []
-    spent = 0
+    # 每行的键名与标点也占字符：只累加值会让真实返回体超出预算，而调用方拿到的
+    # 正是整份 rows 的序列化体积（含外层方括号与行间逗号）。
+    names = [str(name) for name in fields]
+    per_row = _row_overhead(names)
+    # 外层 `[` `]` 两个字符。
+    spent = _json_len([])
     truncated = False
     node_iter = iter(nodes)
     for node in node_iter:
         row: dict[str, Any] = {}
+        # 行与行之间还有一个逗号；第一行前面没有。
+        if rows:
+            spent += 1
+        spent += per_row
         for name, spec in fields.items():
             value = field_value(node, spec, page=page, resolve_urls=resolve_urls)
             room = max(0, max_content_chars - spent)
@@ -251,6 +281,33 @@ def collect_fields(
                 truncated = True
             break
     return rows, truncated
+
+
+def _similarity_threshold(value: Any) -> float:
+    """校验 ``similarityThreshold``：0..1 的实数，显式 null 也按缺省 0.2 处理。
+
+    直接 ``float(args.get(...))`` 会在模型显式传 ``null`` 时抛 ``TypeError``（键在、值是 None），
+    而 ``adapters._wrap_extraction`` 只把 ``ValueError`` 归成 ``BAD_ARGS`` —— ``TypeError``
+    会一路穿到 bridge 的兜底分支变成 ``FETCH_FAILED``，错误码与成因对不上。
+    """
+    if value is None:
+        return 0.2
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1:
+        raise ValueError("similarityThreshold must be a number between 0 and 1")
+    return float(value)
+
+
+def _ignore_attributes(value: Any) -> tuple[str, ...]:
+    """校验 ``ignoreAttributes``：字符串数组；未给时用默认的 href/src。
+
+    不校验的后果是静默错误：字符串 ``"href"`` 会被 ``list(...)`` 拆成 ``['h','r','e','f']``，
+    dict 会被拆成键名列表 —— 两种都变成一组不存在的属性名，``find_similar`` 不会报错。
+    """
+    if value is None:
+        return ("href", "src")
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
+        raise ValueError("ignoreAttributes must be an array of strings")
+    return tuple(value)
 
 
 def locate(args: dict[str, Any]) -> dict[str, Any]:
@@ -287,8 +344,8 @@ def locate(args: dict[str, Any]) -> dict[str, Any]:
         partial=bool(args.get("partial", False)),
         case_sensitive=bool(args.get("caseSensitive", False)),
         clean_match=bool(args.get("cleanMatch", True)),
-        similarity_threshold=float(args.get("similarityThreshold", 0.2)),
-        ignore_attributes=args.get("ignoreAttributes") or ("href", "src"),
+        similarity_threshold=_similarity_threshold(args.get("similarityThreshold")),
+        ignore_attributes=_ignore_attributes(args.get("ignoreAttributes")),
         match_text=bool(args.get("matchText", False)),
     )
     matches: list[dict[str, Any]] = []
@@ -422,7 +479,10 @@ def links(args: dict[str, Any]) -> dict[str, Any]:
             reason = _next_reason(text, href)
             if not reason:
                 continue
-            url = str(page.urljoin(href))
+            # href 来自被抓页面（不可信输入）：`http://[` 这类值会让 urljoin 抛 ValueError，
+            # 而这条路径上的异常会被 _wrap_extraction 归成 BAD_ARGS —— 参数其实没问题，
+            # 是页面内容坏了。复用 _resolve_url 的兜底（拼不出来就保留原值）。
+            url = _resolve_url(page, href)
             if url in seen:
                 continue
             seen.add(url)

@@ -9,6 +9,7 @@ import { once } from "node:events";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, describe, expect, it } from "vitest";
 import { resolvePythonBin } from "../host.ts";
 import { LOCAL_PYTHON } from "./python-bin.ts";
@@ -115,8 +116,10 @@ describe("py-launcher", () => {
     // 标题说的那件事：--which 报的那一支与 --path 交出去的那一支是同一个字符串。
     expect(withVenv.stdout.trim().slice(WHICH_PREFIX.length)).toBe(asPath.stdout.trim());
     const withoutVenv = await run(["--which", `--root=${tempDir()}`]);
+    // 文案是「没有**可用的**」而不是「没有」：`usable` 把同名目录与无可执行位的文件也判成
+    // 不可用，只说「没有」会让「venv 坏了」被读成「venv 不存在」。
     expect(withoutVenv.stdout).toBe(
-      `${WHICH_PREFIX}PATH 上的 ${PATH_PYTHON}（本仓没有 _env/.venv，在伞根跑 pnpm py:setup）\n`,
+      `${WHICH_PREFIX}PATH 上的 ${PATH_PYTHON}（没有可用的 _env/.venv，在伞根跑 pnpm py:setup）\n`,
     );
   });
 
@@ -187,5 +190,48 @@ describe("py-launcher", () => {
     writeFileSync(path.join(bin, VENV_EXE), "");
     const result = await run(["--path", `--root=${root}`]);
     expect(result.stdout.trim()).toBe(PATH_PYTHON);
+  });
+
+  it("-- 之后的内容整段交给解释器，不留在自己的参数里", async () => {
+    // 文件头第 10 行承诺 `[-- python 参数...]`。实现若把 `--` 一起透传，python 会把
+    // 它当成脚本路径并报 `can't open file '.../--'`；这里要的是 stdout 里那句 ok。
+    const result = await run([`--root=${tempDir()}`, "--", "-c", "print('ok')"]);
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe("ok");
+  });
+
+  it("--env 的键以 - 开头时退 2，而不是把旗标吞成环境变量", async () => {
+    // `--env --root=/tmp` 会被 splitEnv 读成「键 --root、值 /tmp」，于是本该是启动器旗标的
+    // 那个 --root 被静默吞掉、当成环境变量送进子进程 —— 命令照样退 0，只是解析根没生效。
+    const result = await run(["--env", "--root=/tmp", "-c", "print('swallowed')"]);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("不能以 - 开头");
+    expect(result.stdout).toBe("");
+  });
+
+  it("--env 形状写错时只报一句，不叠第二句", async () => {
+    // 两层各写一次 stderr 时同一处错会打两行（「要写成 KEY=VALUE」+「取值不合法」），
+    // 而第二行给不出任何新信息。形状错与旗标误吞的出路不同，文案也不该混。
+    const shape = await run(["--env=BOGUS"]);
+    expect(shape.status).toBe(2);
+    expect(shape.stderr.trimEnd().split("\n")).toStrictEqual([
+      "--env 要写成 KEY=VALUE；现在给的是 BOGUS",
+    ]);
+  });
+
+  it.runIf(!WINDOWS)("收到终止信号时转发给子进程，并按 128+n 退出", async () => {
+    // 不带转发时启动器会被信号直接带走（`close` 里 signal 非空、退出码无从映射），
+    // 而交互式终端靠进程组不会暴露这件事 —— 只有脚本化场景（CI 的 kill、timeout 命令）
+    // 只打启动器这一个 pid 时才看得出来。
+    const child = spawn(
+      process.execPath,
+      [LAUNCHER, `--root=${tempDir()}`, "-c", "import time; time.sleep(30)"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    await delay(500);
+    child.kill("SIGTERM");
+    const [code, signal] = (await once(child, "close")) as [number | null, NodeJS.Signals | null];
+    expect(signal).toBeNull();
+    expect(code).toBe(143);
   });
 });

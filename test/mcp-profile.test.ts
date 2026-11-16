@@ -280,6 +280,77 @@ describe("inspectProfile", () => {
     ).toStrictEqual([]);
   });
 
+  /**
+   * 给了 `--port`、条目也在，但 url 读不出端口：旧实现一条端口都收不到就 `return []`，
+   * 于是「比对根本没发生」被打成一致。客户端连的是 patch 里写死的端口，而部署项可能早改了值。
+   */
+  it("给了 --port 但条目里读不出端口时点名，而不是当成一致", () => {
+    // 拼一个 `${PORT}` 占位符：这正是 `!!js` 模板与手写占位符的写法，`new URL()` 读不出端口。
+    // 美元号走 fromCodePoint：普通串里写 `${` 撞 no-template-curly-in-string，模板串里写又会插值。
+    const placeholder = `${String.fromCodePoint(0x24)}{DSH_SCRAPLING_MCP_HTTP_PORT}`;
+    const unreadable = PLUGIN_ENTRY.replace(URL_LINE, `url: ${placeholder}`);
+    const findings = inspectProfile({
+      mode: "mcp",
+      patchText: unreadable,
+      clientVersion: PINNED,
+      officialMcpEnabled: false,
+      expectedPort: OTHER_PORT,
+    });
+    expect(findings.map((finding) => finding.code)).toStrictEqual(["MCP_PORT_UNREADABLE"]);
+    expect(findings[0]?.detail).toContain(String(OTHER_PORT));
+    // 没给 --port 时无从比对，不该凭空报：这条判据只在「本该比对」时才说话。
+    expect(
+      inspectProfile({
+        mode: "mcp",
+        patchText: unreadable,
+        clientVersion: PINNED,
+        officialMcpEnabled: false,
+      }).map((finding) => finding.code),
+    ).toStrictEqual([]);
+  });
+
+  /**
+   * 条目 config 里嵌着的 `name:`（`headers:` / `tools:` 下的子键）不是兄弟条目。
+   *
+   * 旧实现只凭「这一行匹配到 name:」就无条件开新条目，于是**后面的** serverName / transport /
+   * url 全被算到那个伪条目名下（它们比伪条目的 indent 浅），真条目变成一条只有名字的空条目、
+   * 被「serverName 为 scrapling」的过滤剔掉 —— doctor 报的是模式不匹配，与真因无关。
+   */
+  it("条目 config 里嵌着的 name 不起一条新条目", () => {
+    const nested = [
+      "- insert:",
+      `    ${ENTRY_ID_LINE}`,
+      `      name: '${CLIENT}'`,
+      "      config:",
+      "        tools:",
+      "          name: nested-tool",
+      `        ${SERVER_LINE}`,
+      `        ${TRANSPORT_HTTP_LINE}`,
+      `        ${URL_LINE}`,
+      "",
+    ].join("\n");
+    // 真条目仍被读成一条：没有残留的模式误报，端口也读得出来（期望端口同值时无话可说）。
+    expect(
+      inspectProfile({
+        mode: "mcp",
+        patchText: nested,
+        clientVersion: PINNED,
+        officialMcpEnabled: false,
+        expectedPort: DEFAULT_MCP_PORT,
+      }),
+    ).toStrictEqual([]);
+    // 反过来说：把它读成两条时，端口判据会失去比对对象，这里显式钉住「能读出端口」。
+    expect(
+      inspectProfile({
+        mode: "mcp",
+        patchText: nested,
+        clientVersion: PINNED,
+        officialMcpEnabled: false,
+        expectedPort: OTHER_PORT,
+      }).map((finding) => finding.code),
+    ).toStrictEqual(["MCP_PORT_MISMATCH"]);
+  });
+
   // 宿主 --dump-config 打出来的是合成后的列表，name 在 2 格、config 键在 4 格；
   // 手工写条目的人也未必守 6/8 那一档。判据不该因为缩进换档就把真存在的条目说成没有。
   it("条目换个缩进层级也认得出来", () => {
@@ -384,6 +455,16 @@ describe("readProfileSnapshot", () => {
     await expect(readProfileSnapshot(dir)).rejects.toThrow(/读不出/u);
   });
 
+  it("profile 指向普通文件时点名「不是目录」，不按空 profile 静默通过", async () => {
+    // Windows 对「文件\cordis.patch.yml」报 ENOENT（与「目录里没这份文件」同码），只判
+    // readText 的返回值会把它读成空 profile；这条判据必须在两个平台给出同一个结论。
+    const dir = mkdtempSync(path.join(os.tmpdir(), "dsh-profile-file-"));
+    roots.push(dir);
+    const file = path.join(dir, "profile");
+    writeFileSync(file, "");
+    await expect(readProfileSnapshot(file)).rejects.toThrow(/profile 不是目录/u);
+  });
+
   it("重复写 officialMcpEnabled 时按 YAML 的后者生效", async () => {
     const on = await readProfileSnapshot(
       profile("        officialMcpEnabled: false\n        officialMcpEnabled: true\n", "{}"),
@@ -439,6 +520,22 @@ describe("readProfileSnapshot", () => {
     expect(snapshot.officialMcpEnabled).toBe(expected);
   });
 
+  /**
+   * 更深一档的同名键不是同一个键。
+   *
+   * 判据原先跨所有缩进层级取最后一条，于是插件 config（8 格）写着 true、某个子映射（12 格）里
+   * 恰好也有一个同名键且是 false 时，doctor 会把开关判反。取首个命中的缩进作基准即可。
+   */
+  it("嵌套映射里的同名键不把开关判反", async () => {
+    const snapshot = await readProfileSnapshot(
+      profile(
+        "        officialMcpEnabled: true\n        headers:\n          officialMcpEnabled: false\n",
+        "{}",
+      ),
+    );
+    expect(snapshot.officialMcpEnabled).toBe(true);
+  });
+
   it("profile 不存在或 package.json 不成形时按缺依赖处理", async () => {
     const missing = await readProfileSnapshot(
       path.join(os.tmpdir(), "definitely-not-a-profile-dir"),
@@ -446,10 +543,55 @@ describe("readProfileSnapshot", () => {
     expect(missing.clientVersion).toBeUndefined();
     expect(missing.patchText).toBe("");
     expect(missing.officialMcpEnabled).toBe(false);
+    // 文件不在 = 没装，那一位不亮。
+    expect(missing.clientVersionBroken).toBe(false);
     const broken = await readProfileSnapshot(profile("", "not json at all"));
     expect(broken.clientVersion).toBeUndefined();
     const scalar = await readProfileSnapshot(profile("", '"a string"'));
     expect(scalar.clientVersion).toBeUndefined();
+  });
+
+  /**
+   * 「这份 JSON 读不懂」与「这条依赖没装」是两件事，修法相反。
+   *
+   * 折成同一个信号时，doctor 在 package.json 被半截写入 / 留着合并冲突标记的机器上也会说
+   * 「跑 dsh plugin add 装上它」—— 用户去装一个其实已经声明的依赖，而真正要修的是那份文件。
+   */
+  it("package.json 读不懂时报的是文件坏了，不是客户端没装", async () => {
+    const broken = await readProfileSnapshot(profile("", "{半截"));
+    expect(broken.clientVersionBroken).toBe(true);
+
+    const findings = inspectProfile({
+      mode: "mcp",
+      patchText: PLUGIN_ENTRY,
+      clientVersion: broken.clientVersion,
+      clientVersionBroken: broken.clientVersionBroken,
+      officialMcpEnabled: false,
+    });
+    // 只有这一条：再叠一条 MCP_CLIENT_MISSING 会把用户支去装那个已经声明的依赖。
+    expect(findings.map((finding) => finding.code)).toStrictEqual(["MCP_CLIENT_MANIFEST_BROKEN"]);
+    expect(findings[0]?.detail).toContain("不是「没装客户端」");
+  });
+
+  it("package.json 顶层不是对象时同样算读不懂", async () => {
+    const scalar = await readProfileSnapshot(profile("", '"a string"'));
+    expect(scalar.clientVersionBroken).toBe(true);
+    const array = await readProfileSnapshot(profile("", "[]"));
+    expect(array.clientVersionBroken).toBe(true);
+  });
+
+  it("空文本是「没装」而不是「读不懂」", async () => {
+    const empty = await readProfileSnapshot(profile("", ""));
+    expect(empty.clientVersionBroken).toBe(false);
+    expect(
+      inspectProfile({
+        mode: "mcp",
+        patchText: PLUGIN_ENTRY,
+        clientVersion: empty.clientVersion,
+        clientVersionBroken: empty.clientVersionBroken,
+        officialMcpEnabled: false,
+      }).map((finding) => finding.code),
+    ).toStrictEqual(["MCP_CLIENT_MISSING"]);
   });
 });
 

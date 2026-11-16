@@ -59,8 +59,10 @@ const externalNames = new Set([
 // Symbol（不是 Symbol.for），符号身份按模块实例计算，于是宿主 dsh-agent-loop 拿自己那份的
 // Symbol 去读由副本挂载出来的 ToolRuntime，得到 undefined —— 每一次原生工具调用都抛
 // "Cannot read properties of undefined (reading 'prepare')"，全 profile 的工具一起废。
-// 本包用到的 shared 子模块（record / text / jsonl / card-apply）零外部 import、无模块级
-// 状态，打进产物不会复制出共享状态；@deepseek-ai/* 仍一律外部化，保持宿主单例。
+// 本包用到的 shared 子模块（record / locale / placeholder / skill / instance-lock /
+// canonicalize-region-paths / remote-marker）没有模块级可变状态：打进产物不会复制出共享
+// 状态。其中 remote-marker 按值导入 `@deepseek-ai/dsh-typert-protocol` 的 `Remote`，那一条
+// 仍按包名外部化，拿的是宿主那枚单例（@deepseek-ai/* 一律外部化）。
 externalNames.delete("@jayyuen66/dsh-plugin-shared");
 
 const isExternal = externalizePackages(externalNames);

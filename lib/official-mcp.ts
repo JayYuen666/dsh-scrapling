@@ -63,6 +63,17 @@ const CLIENT_VERSION = MCP_DEFAULT_CLIENT_PIN;
 /** 官方 server 在托管 venv 里的入口。
  *  布局跟解释器同源：POSIX 在 `bin/`，Windows 在 `Scripts/` 且可执行体带 `.exe`。 */
 export function officialMcpBinary(dataDir: string): string {
+  // 闸门放在**生成侧**：这一位拼出来的 `command:` 会被写进 patch，而相对路径是按宿主进程的
+  // cwd 解析的 —— 与生成它的那个 shell 不是同一个目录时，patch 指向一个不存在的命令，错误要
+  // 到宿主启动那次才现形。两个现有调用点都先 `path.resolve` 过，但本函数是导出的，注释里也
+  // 预告了 doctor 之类的新入口，所以判据留在这里而不是交给调用方。
+  if (!path.isAbsolute(dataDir)) {
+    throw new OfficialMcpError(
+      "OFFICIAL_MCP_DATA_DIR",
+      `官方 server 的入口要绝对 dataDir 才能拼：现在给的是 ${JSON.stringify(dataDir)}。` +
+        "相对路径会被宿主按它自己的 cwd 解析，写进 patch 的 command 就不是这个文件了。",
+    );
+  }
   const venv = path.join(dataDir, "runtime", "venv");
   return process.platform === "win32"
     ? path.join(venv, "Scripts", "scrapling-mcp.exe")
@@ -103,7 +114,7 @@ function yamlEscape(char: string): string {
 
 // 这条正则**就是**用来抓「不能原样出现在 YAML 双引号标量里的控制字符」的，命中是设计意图。
 // oxlint-disable-next-line eslint/no-control-regex
-const YAML_UNSAFE = /[\u0000-\u001F\u007F-\u009F"\\]/gu;
+const YAML_UNSAFE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029"\\]/gu;
 
 /**
  * 把一个字符串写成 YAML 双引号标量。
@@ -146,10 +157,16 @@ export function officialMcpPlan(options: OfficialMcpOptions): OfficialMcpPlan {
     );
   }
   const command = officialMcpBinary(options.dataDir);
+  // patch 从这几个字段派生，而不是各写一遍：`args` 先前在返回值与 patch 文本里各有一份字面量，
+  // 官方 server 一旦需要参数（transport / dataDir），改一处就会与另一处漂移，而 patch 才是
+  // 用户真正应用的那份。这里用 JSON.stringify 落 `[]` / 带引号的参数数组 —— 形态与 YAML 的
+  // 流式序列一致，且字符串会按 JSON 规则转义（YAML 1.2 的流式集合是 JSON 的超集）。
+  const args: readonly string[] = [];
+  const serverName = MCP_SERVER_NAME;
   return {
     command,
-    args: [],
-    serverName: MCP_SERVER_NAME,
+    args,
+    serverName,
     risk: RISK,
     installCommand: clientInstallCommand(CLIENT_VERSION),
     patch: [
@@ -157,10 +174,10 @@ export function officialMcpPlan(options: OfficialMcpOptions): OfficialMcpPlan {
       `    - id: ${MCP_OFFICIAL_ENTRY_ID}`,
       `      name: '${MCP_CLIENT_PACKAGE}'`,
       "      config:",
-      `        serverName: ${MCP_SERVER_NAME}`,
+      `        serverName: ${serverName}`,
       `        transport: ${MCP_TRANSPORT_STDIO}`,
       `        command: ${yamlScalar(command)}`,
-      "        args: []",
+      `        args: ${JSON.stringify(args)}`,
       "        failOnStartupError: true",
       "",
     ].join("\n"),
@@ -174,7 +191,10 @@ export function officialMcpPlan(options: OfficialMcpOptions): OfficialMcpPlan {
  * 不生成、不写任何 profile。
  */
 export function officialMcpHint(enabled: boolean): string {
+  // `--profile` 不是可省的：那条开关只从 profile 的 cordis.patch.yml 读（见 `lib/cli.ts` 的
+  // setupMode —— 不带 `--profile` 时 `enabled` 恒 false），漏了它的命令按下去必然落进
+  // OFFICIAL_MCP_DISABLED，用户看到的却是「开关没开」，而他已经开了。
   return enabled
-    ? `宿主没有 mcpManager（CLI/headless）或动态注册失败时，用 setup 生成手工接入配置：dsh-scrapling setup --mode official-mcp --accept-risk。${RISK}`
-    : "official-mcp 未启用：先在部署配置里设 officialMcpEnabled=true；宿主没有 mcpManager 时再跑 setup --mode official-mcp --accept-risk。";
+    ? `宿主没有 mcpManager（CLI/headless）或动态注册失败时，用 setup 生成手工接入配置：dsh-scrapling setup --profile <profile 目录> --mode official-mcp --accept-risk。${RISK}`
+    : "official-mcp 未启用：先在部署配置里设 officialMcpEnabled=true；宿主没有 mcpManager 时再跑 dsh-scrapling setup --profile <profile 目录> --mode official-mcp --accept-risk。";
 }

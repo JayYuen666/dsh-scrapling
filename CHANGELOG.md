@@ -6,13 +6,53 @@
 标准六类之外的小节（本仓的 `Boundaries` 收各版本的验证范围与能力边界，即哪些平台/档位真跑过、
 哪些只到本地夹具为止）。
 
+## 0.1.14
+
+设置卡上按次读取的那些设置从下一次调用起生效（此前装配期就把配置收成了快照，改完要重启宿主才看得见）；market 热挂与 bundle 层双路径装载时第二份 `apply` 整份让路；卡片样式改用 shared 的共享 `<style>`；`@deepseek-ai/dsh-error` 与 `@deepseek-ai/dsh-tools` 从 optional peer 改成普通 peer（干净目录里装出来的包原先装载即 `ERR_MODULE_NOT_FOUND`）；托管解释器改选 `runtime/venv`（此前十九个工具一个都不注册）；TLS 证书链用 certifi 兜底；另有十三处独立缺陷（查询串 `;` 分隔符与 pip 索引地址的凭据泄漏、win32 解释器路径、引号标量的 `#`、doctor 的数据目录与 `patchScalar` 的取值顺序、move 空 selector、`deps-check` 静默退 0、安装进度写入、坏 `state.json` 让安装按钮变灰、失败回执缺字段、`--profile` 指向普通文件在 Windows 被当成空 profile、验证服务器单线程被空闲连接堵死）；shared 抬到 `^0.2.10`。十九个工具与 MCP 面的行为不变。
+
+### Fixed
+
+- **shared 抬到 `^0.2.10`**：设置卡吸底保存条的旧固定 id 冲突与底色随 shared 修复；`registerSkill` 在 effect 挂不上时立即撤销注册并回 `false`；client bundle 按新 shared 重建。
+- `_env/v5_spa.py` 的验证服务器原来是单线程 `socketserver.TCPServer`：一条只连上、不发数据的空闲连接就能把后续请求堵死（实测 2 秒超时），而 handler 也没有读超时。改成 `ThreadingMixIn + TCPServer` 并置 `daemon_threads`，与同目录 `_env/v6_guard.py` 的 `ThreadingHTTPServer` 一致；改动后同一组探针下「空闲连接 + 正常请求」由 `TimeoutError` 变 200。
+- **设置卡改完要重启才生效**：宿主的 `_commitVolatile()` 在 volatile 字段被改写时只 `updateVolatile(ref, source)`、**不重跑 `apply`**，而本包在装配期把 `config` 里的抽取类字段（`extractionType` / `mainContentOnly` / `fetchTimeoutMs` / `fetchMaxOutputChars` 等）一次性收进了常量。现在 `depsFor` 交出去的是 `settingsViewOf(config, dataDir, toolName)` 返回的**活视图**：`lib/live-view.ts` 的 `liveView(read)` 给每个键挂 getter、每次访问现读。不用 Proxy 是因为 `const { x } = proxy` 对非自有键只会取到 `undefined`，而十四个 builder 第一行就是 `const { settings } = deps;`。
+- **工具级墙钟停在装配时的值**：`defineTool` 把 `options.timeoutMs` 一次性拷进产物对象，所以只改取值函数没有用——那次求值发生在装配时。`lib/tools.ts` 新增 `bindLiveTimeout(tool, settings)`，用 `Object.defineProperty(tool, "timeoutMs", { get: () => toolTimeoutOf(settings) })` 换成 getter；宿主 `tool-call-timeout-policy` 每次 `tools/execute` 都现读 `ctx.tools.get(name, agent)?.timeoutMs`，于是改设置后下一次调用即用新值。
+- **干净目录里装出来的包装载即失败**：`host.js` 顶层以**值**导入 `@deepseek-ai/dsh-error` 与 `@deepseek-ai/dsh-tools`，而它们在 `peerDependenciesMeta` 里被标成 `optional`。npm 不会替消费者安装 optional peer，于是 `npm install <tarball>` 之后 `import` 直接 `Cannot find package '@deepseek-ai/dsh-error'`。两枚改成普通 peer（`@deepseek-ai/dsh` 仍 optional——它不是值导入，且 profile 里必须由宿主供给）；`test/publish-manifest.test.ts` 加一条守卫：**`host.js` 里按包名值导入的宿主包，一枚都不许被标成 optional peer**。
+- **托管解释器选错了那一支，十九个工具"一个都不注册"**：`resolveRuntime` 的托管档只探 `dataDir/runtime/python/<版本>/bin/python3`（裸托管 CPython），而安装器 `installCore` 先落这份 CPython、再用它 `-m venv` 出 `dataDir/runtime/venv`，所有 wheel（Scrapling、patchright、官方 MCP server）都装在 **venv** 里。裸解释器里一个包都没有，之所以一直没被发现：`import scrapling` 在**子进程里**失败，插件侧看到的是 `capabilities` 全 false ⇒ `planTools` 不注册工具、`guidanceFor` 正文为空 ⇒ 虚拟 skill 也不注册，而装载日志里那行「Python 解释器：<绝对路径>（managed）」看起来完全正常。新增 `managedVenvPythonPath(dataDir)`，托管档按 **venv → 裸解释器** 顺序探（venv 不在才回落，那是装了一半的机器），`test/runtime.test.ts` 补三条用例钉住优先序、回落与层级。真宿主判据：`ps -eo pid,command | grep bridge.py` 的路径从 `runtime/python/3.14.9/bin/python3` 变成 `runtime/venv/bin/python3`。
+- **`scrapling_fetch` 对一类公网站点一律 `unable to get local issuer certificate`**：托管 CPython 没有自己的 OpenSSL 配置，macOS 上 `ssl.get_default_verify_paths()` 落到系统库 `/private/etc/ssl/cert.pem`，那份库缺若干公开根 —— 实测 `example.com` 的 SSL.com 链在它下面 `verify error:num=20`，同一张链条用 certifi 的 bundle 则 `Verify return code: 0`。`py/bridge.py` 新增 `configure_ca_bundle()`，在模块导入期把 `SSL_CERT_FILE` 与 `CURL_CA_BUNDLE` 指向 `certifi.where()`（两条链各喂一支：前者给 Python 的 `ssl`，后者给 libcurl／curl_cffi），**且只在两者都没被设过时才动**——企业 MITM 代理与用户自钉的私有根照旧优先。`py/tests/test_bridge.py` 补 8 条判据（显式指定时让路 / 原值保留 / 干净进程兜底到 certifi 的 cacert.pem（按宿主路径分隔符判定，Windows 原生反斜杠不再判假） / 两条链同值 / stdout 只有那三行 / 显式指定后不再兜底 / 空值的两枚变量按没设处理并真的写入环境）；落值从 `setdefault` 改成直接赋值，与「空值算没设」的早退判据同口径。
+- **输入控件撑出容器**（shared 侧）：`.dsu-form` 整棵子树统一 `border-box`，否则 `.dsu-input` 的 `width:100%` 会连同左右 padding 一起撑出容器 26px。
+- **小节内相邻元素间距为 0**（shared 侧）：`.dsu-form .dsu-section>*+*` 给 10px，`.dsu-sectionHint` 4px，`.dsu-field` 之间仍 0。
+- **`?a=1;token=abc` 这类查询串把凭据原样打进日志**：`py/redact.py` 的 `_redacted_query` 走 `parse_qsl`，而 Python 3.10 起它**不再把 `;` 当参数分隔符**——整串被读成一个名字 `a`、值 `1;token=abc`，参数名判据命中不了。改成按 `[&;]` 自己切：分隔符原样拼回（重排会让日志里的 URL 与真实请求对不上），每段用 `fullmatch` 取名字判 `_SECRET_QUERY_KEYS`。
+- **pip 的索引地址会把凭据回显进错误文案**：`spawn` 继承父进程环境，用户在企业镜像里把 token 写进 `PIP_INDEX_URL` 之后，pip 失败时会把地址原样打回 stderr（实测 `WARNING: The index url "ht!tp://user:SECRETTOKEN123@host/simple" seems invalid` 与 `InvalidURL: … 'https://user:SECRETTOKEN123@/requests/'` 两种形态都是**明文**），而这条 stderr 截断 400 字符后进 `InstallError` 消息、再进作业输出与模型上下文。两层修：`lib/url-policy.ts` 的 `URL_USERINFO` 去掉 `^` 锚点（原先只认「整串就是一个 URL」，而诊断里的地址都夹在句子中间）并把 `redactUrlSecrets` 改成 `replaceAll`；`lib/installer.ts` 新增 `safeStderr()` 闸门，六处 stderr 通路（curl / HTTP 状态 / tar / venv / pip / chromium）与两处下载 URL 全部走它。`test/installer.test.ts` 补一条用例，并断言脱敏不能把诊断本身抹掉（`INSTALL_FAILED` 那一支仍带 `seems invalid`）。
+- **win32 上托管 venv 的解释器路径永不存在**：`managedVenvPythonPath` 照 POSIX 名字拼成 `Scripts/python3.exe`，而 CPython 的 `venv/__init__.py` 在 Windows 上只造 `python.exe` / `python<ver>.exe` / `pythonw*.exe`（`link_sources` 里没有 `python3.exe`）。`executable()` 因此判假 ⇒ 静默回落裸托管解释器（那里一个包都没有），症状与「托管 venv 没装」一模一样。改成 `python.exe`，与同文件 `repoPythonPath` 一致。
+- **带 `#` 的引号标量被截断**：`lib/mcp-profile.ts` 的 `scalarOf` 先剥行尾注释再识引号，于是 `serverName: "scrapling # mine"` 被切成 `"scrapling`（引号不配对）。改成两段式：先认「整段被引号包住」，否则剥注释后再认一次——`"scrapling # mine"` 与 `'scrapling' # 注释` 两个方向都要覆盖。
+- **`doctor` 与 `showStatus` 读的不是同一个数据目录**：`runDoctor` 用的是 `deps.dataDir`，而 `showStatus` 用的是 `patchScalar(patchText, "dataDir") ?? deps.dataDir`。同一个 profile 在两处得出相反答案，且 `doctor` 那侧永远看不到用户在 patch 里改过的目录。
+- **`patchScalar` 取第一条而不是最后一条**：YAML 重复键后者生效，同仓 `lib/mcp-profile.ts` 的 `switchScalar` 早就按这条走并写明理由，而 `lib/cli.ts` 的 `patchScalar` 用 `.find()` 取第一个非空值——profile 聚合多层 patch（示例 / 用户手改 / market force-enable）时两处判据自相矛盾。
+- **move 动作的空 selector 校验与执行错位**：`py/session_page.py` 的 `_validate_actions` 用 `isinstance(target, str) and bool(target)` 放行空串（等于没校验），而执行侧判的是 `not isinstance(..., str)`，空串于是落到 `_require_selector` 抛 `ACTION_INVALID`、再被外层包成 `ACTION_FAILED`。抽出 `_has_target()` 三处共用（`press_key` / `move` / `_validate_actions`），补 `bool(target)` 那一半。
+- **`deps-check.mjs` 可能静默退 0 通过**：`invokedAsScript()` 内层 `catch { return false }` 让 realpath 比较失败时 `main` 根本不跑，进程退 0 且零输出——正是那段 JSDoc 自己警告的「门禁静默放行」。改成在调用点包 try，判不出时**按「是」处理**（多跑一次的代价远小于静默放行）并打一行说明。
+- **取消安装后进度写入失败会把成功写成失败**：`lib/runtime-remote.ts` 的 `progress` 回调裸调 `job.updateProgress` / `job.append`，抛错会从 `installPackFn` 的 await 冒泡进 `done` 的 catch——输出环形缓冲读过上限、作业被 kill 收走都会让 `append` 抛，于是**已经装完的能力包被记成 failed**。两处各包一层 try/catch。
+- **`state.json` 坏掉时四个安装按钮一起变灰**：`status()` 直接 `await packStates(...)`，而 `readRuntimeState` 对 `INSTALL_STATE_CORRUPT` 显式抛 ⇒ `snapshot === null` ⇒ 卡片里安装/修复按钮全被禁，恰好在最需要它修复时不可点。`packs` 这一位降级成空对象（`packsOrEmpty`），安装器自己处理坏状态文件。
+- **失败回执没带 `error` 字段时抛 `Cannot read properties of undefined`**：`src/runtime-reader.ts` 的 `unwrapWire` 只凭 `isWireResult`（只校验 `ok` 是 boolean）就读 `result.error.code`。改成先 `isRecord` 判形态，缺字段时给 `REMOTE_BAD_ENVELOPE` 占位码与一句人读说明。
+- **`--profile` 指向普通文件时两个平台给出相反结论**：POSIX 读 `<文件>/cordis.patch.yml` 报 `ENOTDIR`，Windows 报 `ENOENT` —— 那正是 `readText` 用来表示「目录里没有这份配置」的错误码，于是同一份输入在 Windows 上被当成空 profile，`--status` 静默退 0。`readProfileSnapshot` 现在先判路径是不是目录，不是就报 `profile 不是目录：<路径>`；目录不存在仍按空 profile 处理（`--status` 对还没建的 profile 照旧可用）。
+
+### Added
+
+- **单实例锁**：`apply` 最前面用 shared 的 `claimInstance` 抢 `INSTANCE_LOCK_KEY = "@jayyuen66/dsh-scrapling/instance"`，抢不到就 `ctx.logger.warn` 一行「本次装配让路，工具与设置卡由在册的那一份提供」并整份返回。**让路那一份不该起 sidecar、不该建数据目录、不该做任何不可回退的事**，所以抢锁必须在这些之前。`get` 包一层箭头（成员的 `this` 不能丢）；`reflect` **整个传对象本身**——再包一层 `{ provide }` 会让「这台上下文根本没有注册口」伪装成「有 provide 但它抛错」，让路判据当场误判而把插件整个关掉（这是本轮落地时实测踩到的真缺陷）。
+- **回归测试**：`test/live-view.test.ts`（7 条：属性每次访问现算 / 键集是真实自有属性可解构 / **对象展开会把 getter 求值成快照——调用侧必须避开的坑** / `bindLiveTimeout` 改引用后 `timeoutMs` 跟着变 / `settingsViewOf` 两个抽取类字段与输出预算 / 工具跑到执行期才读设置，含变异验证）、`test/instance-lock.test.ts`（6 条）、`test/host.test.ts` 的装配级让路用例（判据落在「第二遍连数据目录都不该去建」）。
+
+### Changed
+
+- **两处逐字重复收进 shared**：`lib/skill.ts` 的注册正文换成 shared 的 `registerSkill(ctx, spec)`（本文件原先那条「正文为空不注册」的判断现在是统一行为，仍在本包生效），只剩 `SKILL_NAME` 与收 spec 的那一层；`lib/messages.ts` 的 `format()` 换成 shared 的 `fillPlaceholders`。
+- **`format()` 的缺值语义从「替空串」改成「保留原文」**：漏传参数时原样留着的 `{xxx}` 一眼可见。`test/messages.test.ts` 那条断言随之改判。
+- **卡片样式改用 shared 的 `ensureCardUiCss(doc)`**：不再把 `CARD_UI_CSS` 整段拼进本仓的 `<style>`，改为固定 id `dsh-card-ui-css` 的幂等注入 + 引用计数。
+- **运行时 shared 抬到 `^0.2.10`**（`devDependencies`，构建期内联）。
+
 ## 0.1.13
 
 模型可见面全量双语化（中文仍是默认，跟随宿主 locale 偏好切英文）；工具选型的完整指引从常驻提示词搬进按需加载的虚拟 skill；search provider 补上 `ready()`、两个 web provider 的可热改项改成取值函数；十九个工具补调用态卡片与工具级墙钟；设置页多出一级分区与官方标记。
 
 ### Added
 
-- **模型可见面的英文**：新增 `lib/messages.ts`，`ScraplingMessages` 227 键双语（工具描述、参数说明、十五条抓取指引、问答系统提示与六条回执、截断提示、MCP search 四句）。`ToolDeps` 多一个可选 `messages`，`messagesOf(deps)` 落回中文；`host.ts` 的 `localeMessagesOf` 读官方 locale 命名空间的偏好，装配期解析一次并注入全部工具、问答与 MCP 面。此前这些文本全部硬编中文——非中文模型读到的说明与报错是另一种语言。八张工具参数表与五张共享参数表随之从 `as const` 常量改成箭头函数 + `as const`（标宽返回类型会让 `defineTool` 推不出 `ParameterSchemaSpec`）。
+- **模型可见面的英文**：新增 `lib/messages.ts`，`ScraplingMessages` 236 键双语（工具描述、参数说明、十五条抓取指引、问答系统提示与六条回执、截断提示、MCP search 四句）。`ToolDeps` 多一个可选 `messages`，`messagesOf(deps)` 落回中文；`host.ts` 的 `localeMessagesOf` 读官方 locale 命名空间的偏好，装配期解析一次并注入全部工具、问答与 MCP 面。此前这些文本全部硬编中文——非中文模型读到的说明与报错是另一种语言。八张工具参数表与五张共享参数表随之从 `as const` 常量改成箭头函数 + `as const`（标宽返回类型会让 `defineTool` 推不出 `ParameterSchemaSpec`）。
 - **虚拟 skill `scrapling`**：十五条逐工具指引的**全文**经 `ctx.skills.register()` 注册，常驻 system prompt 只留一段跨工具摘要（`usageSummary`）。中文全文 2324 B 缩到常驻 505 B、英文 2869 B 缩到 699 B。正文按 `plan.ready` 现算：没装浏览器的机器那枚 skill 里不会出现 render / capture_xhr 那几句。指路句（`skillPointer`）只在 skill 真注册上时才追加——精简 profile 没有 `dsh-skill` 时把模型指向一个不存在的 skill 比不说更糟。
 - **search provider 的 `ready()`**：按官方契约实现 `ready(llmProvider)`，只查配置不发网络——没有可用凭据时返回 false，宿主的内置 `web_search` 因此整个不出现，而不是出现后每次调用都报鉴权错。凭据判据与 `available()` 刻意分成两套：`available()` 答「本 provider 进不进 `ctx.web` 的候选」（显式指定后端时恒 true，key 缺了留给 `search()` 报 `SEARCH_AUTH`，用户才知道补哪一项），`ready()` 答「内置工具要不要露给模型」。`auto` 看全部三条发现路径，名单外的旧后端名取保守侧 false。`fetch` 侧不加 `ready()`——官方 fetch provider 也没有，它没有凭据可判。
 - **调用态卡片**：十九个工具全部声明 `presentCall`，标题取入参里已有的值、取不到回落工具名。三个会话工具（`session_open` / `session_list` / `session_close`）此前落默认卡片，与检索类工具在时间线上分不出来。

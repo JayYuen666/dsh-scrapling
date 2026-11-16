@@ -902,6 +902,66 @@ describe("host 侧文案跟随官方 locale 偏好", () => {
 });
 
 describe("apply", () => {
+  it("同一作用域第二次装配让路：抢不到锁就整份跳过，不再碰任何装配步骤", async () => {
+    // 现场：dshmarket 运行期热装会在 `.dsh-market/` 下造一棵 `mkt-*` 子树，把**同一份
+    // host.js** 再挂一次；bundle 层那条行也还在。于是同一进程里 apply 跑两遍，第二遍的
+    // 工具 / prompt section / Remote 服务 / skill / MCP 注册全部撞「同名已注册」而抛 ——
+    // 抛错穿出 apply ⇒ fiber 落 failed，插件页显示「启动失败」。
+    //
+    // 判据落在「装配步骤有没有被碰」上，选一条最容易被看见的：数据目录建不出来 + failFast
+    // 关着时，第一遍必须 warn 出 dataDir；第二遍在抢锁处就让路，连数据目录都不该去建，
+    // 所以那条 warn 不该再出现，改为出现「本次装配让路」。
+    const warnings: string[] = [];
+    const services = new Map<string, unknown>();
+    const ctx = {
+      // 锁经 reflect.provide 写进这张表，再由 get 读出来 —— 真 cordis 里两者是同一个 store。
+      get: (service: string): unknown => services.get(service),
+      reflect: {
+        provide: (service: string, value: unknown): (() => void) => {
+          if (services.has(service)) {
+            throw new Error(`service "${service}" has been registered`);
+          }
+          services.set(service, value);
+          return (): void => {
+            services.delete(service);
+          };
+        },
+      },
+      subprocess: {
+        resolveExecutable: async (): Promise<string> => "python3",
+        spawn: (): never => {
+          throw new Error(SHOULD_NOT_REACHED);
+        },
+      },
+      logger: {
+        info: (): void => undefined,
+        warn: (line: string): void => {
+          warnings.push(line);
+        },
+        debug: (): void => undefined,
+      },
+      settings: settingsStub(),
+      systemPrompt: promptStub(),
+      effect: (): void => undefined,
+    } as unknown as never;
+    const holder = mkdtempSync(path.join(os.tmpdir(), "dsh-double-apply-"));
+    const blocker = path.join(holder, "blocker");
+    writeFileSync(blocker, "");
+    const dataDir = path.join(blocker, "impossible");
+    try {
+      const config = makeConfig({ dataDir, failFastOnMissingPython: false });
+      await apply(ctx, config);
+      expect(warnings.some((line) => line.includes("dataDir"))).toBe(true);
+
+      warnings.length = 0;
+      await expect(apply(ctx, config)).resolves.toBeUndefined();
+      expect(warnings.some((line) => line.includes("本次装配让路"))).toBe(true);
+      expect(warnings.some((line) => line.includes("dataDir"))).toBe(false);
+    } finally {
+      rmSync(holder, { recursive: true, force: true });
+    }
+  });
+
   it("数据目录建不出来时默认拒绝加载（failFast），不去 spawn", async () => {
     let spawned = 0;
     const ctx = {

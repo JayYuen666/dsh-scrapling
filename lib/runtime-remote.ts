@@ -13,7 +13,7 @@ import type { JobId, JobOutcome, JobOutputRead, JobRegistry, JobSpec } from "@de
 import { TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { markRemote } from "@jayyuen66/dsh-plugin-shared/lib/remote-marker";
-import { packStates } from "./installer.ts";
+import { errorCodeOf, packStates } from "./installer.ts";
 import type { installCapabilityPack, InstallerIO } from "./installer.ts";
 import { resolveRuntime } from "./runtime.ts";
 import { RUNTIME_PACKS, RUNTIME_REMOTE_NAMESPACE, isRuntimePack } from "./runtime-shape.ts";
@@ -79,10 +79,21 @@ function outputOf(read: JobOutputRead): string {
  *
  * 输出环形缓冲被回收或读数异常都不改变「这条作业还在」的事实，所以这里的失败不能升级成
  * 「整份作业视图没有」。
+ *
+ * **从尾窗起点读，而不是从 0 读全量**：安装是分钟级的，pip / patchright 的输出能到几百 KB，
+ * 而卡片每 2 秒轮询一次 `status()`。从 0 读等于每次轮询都把整份输出搬一遍，开销随安装时长
+ * 线性增长；`readAt` 接受任意起点（返回与该窗口相交的保留块），而窗口外的内容本来也会被
+ * {@link outputOf} 截掉。
+ *
+ * @param jobs - 作业注册表
+ * @param id - 作业 id
+ * @param total - 该作业当前已写入的字节数（`JobView.output.total`，即下一块的起始偏移）
+ * @returns 尾部窗口内的文本；读不到时为空串
  */
-function outputTextOf(jobs: RuntimeJobs, id: JobId): string {
+function outputTextOf(jobs: RuntimeJobs, id: JobId, total: number): string {
   try {
-    return outputOf(jobs.readAt(id, 0));
+    const from = Math.max(0, total - JOB_OUTPUT_VIEW_CHARS);
+    return outputOf(jobs.readAt(id, from));
   } catch {
     return "";
   }
@@ -110,8 +121,15 @@ export class ScraplingRuntimeService extends TypertRemoteService {
     }
     const tracked = this.job;
     let status: RuntimeJobStatus;
+    let total: number;
     try {
-      ({ status } = jobs.get(tracked.id));
+      // 一次取两位：状态进视图，`output.total` 是尾窗起点的算式输入。
+      const {
+        status: current,
+        output: { total: written },
+      } = jobs.get(tracked.id);
+      status = current;
+      total = written;
     } catch {
       // 注册表不认这条了（被重载或已收走）：卡片按“没有作业”处理，不把旧读数当现状。
       return null;
@@ -122,7 +140,7 @@ export class ScraplingRuntimeService extends TypertRemoteService {
       id: String(tracked.id),
       pack: tracked.pack,
       status,
-      output: outputTextOf(jobs, tracked.id),
+      output: outputTextOf(jobs, tracked.id, total),
     };
   }
 
@@ -166,12 +184,35 @@ export class ScraplingRuntimeService extends TypertRemoteService {
     });
     return {
       ok: true,
-      packs: await packStates(this.deps.dataDir, installing),
+      packs: await this.packsOrEmpty(installing),
       python: { path: python.pythonPath, via: python.via, version: python.version },
       dataDir: this.deps.dataDir,
       jobsReady: jobs !== undefined,
       job,
     };
+  }
+
+  /**
+   * 读能力包状态；读不出来时退成「全部未装」，不让整张卡跟着崩。
+   *
+   * `packStates` 会读 `runtime/state.json`，而那份文件在中断的安装、磁盘写坏、旧版本留下的
+   * 半截 JSON 上会让 `readRuntimeState` 显式抛 `INSTALL_STATE_CORRUPT`。让这个异常从
+   * `status()` 冒出去，后果是卡片收到失败、`snapshot` 停在 null，于是**所有能力包一起显示成
+   * 未知、四个安装/修复按钮全被禁**（`src/settings-card.ts` 的 `disabled = … || snapshot === null`）
+   * —— 恰恰在最需要那个按钮去修复的时候它不可点。降级成「未装」至少让人能点安装，而安装器
+   * 自己会处理坏状态文件（`installCapabilityPack` 里对 `INSTALL_STATE_CORRUPT` 有明确出路）。
+   *
+   * @param installing - 正在安装的那个包，写进 `installing` 位
+   * @returns 能力包状态；读状态失败时是空对象
+   */
+  private async packsOrEmpty(
+    installing: RuntimePack | undefined,
+  ): Promise<RuntimeStatusResult["packs"]> {
+    try {
+      return await packStates(this.deps.dataDir, installing);
+    } catch {
+      return {};
+    }
   }
 
   public installPack(request: unknown): RuntimeActionResult {
@@ -222,8 +263,20 @@ export class ScraplingRuntimeService extends TypertRemoteService {
       label: `${action} ${pack}`,
       run: (job) => {
         const progress = (line: string): void => {
-          job.updateProgress(line);
-          job.append(`${line}\n`, { channel: "log" });
+          // 进度回调不能把安装本身打掉：`installCapabilityPack` 是把它当同步回调在 await 链里
+          // 调的，这里抛出去会一路冒到 `done` 的 catch，把**已经成功**的安装写成 failed。
+          // 输出环形缓冲读过上限、作业已被 kill 收走都会让 `append` 抛，那时唯一正确的做法是
+          // 丢掉这一行进度的展示，安装照旧往下走（成败只由 installPackFn 说了算）。
+          try {
+            job.updateProgress(line);
+          } catch {
+            // 进度位是展示面：写不进去不影响安装。
+          }
+          try {
+            job.append(`${line}\n`, { channel: "log" });
+          } catch {
+            // 输出环形缓冲已经不认这次写入：日志少一行，安装继续。
+          }
         };
         const done = (async (): Promise<JobOutcome> => {
           try {
@@ -236,16 +289,20 @@ export class ScraplingRuntimeService extends TypertRemoteService {
             });
             return { status: "completed" };
           } catch (error) {
+            // 取消有自己的错误码，不再靠 `signal.aborted` 反推：安装器中途被叫停时抛的是
+            // `INSTALL_CANCELLED`，这条判据在那时成立，而「信号被 abort 了但安装是另一条
+            // 路径失败的」也不会被误读成取消。
             const { aborted } = controller.signal;
-            const detail = aborted ? "cancelled from settings card" : String(error);
+            const cancelled = aborted || errorCodeOf(error) === "INSTALL_CANCELLED";
+            const detail = cancelled ? "cancelled from settings card" : String(error);
             // 原因必须落到作业输出里：作业视图只透出 status 与 output，`JobOutcome.detail`
             // 到不了卡片 —— 否则界面只看得见一个停在 "installing browser" 的 failed。
             try {
-              job.append(`${aborted ? "CANCELLED" : "FAILED"}: ${detail}\n`, { channel: "log" });
+              job.append(`${cancelled ? "CANCELLED" : "FAILED"}: ${detail}\n`, { channel: "log" });
             } catch {
               // 输出环形缓冲已经不认这次写入：原因进不了界面，但作业的终态照旧交回注册表。
             }
-            return aborted ? { status: "killed", detail } : { status: "failed", detail };
+            return cancelled ? { status: "killed", detail } : { status: "failed", detail };
           }
         })();
         return {
@@ -267,6 +324,12 @@ export class ScraplingRuntimeService extends TypertRemoteService {
     } catch (error) {
       // `start` 可能在调用过 `run` 之后才失败（登记环节出问题），那时装包已经在后台跑，
       // 而 `this.job` 还没写上——不摘掉它，第二次安装就会与它同时写同一份 venv/state.json。
+      //
+      // 这里只能 abort，没有第二条路可走：按 `JobRegistry.start` 的契约，抛出去的 start
+      // **不留任何登记**（`@deepseek-ai/dsh-jobs` 的 `start` 文档：「A throwing starter leaves
+      // nothing registered」），所以既没有 job id 可以 kill，`list()` 里也扫不到它。手上唯一
+      // 的把手就是这次安装自己的 `AbortSignal`。而「下一次安装会不会与它撞车」不靠这条注释
+      // 保证：`start` 顶部那段按 kind 的 foreign 扫描读的是注册表现状，那条路径独立成立。
       controller.abort();
       return refused(500, String(error));
     }
@@ -288,16 +351,33 @@ export class ScraplingRuntimeService extends TypertRemoteService {
     if (jobs === undefined) {
       return refused(503, "this profile has no jobs backend");
     }
-    if (!jobs.list().some((view) => String(view.id) === raw)) {
+    // 这层判存在性也包 try：`list()` 读的是注册表内部状态，读失败与 `start` 里那次
+    // 同源。不包的话异常会直接从 Remote 调用冒到卡片，用户看到的是 `String(error)` 的原始
+    // 堆栈串，而不是本包统一的那句「取消没能完成」。
+    let listed: boolean;
+    try {
+      listed = jobs.list().some((view) => String(view.id) === raw);
+    } catch (error) {
+      return refused(500, `cannot read the job list: ${String(error)}`);
+    }
+    if (!listed) {
       // 注册表已经把这条收走（`remove()` 或服务销毁）。本包对「缺席」的规则是自愈信号，
       // 不是一次取消失败：报 404 并忘掉它，下一次安装才不会被一条已不存在的作业挡住。
       this.job = null;
       return refused(404, `unknown jobId: ${raw}`);
     }
+    let outcome: "requested" | "already-finished";
     try {
-      jobs.kill(tracked.id, undefined, "cancelled from settings card");
+      outcome = jobs.kill(tracked.id, undefined, "cancelled from settings card");
     } catch (error) {
       return refused(500, String(error));
+    }
+    // 「这条作业早就结束了」不是取消成功：`kill` 对终态作业如实回 `already-finished`
+    // 且什么都没做，把它报成 `{ ok: true }` 会让卡片显示「已取消」，而安装其实已经以
+    // 别的结论收场。按 409 报，卡片读得懂（与「另一个安装在跑」同一档语义）。
+    if (outcome === "already-finished") {
+      this.job = null;
+      return refused(409, `job ${raw} already finished; nothing to cancel`);
     }
     return { ok: true, jobId: String(tracked.id) };
   }

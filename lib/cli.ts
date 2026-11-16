@@ -35,6 +35,7 @@ import {
   withInstallLock,
 } from "./installer.ts";
 import { resolveRuntime, runtimeManifest } from "./runtime.ts";
+import type { PackState } from "./runtime-shape.ts";
 
 /** patch 文本的行分隔与行尾注释。 */
 const LINE_BREAK = /\r\n|\n|\r/u;
@@ -194,11 +195,65 @@ function modeValue(flags: FlagMap): McpMode | null {
   return value === undefined || !isMcpMode(value) ? null : value;
 }
 
+/**
+ * 某个取值旗标不合法时的提示：点名合法取值，并如实打出当前给的是什么。
+ *
+ * `--mode` / `--feature` / `--uninstall` 三处共用：它们都只能写名单里那几个取值，
+ * 各自手写一份文案会在加值或改名时漂移，而用户看到的正好是这一行。
+ *
+ * @param flag - 旗标名（不带前导 `--`）
+ * @param allowed - 合法取值
+ * @param value - 本次命令行给的原始项
+ * @returns 一行可照抄的提示
+ */
+function choiceHint(
+  flag: string,
+  allowed: readonly string[],
+  value: string | true | undefined,
+): string {
+  const given = typeof value === "string" ? JSON.stringify(value) : "（缺省）";
+  return `--${flag} 要写 ${allowed.join(" / ")} 之一；现在给的是 ${given}`;
+}
+
 /** `--mode` 取不到合法值时点名合法取值；与 pin 那条提示同一种做法。 */
 function modeHint(flags: FlagMap): string {
-  const value = stringFlag(flags, "mode");
-  const given = value === undefined ? "（缺省）" : JSON.stringify(value);
-  return `--mode 要写 ${MCP_MODES.join(" / ")} 之一；现在给的是 ${given}`;
+  return choiceHint("mode", MCP_MODES, flags.get("mode"));
+}
+
+/** `--feature` / `--uninstall` 取不到合法值时点名六个能力包（不再静默退 2）。 */
+function featureHint(flag: string, flags: FlagMap): string {
+  return choiceHint(flag, FEATURES, flags.get(flag));
+}
+
+/**
+ * 这次是否允许真的落地。
+ *
+ * `--apply` 是「允许写」，`--dry-run` 是「这一次仍然只打印」，两者同时出现时后者胜
+ * —— 否则 `setup --feature core --apply --dry-run` 会真下载几百 MB 并改写 runtime，
+ * 而命令行上明写着 dry-run。
+ */
+function shouldApply(flags: FlagMap): boolean {
+  return flags.has("apply") && !flags.has("dry-run");
+}
+
+/**
+ * 干跑时那一句提示（三处写动词共用）。
+ *
+ * 提示**必须按本次实际给的旗标分叉**：`--apply` 与 `--dry-run` 同时给出时还说
+ * 「add --apply」，用户照做之后仍然什么都没写 —— 命令在骗人。原先 setup / install /
+ * uninstall 三处各写一遍三分支，其中一处（setup）漏了「压过」这一支。
+ *
+ * @param flags - 本次旗标
+ * @param wording - 两个分支的措辞：`suppressed` 用于真给了 --apply、`missingApply` 用于确实缺 --apply
+ * @returns 一行提示
+ */
+function dryRunNotice(
+  flags: FlagMap,
+  wording: { readonly suppressed: string; readonly missingApply: string },
+): string {
+  return flags.has("dry-run") && flags.has("apply")
+    ? `dry-run：--dry-run 压过 --apply，${wording.suppressed}`
+    : wording.missingApply;
 }
 
 interface ModeOutput {
@@ -297,14 +352,31 @@ async function setupMode(flags: FlagMap, deps: CliDeps): Promise<number> {
       );
     }
   }
-  if (!flags.has("apply") || flags.has("dry-run")) {
-    deps.log(`dry-run; add --apply to write ${target}`);
+  if (!shouldApply(flags)) {
+    deps.log(
+      dryRunNotice(flags, {
+        suppressed: `只打印条目，不写 ${target}`,
+        missingApply: `dry-run; add --apply to write ${target}`,
+      }),
+    );
     return 0;
   }
   await writePatch(target, out.text);
   deps.log(`wrote ${target}`);
   deps.log("profile 不会被这条命令改写：把这段并进 <profile>/cordis.patch.yml，再重启宿主。");
   return 0;
+}
+
+/**
+ * 把一段字面量转成能安全拼进正则的形式。
+ *
+ * 只服务 {@link patchScalar}：键名在那里的用法是「整段字面量」，不是模式。
+ *
+ * @param text - 任意字面量
+ * @returns 转义后的字面量
+ */
+function escapeRegExp(text: string): string {
+  return text.replaceAll(/[.*+?^${}()|[\]\\]/gu, String.raw`\$&`);
 }
 
 /** 去掉行尾注释与成对引号。`#` 前面必须有空白才算注释（YAML 的规则），`true#x` 是值不是注释。 */
@@ -321,20 +393,32 @@ function bareScalar(raw: string): string {
 }
 
 /**
- * 取 patch 文本里某个键第一个**有值**的标量（整行注释跳过，行尾注释与引号由 bareScalar 去掉）。
+ * 取 patch 文本里某个键**最后一条有值**的标量（整行注释跳过，行尾注释与引号由 bareScalar 去掉）。
  * 只写了键名没给值的那些出现被跳过，所以返回值为 `undefined` 就等于「这份 patch 没配这一项」。
+ *
+ * **取最后一条而不是第一条**：YAML 的重复键按「后者生效」解析，宿主读到的就是那一条。
+ * profile 的 `cordis.patch.yml` 聚合了多层 patch，同一个键可能被写过好几次（本仓 `setup --mode`
+ * 的示例、用户手改、market 的 force-enable 各落一次），取第一条会让 doctor 的判据与宿主
+ * 实际行为相反 —— 前 `false` 后 `true` 时 doctor 说没开，而宿主已经把工具端出去了。
+ * 同文件 `switchScalar`（lib/mcp-profile.ts）早就按这条走的。
+ *
+ * 「跳过空值」与「取最后一条」不冲突：空 `pythonBin:` 是「这层没给值」，它盖不掉别层的真值；
+ * 但两处都给了真值时，后落的那处才是宿主读到的。
  */
 function patchScalar(text: string, key: string): string | undefined {
-  const line = new RegExp(`^[\\t ]*(?:-[\\t ]+)?${key}:(?<value>[^\\r\\n]*)$`, "u");
-  return (
-    text
-      .split(LINE_BREAK)
-      .filter((raw) => !raw.trimStart().startsWith("#"))
-      .map((raw) => bareScalar(line.exec(raw)?.groups?.["value"] ?? ""))
-      // 只写了键名的那些出现跳过而不是收尾：profile 的 cordis.patch.yml 聚合了多层 patch，
-      // 别的条目先落一个空 `pythonBin:` 会把本条目后面那份真值盖掉，读侧只剩「没配」可报。
-      .find((value) => value !== "")
+  // 键要转义再拼进正则：现调用点传的都是字面量键，但签名看起来接受任意键 ——
+  // 一旦传进含 `.` / `+` / `(` 的键，`patchScalar` 会静默换成另一种匹配语义（`.` 能匹配任何字符），
+  // 判据从此对不上的行也照绿。
+  const pattern = new RegExp(
+    `^[\\t ]*(?:-[\\t ]+)?${escapeRegExp(key)}:(?<value>[^\\r\\n]*)$`,
+    "u",
   );
+  const values = text
+    .split(LINE_BREAK)
+    .filter((raw) => !raw.trimStart().startsWith("#"))
+    .map((raw) => bareScalar(pattern.exec(raw)?.groups?.["value"] ?? ""))
+    .filter((value) => value !== "");
+  return values.at(-1);
 }
 
 function hasPatchValue(text: string, key: string): boolean {
@@ -356,11 +440,22 @@ interface StatusProfile {
 }
 
 const NO_PROFILE_NOTE =
-  "未读 profile：runtime 只按 CLI 自身的解析链（pythonBin 配置 → 托管 runtime → 仓内 _env/.venv → PATH python3）；" +
+  "未读 profile：runtime 只按 CLI 自身的解析链（pythonBin 配置 → 托管 venv → 裸托管解释器 → 仓内 _env/.venv → PATH python3）；" +
   "要看部署配置解析出的解释器就加 --profile <目录>";
 
 const NO_PYTHON_BIN_NOTE =
-  "profile 里没有 scrapling 的 pythonBin：runtime 回落到 CLI 自身的解析链（托管 runtime → 仓内 _env/.venv → PATH python3）";
+  "profile 里没有 scrapling 的 pythonBin：runtime 回落到 CLI 自身的解析链（托管 venv → 裸托管解释器 → 仓内 _env/.venv → PATH python3）";
+
+/**
+ * profile 里那两位路径位写成相对路径时的提示。
+ *
+ * 宿主按**自己的 cwd** 展开（`resolveDataDir` 的 `path.resolve`），CLI 的 cwd 不是同一个，
+ * 所以相对路径在两边会落到不同目录。CLI 读不到宿主的 cwd，只能按自己的展开一次并如实说明，
+ * 而不是让用户拿着一个量错目录的 `--status` 去排障。
+ */
+const RELATIVE_PATH_NOTE =
+  "profile 里的 pythonBin / dataDir 写的是相对路径：CLI 已按自己进程的 cwd 展开，而宿主按它自己的 cwd 展开，" +
+  "两处可能不是同一个目录；改写成绝对路径才没有这层歧义";
 
 /**
  * `--status` 的解释器与数据目录来源。
@@ -376,6 +471,28 @@ const NO_PYTHON_BIN_NOTE =
  * @returns 写进 JSON 的 profile 段、交给 `resolveRuntime` 的 `pythonBin`，
  *   以及 profile 声明的 dataDir（未声明时为 undefined，调用方沿用默认）
  */
+/**
+ * 把 profile 里写下的路径就地展开成绝对路径，并说明它原本是不是相对的。
+ *
+ * 宿主自己用 `path.resolve` 展开 `dataDir`（`host.ts` 的 `resolveDataDir`），那一步按
+ * **宿主进程的 cwd** 解析；CLI 的 cwd 与宿主的不是同一个，所以相对路径在两边会落到不同目录。
+ * CLI 修不了这个差别（它读不到宿主的 cwd），但可以做两件事：按自己的 cwd 展开一次，
+ * 让 `packStates` / `readRuntimeState` 的读法**不随每次调用隐含变化**；以及在输出里点明
+ * 「这一位是相对的，宿主可能解析到别处」—— 否则用户看到的就是一个与部署无关的目录被静静地量。
+ *
+ * 裸命令名（`python3`、`python`）不当路径处理：`path.resolve("python3")` 会变成
+ * `<cwd>/python3`，那是另一个东西。
+ *
+ * @param raw - profile 里写下的原始值
+ * @returns 展开后的路径与「原本是否相对」这一事实
+ */
+function expandDeclared(raw: string): { readonly value: string; readonly relative: boolean } {
+  if (!raw.includes("/") && !raw.includes("\\")) {
+    return { value: raw, relative: false };
+  }
+  return { value: path.resolve(raw), relative: !path.isAbsolute(raw) };
+}
+
 async function statusProfile(
   flags: FlagMap,
 ): Promise<{ profile: StatusProfile; pythonBin: string; dataDirOverride?: string }> {
@@ -387,20 +504,24 @@ async function statusProfile(
     };
   }
   const snapshot = await readProfileSnapshot(dir);
-  const pythonBin = patchScalar(snapshot.patchText, "pythonBin") ?? "";
-  const dataDir = patchScalar(snapshot.patchText, "dataDir") ?? "";
+  const declaredBin = patchScalar(snapshot.patchText, "pythonBin") ?? "";
+  const declaredDir = patchScalar(snapshot.patchText, "dataDir") ?? "";
+  const bin = expandDeclared(declaredBin);
+  const dataDir = expandDeclared(declaredDir);
+  const pythonBin = bin.value;
+  const notes = [
+    ...(declaredBin === "" ? [NO_PYTHON_BIN_NOTE] : []),
+    ...(bin.relative || dataDir.relative ? [RELATIVE_PATH_NOTE] : []),
+  ];
   return {
-    profile:
-      pythonBin === ""
-        ? {
-            path: dir,
-            pythonBin: null,
-            dataDir: dataDir === "" ? null : dataDir,
-            note: NO_PYTHON_BIN_NOTE,
-          }
-        : { path: dir, pythonBin, dataDir: dataDir === "" ? null : dataDir },
+    profile: {
+      path: dir,
+      pythonBin: declaredBin === "" ? null : declaredBin,
+      dataDir: declaredDir === "" ? null : declaredDir,
+      ...(notes.length === 0 ? {} : { note: notes.join("；") }),
+    },
     pythonBin,
-    ...(dataDir === "" ? {} : { dataDirOverride: dataDir }),
+    ...(declaredDir === "" ? {} : { dataDirOverride: dataDir.value }),
   };
 }
 
@@ -465,7 +586,34 @@ function backendConfigFinding(backendRaw: string | undefined): SearchFinding[] {
   ];
 }
 
-function searchDiagnostics(patchText: string, coreReady: boolean): SearchDiagnostics {
+/**
+ * 搜索侧的 doctor 判据需要一个比「ready 不 ready」更细的输入。
+ *
+ * `blocked` 与 `missing` 不是同一件事：`packStates` 在 `installerSupported()` 为假
+ * （非 macOS arm64）时无条件报全 `blocked`，而那些平台上 `resolveRuntime` 仍可回落到
+ * PATH 的 python3 —— 也就是说「装不了」不等于「装不上就跑不了」。把两者压成一个 boolean
+ * 之后，Linux 上装好且能跑的部署会被 doctor 固定判红，并指向一条在那台机器上永远修不好
+ * 的 `setup --feature core --apply`。
+ *
+ * @param state - `packStates` 给出的 core 状态；调用点只在它不是 `ready` 时进来
+ * @returns 一句可以照做的处置
+ */
+function coreUnreadyDetail(state: PackState): string {
+  const prefix =
+    "searchProvider 已指向 scrapling，但能力包没装好：web_search 会报 WEB_PROVIDER_CONFIGURED_UNAVAILABLE。";
+  if (state === "blocked") {
+    // 这一档刻意**不点** setup 命令：`installerSupported()` 为假时它在那些平台上永远修不好，
+    // 把命令写进文案再解释说「但没用」只会让人照着敲一遍（判据侧也据此断言这句不出现）。
+    return (
+      `${prefix}原因是这台机器不在安装器支持的范围内（只验过 macOS arm64），` +
+      "所以 core 被标成 blocked —— 这不是「没装」，重跑安装计划在那台机器上也修不好。" +
+      "修复：把 profile 里 - id: scrapling 的 pythonBin 指到一个装好 scrapling 的解释器，或把 searchProvider 从 scrapling 改回宿主自己的 provider。"
+    );
+  }
+  return `${prefix}修复：dsh-scrapling setup --feature core --apply。`;
+}
+
+function searchDiagnostics(patchText: string, coreState: PackState): SearchDiagnostics {
   const provider = patchScalar(patchText, "searchProvider");
   const backendRaw = patchScalar(patchText, "searchBackend");
   const backend = backendRaw ?? "auto";
@@ -494,11 +642,10 @@ function searchDiagnostics(patchText: string, coreReady: boolean): SearchDiagnos
     );
   }
   findings.push(...backendConfigFinding(backendRaw));
-  if (pointedHere && !coreReady) {
+  if (pointedHere && coreState !== "ready") {
     findings.push({
       code: "WEB_PROVIDER_CONFIGURED_UNAVAILABLE",
-      detail:
-        "searchProvider 已指向 scrapling，但能力包没装好（core venv 不在 ready）：web_search 会报 WEB_PROVIDER_CONFIGURED_UNAVAILABLE。修复：dsh-scrapling setup --feature core --apply。",
+      detail: coreUnreadyDetail(coreState),
     });
   }
   if (pointedHere && discoveryMissing) {
@@ -535,9 +682,14 @@ async function runDoctor(flags: FlagMap, deps: CliDeps): Promise<number> {
     return 2;
   }
   const snapshot = await readProfileSnapshot(profile);
-  const packs = await packStates(deps.dataDir);
+  // 判「core 能力包装没装」必须落在宿主真正用的那份数据目录上：profile 声明了 dataDir 时
+  // 宿主把它传给插件，CLI 默认目录上的状态与它无关。用 `deps.dataDir` 会让 doctor 在
+  // 「profile 指到别处、那边装好了、默认目录没装」的机器上报 core 未就绪 —— 与
+  // `--status` 的判据（`dataDirOverride ?? deps.dataDir`）得出相反的答案。
+  const dataDir = patchScalar(snapshot.patchText, "dataDir") ?? deps.dataDir;
+  const packs = await packStates(dataDir);
   const findings = inspectProfile({ mode, expectedPort: given.port, ...snapshot });
-  const search = searchDiagnostics(snapshot.patchText, packs.core === "ready");
+  const search = searchDiagnostics(snapshot.patchText, packs.core);
   // 提示只解释现状（含「不可用是预期行为」），不改变退出码；真正的配置错进 findings 判红。
   for (const hint of search.hints) {
     deps.log(hint);
@@ -567,6 +719,7 @@ async function runDoctor(flags: FlagMap, deps: CliDeps): Promise<number> {
 async function uninstallPack(flags: FlagMap, deps: CliDeps): Promise<number> {
   const value = flags.get("uninstall");
   if (typeof value !== "string" || !isFeature(value)) {
+    deps.log(featureHint("uninstall", flags));
     return 2;
   }
   const purge = flags.has("purge");
@@ -574,12 +727,13 @@ async function uninstallPack(flags: FlagMap, deps: CliDeps): Promise<number> {
   deps.log(
     `uninstall ${value}${purge ? " (and purge user data)" : ""} from ${path.join(deps.dataDir, "runtime")}`,
   );
-  // 干跑判据与 installPack 同源：--apply 才允许落地，--dry-run 压过 --apply。
-  if (!flags.has("apply") || flags.has("dry-run")) {
+  // 干跑判据与 installPack / setupMode 同源（同一个 shouldApply）。
+  if (!shouldApply(flags)) {
     deps.log(
-      flags.has("dry-run")
-        ? "dry-run：--dry-run 压过 --apply，只打印计划，不删任何 runtime 文件"
-        : "dry-run; add --apply to uninstall",
+      dryRunNotice(flags, {
+        suppressed: "只打印计划，不删任何 runtime 文件",
+        missingApply: "dry-run; add --apply to uninstall",
+      }),
     );
     return 0;
   }
@@ -591,13 +745,31 @@ async function uninstallPack(flags: FlagMap, deps: CliDeps): Promise<number> {
   return 0;
 }
 
+/**
+ * 安装计划的三到四行文案。
+ *
+ * 体积**只打清单里那一枚**（`sizeBytes`，托管 Python 压缩包），其余一律不给数字：
+ * 原先 wheelhouse 与 Chromium 各写了 `~327M` / `~583M`，两个常数没有任何可核对来源、
+ * 会随清单版本漂移，而且除 `browser` 之外的每一包（含 `mcp`，它还要多一个官方 server 入口）
+ * 都被印成同一句「core wheels」—— 计划文案与实际要下载的东西对不上。
+ *
+ * @param feature - 目标能力包
+ * @param deps - 数据目录与包根
+ * @returns 多行计划
+ */
 function installPlan(feature: Feature, deps: CliDeps): string {
   const asset = runtimeManifest.darwinArm64;
-  return [
-    `python ${asset.pythonVersion} (${asset.sizeBytes} bytes)`,
-    feature === "browser" ? "full Chromium (~583M)" : "core wheels (~327M)",
-    `into ${path.join(deps.dataDir, "runtime")}`,
-  ].join("\n");
+  const requirements = path.join(deps.repoRoot, "py", "runtime-requirements.txt");
+  const lines = [
+    `python ${asset.pythonVersion}（清单声明 ${String(asset.sizeBytes)} 字节，sha256 前 12 位 ${asset.sha256.slice(0, 12)}）`,
+    // browser 是 core 之上的增量：先建 venv 装依赖，再用 patchright 拉一份完整 Chromium。
+    // 其余五包都只是 core venv 里的依赖（各自的 wheel 与入口钉在同一份 requirements 里）。
+    feature === "browser"
+      ? `core venv 依赖：${requirements}，再装一份完整 Chromium（patchright）`
+      : `core venv 依赖：${requirements}`,
+    `落地位置：${path.join(deps.dataDir, "runtime")}（Python 在 runtime/python/，wheel 在 runtime/venv/）`,
+  ];
+  return lines.join("\n");
 }
 
 async function applyInstall(
@@ -619,6 +791,9 @@ async function applyInstall(
 async function installPack(flags: FlagMap, deps: CliDeps): Promise<number> {
   const value = flags.get("feature");
   if (typeof value !== "string" || !isFeature(value)) {
+    // 不打印任何一行就退 2 的那一代已经走了：`dsh-scrapling setup`（不带旗标）曾静默退出，
+    // 用户看不到任何原因，而 runCli 的注释恰好写着「仅退出 2 会让用户不知道是哪一段写错了」。
+    deps.log(featureHint("feature", flags));
     return 2;
   }
   const offline = stringFlag(flags, "offline");
@@ -632,14 +807,15 @@ async function installPack(flags: FlagMap, deps: CliDeps): Promise<number> {
   if (offline !== undefined) {
     deps.log(`离线资产目录：${offline}`);
   }
-  // 干跑判据与 setupMode 同源：--apply 是"允许落地"，--dry-run 是"仍然只打印"，
-  // 两者同时出现时后者胜——否则 `setup --feature core --apply --dry-run` 会真下载
-  // 几百 MB 并改写 runtime，而命令行上明写着 dry-run。
-  if (!flags.has("apply") || flags.has("dry-run")) {
+  // 干跑判据与 setupMode / uninstallPack 同源（同一个 shouldApply）：--apply 是"允许落地"，
+  // --dry-run 是"仍然只打印"，两者同时出现时后者胜——否则 `setup --feature core --apply --dry-run`
+  // 会真下载几百 MB 并改写 runtime，而命令行上明写着 dry-run。
+  if (!shouldApply(flags)) {
     deps.log(
-      flags.has("dry-run")
-        ? "dry-run：--dry-run 压过 --apply，只打印计划，不下载也不写 runtime"
-        : "dry-run; add --apply to install",
+      dryRunNotice(flags, {
+        suppressed: "只打印计划，不下载也不写 runtime",
+        missingApply: "dry-run; add --apply to install",
+      }),
     );
     return 0;
   }
@@ -666,8 +842,11 @@ function reportFailure(error: unknown, deps: CliDeps): number {
  */
 const USAGE =
   "用法：dsh-scrapling setup [--feature <core|browser|search|media|adaptive-redis|mcp>] " +
-  "[--mode <native|mcp|official-mcp>] [--profile <目录>] [--port <1-65535>] [--apply] " +
-  "[--repair] [--status] [--uninstall <包> [--purge]]；dsh-scrapling doctor --mode <...> --profile <目录>";
+  "[--mode <native|mcp|official-mcp>] [--profile <目录>] [--port <1-65535>] " +
+  "[--offline <资产目录>] [--apply] [--dry-run] [--repair] [--status] [--with-auth] " +
+  "[--accept-risk] [--uninstall <core|browser|search|media|adaptive-redis|mcp> [--purge]]；" +
+  "dsh-scrapling doctor --mode <native|mcp|official-mcp> --profile <目录>；" +
+  "--apply 才落地，--dry-run（缺省）只打印计划，两者同时给时 --dry-run 胜。";
 
 export async function runCli(
   argv: readonly string[],

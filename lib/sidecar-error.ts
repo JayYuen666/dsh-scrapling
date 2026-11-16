@@ -49,7 +49,11 @@ export class SidecarError extends HarnessError {
     // 本类不再声明同名字段 —— 声明了会遮住父类那一位，两处各存一份。
     super(message, code, options);
     this.name = "SidecarError";
-    this.details = details;
+    // 浅拷贝 + 冻结：`readonly details` 只保护绑定，不保护内容。调用方传进来的对象字面量
+    // 或解码结果之后被改写时，这条错误的 details 会跟着变；而错误对象在宿主那里是**不可变
+    // 快照**（持久化、日志、模型侧按 code 分流），两处语义不一致时症状是「日志里那条错误的
+    // 细节与当时对端回的对不上」。浅拷贝够用：深层的值由解码层新建，本类不持有它的写权。
+    this.details = Object.freeze({ ...details });
   }
 }
 

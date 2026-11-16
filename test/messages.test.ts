@@ -90,8 +90,8 @@ describe("format（host 侧 {name} 插值）", () => {
     expect(format("{one}-{two}-{one}", { one: "1", two: "x" })).toBe("1-x-1");
   });
 
-  it("缺键替成空串：文案不该因一个占位符打断工具调用", () => {
-    expect(format("a{missing}b", { other: "x" })).toBe("ab");
+  it("缺键保留原文：写错占位符时一眼可见", () => {
+    expect(format("a{missing}b", { other: "x" })).toBe("a{missing}b");
   });
 
   it(String.raw`非 \w+ 的花括号片段原样保留（{path, content} 不是插值）`, () => {

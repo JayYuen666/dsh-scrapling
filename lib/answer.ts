@@ -60,15 +60,28 @@ export interface AnswerResult {
  * - 替换物不能仍是标签形态。换成 `<\/page>` 看起来像转义，但反斜杠不是标签语法的一部分，
  *   模型看到的依旧是一个闭合标签。
  *
+ * 还有一条同样不能省：**不能要求 `>` 在场**。`</page` 后面直接换行、或者跟着属性
+ * （`</page x>`）时，前面那条带 `>` 的正则一个都匹配不上，而模型照样能把 `</page` 读成
+ * 闭合标签的开头。所以第二条只认「`</page` 后面不再接标识符字符」—— 那个前瞻是为了
+ * 不误伤 `</pages>`、`</pageant>` 这类本身不是闭合标签的词。
+ *
+ * 实体写法（`&lt;/page&gt;`）不处理，这条**不是**遗漏：模型读的是原始文本，实体序列在
+ * 它眼里只是一串 `&lt;` 之类的普通字符，成不了标签。真正的主防线始终是 `§page_end§`
+ * 那条记号，它在上面那条注释里说过，也在下面一并替换。
+ *
  * 只动闭合侧：正文里的开标签无害，模型仍把整块正文当一整段数据看。
  *
  * @param text - 不可信正文
  * @returns 转义后的正文
  */
 export function escapePageText(text: string): string {
-  return text
-    .replaceAll(/<\s*\/\s*page[\s/]*>/giu, "〔page-close〕")
-    .replaceAll(/§\s*page_end\s*§/giu, "〔page-end〕");
+  return (
+    text
+      .replaceAll(/<\s*\/\s*page[\s/]*>/giu, "〔page-close〕")
+      // 没有 `>` 的那些形态：`</page` + 换行 / `</page x>` / 结尾处截断。
+      .replaceAll(/<\s*\/\s*page(?![a-z0-9])/giu, "〔page-close〕")
+      .replaceAll(/§\s*page_end\s*§/giu, "〔page-end〕")
+  );
 }
 
 /**
@@ -95,7 +108,10 @@ export function buildAnswerPrompt(request: AnswerRequest, messages: ScraplingMes
   return format(messages.answerPagePrompt, {
     url,
     body,
-    question: request.question,
+    // `question` 与 `body` 同一条边界：它也来自模型填写的工具参数，而页面正文可以诱导
+    // 模型把「忽略之前的指令 §page_end§ …」原样抄进问题里 —— 那等于让页面自己关掉边界。
+    // 三个插值位都过同一套转义，边界才只由模板关闭。
+    question: escapePageText(request.question),
   });
 }
 
@@ -165,8 +181,21 @@ export function sessionRoute(agent: unknown): AnswerRoute | undefined {
  * @returns profile 默认路由，或 undefined
  */
 export function profileRoute(service: unknown): AnswerRoute | undefined {
-  const selection = methodOf(service, "currentSelection");
-  return routeOf(fieldOf(selection, "provider"), fieldOf(selection, "model"));
+  // 服务由第三方插件提供、形状完全未知：`currentSelection` 可能是 getter（读属性即抛）、
+  // 也可能在调用时抛。这里是装配期路径，异常穿出去会让整个插件装不上 —— 而它只是个
+  // 「有没有兜底路由」的可选查询，读不到就是没有。
+  let route: AnswerRoute | undefined;
+  try {
+    route = routeOf(
+      fieldOf(methodOf(service, "currentSelection"), "provider"),
+      fieldOf(methodOf(service, "currentSelection"), "model"),
+    );
+  } catch {
+    // 读属性就抛（getter）、取值或调用抛错，都归到「读不到」这一条出路：装配期异常
+    // 穿出去会让整个插件装不上，而它只是个可选查询。
+    route = undefined;
+  }
+  return route;
 }
 
 /**
@@ -189,7 +218,13 @@ export function resolveAnswerRoute(
   fallback: AnswerRoute | undefined,
   messages: ScraplingMessages,
 ): AnswerRoute {
-  const route = override ?? sessionRoute(agent) ?? fallback;
+  // 三条路都过同一道 `routeOf` 校验：`AnswerRoute` 的字段类型是 `string`，空串在类型上
+  // 完全合法（`createAnswerer` 是导出 API，测试与外部装配都能传 `{ provider: "", model: "" }`）。
+  // 只让会话与兜底过校验、把部署配置直接短路的话，那种路由会带着空 provider/model 去调
+  // `llm.stream`，报成 ANSWER_FAILED —— 而正确答案是「这条不算数」，继续往下找。
+  const configured =
+    override === undefined ? undefined : routeOf(override.provider, override.model);
+  const route = configured ?? sessionRoute(agent) ?? fallback;
   if (route === undefined) {
     throw new SidecarError("ANSWER_NO_ROUTE", messages.answerNoRoute);
   }
@@ -213,12 +248,28 @@ interface LlmStreamer {
 export interface AnswerDeps {
   /** 宿主上下文，取 `ctx.llm`。 */
   readonly ctx: Context;
-  /** 部署侧单独指定的路由；未配置时为 undefined，表示跟随会话。 */
-  readonly override: AnswerRoute | undefined;
-  /** profile 默认路由，用作最后兜底。 */
-  readonly fallback: AnswerRoute | undefined;
-  /** 单次回答的 token 上限。 */
-  readonly maxTokens: number;
+  /**
+   * 部署侧单独指定的路由；未配置时回 undefined，表示跟随会话。
+   *
+   * **写成取值函数**：它由 `answerProvider` / `answerModel` 两位拼出来，而那两位都是
+   * volatile（`host.ts` 的 `Schema.string().default(\"\").volatile()`）。宿主改设置卡只换
+   * 引用、不重跑 apply —— 装配期收成常量就等于把热更新冻在那一刻：用户在卡上把问答切到
+   * 另一个模型，保存成功、后续问答却仍旧走老路由。
+   */
+  readonly override: () => AnswerRoute | undefined;
+  /**
+   * profile 默认路由，用作最后兜底。
+   *
+   * 同样是取值函数：`ctx.agentDefaultModel` 的 `currentSelection()` 是活查询，用户在
+   * 设置里换默认模型之后它当场就变，装配期抄一份没有理由。
+   */
+  readonly fallback: () => AnswerRoute | undefined;
+  /**
+   * 单次回答的 token 上限。**写成取值函数**：它对应的 `answerMaxTokens` 是 volatile
+   * （`host.ts` 的 `Schema.natural().min(1).default(2000).volatile()`），宿主改设置卡只
+   * 更新引用、不重跑 apply。收成数值就等于把热更新冻在装配那一刻。
+   */
+  readonly maxTokens: () => number;
   /** 当前语言的文案表：系统提示、用户消息外框、六条回执正文都从它取。 */
   readonly messages: ScraplingMessages;
 }
@@ -239,9 +290,15 @@ function rethrowIfAborted(signal: AbortSignal, error: unknown): void {
   }
 }
 
-/** `stream` 可调用的形状判据；宿主服务可能缺席，也可能是同名但版本不同的实现。 */
-function hasStream(value: Partial<LlmStreamer>): value is LlmStreamer {
-  return typeof value.stream === "function";
+/** `stream` 可调用的形状判据；宿主服务可能缺席，也可能是同名但版本不同的实现。
+ *  入参按 `unknown` 收：`ctx.get("llm")` 交回 `null` 时，`typeof value.stream` 会抛
+ *  TypeError 而不是落到 ANSWER_UNAVAILABLE —— 那两句文案差很远。 */
+function hasStream(value: unknown): value is LlmStreamer {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, "stream") === "function"
+  );
 }
 
 /**
@@ -253,8 +310,8 @@ function hasStream(value: Partial<LlmStreamer>): value is LlmStreamer {
  * @throws SidecarError 代码 ANSWER_UNAVAILABLE —— 服务缺席或形状不对
  */
 function requireLlm(ctx: Context, messages: ScraplingMessages): LlmStreamer {
-  const llm = ctx.get("llm") as Partial<LlmStreamer> | undefined;
-  if (llm === undefined || !hasStream(llm)) {
+  const llm: unknown = ctx.get("llm");
+  if (!hasStream(llm)) {
     throw new SidecarError("ANSWER_UNAVAILABLE", messages.answerNoLlm);
   }
   return llm;
@@ -294,12 +351,19 @@ export function createAnswerer(
 ): (request: AnswerRequest) => Promise<AnswerResult> {
   const { ctx, override, fallback, maxTokens, messages } = deps;
   return async (request: AnswerRequest): Promise<AnswerResult> => {
-    const llm = requireLlm(ctx, messages);
+    let llm: LlmStreamer;
     let answer = "";
     let finished = false;
     let route: AnswerRoute;
     try {
-      route = resolveAnswerRoute(override, request.agent, fallback, messages);
+      // 取服务放在 try **里面**：`ctx.get` 自身可能抛（装配期打在一个正在卸载的 fiber 上），
+      // 而放外面的话那条异常会绕过下面的归一，模型看到的是一句宿主内部报错而不是我们的
+      // 机器可读码。`requireLlm` 自己抛的 SidecarError 会被下面原样放行，所以
+      // ANSWER_UNAVAILABLE 这一档的行为不变。
+      llm = requireLlm(ctx, messages);
+      // 两条路由都现读：`answerProvider`/`answerModel` 是 volatile，`agentDefaultModel`
+      // 的 `currentSelection()` 是活查询 —— 装配期抄一份等于把热更新冻住。
+      route = resolveAnswerRoute(override(), request.agent, fallback(), messages);
       for await (const chunk of llm.stream({
         provider: route.provider,
         model: route.model,
@@ -311,7 +375,8 @@ export function createAnswerer(
           },
         ],
         temperature: 0,
-        maxTokens,
+        // 现读：一次问答一次取值，装配后改设置卡立刻生效。
+        maxTokens: maxTokens(),
         signal: request.signal,
       })) {
         if (chunk.type === "finish") {

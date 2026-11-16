@@ -54,7 +54,9 @@ import {
 } from "@jayyuen66/dsh-plugin-shared/lib/locale";
 import { officialMcpBinary, officialMcpHint } from "./lib/official-mcp.ts";
 import type { SearchBackend } from "./lib/search-backends.ts";
+import { SEARCH_BACKENDS } from "./lib/search-backends.ts";
 import { createAnswerer, profileRoute } from "./lib/answer.ts";
+import type { AnswerRoute } from "./lib/answer.ts";
 import {
   createDownloadTool,
   createScreenshotTool,
@@ -77,6 +79,7 @@ import {
   createSessionOpenTool,
   createSessionStateLoadTool,
   createSessionStateSaveTool,
+  bindLiveTimeout,
 } from "./lib/tools.ts";
 import type {
   AttachmentSaver,
@@ -86,6 +89,12 @@ import type {
   ToolSettings,
 } from "./lib/tools.ts";
 import type { SidecarCapabilities, SidecarClient } from "./lib/sidecar.ts";
+// 把「每次读都现算」的活视图交给工具 builder：装配期算一次的值会让标了 .volatile() 的
+// 旋钮改完永不生效（宿主只换引用的值、不重跑 apply，而 builder 每个只被调一次）。
+import { liveView } from "./lib/live-view.ts";
+// 双路径装载的自保：market 热挂子树与 bundle 层会各跑一次 apply，注册面在第二遍撞名即抛。
+// 本模块已收进 shared，各插件仓不再各留一份副本；判据与取舍见它的头注释。
+import { claimInstance } from "@jayyuen66/dsh-plugin-shared/lib/instance-lock";
 
 /**
  * 抽取输出的形态。
@@ -469,17 +478,10 @@ const configSchema = Schema.object({
   dataDir: Schema.string().default("").volatile(),
   provideWebFetch: Schema.boolean().default(true).volatile(),
   provideWebSearch: Schema.boolean().default(true).volatile(),
-  searchBackend: Schema.union([
-    "auto",
-    "tavily",
-    "bing",
-    "brave",
-    "serper",
-    "duckduckgo",
-    "searxng",
-  ])
-    .default("auto")
-    .volatile(),
+  // 取值直接读 lib/search-backends.ts 的那一份数组，不在这里再抄一遍字面量：抄一遍之后
+  // 「名单加了一项却忘改 schema」时 CLI 与设置卡认这个值、而配置读入时被 schema 拒掉，
+  // TypeScript 帮不上忙（两个独立字面量），症状是「卡上选了它、保存后不生效」。
+  searchBackend: Schema.union(SEARCH_BACKENDS).default("auto").volatile(),
   searchPublicFallback: Schema.boolean().default(false).volatile(),
   tavilyApiKey: Schema.string().default("").volatile(),
   braveApiKey: Schema.string().default("").volatile(),
@@ -690,6 +692,13 @@ export type ToolRequirement = "scrapling" | "browser" | "jobs" | "session-state"
 
 /** 会话状态工具的能力门：`sessionStateDir` 配了才有地方写到磁盘。 */
 const SESSION_STATE_REQUIREMENT = "session-state";
+/**
+ * 单实例锁的服务名。dshmarket 热挂子树与 bundle 层会各跑一次 `apply`，第二遍的注册面会撞
+ * 「同名已注册」而把 fiber 打成 failed；抢这把锁能把第二遍安静地挡在注册面之外。
+ * 取包名形态而**不带随机后缀**：名字必须每一份实例都算出同一个串才可能互斥，随机后缀等于
+ * 谁都能抢到。判据与边界见 shared 的 lib/instance-lock 头注释。
+ */
+const INSTANCE_LOCK_KEY = "@jayyuen66/dsh-scrapling/instance";
 /** 工具构造器：名字到「给定依赖造一个工具定义」的映射。 */
 type ToolBuilder = (deps: ToolDeps) => ToolDefinition;
 
@@ -1006,21 +1015,22 @@ export function resolveDataDir(configured: string): string {
 export interface PythonChoice {
   /** 交给 `ctx.subprocess.resolveExecutable` 的那个名字或绝对路径。 */
   readonly path: string;
-  /** 选中来源：显式配置 / 托管 runtime / 仓内 venv / PATH。 */
-  readonly via: "configured" | "managed" | "_env/.venv" | "PATH";
+  /** 选中来源：显式配置 / 托管 venv / 裸托管解释器 / 仓内 venv / PATH。 */
+  readonly via: "configured" | "managed-venv" | "managed" | "_env/.venv" | "PATH";
 }
 
 /**
  * 定下这次用哪个 Python。
  *
- * 三条规则，按优先级：设置卡填了就用它；没填时**先看仓内 venv**（`py:setup` 建的那份；
- * POSIX 认可执行位，Windows 认文件是否存在——那边没有可执行位）；都没有才落 PATH 上的
- * 解释器（POSIX 是 `python3`，Windows 是 `python`，靠宿主 `resolveExecutable` 的 PATHEXT
- * 展开取到 `python.exe`）。判据与根 `scripts/lib/py-env.mjs`
- * 的 `resolvePython` 逐条一致：两处答得不一样时，门禁判绿的解释器就不是插件真用的那个。
+ * 解析本体在 `lib/runtime.ts` 的 `resolveRuntime`：显式配置 → 托管 venv → 裸托管解释器 →
+ * 仓内 `_env/.venv`（`py:setup` 建的那份；POSIX 认可执行位，Windows 认文件存在）→ PATH
+ * （POSIX 是 `python3`，Windows 是 `python`）。这里只把 runtime 那一层的 `repo` / `path`
+ * 标签翻成 `_env/.venv` / `PATH`，其余原样透传（`managed-venv` 与 `managed` 必须分开报，
+ * 见 {@link PythonChoice.via}）。
  *
  * @param configured - 设置卡上的 `pythonBin`；空白表示没表态
  * @param packageRoot - 包根目录（`host.js` 所在的那一层）
+ * @param dataDir - 数据目录；托管两档从它下面探 `runtime/venv` 与 `runtime/python`
  * @returns 选中的解释器与来源
  */
 export function resolvePythonBin(
@@ -1681,7 +1691,10 @@ async function registerSurface(args: SurfaceArgs): Promise<void> {
   const ready = new Set(plan.ready);
   for (const spec of TOOL_SPECS) {
     if (ready.has(spec.name)) {
-      ctx.tools.register(spec.build(depsFor(spec)));
+      const deps = depsFor(spec);
+      // 墙钟在 builder 里算过一次（`timeoutMs: toolTimeoutOf(settings)`，见 lib/tools.ts），
+      // 那一次求值发生在装配时；这里改挂 getter，让 `fetchTimeoutMs` 改完也立即生效。
+      ctx.tools.register(bindLiveTimeout(spec.build(deps), deps.settings));
     }
   }
 }
@@ -1711,15 +1724,21 @@ function registerSearchProvider(
 type BaseSettings = Omit<ToolSettings, "maxOutputBytes">;
 
 /**
- * 把 Config 收成一份共用设置：volatile 字段现取一次快照，部署级字段原样搬过去，不包成引用。
+ * 把 Config 读成一份设置**值**：volatile 字段取引用的当前值，部署级字段原样搬过去。
+ *
+ * 这个函数本身只配当"读取器"用 —— 它交回的是那一刻的值。装配期把它调一次然后存成常量，
+ * 等于把标了 `.volatile()` 的旋钮钉死在装配那一刻：宿主改设置只换引用的值、不重跑 `apply`，
+ * 而工具 builder 每个只被调用一次（`ctx.tools.register(spec.build(deps))`）。要交出去的
+ * 必须是 {@link settingsViewOf} 包出来的活视图。
  *
  * 抽出来是为了让 apply() 只留「注册哪些、按什么顺序」这条主干；两百多行的注册循环里再夹一
  * 整份字段表会把真正的分支淹没。
  *
  * @param config - 已解析的设置
- * @returns 除输出预算之外的那一份设置
+ * @param dataDir - 已解析的数据目录
+ * @returns 除输出预算之外的那一份设置（**当前值**，不是视图）
  */
-function baseSettingsOf(config: Config, dataDir: string): BaseSettings {
+function readBaseSettings(config: Config, dataDir: string): BaseSettings {
   return {
     downloadDir: path.join(dataDir, "downloads"),
     downloadMaxBytes: config.downloadMaxBytes,
@@ -1753,6 +1772,31 @@ function baseSettingsOf(config: Config, dataDir: string): BaseSettings {
     allowWriteMethods: config.allowWriteMethods,
     stripInlineImages: config.stripInlineImages.get(),
   };
+}
+
+/**
+ * 交给工具 builder 的那份设置：**每次读属性现算**，不是装配时的值。
+ *
+ * 为什么必须这样：宿主对设置卡的改动只提交给已装好的那些 volatile 引用
+ * （`cordis-plugin-loader` 的 `_commitVolatile()` → `cosmokit` 的 `updateVolatile` 原地换值），
+ * **不会重跑 `apply`**；而工具 builder 每个只被调用一次（`ctx.tools.register(spec.build(deps))`），
+ * 各 builder 又一进来就先解构 `deps.settings`。于是装配期算一次的 settings 一旦
+ * 是值快照，`extractionType` / `headless` / `fetchMaxOutputChars` 这些标了 `.volatile()` 的
+ * 旋钮改完就**永不生效**——卡片上保存成功、刷新也持久，工具行为纹丝不动。
+ *
+ * 输出预算按工具名分别算（`outputBudgetOf`），所以视图的 `read()` 接收工具名：它同样每次
+ * 现读，四个 `*MaxOutputChars` 改完也立即生效。
+ *
+ * @param config - 已解析的设置
+ * @param dataDir - 已解析的数据目录
+ * @param toolName - 工具名（决定取哪一档输出预算）
+ * @returns 活视图；属性每次访问都重新读引用
+ */
+export function settingsViewOf(config: Config, dataDir: string, toolName: string): ToolSettings {
+  return liveView(() => ({
+    ...readBaseSettings(config, dataDir),
+    maxOutputBytes: outputBudgetOf(config, toolName),
+  }));
 }
 
 /**
@@ -1940,7 +1984,46 @@ function registerUsageSection(
   );
 }
 
-export async function apply(ctx: Context & SettingsFace, config: Config): Promise<void> {
+/**
+ * 抢「同一作用域只让一份 `apply` 走注册面」的单实例锁；抢不到就打一行说明并回 false。
+ *
+ * 为什么需要它：dshmarket 在运行期热装插件时，会在 `<profile>/.dsh-market/` 下造一棵 market 自己
+ * 的 Include 子树（条目 id 形如 `mkt-<包>`），把**同一份 host.js** 再挂一次；而 profile 的
+ * `dsh.profile.bundles` 那条 bundle 行仍会被宿主按 patch 重新组装。于是同一个进程里 `apply`
+ * 跑两遍，注册面（工具 / prompt section / Typert Remote 服务 / skill / MCP）在第二遍全部撞
+ * 「同名已注册」而抛错；抛错穿出 `apply` ⇒ 那条 fiber 落 `failed`，用户在插件页看到
+ * 「启动失败」。判据与边界见 shared 的 lib/instance-lock 头注释。
+ *
+ * 「后到者让路」与持久性天然一致：双挂只发生在用户经 market 现场启用插件的那一次会话里
+ * （`hot-*.yml` 每次 boot 被 wipe），下一次启动只剩 bundle 层一条，自己就会恢复。锁随那一份的
+ * fiber 卸载自动释放，所以后续装配仍能抢到。
+ *
+ * 必须放在 `apply` 最前面调用：让路那一份不该起 sidecar、不该建数据目录、不该做任何不可回退的
+ * 事。抽成独立函数是为了让 `apply` 的语句数留在 lint 上限内，不是为了复用。
+ */
+function claimSingleInstance(ctx: Context & SettingsFace): boolean {
+  // `ctx.get` 要箭头包一层（成员的 `this` 不能丢）；`ctx.reflect` 直接传对象本身：再包一层
+  // `{ provide }` 会让「这台上下文根本没有注册口」伪装成「有注册口但 provide 抛错」，让路判据
+  // 当场误判成「已有一份在册」而把插件整个关掉。
+  if (
+    claimInstance(
+      { get: (key: string): unknown => ctx.get(key), reflect: ctx.reflect },
+      INSTANCE_LOCK_KEY,
+    )
+  ) {
+    return true;
+  }
+  ctx.logger.warn(
+    "[dsh-scrapling] 检测到本插件已在同一作用域内装载：本次装配让路，工具与设置卡由在册的那一份提供。",
+  );
+  return false;
+}
+
+/**
+ * 装配本体。抽出来是为了让 `apply` 留在 lint 的语句数上限内（`apply` 只做「抢锁 → 装配」），
+ * 判据与取舍见 `claimSingleInstance` 的说明。
+ */
+async function activate(ctx: Context & SettingsFace, config: Config): Promise<void> {
   // 登记「本页由自带卡片编辑」。`auto: false` 是告诉宿主别再自动生成一份通用表单 ——
   // 自动那份会把整表字段摊成没有分组、没有说明的长列表，而真正在编辑这张卡的
   // client.js 已经按用途分了组、补了「改了会怎样」。
@@ -2040,29 +2123,38 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
     startCrawlJob(ctx, crawlEvents, label, run);
   // 回答模型：三项配置全空就跟随会话当前模型，与官方内置 web_search 的做法一致。
   // profile 默认值只当兜底 —— 会话发起的调用总能读到活的请求头。
-  const answerProvider = config.answerProvider.get().trim();
-  const answerModel = config.answerModel.get().trim();
-  const defaultSelection = profileRoute(ctx.get("agentDefaultModel"));
+  //
+  // **两项路由都写成取值函数**：`answerProvider` / `answerModel` 是 volatile（宿主改设置卡
+  // 只换引用、不重跑 apply），而 `agentDefaultModel` 的 `currentSelection()` 本身就是活查询。
+  // 装配期 `.get()` 成常量的话，用户在卡上换了问答模型、保存也成功，后续问答仍走老路由 ——
+  // 与 `maxTokens` 同一条热更新约束。
+  const answerRoute = (): AnswerRoute | undefined => {
+    const provider = config.answerProvider.get().trim();
+    const model = config.answerModel.get().trim();
+    return provider.length > 0 && model.length > 0 ? { provider, model } : undefined;
+  };
   // 文案在装配期解析一次：模型可见面在插件装好之后不会再变，而用户改语言会触发重装。
   // 它要排在 createAnswerer 之前 —— 问答的系统提示与回执正文都从这一份取。
   const localeMessages = localeMessagesOf(ctx);
   const answer = createAnswerer({
     ctx,
-    override:
-      answerProvider.length > 0 && answerModel.length > 0
-        ? { provider: answerProvider, model: answerModel }
-        : undefined,
-    fallback: defaultSelection,
-    maxTokens: config.answerMaxTokens.get(),
+    override: answerRoute,
+    fallback: () => profileRoute(ctx.get("agentDefaultModel")),
+    // 取值函数而不是数值：`answerMaxTokens` 是 volatile，宿主改设置卡不会重跑 apply，
+    // 快照进闭包的话卡片保存成功、问答却仍用旧上限。
+    maxTokens: () => config.answerMaxTokens.get(),
     messages: localeMessages,
   });
-  const baseSettings = baseSettingsOf(config, dataDir);
   const searchProvider = searchProviderOf(config, sidecar, urlGate);
   // 预算按工具分别给：静态抓取的正文、浏览器渲染后的正文、XHR 快照三者体量差一个
   // 数量级，共用一份预算等于把三档调节压成一档——调 fetch 的旋钮会连带改掉 render。
+  //
+  // `settings` 是**活视图**：属性每次读都现取 volatile 引用。这里不能写成
+  // `{ ...readBaseSettings(...), maxOutputBytes: ... }` —— 对象展开会把每个 getter 当场求值
+  // 成常量，等于把刚修好的热更新又冻回去。
   const depsFor = (spec: ToolSpec): ToolDeps => ({
     sidecar,
-    settings: { ...baseSettings, maxOutputBytes: outputBudgetOf(config, spec.name) },
+    settings: settingsViewOf(config, dataDir, spec.name),
     messages: localeMessages,
     startCrawlJob: startJob,
     answer,
@@ -2106,4 +2198,12 @@ export async function apply(ctx: Context & SettingsFace, config: Config): Promis
     `[dsh-scrapling] 能力 ${JSON.stringify(capabilities ?? null)}；` +
       `注册 ${plan.ready.length}/${TOOL_SPECS.length}：${plan.ready.join(", ") || "(none)"}`,
   );
+}
+
+/** cordis 入口：先抢单实例锁，抢到才装配。 */
+export async function apply(ctx: Context & SettingsFace, config: Config): Promise<void> {
+  if (!claimSingleInstance(ctx)) {
+    return;
+  }
+  await activate(ctx, config);
 }

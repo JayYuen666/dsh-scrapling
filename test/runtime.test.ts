@@ -7,9 +7,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { mockPlatform } from "./managed-host.ts";
 import {
   managedPythonPath,
+  managedVenvPythonPath,
   parseRuntimeManifest,
+  readManifestText,
   resolveRuntime,
   runtimeManifest,
+  venvVersionOf,
 } from "../lib/runtime.ts";
 
 /** Windows 没有可执行位，对应的判据由同名的 win32 用例负责，不在这里两头判。 */
@@ -66,6 +69,86 @@ describe("resolveRuntime", () => {
       repoRoot: tempDir(),
     });
     expect(resolved).toMatchObject({ pythonPath: "/x/python3", via: "configured" });
+  });
+
+  it("托管档优先选 venv：裸托管解释器里装不了包，它不是 sidecar 能用的那支", () => {
+    // 安装器落的是「托管 CPython + 由它建出的 runtime/venv」两件东西，scrapling 在 venv 里。
+    // 两枚都可执行时必须选 venv：选错的那一版表面完全正常（路径是绝对路径、可执行、
+    // 日志写着 managed），只有 sidecar 的 ready 帧会把 capabilities 全报 false，
+    // 症状是「工具一只都不注册、skill 正文为空」。
+    const dataDir = tempDir();
+    const repoRoot = tempDir();
+    fakeExecutable(managedPythonPath(dataDir));
+    fakeExecutable(managedVenvPythonPath(dataDir));
+    // `via` 与裸托管解释器分开报：两支的差别就是「工具全在」与「工具一只都不在」，
+    // 都报 managed 时日志与设置卡读不出选中的是哪一支。
+    expect(resolveRuntime({ pythonBin: "", dataDir, repoRoot })).toStrictEqual({
+      pythonPath: managedVenvPythonPath(dataDir),
+      via: "managed-venv",
+      version: runtimeManifest.darwinArm64.pythonVersion,
+    });
+  });
+
+  it("托管 venv 不在时回落到裸托管解释器（装了一半的机器）", () => {
+    const dataDir = tempDir();
+    fakeExecutable(managedPythonPath(dataDir));
+    expect(resolveRuntime({ pythonBin: "", dataDir, repoRoot: tempDir() })).toStrictEqual({
+      pythonPath: managedPythonPath(dataDir),
+      via: "managed",
+      version: runtimeManifest.darwinArm64.pythonVersion,
+    });
+  });
+
+  it("win32 上托管 venv 落在 Scripts/python.exe（venv 不造 python3.exe）", () => {
+    // 安装器本身只在 darwin/arm64 落地（`installerSupported`），所以这条分支在真机上走不到；
+    // 留着它是因为布局函数被 CLI 的 `--status` 与设置卡共用，那边不判平台。判据是自己拼的
+    // 路径而不是复用函数，层级写错才会红。
+    // 名字是 `python.exe` 不是 `python3.exe`：CPython 的 `venv/__init__.py` 里 `link_sources`
+    // 的键只有 `python.exe` / `python{exe_d}.exe` / `python{exe_t}.exe` / `pythonw*.exe`，
+    // Windows 那边不走 POSIX 的 `python` / `python3` 三后缀那套。
+    const dataDir = tempDir();
+    const restore = mockPlatform("win32", "x64");
+    try {
+      expect(managedVenvPythonPath(dataDir)).toBe(
+        path.join(dataDir, "runtime", "venv", "Scripts", "python.exe"),
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("托管 venv 的版本问它自己的 pyvenv.cfg，不抄清单", () => {
+    // venv 的路径不带版本号（runtime/venv），版本只能问 venv 自己。清单升到 3.15 而机器上
+    // 留着 3.14 的旧 venv 时，抄清单会让「状态」页把基座版本说成 3.15。
+    const dataDir = tempDir();
+    const repoRoot = tempDir();
+    fakeExecutable(managedVenvPythonPath(dataDir));
+    writeFileSync(
+      path.join(dataDir, "runtime", "venv", "pyvenv.cfg"),
+      "home = /opt/python/bin\nversion = 3.13.7\n",
+    );
+    expect(resolveRuntime({ pythonBin: "", dataDir, repoRoot })).toMatchObject({
+      pythonPath: managedVenvPythonPath(dataDir),
+      via: "managed-venv",
+      version: "3.13.7",
+    });
+  });
+
+  it("pyvenv.cfg 读不到时版本回落到清单值", () => {
+    const dataDir = tempDir();
+    fakeExecutable(managedVenvPythonPath(dataDir));
+    expect(resolveRuntime({ pythonBin: "", dataDir, repoRoot: tempDir() }).version).toBe(
+      runtimeManifest.darwinArm64.pythonVersion,
+    );
+  });
+
+  it("托管 venv 的层级是 runtime/venv/bin/python3", () => {
+    // 与 managedPythonPath 那条同理由：期望值自己拼一遍，层级被改出另一个形状时本条要红。
+    // 布局与 officialMcpBinary 同源，改一处就得两处一起改。
+    const dataDir = tempDir();
+    expect(managedVenvPythonPath(dataDir)).toBe(
+      path.join(dataDir, "runtime", "venv", "bin", "python3"),
+    );
   });
 
   it("托管 runtime 先于仓内 _env", () => {
@@ -140,6 +223,16 @@ describe("resolveRuntime", () => {
     });
   });
 
+  it("repoRoot 为空时不按 cwd 猜仓内 venv", () => {
+    // `repoPythonPath("")` 拼出来是相对路径 `_env/.venv/bin/python`，而 `executable()` 的
+    // statSync 会按 `process.cwd()` 解析 —— 在仓根跑测试时它恰好存在，于是这一档会选中
+    // 一个与部署无关的解释器。这里只要求它**不**被选中，不要求 cwd 恰好有那份 venv：
+    // 拿空的 repoRoot 问一次，答案必须落到 PATH。
+    expect(resolveRuntime({ pythonBin: "", dataDir: tempDir(), repoRoot: "" })).toMatchObject({
+      via: "path",
+    });
+  });
+
   it("非 macOS arm64 不探托管 runtime", () => {
     const dataDir = tempDir();
     fakeExecutable(managedPythonPath(dataDir));
@@ -162,7 +255,14 @@ describe("resolveRuntime", () => {
     try {
       expect(
         resolveRuntime({ pythonBin: "", dataDir: tempDir(), repoRoot: tempDir() }),
-      ).toStrictEqual({ pythonPath: "python", via: "path", version: "unknown" });
+      ).toStrictEqual({
+        pythonPath: "python",
+        via: "path",
+        version: "unknown",
+        // 落到 PATH 时把清单为这台机器写下的原因一并交回：`unsupported` 那一格此前
+        // 谁都不读，等于一条校验了却永不生效的字段。
+        assetNote: runtimeManifest.unsupported["win32-x64"],
+      });
     } finally {
       restore();
     }
@@ -183,8 +283,40 @@ describe("resolveRuntime", () => {
     }
   });
 
+  it("venv 的版本从它自己的 pyvenv.cfg 里读", () => {
+    const dataDir = tempDir();
+    mkdirSync(path.join(dataDir, "runtime", "venv"), { recursive: true });
+    writeFileSync(
+      path.join(dataDir, "runtime", "venv", "pyvenv.cfg"),
+      "home = /opt/homebrew/opt/python@3.13/bin\nversion = 3.13.7\n",
+    );
+    expect(venvVersionOf(dataDir)).toBe("3.13.7");
+  });
+
+  it("没有 pyvenv.cfg 时 venv 版本是 undefined（调用方回落到清单值）", () => {
+    expect(venvVersionOf(tempDir())).toBeUndefined();
+  });
+
   it("坏清单在加载期抛错", () => {
     expect(() => parseRuntimeManifest('{"darwinArm64":{}}')).toThrow(/darwinArm64/u);
+  });
+
+  it("清单读不到时，报错点明是哪份文件（不甩裸 ENOENT）", () => {
+    const missing = path.join(tempDir(), "runtime-manifest.json");
+    // 两条分开判：一句钉「点明是清单」，一条钉「带上完整路径」。
+    // 拼正则会把路径当模式（反斜杠、括号都成了元字符），这里直接比字符串包含。
+    expect(() => readManifestText(missing)).toThrow(/runtime-manifest\.json is unreadable/u);
+    expect(() => readManifestText(missing)).toThrow(missing);
+  });
+
+  it("惰性读清单：模块载入不碰文件，只有真去取清单时才读", () => {
+    // 这一条钉的是「模块顶层不同步读」这件事本身：runtimeManifest 是带 getter 的对象，
+    // 上面所有用例都在导入之后才访问 darwinArm64，模块载入期就没抛过。
+    const descriptor = Object.getOwnPropertyDescriptor(runtimeManifest, "darwinArm64");
+    expect(Reflect.get(descriptor ?? {}, "get")).toBeTypeOf("function");
+    expect(runtimeManifest.darwinArm64.pythonVersion).toMatch(/^\d+\.\d+\.\d+$/u);
+    // 另一枚 getter 走同一条惰性路径：两枚都读一次，任何一枚被改成取值常量都会红。
+    expect(runtimeManifest.unsupported).toBeDefined();
   });
 
   it("清单不是合法 JSON 时，报错点明是哪份文件", () => {
@@ -208,10 +340,26 @@ describe("resolveRuntime", () => {
     }
   });
 
-  it("url 必须是绝对 URL：没有协议头的写法在加载期就拒", () => {
-    // 这份 url 会被 installer 直接交给 fetch，缺协议的写法要等到下载那一步才炸。
-    for (const value of ["", "example.com/x.tar.gz", "//example.com/x.tar.gz"]) {
+  it("url 必须是绝对 URL 且只用 https：明文与本机文件协议在加载期就拒", () => {
+    // 这份 url 会被 installer 直接交给 fetch / curl。缺协议的写法要等到下载那一步才炸；
+    // 而 `http://` 与 `file://` 是**合法 URL**，只校验形态会让安装器去取明文或本机文件，
+    // 所以协议也在这一层收死。
+    for (const value of [
+      "",
+      "example.com/x.tar.gz",
+      "//example.com/x.tar.gz",
+      "http://example.com/x.tar.gz",
+      "file:///etc/passwd",
+      "ftp://example.com/x.tar.gz",
+    ]) {
       expect(() => parseRuntimeManifest(manifestWith({ url: value }))).toThrow(/url/u);
+    }
+  });
+
+  it("platform / arch 只认 darwin 与 arm64：清单写错在加载期就拒", () => {
+    // 这两枚原先只校验「是个字符串」且全仓无人比对，清单里写 linux 照样能装。
+    for (const patch of [{ platform: "linux" }, { arch: "x64" }, { platform: "" }]) {
+      expect(() => parseRuntimeManifest(manifestWith(patch))).toThrow(/darwinArm64|platform|arch/u);
     }
   });
 

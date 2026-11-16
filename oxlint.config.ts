@@ -29,11 +29,6 @@ export const OFF_REASONS = {
     measured: 4,
     note: "build-cli.ts、build-client.ts、build-host.ts、cli-main.ts 各一处。前三份由 `node build-*.ts` 按 ESM 直接执行，cli-main.ts 打成 bin/dsh-scrapling.mjs 这个 ESM 入口 —— 没有一份是被 require(esm) 同步加载进来的库代码，本规则担心的那条代价路径在这里不存在，而构建脚本必须 await rolldown()、CLI 入口必须 await 一次运行。",
   },
-  "promise/avoid-new": {
-    kind: "实测有害",
-    measured: 5,
-    note: "lib/sidecar.ts 三处（`#waitForReady` 等握手帧、`call()` 里按 id 接回响应的 `settled`、`dispose()` 的宽限期 `grace`）加 lib/mcp-server.ts 两处（`listenOn` 把 listen 的 error/listening 两个事件收成一支 Promise、`settled` 等 close 回调）。这些都是「以后再兑现」的 deferred：事件只在未来某刻到达，除先把 resolve/reject 拿到手没有别的写法。按本条改写只剩轮询，白烧 CPU 还把延迟从 O(响应时间) 变成 O(轮询间隔)。命中全在协议实现本身，不在 async 函数的包装上。",
-  },
   "promise/prefer-await-to-then": {
     kind: "实测有害",
     measured: 2,
@@ -57,15 +52,21 @@ export const OFF_REASONS = {
 } satisfies Record<string, OffJustification>;
 
 /**
- * node/no-sync 的例外，按文件登记（基线的只读组 existsSync / readFileSync / readdirSync /
- * statSync 统一放行，这里不重复）。
+ * node/no-sync 的例外，按文件登记（基线的只读组统一放行：existsSync / readFileSync /
+ * readdirSync / readSync / realpathSync / statSync —— 组的内容以 shared 的
+ * `READONLY_SYNC_ALLOWLIST` 为准，这里不重抄，也不重复登记）。
  *
  * 收窄到文件级是有意的：早先那一张包级扁平名单把 writeFileSync / rmSync 登记进去之后，
  * lib/ 与 host.ts 里的同步写一并免疫，这条规则在本仓就再也拦不住新增的同步调用。
  *
- * - 构建脚本：writeFileSync/mkdirSync/mkdtempSync 造产物与临时目录，renameSync 是原子写的
- *   最后一步（先写临时文件再改名），rmSync/unlinkSync 只清理上次中断留下的临时文件，
- *   chmodSync 给 venv 入口补可执行位。
+ * 名单里**只列本仓真在用的**：登记一枚不存在的 api 看起来无害，代价是它把「这枚同步调用
+ * 出现在哪」这个信息抹掉了 —— 后来真用上时没人会因为多了一行而注意到，而这条 scope 的
+ * 作用恰恰是让每一枚都有个可核对的理由。造目录与补可执行位走的是 `node:fs/promises`
+ * （`build-cli.ts` 的 `await mkdir(...)` / `await chmod(target, 0o755)`），异步版本本就不被
+ * 这条规则拦，所以那三枚（mkdirSync / mkdtempSync / chmodSync）不在构建档里。
+ *
+ * - 构建脚本：writeFileSync 写暂存文件、renameSync 是原子写的最后一步、rmSync/unlinkSync
+ *   只清理上次中断留下的临时文件；realpathSync 走基线只读组，不必登记。
  * - `test/**`：夹具造现场要写到磁盘；同步写在这里没有并发问题，但也不许外溢到 lib/ 与 host.ts。
  * - `lib/runtime.ts`：用 accessSync 判「venv 解释器还能不能跑」——插件装载期的一次性探测，
  *   不在热路径上，而基线的只读组不含这一枚。
@@ -73,20 +74,16 @@ export const OFF_REASONS = {
 export const SYNC_IO_SCOPES = [
   {
     files: ["build-helpers.ts", "build-client.ts", "build-host.ts", "build-cli.ts"],
-    apis: [
-      "writeFileSync",
-      "mkdirSync",
-      "mkdtempSync",
-      "renameSync",
-      "rmSync",
-      "unlinkSync",
-      "chmodSync",
-    ],
+    apis: ["writeFileSync", "renameSync", "rmSync", "unlinkSync"],
   },
   {
     files: ["test/**"],
     // globSync 是给「override 点名的文件还在不在」那条自检用的存在性扫描：它要递归读目录，
-    // 而基线的只读组不含这一枚。
+    // 而基线的只读组不含这一枚。utimesSync 只出现在「构造一个 mtime 很旧的临时件」这条用例里 ——
+    // 判 `writeArtifact` 回收残留的年龄阈值必须能把 mtime 摆到过去，否则那条判据测不出来。
+    // writeSync 只出现在 `test/global-setup.ts` 的 refuse()：那里必须在 throw 之前**同步**把原因
+    // 写到 fd 2，`process.stderr.write` 在 POSIX 上接管道时是异步的，紧接着的 throw 会把排队的
+    // 那块 buffer 一起带走 —— 恰好在最需要那句话的 CI 场景里丢掉它。
     apis: [
       "writeFileSync",
       "mkdirSync",
@@ -95,6 +92,8 @@ export const SYNC_IO_SCOPES = [
       "chmodSync",
       "accessSync",
       "globSync",
+      "utimesSync",
+      "writeSync",
     ],
   },
   { files: ["lib/runtime.ts"], apis: ["accessSync"] },
@@ -130,23 +129,8 @@ export const EXTRA_OVERRIDES = [
     },
   },
   {
-    files: ["lib/mcp-server.ts"],
-    rules: {
-      // node 的 http server 只有回调：listen 的成功/失败是两个事件，close 是回调式收尾。
-      // 要把「EADDRINUSE 归成点名错误码」和「close 回来时端口真的空了」写成可 await 的
-      // 形式，就必须先拿到一个以后再兑现的 Promise —— 与 sidecar 同一类 deferred，
-      // 不是「把 async 函数包进 Promise」那种反模式。
-      "promise/avoid-new": "off",
-    },
-  },
-  {
     files: ["lib/sidecar.ts"],
     rules: {
-      // 请求/响应协议的本质就是 deferred：先拿到一个「以后再兑现」的 Promise，
-      // 靠 id 把响应接回去。eslint-plugin-promise 的 avoid-new 假设的是「把一个
-      // async 函数包进 Promise」这种反模式，这里不是那种情况。宽限期 `grace` 也一样：
-      // 它等的是 setTimeout，只能先把 resolve 拿到手。
-      "promise/avoid-new": "off",
       // child.done 是一条**故意不 await** 的链：子进程活着的时候它永远 pending，
       // 这里只是在它落定的那一刻做清理。没有可 await 的位置，改成 async/await 反而
       // 会把整个 spawn 挂住。

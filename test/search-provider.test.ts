@@ -633,6 +633,23 @@ describe("search provider 检索与渲染", () => {
     expect(result.content).toBeUndefined();
   });
 
+  it("后端一条都没抓到、却带了一句原因时，把原因报出来而不是当成空搜索", async () => {
+    const sidecar = makeSidecar({
+      discovery: {
+        backend: "bing",
+        hits: [],
+        note: "bing returned no li.b_algo results; the page layout may have changed",
+      },
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({ query: "q" }),
+    );
+    // 抓 HTML 的后端（Bing / DuckDuckGo）空表多是版式变了或弹了验证码，那一句是
+    // 唯一能说清成因的东西；不带原因的空表才是真空搜索（上一条用例钉着）。
+    expect(error.code).toBe(SEARCH_FAILED);
+    expect(error.message).toContain("li.b_algo");
+  });
+
   it("maxResults 不是正整数时直接判否，不夹成一条空结果", async () => {
     const sidecar = makeSidecar({ hits: [{ url: PAGE_A }] });
     const codes = await Promise.all(
@@ -699,6 +716,17 @@ describe("search provider 错误与取消", () => {
     );
     expect(error.code).toBe(SEARCH_FAILED);
     expect(error.message).toContain("hits");
+  });
+
+  it("发现层回包根本不是对象时报 SCRAPLING_SEARCH_FAILED，且说得出收到的是什么", async () => {
+    // 协议声明的是一个对象。sidecar 版本不匹配或对端换了形状时这里会收到别的东西，
+    // 报错里带上类型名，比一句「没有 hits 数组」更容易看出是哪一层出了问题。
+    const sidecar = makeSidecar({ discovery: ["not", "an", "object"] });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({ query: "q" }),
+    );
+    expect(error.code).toBe(SEARCH_FAILED);
+    expect(error.message).toContain("object");
   });
 
   it("发现层的非 SEARCH_* sidecar 错误折成通用失败码", async () => {

@@ -2,8 +2,13 @@
 //
 // 路径由 `lib/runtime.ts` 的 `repoPythonPath` 算：POSIX 是 `bin/python`，Windows 是
 // `Scripts/python.exe`（venv 只在那一边生成 .exe 入口）。插件解析与门禁读的是同一个函数，
-// 门禁量到的就是插件真会拉起的那支解释器；`py-launcher.mjs` 那份 CLI 拼接由
-// `test/py-launcher.test.ts` 拿 `--root` 对同一棵树比对，见该文件头部。
+// 门禁量到的就是插件真会拉起的那支解释器。
+//
+// 「单一来源」是**这份文件要守住的目标**，不是既成事实：`test/py-launcher.test.ts` 的
+// 「三处解析对同一棵树给出同一支」拿独立写死的布局常量（`VENV_DIR` / `VENV_EXE`）跟这里的
+// 输出对齐，`test/e2e/byte-pipe.e2e.test.ts` 与 `test/platform/interpreter.platform.test.ts`
+// 也都 import 本文件而不是自己拼 `_env/.venv/...`。改布局时只有 `repoPythonPath` 一处要动；
+// 谁再手拼一遍，那条对表就会红。
 
 import path from "node:path";
 import { repoPythonPath } from "../lib/runtime.ts";

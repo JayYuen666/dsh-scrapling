@@ -448,7 +448,7 @@ def screenshot(
     timeout_ms: int,
 ) -> dict[str, Any]:
     """对会话当前页或页内单个元素截图，返回 base64 与固有尺寸。"""
-    from session_page import _finish_page, _ready_page
+    from session_page import _closed_page_error, _finish_page, _ready_page
 
     if image_type not in ("png", "jpeg"):
         raise _error("BAD_ARGS", "imageType must be png or jpeg")
@@ -463,7 +463,7 @@ def screenshot(
     page = page_info.page
     try:
         if page.is_closed():
-            raise _error("PAGE_BUSY", "the session's page has been closed")
+            raise _closed_page_error()
         if selector is not None:
             locator = page.locator(selector)
             matches = locator.count()

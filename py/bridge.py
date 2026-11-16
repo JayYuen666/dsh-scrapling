@@ -91,6 +91,47 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+
+def configure_ca_bundle() -> str | None:
+    """环境里没有指定 CA 包时，用 certifi 的那份兜底，返回实际用上的路径。
+
+    为什么需要这一步：托管 CPython（``runtime/python/<版本>/``）编译时没有自己的
+    OpenSSL 配置，``ssl.get_default_verify_paths()`` 在 macOS 上会落到系统库
+    ``/private/etc/ssl/cert.pem``。那份库缺若干公开根 —— 实测 example.com 走
+    SSL.com 链，系统库里验不过（``openssl s_client`` 报 ``verify error:num=20``，
+    同一张证书链用 certifi 的 bundle 验则 ``Verify return code: 0``）。症状在插件这一层
+    是 ``scrapling_fetch`` 一律 ``FETCH_FAILED ... unable to get local issuer certificate``，
+    而 curl_cffi 与 urllib 的报错都只说「找不到签发者」，看不出是信任源选错了。
+
+    两枚变量都要设，因为它们喂的是两条不同的链：``SSL_CERT_FILE`` 给 Python 的 ``ssl``
+    （urllib、httpx、playwright 一侧），``CURL_CA_BUNDLE`` 给 libcurl（curl_cffi 的
+    impersonate 路径）。
+
+    只在两枚变量都没被设过时才动手（**空值按没设处理**）：用户显式指定的 CA 包
+    （企业 MITM 代理、自签根）必须压过这里的兜底，否则那些环境反而全坏。
+
+    :returns: 兜底用上的 bundle 路径；certifi 不可用、或两枚变量都已有非空取值时返回 None
+    """
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("CURL_CA_BUNDLE"):
+        return None
+    try:
+        import certifi
+    except ImportError:
+        # certifi 是 runtime-requirements 里钉版的传递依赖，真装不上时不该把 sidecar
+        # 拖死：退回系统库只是少几个根，能连的主机照连。
+        return None
+    bundle = certifi.where()
+    if not bundle:
+        return None
+    # 早退那一支已经确认两枚都为空，所以这里直接赋值（而不是 setdefault）：
+    # 直接赋值与「空值算没设」同口径，空值环境也会真的被兜底路径填上。
+    os.environ["SSL_CERT_FILE"] = bundle
+    os.environ["CURL_CA_BUNDLE"] = bundle
+    return bundle
+
+
+CA_BUNDLE = configure_ca_bundle()
+
 PROTOCOL_VERSION = 1
 
 # 并发上限：与工作线程数一致，多了也只是排队。

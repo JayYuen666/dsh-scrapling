@@ -1,16 +1,4 @@
 {
   "extends": "@jayyuen66/dsh-plugin-shared/config/tsconfig.base.json",
-  "include": [
-    "host.ts",
-    "lib/**/*.ts",
-    "test/**/*.ts",
-    "build-host.ts",
-    "build-client.ts",
-    "build-cli.ts",
-    "build-helpers.ts",
-    "cli-main.ts",
-    "oxfmt.config.ts",
-    "oxlint.config.ts",
-    "vitest.config.ts"
-  ]
+  "include": ["*.ts", "lib/**/*.ts", "test/**/*.ts"]
 }
