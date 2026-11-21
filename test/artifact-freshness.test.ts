@@ -125,7 +125,10 @@ describe("client.js 的 ModuleLoader 外壳", () => {
       code.matchAll(/require\((?<quote>["'`])(?<spec>.*?)\k<quote>\)/gu),
       (match) => match.groups?.["spec"] ?? "",
     );
-    // shared 的客户端行由 patch 的无 id 供应行提供；其余依赖仍内联。
+    // shared 的客户端行由 patch 的固定 id 供应行提供（唯一外置的 shared 子路径）；
+    // lib/typert-client 内联（读取器的 isRemoteMounter/RemoteHost 收编自 shared 骨架，
+    // 而宿主模块表只物化供应行声明的 /client，外置它会让 require 落空、整卡不激活）；
+    // 其余依赖仍内联。
     expect([...new Set(specs)].toSorted()).toStrictEqual([
       "@jayyuen66/dsh-plugin-shared/client",
       "react",
@@ -141,7 +144,14 @@ describe("client.js 的 ModuleLoader 外壳", () => {
     expect(RUNTIME_EXTERNALS).toContain("react/jsx-runtime");
     expect(RUNTIME_EXTERNALS).toContain("react-dom/client");
     expect(RUNTIME_EXTERNALS).toContain("zod");
-    expect(RUNTIME_EXTERNALS).toContain("@jayyuen66/dsh-plugin-shared");
+    // shared 刻意**不**在这份包名段清单里：包名段匹配会把 lib/typert-client 一起放成
+    // 运行时 require，而宿主只物化 /client。它走 EXACT_EXTERNALS 的精确 specifier，
+    // 判据钉在 isExternal 的两位输出上。
+    expect(RUNTIME_EXTERNALS).not.toContain("@jayyuen66/dsh-plugin-shared");
+    const { isExternal } = await import("../build-client.ts");
+    expect(isExternal("@jayyuen66/dsh-plugin-shared/client")).toBe(true);
+    expect(isExternal("@jayyuen66/dsh-plugin-shared/lib/typert-client")).toBe(false);
+    expect(isExternal("@jayyuen66/dsh-plugin-shared/lib/record")).toBe(false);
   });
 
   it("用假 require 执行 factory 后，exports 上是可运行的 apply 与宿主装配清单 inject", async () => {

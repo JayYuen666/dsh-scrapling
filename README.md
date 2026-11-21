@@ -12,7 +12,7 @@
   <a href="https://github.com/JayYuen666/dsh-scrapling/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-scrapling/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.2-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.5-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -81,7 +81,7 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 Remove with `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`. The package is on the public npm registry, so installation needs no credentials and no scoped-registry line.
 
 - **Requires Node.js `>= 24.9`.** This is an ESM-only package, and the build entry points (`build-client.ts`, `build-host.ts`, `build-cli.ts`) are executed by `node` directly, so the floor has to sit where TypeScript type stripping is on by default (Node 22.18 up). The number itself is the host floor: `0.2.2` hosts declare Node `>= 24.9.0`, and a host below it never starts.
-- **Requires host `dsh` at the `0.2.2-rc.2` line or later.** The requirement the host actually reads is `engines.dsh` (`^0.2.2-rc.2`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against every released host version inside the window at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
+- **Requires host `dsh` at the `0.2.2-rc.5` line or later.** The requirement the host actually reads is `engines.dsh` (`^0.2.2-rc.5`), and it decides alone; a host on a later line is refused and needs the explicit risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against every released host version inside the window at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
 - **Requires Python 3.14+ with Scrapling installed** — named by `pythonBin`, or found by the fixed chain in `lib/runtime.ts` (the managed venv `dataDir/runtime/venv`, then the bare managed interpreter `dataDir/runtime/python/<version>`, then the repository's `_env/.venv`, then `PATH`). In an installed package the `_env/.venv` leg does not exist, so after `setup --feature core --apply` the interpreter is the managed venv and otherwise the `python3` on your `PATH` (`python` on Windows); whichever one is chosen is logged at load time, and a missing Scrapling reports an error carrying the install line to copy. The two managed legs are not interchangeable: the installer drops a managed CPython and then creates `runtime/venv` from it, and every wheel (Scrapling, patchright, the official MCP server) goes into the venv — the bare interpreter has no packages at all, so using it would fail every import while the logged path still looked right.
 
 ```sh
@@ -234,10 +234,10 @@ In `mcp` mode the server runs inside the plugin's own host process and calls the
 
 On a host that exposes the `mcpManager` service (the rc.2 web/desktop bundle) the plugin registers its server there at load: no `dsh-mcp-client` install and no profile entry are needed, and `mcpPort` alone decides the endpoint. The manual entry below is for CLI/headless profiles, where that service is absent. If an upgraded profile still carries the manual entry, remove it when relying on dynamic registration - otherwise the manager refuses the duplicate server name and the old entry keeps serving.
 
-Connecting dsh needs `@deepseek-ai/dsh-mcp-client`, which this plugin deliberately does not depend on. Pin the exact build matching the host version - npm `latest` is older than the host's own line, and the client's peer versions are literal, so one prerelease off installs but never activates. `0.2.2-rc.2` is the default; a host still on rc.1 takes `0.2.2-rc.1`, and `next` tracks the official beta line:
+Connecting dsh needs `@deepseek-ai/dsh-mcp-client`, which this plugin deliberately does not depend on. Pin the exact build matching the host version - npm `latest` is older than the host's own line, and the client's peer versions are literal, so one prerelease off installs but never activates. `0.2.2-rc.5` is the default; a host still on rc.1 takes `0.2.2-rc.1`, and `next` tracks the official beta line:
 
 ```bash
-dsh plugin --profile <name> add @deepseek-ai/dsh-mcp-client@0.2.2-rc.2
+dsh plugin --profile <name> add @deepseek-ai/dsh-mcp-client@0.2.2-rc.5
 ```
 
 Then add one entry to that profile's `cordis.patch.yml` — this is exactly what `dsh-scrapling setup --mode mcp` prints, so you can also let the CLI write it (drop `headers` when no token is configured):
@@ -270,7 +270,7 @@ dsh-scrapling setup --mode native --apply     # a file that deliberately contain
 dsh-scrapling doctor --mode mcp --profile <profileDir>
 ```
 
-`doctor` reads what the profile actually says - `cordis.patch.yml` plus that profile's `package.json` - and prints one line per problem: two entries under `serverName: scrapling`, this plugin's entry next to an official `stdio` one, entries that do not match the mode, an entry whose port disagrees with `--port`, a profile without `@deepseek-ai/dsh-mcp-client` or with it pinned to something other than `0.2.2-rc.2` / `0.2.2-rc.1` / `next`, and an official entry while `officialMcpEnabled` is off. Exit `0` is "consistent", `1` names at least one problem, `2` is a bad argument. `integrationMode` itself is a plugin setting the CLI cannot read, so `--mode` is the claim being checked and has to match the deployment.
+`doctor` reads what the profile actually says - `cordis.patch.yml` plus that profile's `package.json` - and prints one line per problem: two entries under `serverName: scrapling`, this plugin's entry next to an official `stdio` one, entries that do not match the mode, an entry whose port disagrees with `--port`, a profile without `@deepseek-ai/dsh-mcp-client` or with it pinned to something other than `0.2.2-rc.5` / `0.2.2-rc.1` / `next`, and an official entry while `officialMcpEnabled` is off. Exit `0` is "consistent", `1` names at least one problem, `2` is a bad argument. `integrationMode` itself is a plugin setting the CLI cannot read, so `--mode` is the claim being checked and has to match the deployment.
 
 `setup` for `official-mcp` asks for two separate statements before it writes anything: `officialMcpEnabled: true` in the profile and `--accept-risk` on the command line; missing either one prints `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED` and writes nothing. At load time the host-side path is gated by `officialMcpEnabled` alone: a host exposing `mcpManager` registers the managed `scrapling-mcp` directly, while the `setup`-generated `dsh-mcp-client` entry is the fallback for CLI/headless profiles. Either path starts `<dataDir>/runtime/venv/bin/scrapling-mcp`, so run `setup --feature mcp --apply` first - see [Runtime packs](#runtime-packs-macos-arm64). When that binary is missing, `setup` prints a line saying so.
 

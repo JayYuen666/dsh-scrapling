@@ -30,7 +30,13 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { ToolCallViewProps } from "@deepseek-ai/dsh-client-ui-tool/client";
 import { createElement } from "react";
 import type { ReactNode } from "react";
-import { claimApply, isRecord } from "@jayyuen66/dsh-plugin-shared/client";
+import {
+  ToolRow,
+  ToolRowGrid,
+  ToolRowItem,
+  claimApply,
+  isRecord,
+} from "@jayyuen66/dsh-plugin-shared/client";
 import {
   BUNDLE_PACKAGE_NAME,
   LOCALE_NS,
@@ -304,15 +310,6 @@ export function resultMetaOf(props: ToolCallViewProps): unknown {
 
 /** 结果行自己的样式。跟着宿主的语义色走，明暗两套主题都成立。 */
 const ROW_CSS = `
-.dsh-scrapling-row{display:flex;flex-direction:column;gap:2px;min-width:0}
-.dsh-scrapling-rowTitle{color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dsh-scrapling-rowFields{display:flex;flex-wrap:wrap;gap:2px 12px;margin:0;padding:0;list-style:none}
-.dsh-scrapling-rowField{display:flex;gap:4px;min-width:0;font-size:12px;line-height:18px}
-.dsh-scrapling-rowLabel{color:var(--dsw-alias-label-tertiary);flex:none}
-.dsh-scrapling-rowValue{color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dsh-scrapling-rowButton{align-self:flex-start;border:0;background:0 0;padding:0;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:12px;cursor:pointer}
-.dsh-scrapling-rowButton:hover{color:var(--dsw-alias-label-primary)}
-.dsh-scrapling-rowButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
 .dsh-scrapling-page{padding:4px 0 8px}
 .dsh-scrapling-icon{position:relative;display:inline-block;flex:none}
 .dsh-scrapling-iconLayer{position:absolute;inset:0;background-color:currentColor;-webkit-mask-size:100% 100%;mask-size:100% 100%;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-image:url(${SCRAPLING_LOGO_BODY_URI});mask-image:url(${SCRAPLING_LOGO_BODY_URI})}
@@ -329,49 +326,31 @@ function RowView(props: ToolCallViewProps & { readonly t: Translate }): ReactNod
   const { toolName, block, inspect, t } = props;
   const meta = resultMetaOf(props);
   const spec = buildRow(toolName, readArgs(block.args), meta);
-  const children: ReactNode[] = [
-    createElement("div", { className: "dsh-scrapling-rowTitle", key: "title" }, spec.title),
-  ];
-  if (spec.fields.length > 0) {
-    children.push(
-      createElement(
-        "ul",
-        { className: "dsh-scrapling-rowFields", key: "fields" },
-        spec.fields.map((field) =>
-          createElement(
-            "li",
-            { className: "dsh-scrapling-rowField", key: field.labelKey },
-            createElement("span", { className: "dsh-scrapling-rowLabel" }, t(field.labelKey)),
-            createElement(
-              "span",
-              { className: "dsh-scrapling-rowValue" },
-              field.valueKey === undefined ? field.value : t(field.valueKey),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-  if (inspect !== undefined) {
-    children.push(
-      createElement(
-        "button",
-        {
-          type: "button",
-          className: "dsh-scrapling-rowButton",
-          key: "inspect",
-          onClick: (): void => {
-            inspect();
+  const items = spec.fields.map((field) =>
+    createElement(ToolRowItem, {
+      key: field.labelKey,
+      label: t(field.labelKey),
+      value: field.valueKey === undefined ? field.value : t(field.valueKey),
+    }),
+  );
+  const foot =
+    inspect === undefined
+      ? undefined
+      : createElement(
+          "button",
+          {
+            type: "button",
+            className: "dsu-btn dsu-btnGhost dsu-btnSm",
+            onClick: (): void => {
+              inspect();
+            },
           },
-        },
-        t("row.inspect"),
-      ),
-    );
-  }
+          t("row.inspect"),
+        );
   return createElement(
-    "div",
-    { className: "dsh-scrapling-row", "data-tool": toolName },
-    ...children,
+    ToolRow,
+    { name: spec.title, phase: props.phase, foot },
+    createElement(ToolRowGrid, null, ...items),
   );
 }
 

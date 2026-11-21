@@ -12,6 +12,8 @@ import type {
   TypertCodec,
 } from "@deepseek-ai/dsh-typert-protocol";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/client";
+import { isRemoteMounter } from "@jayyuen66/dsh-plugin-shared/lib/typert-client";
+import type { RemoteHost } from "@jayyuen66/dsh-plugin-shared/lib/typert-client";
 import { z } from "zod";
 import {
   JOB_STATUSES,
@@ -28,6 +30,11 @@ import type {
   RuntimePackRequest,
   RuntimeStatusResult,
 } from "../lib/runtime-shape.ts";
+
+// RemoteHost / isMounter 由 shared `./lib/typert-client` 收编（七份逐字副本的正主；
+// 本仓此前的 field() 访问器与正主的 record[key] 直读行为等价——输入全为 JSON 记录）。
+// 再导出放在 import 块之后：夹在中间会让后续 import 被判「不在文件顶部」。
+export type { RemoteHost } from "@jayyuen66/dsh-plugin-shared/lib/typert-client";
 
 const PACKAGE_NAME = "@jayyuen66/dsh-scrapling";
 
@@ -162,17 +169,6 @@ export const RUNTIME_DESCRIPTORS: readonly InvocationDescriptor[] = [
   requestDescriptor("cancelJob", CANCEL_CODEC),
 ];
 
-export interface RemoteHost {
-  get?: (name: string, strict?: boolean) => unknown;
-}
-
-interface RemoteMounter {
-  $mount: (contribution: {
-    package: string;
-    descriptors: readonly InvocationDescriptor[];
-  }) => Promise<unknown>;
-}
-
 interface RuntimeNamespace {
   status: () => Promise<RemoteResult<unknown>>;
   installPack: (request: RuntimePackRequest) => Promise<RemoteResult<unknown>>;
@@ -185,10 +181,6 @@ export interface RuntimeReader {
   install: (pack: RuntimePack) => Promise<RuntimeActionResult>;
   repair: (pack: RuntimePack) => Promise<RuntimeActionResult>;
   cancel: (jobId: string) => Promise<RuntimeActionResult>;
-}
-
-function isMounter(value: unknown): value is RemoteMounter {
-  return isRecord(value) && typeof field(value, "$mount") === "function";
 }
 
 function isNamespace(value: unknown): value is RuntimeNamespace {
@@ -284,7 +276,7 @@ function buildReader(ctx: RemoteHost): RuntimeReader {
   let mounted: Promise<unknown> | undefined;
   const namespaceOf = async (): Promise<RuntimeNamespace> => {
     const mounter = ctx.get?.("remote");
-    if (!isMounter(mounter)) {
+    if (!isRemoteMounter(mounter)) {
       throw new Error("运行环境读面不可用：宿主网关没有提供 remote 服务");
     }
     try {

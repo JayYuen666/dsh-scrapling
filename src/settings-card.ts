@@ -41,6 +41,7 @@ import type { FieldSpec, GroupSpec } from "./settings-fields.ts";
 import {
   CardForm,
   Field,
+  LogPanel,
   SaveBar,
   Section,
   SelectField,
@@ -274,8 +275,6 @@ const CARD_CSS = `
 .dss-packs{display:flex;flex-direction:column;gap:8px}
 .dss-pack{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center}
 .dss-packActions{display:flex;gap:6px;grid-column:2;justify-content:flex-end}
-.dss-command{display:block;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-3);padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all}
-.dss-job{margin:0;max-height:180px;overflow:auto;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-3);padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap}
 `;
 
 /**
@@ -809,11 +808,7 @@ function renderRuntime(props: {
   readonly onCancel: () => void;
 }): ReactNode {
   const { reader, t, snapshot, busy, failure, onAct, onCancel } = props;
-  const command = createElement(
-    "code",
-    { className: "dss-command" },
-    "dsh-scrapling setup --feature <pack> --apply",
-  );
+  const command = createElement(LogPanel, null, "dsh-scrapling setup --feature <pack> --apply");
   const failureLine =
     failure === ""
       ? null
@@ -855,9 +850,7 @@ function renderRuntime(props: {
             : t("runtimeJobEnded", { status: job.status }),
         );
   const jobOutput =
-    job === null || job.output === ""
-      ? null
-      : createElement("pre", { className: "dss-job" }, job.output);
+    job === null || job.output === "" ? null : createElement(LogPanel, null, job.output);
   const disabled = busy !== "" || !jobsReady || snapshot === null;
   // 缺键按「未安装」呈现，**不是**「正在读取」：`snapshot` 非空而某个包缺键，成因只有两种
   // ——宿主读状态失败后退成空对象（`lib/runtime-remote.ts` 的 `packsOrEmpty` 降级），或

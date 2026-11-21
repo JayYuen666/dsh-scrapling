@@ -49,6 +49,7 @@ import type { Volatile } from "@deepseek-ai/cordis";
 import { Context } from "@deepseek-ai/cordis";
 import type { SidecarCapabilities } from "../lib/sidecar.ts";
 import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
+import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
 import { LOCAL_PYTHON } from "./python-bin.ts";
 
 /**
@@ -209,11 +210,22 @@ interface RegisteredSkill {
   readonly content: string;
 }
 
+// 官方 SystemPrompt 的真实例：挂在一次性装配的独立 Context 上，全文件共用。段排序的
+// 取值与「官方表里没有的名字交 undefined」的语义都来自它 —— 替身不再自编 2100 这类
+// 数字，下方 apply 注册段的 order 断言因此钉的是官方现值，宿主调整段落位置时跟着改。
+const promptContext = new Context();
+await promptContext.plugin(SystemPrompt, {});
+const officialPrompt = promptContext.systemPrompt;
+
 /**
  * 假 ctx 的 systemPrompt 面。
  *
  * apply 会注册一段用量指引，所以每个跑 apply 的用例都得给它挂上这一类 —— 缺了它，症状不是
  * 「指引段没注册」而是整个 apply 抛，那会把一堆无关用例一起带走，报错还不指向真正的原因。
+ *
+ * `getSectionOrder` 委托真件而不是回替身自编的常数：插件传的段名不经它就没有被验的机会
+ * （自编常数对任何名字都回同一个数）。`section` 只做记录、不去真件上注册 —— 真件同层重名
+ * 会抛，而这里每个用例都注册同一段名。
  *
  * `into` 每次调用新建一份：默认值若是模块级共享数组，跑 apply 的用例就会互相往里面塞段，
  * `at(-1)` 取到的可能是别的用例注册的。要读收到什么的用例自己传一个进来。
@@ -223,7 +235,9 @@ interface RegisteredSkill {
  */
 function promptStub(into: PromptRecord[] = []): unknown {
   return {
-    getSectionOrder: (): number => 2100,
+    getSectionOrder: (
+      sectionName: Parameters<SystemPrompt["getSectionOrder"]>[0],
+    ): number | undefined => officialPrompt.getSectionOrder(sectionName),
     section: (section: PromptRecord): (() => void) => {
       into.push(section);
       return (): void => undefined;
@@ -703,6 +717,9 @@ describe("system prompt 指引段", () => {
     }
     const section = sections.at(-1);
     expect(section?.name).toBe("scrapling-usage");
+    // 段落位置必须取自宿主的官方现值（`getSectionOrder` 委托真 SystemPrompt，见其定义处），
+    // 这条断言钉的是「插件把宿主交回的位置原样带上」，不是某个写死的数。
+    expect(section?.order).toBe(officialPrompt.getSectionOrder("TOOL_WEB_FETCH"));
     expect(section?.text).toBeTypeOf("function");
     const read = (): string => (typeof section?.text === "function" ? section.text({}) : "");
 

@@ -35,6 +35,13 @@ const root = import.meta.dirname;
 // 运行期解析任何东西。
 // zod 是宿主 `PLATFORM_MODULES` 冻结模块表里的一枚；内联会得到第二份 zod 身份。
 //
+// shared 只外置 `dsh.client.external` 声明的那条精确子路径（客户端行），其余子路径
+// （lib/typert-client 等）一律内联。教训：曾按「包名段」外置 shared，typert-client 收编进
+// shared 之后（读取器的 isRemoteMounter/RemoteHost 收编自 shared 骨架），那个子路径也被
+// 放成了运行时 require，而宿主模块表只物化供应行声明的 /client —— require 落空，
+// 整张设置卡不激活（host 0.2.2-rc.5 web profile 实测，报 "missed the module table"）。
+// 统一构建切面的七仓同构：只外置 dsh.client.external 里声明的精确 specifier。
+//
 // shared 的客户端行由 cordis.patch.yml 插入的固定 id `dsh-plugin-shared` 供应行装载成模块表条目；
 // package.json 的 dsh.client.external 同步声明这一条，供宿主按依赖边排序。
 // 历史教训：只作为传递依赖安装、宿主没把 shared 排进启动图时，页面启动会落进
@@ -46,10 +53,15 @@ export const RUNTIME_EXTERNALS = [
   "react-dom",
   "react-dom/client",
   "zod",
-  // 这个清单按「包名段」匹配（externalizePackages 会把子路径归到包名），所以登记裸包名。
-  "@jayyuen66/dsh-plugin-shared",
 ];
-const isExternal = externalizePackages(RUNTIME_EXTERNALS);
+/** 按精确 specifier 外置的模块：shared 的客户端行，与 package.json 的
+ *  `dsh.client.external` 同源（宿主按依赖边排序、模块表按它物化供应行）。 */
+export const EXACT_EXTERNALS: readonly string[] = ["@jayyuen66/dsh-plugin-shared/client"];
+
+const packageExternal = externalizePackages(RUNTIME_EXTERNALS);
+const exactExternal = new Set(EXACT_EXTERNALS);
+const isExternal = (id: string): boolean => exactExternal.has(id) || packageExternal(id);
+export { isExternal };
 
 const nameKey = "name";
 

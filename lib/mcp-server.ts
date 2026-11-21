@@ -7,7 +7,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
-import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import { fieldOf, isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import {
   MCP_LISTEN_HOST,
   MCP_PATH,
@@ -91,7 +91,7 @@ export interface McpServerHandle {
 }
 
 /** MCP server 自述的版本；由 test/publish-manifest.test.ts 钉成 package.json 同值。 */
-export const MCP_SERVER_VERSION = "0.1.14";
+export const MCP_SERVER_VERSION = "0.1.15";
 
 const RAW_PREFIX = "scrapling_";
 
@@ -196,10 +196,6 @@ export function createMcpImageSink(): McpImageSink {
       return found === undefined ? undefined : { data: found.data, mimeType: found.mimeType };
     },
   };
-}
-
-function fieldOf(block: unknown, key: string): unknown {
-  return isRecord(block) ? block[key] : undefined;
 }
 
 /** 把 native 的 render 结果投成 MCP content；投不出去的原样带 JSON，不静默丢。 */

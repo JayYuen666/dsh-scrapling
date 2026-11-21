@@ -6,6 +6,17 @@
 标准六类之外的小节（本仓的 `Boundaries` 收各版本的验证范围与能力边界，即哪些平台/档位真跑过、
 哪些只到本地夹具为止）。
 
+## 0.1.15
+
+宿主基线抬到 `0.2.2-rc.5`；mcp server 自述版本对齐包版本；mcp-server 的字段读取收编 shared。
+
+### Changed
+
+- **宿主依赖线抬到 `0.2.2-rc.5`**：devDependencies 全族精确钉 rc.5，`engines.dsh` 与 dsh 家族 peer 同一条窗口；bin 产物随 rc.5 常量重建，MCP 默认客户端 pin（`MCP_DEFAULT_CLIENT_PIN`）与宿主窗口注释同步，THIRD_PARTY_NOTICES 的 shared 行更新 catalog 现量。
+- **`MCP_SERVER_VERSION` 对齐包版本 `0.1.15`**（mcp server 自述版本与包版本同值的门禁）。
+- **`lib/mcp-server.ts` 的本地 `fieldOf` 收编 shared**（同构副本）：shared 版多一层 getter/Proxy 抛错保护；调用点的键无一撞原型成员、输入全为 JSON 数据，行为不变。
+- **runtime-reader 的 `RemoteHost` / `isMounter` 与 url-policy 的 `withTimeout` 竞速骨架收编 shared**（`./lib/typert-client` / `./lib/with-timeout`；超时文案的 label 拼串留在调用方回调里）。shared 经 catalog 抬到 `^0.2.12`，`pnpm-lock.yaml` 经 `pnpm install --lockfile-only` 重解到 registry 现量；devDependencies 补 `react-dom`（`^19.3.0`，与 react 相邻）——shared 0.2.12 的 card-ui 经 `createPortal` 引 `react-dom`，客户端测试经 ESM 链解析到它（与 danger-guard / dir-prep / session-rescue 的既有供应同形）；THIRD_PARTY_NOTICES 的 shared 行随伞根 catalog 改 `^0.2.12`。
+
 ## 0.1.14
 
 设置卡上按次读取的那些设置从下一次调用起生效（此前装配期就把配置收成了快照，改完要重启宿主才看得见）；market 热挂与 bundle 层双路径装载时第二份 `apply` 整份让路；卡片样式改用 shared 的共享 `<style>`；`@deepseek-ai/dsh-error` 与 `@deepseek-ai/dsh-tools` 从 optional peer 改成普通 peer（干净目录里装出来的包原先装载即 `ERR_MODULE_NOT_FOUND`）；托管解释器改选 `runtime/venv`（此前十九个工具一个都不注册）；TLS 证书链用 certifi 兜底；另有十三处独立缺陷（查询串 `;` 分隔符与 pip 索引地址的凭据泄漏、win32 解释器路径、引号标量的 `#`、doctor 的数据目录与 `patchScalar` 的取值顺序、move 空 selector、`deps-check` 静默退 0、安装进度写入、坏 `state.json` 让安装按钮变灰、失败回执缺字段、`--profile` 指向普通文件在 Windows 被当成空 profile、验证服务器单线程被空闲连接堵死）；shared 抬到 `^0.2.10`。十九个工具与 MCP 面的行为不变。

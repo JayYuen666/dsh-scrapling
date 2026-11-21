@@ -15,6 +15,7 @@
 // `follow_redirects="safe"` 兜住重定向，浏览器侧由 py/guard.py 的 route handler 兜住。
 
 import ipaddr from "ipaddr.js";
+import { raceTimeout } from "@jayyuen66/dsh-plugin-shared/lib/with-timeout";
 
 /** authority 的终点字符与 URL 内嵌凭据形态。 */
 const AUTHORITY_END = /[/?#]/u;
@@ -594,9 +595,9 @@ async function resolveWithNodeDns(hostname: string): Promise<readonly string[]> 
  * 给一个 Promise 加超时；到点以带说明的 Error 拒绝。
  *
  * 底层操作（getaddrinfo）不可中止：到点后它仍在后台跑完，这里只是不再等它。
- * 计时器在两端都要清掉，否则成功路径会给事件循环留一枚空转的定时器。
- * 限时拒绝这一类 deferred 用 `Promise.withResolvers` 落笔：除先把 reject 拿到手
- * 没有别的写法，而 `new Promise` 的 executor 形态在本仓被 lint 关着。
+ * 竞速骨架（计时器两端都清、`Promise.withResolvers` 落笔）由 shared
+ * `./lib/with-timeout` 收编——与 dir-prep 客户端那份剥掉拒绝值构造后逐字同；
+ * 拒绝文案（label 拼串）是本仓自己的措辞，留在回调里。
  *
  * @param promise - 要等的那次操作
  * @param timeoutMs - 超时毫秒数
@@ -608,15 +609,11 @@ async function withTimeout<Value>(
   timeoutMs: number,
   label: string,
 ): Promise<Value> {
-  const { promise: limit, reject } = Promise.withResolvers<never>();
-  const timer = setTimeout(() => {
-    reject(new Error(`${label} timed out after ${timeoutMs}ms`));
-  }, timeoutMs);
-  try {
-    return await Promise.race([promise, limit]);
-  } finally {
-    clearTimeout(timer);
-  }
+  return raceTimeout(
+    promise,
+    timeoutMs,
+    () => new Error(`${label} timed out after ${timeoutMs}ms`),
+  );
 }
 
 /**
