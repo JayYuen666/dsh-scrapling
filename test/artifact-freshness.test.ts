@@ -165,6 +165,7 @@ describe("client.js 的 ModuleLoader 外壳", () => {
       "inject",
       "readArgs",
       "resultMetaOf",
+      "toolRowTone",
     ]);
     expect(exports["apply"]).toBeTypeOf("function");
     // inject 是宿主用来装配注入的清单（src/client-entry.ts 里的字面量），不是函数。

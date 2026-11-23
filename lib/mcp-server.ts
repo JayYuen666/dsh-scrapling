@@ -91,7 +91,7 @@ export interface McpServerHandle {
 }
 
 /** MCP server 自述的版本；由 test/publish-manifest.test.ts 钉成 package.json 同值。 */
-export const MCP_SERVER_VERSION = "0.1.15";
+export const MCP_SERVER_VERSION = "0.1.16";
 
 const RAW_PREFIX = "scrapling_";
 

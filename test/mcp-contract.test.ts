@@ -39,8 +39,8 @@ describe("mcpUrl", () => {
 
 describe("客户端钉版", () => {
   // 期望值逐字写死，不从 MCP_DEFAULT_CLIENT_PIN 派生：常量本身改坏时这一条必须红。
-  const DEV_LINE = "0.2.2-rc.5";
-  const RELEASED_LINES: readonly string[] = [DEV_LINE, "0.2.2-rc.1"];
+  const DEV_LINE = "0.2.3-alpha.2";
+  const RELEASED_LINES: readonly string[] = [DEV_LINE, "0.2.2-rc.5", "0.2.2-rc.1"];
 
   it("默认命令钉开发线同版", () => {
     expect(clientInstallCommand()).toContain(`@deepseek-ai/dsh-mcp-client@${DEV_LINE}`);

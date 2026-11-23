@@ -28,9 +28,12 @@
 
 import type { Context } from "@deepseek-ai/cordis";
 import type { ToolCallViewProps } from "@deepseek-ai/dsh-client-ui-tool/client";
-import { createElement } from "react";
+import { createElement, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import {
+  Badge,
+  KpiGrid,
+  KpiTile,
   ToolRow,
   ToolRowGrid,
   ToolRowItem,
@@ -47,6 +50,8 @@ import { SettingsCard, browserDocument, installStyle, installStyles } from "./se
 import { createRuntimeReader } from "./runtime-reader.ts";
 import { SCRAPLING_LOGO_ACCENT_URI, SCRAPLING_LOGO_BODY_URI } from "./scrapling-icon.ts";
 import type { RuntimeReader } from "./runtime-reader.ts";
+import type { RuntimeStatusResult } from "../lib/runtime-shape.ts";
+import { RUNTIME_PACKS, pythonViaKey } from "../lib/runtime-shape.ts";
 import type {
   CardProps,
   DocumentFace,
@@ -179,6 +184,88 @@ function linksRow(
  * @param meta Host 侧 presentationMeta 投影（可能缺席）
  * @returns 行规格
  */
+/** 会话网络/登录态这三条工具的行：会话 id 必有，文件名只在登录态出现。 */
+function sessionNetworkRow(tool: string, parameters: Record<string, unknown>): RowSpec {
+  const fields: RowField[] = [{ labelKey: ROW_SESSION_KEY, value: text(parameters["sessionId"]) }];
+  const name = text(parameters["name"]);
+  if (name !== "") {
+    fields.push({ labelKey: "row.name", value: name });
+  }
+  return { tool, title: tool, fields };
+}
+
+/** 爬取任务行：起始 URL、页数上限与任务 id。 */
+function crawlRow(
+  tool: string,
+  url: string,
+  parameters: Record<string, unknown>,
+  projected: Record<string, unknown>,
+): RowSpec {
+  return {
+    tool,
+    title: tool,
+    fields: [
+      { labelKey: "row.start", value: url },
+      { labelKey: "row.pageCap", value: text(parameters["maxPages"]) },
+      { labelKey: "row.job", value: text(projected["jobId"]) },
+    ],
+  };
+}
+
+/** 抓取类兜底：URL、HTTP 状态与截断标记，只有拿得到才出字段。 */
+function fetchRow(tool: string, url: string, projected: Record<string, unknown>): RowSpec {
+  const fields: RowField[] = [];
+  if (url !== "") {
+    fields.push({ labelKey: "row.url", value: url });
+  }
+  const status = projected["statusCode"];
+  if (typeof status === "number") {
+    fields.push({ labelKey: "row.http", value: String(status) });
+  }
+  if (typeof projected["truncated"] === "boolean") {
+    fields.push({
+      labelKey: "row.body",
+      value: "",
+      valueKey: projected["truncated"] ? "row.truncated" : "row.notTruncated",
+    });
+  }
+  return { tool, title: tool, fields };
+}
+
+/** 结果行的 HTTP 语义色：2xx 正常，4xx 警告，5xx 错误。 */
+type HttpTone = "ok" | "warn" | "err";
+
+function httpToneOf(status: number): HttpTone {
+  if (status >= 500) {
+    return "err";
+  }
+  if (status >= 400) {
+    return "warn";
+  }
+  return "ok";
+}
+
+/**
+ * 一行工具结果的状态点色调。
+ *
+ * 只按宿主真给的 `statusCode` / `truncated` 分档：preparing / start 是 mute；结果侧
+ * 5xx 升 err，4xx 与截断是 warn；有 2xx/3xx 才是 ok。没有状态码的已完成结果保持 mute
+ * ——设计稿要求「只画真实投射字段」，不拿相位猜成功。
+ */
+export function toolRowTone(phase: ToolCallViewProps["phase"], meta: unknown): HttpTone | "mute" {
+  if (phase !== "result" || !isRecord(meta)) {
+    return "mute";
+  }
+  const status = typeof meta["statusCode"] === "number" ? meta["statusCode"] : undefined;
+  if (status !== undefined && status >= 500) {
+    return "err";
+  }
+  if (meta["truncated"] === true) {
+    return "warn";
+  }
+  return status === undefined ? "mute" : httpToneOf(status);
+}
+
 export function buildRow(tool: string, args: unknown, meta: unknown): RowSpec {
   const parameters = isRecord(args) ? args : {};
   const projected = isRecord(meta) ? meta : {};
@@ -219,41 +306,15 @@ export function buildRow(tool: string, args: unknown, meta: unknown): RowSpec {
     tool === "scrapling_session_state_save" ||
     tool === "scrapling_session_state_load"
   ) {
-    const fields: RowField[] = [
-      { labelKey: ROW_SESSION_KEY, value: text(parameters["sessionId"]) },
-    ];
     // 网络历史与登录态都以会话为轴；登录态那一对再多一个文件名，那是它唯一的模型侧入参。
-    const name = text(parameters["name"]);
-    if (name !== "") {
-      fields.push({ labelKey: "row.name", value: name });
-    }
-    return { tool, title: tool, fields };
+    return sessionNetworkRow(tool, parameters);
   }
   if (tool === "scrapling_crawl") {
-    return {
-      tool,
-      title: tool,
-      fields: [
-        { labelKey: "row.start", value: url },
-        { labelKey: "row.pageCap", value: text(parameters["maxPages"]) },
-        { labelKey: "row.job", value: text(projected["jobId"]) },
-      ],
-    };
+    return crawlRow(tool, url, parameters, projected);
   }
 
   // 抓取类：URL / HTTP / 是否截断。只展示拿得到的。
-  const fields: RowField[] = [];
-  if (url !== "") {
-    fields.push({ labelKey: "row.url", value: url });
-  }
-  const status = projected["statusCode"];
-  if (typeof status === "number") {
-    fields.push({ labelKey: "row.http", value: String(status) });
-  }
-  if (projected["truncated"] === true) {
-    fields.push({ labelKey: "row.body", value: "", valueKey: "row.truncated" });
-  }
-  return { tool, title: tool, fields };
+  return fetchRow(tool, url, projected);
 }
 
 /** 结果行用得到的参数键。视图是惰性的，只挑这几个读才不会物化整段参数 JSON。 */
@@ -326,11 +387,24 @@ function RowView(props: ToolCallViewProps & { readonly t: Translate }): ReactNod
   const { toolName, block, inspect, t } = props;
   const meta = resultMetaOf(props);
   const spec = buildRow(toolName, readArgs(block.args), meta);
+  // 状态只来自宿主真给的 statusCode：4xx/5xx 才着色，缺省与 2xx 都是主文字色。
+  const status =
+    isRecord(meta) && typeof meta["statusCode"] === "number" ? meta["statusCode"] : undefined;
+  const valueTone = status === undefined ? undefined : httpToneOf(status);
+  const truncated = isRecord(meta) && meta["truncated"] === true;
+  // 截断是「拿到了但只给了一部分」，既不是错误也不是完整成功；4xx 仍然只是警告，5xx 才升级成错误。
+  const tone = toolRowTone(props.phase, meta);
+  const badge =
+    status === undefined
+      ? undefined
+      : createElement(Badge, { tone: httpToneOf(status) }, String(status));
   const items = spec.fields.map((field) =>
     createElement(ToolRowItem, {
       key: field.labelKey,
       label: t(field.labelKey),
       value: field.valueKey === undefined ? field.value : t(field.valueKey),
+      ...(field.labelKey === "row.http" && valueTone !== undefined ? { tone: valueTone } : {}),
+      ...(field.labelKey === "row.body" && truncated ? { tone: "warn" } : {}),
     }),
   );
   const foot =
@@ -349,8 +423,54 @@ function RowView(props: ToolCallViewProps & { readonly t: Translate }): ReactNod
         );
   return createElement(
     ToolRow,
-    { name: spec.title, phase: props.phase, foot },
+    { name: spec.title, phase: props.phase, tone, badge, foot },
     createElement(ToolRowGrid, null, ...items),
+  );
+}
+
+/** 会话侧栏的抓取能力小节：读一次 runtime 状态，只显示包与解释器两项。 */
+function ScraplingPanelSection(props: {
+  readonly t: Translate;
+  readonly runtime: RuntimeReader | undefined;
+}): ReactNode {
+  const { t, runtime } = props;
+  const [snapshot, setSnapshot] = useState<RuntimeStatusResult | null>(null);
+  useEffect(() => {
+    let live = true;
+    const load = async (): Promise<void> => {
+      if (runtime === undefined) {
+        return;
+      }
+      try {
+        const next = await runtime.status();
+        if (live) {
+          setSnapshot(next);
+        }
+      } catch {
+        // 侧栏小节允许静默缺席：读不到就不画。
+      }
+    };
+    void load();
+    return () => {
+      live = false;
+    };
+  }, [runtime]);
+  if (runtime === undefined || snapshot === null) {
+    return null;
+  }
+  const ready = RUNTIME_PACKS.filter((pack) => snapshot.packs[pack] === "ready").length;
+  const python =
+    snapshot.python.version === "unknown"
+      ? t(pythonViaKey(snapshot.python.via))
+      : snapshot.python.version;
+  return createElement(
+    KpiGrid,
+    null,
+    createElement(KpiTile, {
+      label: t("panelPacks"),
+      value: `${ready}/${RUNTIME_PACKS.length}`,
+    }),
+    createElement(KpiTile, { label: t("panelPython"), value: python }),
   );
 }
 
@@ -379,7 +499,9 @@ interface ClientFace {
         order?: number;
         label?: () => string;
         locale?: string;
-        inject?: () => CardInject;
+        inject?: () =>
+          | CardInject
+          | { readonly t: Translate; readonly runtime: RuntimeReader | undefined };
       },
       render: (props: never) => unknown,
     ) => () => void;
@@ -559,6 +681,20 @@ function apply(ctx: ClientFace): void {
       disposeCard = ctx.slots.register(
         { name: "plugins.bundle.config", key: BUNDLE_PACKAGE_NAME, locale: LOCALE_NS },
         (props: CardProps) => createElement(SettingsCard, { ...props, ...cardInject() }),
+      );
+    });
+
+    // 会话侧栏小节：runtime 与卡片同一份读取器；读不到就整段缺席。
+    ctx.slots.inject("conversation.session.panel.section", () => {
+      ctx.slots.register(
+        {
+          name: "conversation.session.panel.section",
+          id: "scrapling-runtime",
+          order: 140,
+          label: () => t("navLabel"),
+          inject: () => ({ t, runtime }),
+        },
+        ScraplingPanelSection,
       );
     });
 

@@ -96,7 +96,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 | 依赖 | 版本 | 许可 | 引入方 |
 | --- | --- | --- | --- |
-| `@jayyuen66/dsh-plugin-shared` | catalog（根 ^0.2.12） | MIT | 设置卡的共享组件供应行与 shared 子路径 |
+| `@jayyuen66/dsh-plugin-shared` | catalog（根 ^0.2.13） | MIT | 设置卡的共享组件供应行与 shared 子路径 |
 | `scrapling` | 0.5 | BSD-3-Clause | Python sidecar |
 | `browserforge` | 1.2.4 | MIT | Scrapling 静态抓取的浏览器头生成 |
 | `apify-fingerprint-datapoints` | 0.15.0 | Apache-2.0 | browserforge 的指纹数据 |

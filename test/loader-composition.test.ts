@@ -233,6 +233,11 @@ async function load(dataDir: string): Promise<Loaded> {
   // ctx 了，之后再改不会传进去（app-boot 也是这个次序）。
   ctx.baseUrl = `${pathToFileHref()}/`;
   await ctx.plugin(Loader);
+  ctx.provide("sessionProjections", {
+    register: (): (() => void) => () => {
+      void 0;
+    },
+  });
   await ctx.plugin(SystemPrompt, {});
   await ctx.plugin(WebRuntime, {});
   await ctx.plugin(ToolRuntime, {});
@@ -461,11 +466,13 @@ describe("经真实 Loader 装载本插件", () => {
     // 另一条用正则扫全文取 name（会连注释与将来 config 里的 name 键一起算），两条职责重叠，
     // 补丁一演进就会静默失效。
     const text = await readFile(path.resolve(import.meta.dirname, "../cordis.patch.yml"), "utf8");
-    const rows = applyEntryPatches(
+    const composed = applyEntryPatches(
       [],
       [{ insert: insertRowsOfPatch(text) }],
       (): void => undefined,
     );
+    // alpha.2 的上游合成函数交回 `{ data, index }`（rc 线是裸数组）；两种形状都按同一条链读。
+    const rows = Array.isArray(composed) ? composed : composed.data;
     // 补丁含无 id 的 shared 供应行 + 本包一行；装载条目仍必须与补丁里的本包那一条同源。
     expect(rows).toStrictEqual([
       {

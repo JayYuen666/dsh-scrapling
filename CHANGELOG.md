@@ -6,6 +6,10 @@
 标准六类之外的小节（本仓的 `Boundaries` 收各版本的验证范围与能力边界，即哪些平台/档位真跑过、
 哪些只到本地夹具为止）。
 
+## 0.1.16
+
+宿主基线切到 `dsh 0.2.3-alpha.2`（Node `^24.22.3 || >=26.13.1`），shared 经 catalog 抬到 `^0.2.13`。MCP 客户端默认钉版与 doctor 的放行名单对齐 alpha.2（rc.5 / rc.1 只留给显式 `allow-version` 的旧 profile）；设置卡随 shared v3 视觉层更新，并新增 `ScraplingPanelSection` 与「就绪能力包 / 解释器」两项 KPI，客户端注册数与解释器测试同步。
+
 ## 0.1.15
 
 宿主基线抬到 `0.2.2-rc.5`；mcp server 自述版本对齐包版本；mcp-server 的字段读取收编 shared。

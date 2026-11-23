@@ -6,7 +6,15 @@
 import { describe, expect, it } from "vitest";
 import { TOOL_SPECS } from "../host.ts";
 import type { ToolCallViewProps } from "@deepseek-ai/dsh-client-ui-tool/client";
-import { apply, buildRow, inject, readArgs, resultMetaOf, ROW_TOOLS } from "../src/client-entry.ts";
+import {
+  apply,
+  buildRow,
+  inject,
+  readArgs,
+  resultMetaOf,
+  ROW_TOOLS,
+  toolRowTone,
+} from "../src/client-entry.ts";
 import {
   BUNDLE_PACKAGE_NAME,
   LOCALE_NS,
@@ -93,6 +101,7 @@ describe("buildRow", () => {
     expect(row.fields).toStrictEqual([
       { labelKey: "row.url", value: SAMPLE },
       { labelKey: "row.http", value: "200" },
+      { labelKey: "row.body", value: "", valueKey: "row.notTruncated" },
     ]);
   });
 
@@ -261,6 +270,26 @@ describe("readArgs", () => {
  * 宿主的 toolview props 把阶段写在顶层，`block` 是按阶段变形的联合。
  * 这一组期望写死成字面量：把判据改成从 `resultMetaOf` 反推，它就只是在复读自己。
  */
+describe("toolRowTone", () => {
+  it("5xx 是错误，4xx 与截断是警告，2xx 才是 ok", () => {
+    expect(toolRowTone("result", { statusCode: 200 })).toBe("ok");
+    expect(toolRowTone("result", { statusCode: 302 })).toBe("ok");
+    expect(toolRowTone("result", { statusCode: 403 })).toBe("warn");
+    expect(toolRowTone("result", { statusCode: 503 })).toBe("err");
+  });
+
+  it("截断把成功结果降成警告；5xx 仍优先于截断", () => {
+    expect(toolRowTone("result", { statusCode: 200, truncated: true })).toBe("warn");
+    expect(toolRowTone("result", { statusCode: 500, truncated: true })).toBe("err");
+  });
+
+  it("preparing / start 与没有状态码的结果都保持 mute，不猜成功", () => {
+    expect(toolRowTone("start", { statusCode: 200 })).toBe("mute");
+    expect(toolRowTone("result", { url: SAMPLE })).toBe("mute");
+    expect(toolRowTone("result", undefined)).toBe("mute");
+  });
+});
+
 describe("resultMetaOf", () => {
   it("只有 result 那一支才交回投影", () => {
     const meta = { statusCode: 200, url: SAMPLE };
@@ -695,8 +724,8 @@ describe("apply", () => {
     const first = registered.length;
     // 先钉「第一次确实登记满了」：一次都没注册时（标记没复位、claimApply 认为已应用过），
     // 下面那句「长度没变」照样成立 —— 那是最严重的坏形状，不能被当成幂等。
-    // +3 = 设置卡 + 设置页一级分区 + 导航图标（本包在客户端一共贡献这四个面）。
-    expect(first).toBe(ROW_TOOLS.length + 3);
+    // +4 = 设置卡 + 设置页一级分区 + 导航图标 + 会话侧栏小节（本包在客户端一共贡献五个面）。
+    expect(first).toBe(ROW_TOOLS.length + 4);
     apply(ctx as never);
     expect(registered).toHaveLength(first);
   });

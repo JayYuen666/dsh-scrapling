@@ -15,7 +15,7 @@ import {
 } from "react";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { localeDictionaries, SETTINGS_GROUPS } from "../src/settings-fields.ts";
-import { SettingsCard } from "../src/settings-card.ts";
+import { SettingsCard, jobStatusTone, packStateTone, pythonViaTone } from "../src/settings-card.ts";
 import type { CardProps, FormSource, FormState, PathOp } from "../src/settings-card.ts";
 import type { RuntimeReader } from "../src/runtime-reader.ts";
 import type { RuntimeActionResult, RuntimeStatusResult } from "../lib/runtime-shape.ts";
@@ -166,6 +166,15 @@ function fillTemplate(text: string, params: Record<string, unknown>): string {
 const t = (key: string, params?: Record<string, unknown>): string =>
   fillTemplate(zh[key] ?? key, params ?? {});
 
+/** 运行环境夹具里重复出现的机器标识与临时目录：三处用例共用一份，避免同一字面量三写。 */
+const MANAGED_VIA = "managed-venv";
+const MANAGED_PYTHON = {
+  path: "/tmp/runtime/venv/bin/python3",
+  via: MANAGED_VIA,
+  version: "3.14.9",
+} satisfies RuntimeStatusResult["python"];
+const CARD_DATA_DIR = "/tmp/dsh-scrapling-card-test";
+
 interface NodeProps {
   children?: unknown;
   className?: unknown;
@@ -279,7 +288,10 @@ function classNameOf(node: HostNode): string {
 }
 
 function statusText(tree: unknown): string {
-  const node = hostNodes(tree).find((host) => classNameOf(host).startsWith("dsu-status"));
+  const node = hostNodes(tree).find((host) => {
+    const className = classNameOf(host);
+    return className.startsWith("dsu-status") || className === "dsu-dirtyPill";
+  });
   return node === undefined ? "" : textOf(node.props.children);
 }
 
@@ -641,7 +653,9 @@ describe("scrapling 设置卡：渲染结构", () => {
   it("凭据字段默认遮罩，点「显示」后切成明文", () => {
     const { form } = formOf({ proxyUrl: "http://127.0.0.1:7890" });
     const card = mountCard({ ...PAGE, t, form });
-    const reveal = hostNodes(card.tree()).find((node) => classNameOf(node).includes("dss-reveal"));
+    const reveal = hostNodes(card.tree()).find((node) =>
+      classNameOf(node).includes("dsu-secretEye"),
+    );
     if (reveal === undefined) {
       throw new Error("找不到凭据字段的显示按钮");
     }
@@ -674,8 +688,8 @@ describe("scrapling 设置卡：渲染结构", () => {
     const status = {
       ok: true,
       packs: { core: "ready", browser: "missing" },
-      python: { path: "/tmp/runtime/venv/bin/python3", via: "managed-venv", version: "3.14.9" },
-      dataDir: "/tmp/dsh-scrapling-card-test",
+      python: MANAGED_PYTHON,
+      dataDir: CARD_DATA_DIR,
       jobsReady: false,
       job: null,
     } satisfies RuntimeStatusResult;
@@ -690,8 +704,47 @@ describe("scrapling 设置卡：渲染结构", () => {
     await flush();
     const text = textOf(card.tree());
     expect(text).toContain(t("runtime.via.managed-venv"));
-    expect(text).not.toContain("managed-venv");
+    expect(text).not.toContain(MANAGED_VIA);
     expect(text).not.toContain("runtime.via.");
+  });
+
+  it("运行环境三类检查行都带状态点，且状态映射与语义一致", async () => {
+    const status = {
+      ok: true,
+      packs: { core: "ready", browser: "missing", media: "corrupt" },
+      python: MANAGED_PYTHON,
+      dataDir: CARD_DATA_DIR,
+      jobsReady: false,
+      job: null,
+    } satisfies RuntimeStatusResult;
+    const reader: RuntimeReader = {
+      status: () => Promise.resolve(status),
+      install: actionMustNotRun,
+      repair: actionMustNotRun,
+      cancel: actionMustNotRun,
+    };
+    const { form } = formOf({});
+    const card = mountCard({ ...PAGE, t, form, runtime: reader });
+    await flush();
+    const tree = card.tree();
+    const dotOf = (field: string): string => {
+      const [line] = byField(tree, field);
+      if (line === undefined) {
+        throw new Error(`找不到状态行 ${field}`);
+      }
+      const dot = hostNodes(line).find((node) => classNameOf(node).startsWith("dsu-dot"));
+      return dot === undefined ? "" : classNameOf(dot);
+    };
+    expect(dotOf("runtime-python")).toContain("dsu-dotOk");
+    expect(dotOf("runtime-pack-core")).toContain("dsu-dotOk");
+    expect(dotOf("runtime-pack-browser")).toContain("dsu-dotMute");
+    expect(dotOf("runtime-pack-media")).toContain("dsu-dotErr");
+    expect(dotOf("runtime-jobs")).toContain("dsu-dotWarn");
+    // 值域映射单独钉住：新增状态却没配色调时，上面的渲染断言未必覆盖到。
+    expect(packStateTone("installing")).toBe("warn");
+    expect(pythonViaTone("managed")).toBe("warn");
+    expect(jobStatusTone("failed")).toBe("err");
+    expect(jobStatusTone("completed")).toBe("ok");
   });
 });
 
@@ -718,6 +771,7 @@ describe("scrapling 设置卡：保存回路", () => {
     const card = mountCard({ ...PAGE, t, form: fixture.form });
     change(card.tree(), "crawlMaxItems", "1.");
     expect(saveButton(card.tree()).props.disabled).toBe(true);
+    expect(byField(card.tree(), "discard")[0]?.props.disabled).toBe(false);
     expect(statusText(card.tree())).toContain(t("statusInvalid", { count: 1 }));
     click(saveButton(card.tree()));
     // 与其余用例同一形状：等一拍再断言「没发出写入」。这里原先不加等待就能过，
@@ -734,6 +788,21 @@ describe("scrapling 设置卡：保存回路", () => {
     click(saveButton(card.tree()));
     await flush();
     expect(fixture.calls[0]?.ops).toStrictEqual([{ op: "unset", path: ["crawlMaxItems"] }]);
+  });
+
+  it("改出去再改回宿主原值即回到干净态，卡顶不再重复状态行", () => {
+    const fixture = formOf({ crawlMaxItems: 1000 });
+    const card = mountCard({ ...PAGE, t, form: fixture.form });
+    expect(hostNodes(card.tree()).some((node) => classNameOf(node) === "dsu-statusbar")).toBe(
+      false,
+    );
+
+    change(card.tree(), "crawlMaxItems", "250");
+    expect(statusText(card.tree())).toContain(t("statusChanged", { count: 1 }));
+
+    change(card.tree(), "crawlMaxItems", "1000");
+    expect(statusText(card.tree())).toBe(t("statusClean"));
+    expect(saveButton(card.tree()).props.disabled).toBe(true);
   });
 
   it("宿主不受理 → 失败文案可见且草稿保留（保存仍可重试）", async () => {
@@ -775,7 +844,7 @@ describe("scrapling 设置卡：运行时轮询计时器的回收", () => {
       ok: true,
       packs: { core: "ready", browser: "ready" },
       python: { path: "/usr/bin/python3", via: "path", version: "3.14.0" },
-      dataDir: "/tmp/dsh-scrapling-card-test",
+      dataDir: CARD_DATA_DIR,
       jobsReady: true,
       job: { id: "job-0123456789abcdef", pack: "browser", status: "running", output: "" },
     } satisfies RuntimeStatusResult;

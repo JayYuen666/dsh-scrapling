@@ -11,8 +11,8 @@
   <a href="https://www.npmjs.com/package/@jayyuen66/dsh-scrapling"><img src="https://img.shields.io/npm/d18m/@jayyuen66/dsh-scrapling?style=flat-square" alt="npm downloads (total)" /></a>
   <a href="https://github.com/JayYuen666/dsh-scrapling/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-scrapling/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
-  <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.5-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/node-%5E24.22.3%7C%7C%3E%3D26.13.1-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.3--alpha.2-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -80,8 +80,8 @@ dsh plugin --profile web add @jayyuen66/dsh-scrapling
 
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-scrapling`。包在公共 npm registry 上，安装不需要凭据，也不需要 scoped-registry 配置行。
 
-- **需要 Node.js `>= 24.9`。** 本包是 ESM-only，且构建入口（`build-client.ts`、`build-host.ts`、`build-cli.ts`）由 `node` 直接执行，所以下限必须落在 TypeScript 类型剥离默认开启的那批版本上（Node 22.18 起）。数字本身取自宿主：`0.2.2` 系列宿主声明 Node `>= 24.9.0`，低于它的宿主根本起不来。
-- **需要宿主 `dsh` 处在 `0.2.2-rc.5` 或更新的 `0.2.2` 版本线。** 宿主真正读的是 `engines.dsh`（`^0.2.2-rc.5`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
+- **需要 Node.js `^24.22.3 || >=26.13.1`。** 本包是 ESM-only，且构建入口（`build-client.ts`、`build-host.ts`、`build-cli.ts`）由 `node` 直接执行，所以下限必须落在 TypeScript 类型剥离默认开启的那批版本上（Node 22.18 起）。这条范围本身取自宿主：`0.2.3` 线从 `alpha.2` 起声明 Node `^24.22.3 || >=26.13.1`（Node 25 不在其中），低于它的宿主根本起不来。
+- **需要宿主 `dsh` 处在 `0.2.3-alpha.2` 这条宿主线上。** 宿主真正读的是 `engines.dsh`（`^0.2.3-alpha.2`），且它**单独决定**；更新版本线的宿主会被拒，需要显式风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
 - **需要 Python 3.14+ 且装好 Scrapling** —— 由 `pythonBin` 指定，或按 `lib/runtime.ts` 的固定链找到：托管 venv `dataDir/runtime/venv` → 裸托管解释器 `dataDir/runtime/python/<版本>` → 仓内 `_env/.venv` → `PATH`。装出去的包里没有 `_env/.venv` 这一档，所以跑过 `setup --feature core --apply` 的机器用的是那个托管 venv，没装过就是你 `PATH` 上的 `python3`（Windows 上是 `python`）；选中哪一支会在装载时写进日志，缺 Scrapling 时报错里带着可直接照抄的安装命令。托管那两档不能互换：安装器先落一份托管 CPython，再用它建出 `runtime/venv`，所有 wheel（Scrapling、patchright、官方 MCP server）都装在 venv 里 —— 裸解释器里一个包都没有，拿它起 sidecar 会每个 import 都失败，而日志里那行路径看起来完全正常。
 
 ```sh
@@ -234,10 +234,10 @@ dsh-scrapling setup --status
 
 宿主有 `mcpManager` 服务时（rc.2 的 web/桌面组合包），插件在装载时把自己的 server 注册进去：不用装 `dsh-mcp-client`，也不用往 profile 加条目，只有 `mcpPort` 决定端点。下面的手工条目是给没有该服务的 CLI/headless profile 用的。升级上来的 profile 若还留着那条手工条目，切到动态注册时请把它删掉 —— 否则 manager 会因重名拒绝动态注册，实际仍由旧条目提供服务。
 
-要接进 dsh 需要 `@deepseek-ai/dsh-mcp-client`，本插件刻意不依赖它。装与宿主**逐版**相同的那一支 —— npm 的 `latest` 比宿主还旧，而客户端对宿主各包的 peer 是逐字同版，差一个预发布就会「装得上、永不生效」。默认是 `0.2.2-rc.5`；仍停在 rc.1 的宿主装 `0.2.2-rc.1`，`next` 跟官方 beta 线：
+要接进 dsh 需要 `@deepseek-ai/dsh-mcp-client`，本插件刻意不依赖它。装与宿主**逐版**相同的那一支 —— npm 的 `latest` 比宿主还旧，而客户端对宿主各包的 peer 是逐字同版，差一个预发布就会「装得上、永不生效」。默认是 `0.2.3-alpha.2`；仍停在 rc.1 的宿主装 `0.2.2-rc.1`，`next` 跟官方 beta 线：
 
 ```bash
-dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.2-rc.5
+dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.3-alpha.2
 ```
 
 再往那个 profile 的 `cordis.patch.yml` 加一条（没配 token 就不写 `headers`）：
@@ -270,7 +270,7 @@ dsh-scrapling setup --mode native --apply     # 写出的文件里一条条目�
 dsh-scrapling doctor --mode mcp --profile <profileDir>
 ```
 
-`doctor` 读的是 profile 自己写下的东西 —— `cordis.patch.yml` 加那份 `package.json` —— 每处问题打一行：`serverName: scrapling` 下有两条例目、本插件的条目与官方 `stdio` 那条并存、条目类型与模式不符、条目的端口与 `--port` 说的不一致、profile 里没有 `@deepseek-ai/dsh-mcp-client` 或它钉的不是 `0.2.2-rc.5` / `0.2.2-rc.1` / `next`、以及 `officialMcpEnabled` 关着却留着官方条目。退 `0` 是一致，`1` 是至少点出一处，`2` 是参数不对。`integrationMode` 本身是插件设置，CLI 读不到，所以 `--mode` 就是被核对的那一句声明，它必须和部署配置说的是同一件事。
+`doctor` 读的是 profile 自己写下的东西 —— `cordis.patch.yml` 加那份 `package.json` —— 每处问题打一行：`serverName: scrapling` 下有两条例目、本插件的条目与官方 `stdio` 那条并存、条目类型与模式不符、条目的端口与 `--port` 说的不一致、profile 里没有 `@deepseek-ai/dsh-mcp-client` 或它钉的不是 `0.2.3-alpha.2` / `0.2.2-rc.1` / `next`、以及 `officialMcpEnabled` 关着却留着官方条目。退 `0` 是一致，`1` 是至少点出一处，`2` 是参数不对。`integrationMode` 本身是插件设置，CLI 读不到，所以 `--mode` 就是被核对的那一句声明，它必须和部署配置说的是同一件事。
 
 `setup` 生成 `official-mcp` 条目要两处分开表态：profile 里的 `officialMcpEnabled: true`，以及命令行的 `--accept-risk`；缺任何一处只打 `OFFICIAL_MCP_DISABLED` / `RISK_NOT_ACCEPTED`，一个字节都不写。装载时的宿主侧路径只由 `officialMcpEnabled` 决定：有 `mcpManager` 的宿主直接动态注册托管的 `scrapling-mcp`，`setup` 生成的 `dsh-mcp-client` 条目则留给没有该服务的 CLI/headless profile。两条路径起的都是 `<dataDir>/runtime/venv/bin/scrapling-mcp`，所以要先跑 `setup --feature mcp --apply` —— 见[运行时能力包](#运行时能力包macos-arm64)。那枚二进制不存在时，`setup` 会额外打一行说明这条条目现在起不来。
 

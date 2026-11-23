@@ -214,6 +214,12 @@ interface RegisteredSkill {
 // 取值与「官方表里没有的名字交 undefined」的语义都来自它 —— 替身不再自编 2100 这类
 // 数字，下方 apply 注册段的 order 断言因此钉的是官方现值，宿主调整段落位置时跟着改。
 const promptContext = new Context();
+// oxlint-disable-next-line vitest/require-hook -- 这段注册是模块级测试上下文的一次性装配：SystemPrompt 在顶层 await 装载，放进 hook 就赶不上同一轮
+promptContext.provide("sessionProjections", {
+  register: (): (() => void) => () => {
+    void 0;
+  },
+});
 await promptContext.plugin(SystemPrompt, {});
 const officialPrompt = promptContext.systemPrompt;
 

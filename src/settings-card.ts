@@ -31,6 +31,8 @@ import { z } from "zod";
 import { RUNTIME_PACKS, packLabelKey, packStateKey, pythonViaKey } from "../lib/runtime-shape.ts";
 import type {
   PackState,
+  PythonVia,
+  RuntimeJobStatus,
   RuntimeJobView,
   RuntimePack,
   RuntimeStatusResult,
@@ -39,18 +41,23 @@ import type { RuntimeReader } from "./runtime-reader.ts";
 import { SETTINGS_FIELDS, SETTINGS_GROUPS } from "./settings-fields.ts";
 import type { FieldSpec, GroupSpec } from "./settings-fields.ts";
 import {
+  Callout,
   CardForm,
   Field,
   LogPanel,
   SaveBar,
   Section,
+  SecretField,
   SelectField,
-  StatusBar,
+  StatusDot,
   TextField,
+  ToggleCell,
   ToggleField,
+  ToggleGrid,
   ensureCardUiCss,
   splitHint,
 } from "@jayyuen66/dsh-plugin-shared/client";
+import type { DotTone } from "@jayyuen66/dsh-plugin-shared/client";
 
 /** 宿主 locale 服务给的翻译函数；键域是本包的字典键。 */
 export type Translate = (key: string, params?: Record<string, unknown>) => string;
@@ -267,15 +274,23 @@ export function buildOps(draft: Readonly<Record<string, unknown>>): PathOp[] {
 
 const BUTTON_CLASS = "dsu-btn";
 const STATUS_CLASS = "dsu-hint";
+/** 无远程读面/无作业后端时给用户照抄的命令；一处定义，面板正文与复制动作同源。 */
+const RUNTIME_CLI_COMMAND = "dsh-scrapling setup --feature <pack> --apply";
 
-/** 卡片样式：字段版式与控件外观由 @jayyuen66/dsh-plugin-shared/client 提供，这里只留本卡特有的运行环境区。 */
-const CARD_CSS = `
-.dss-secret{display:flex;gap:8px;align-items:center;width:100%}
-.dss-reveal{flex:none;white-space:nowrap}
-.dss-packs{display:flex;flex-direction:column;gap:8px}
-.dss-pack{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center}
-.dss-packActions{display:flex;gap:6px;grid-column:2;justify-content:flex-end}
-`;
+/**
+ * 作业状态的文案键。
+ *
+ * `job.status` 是协议里的英文 token（`completed` / `killed` / `failed` / `stopping`），
+ * 直接拼进「安装结束：{status}」会让中文卡面露出英文。这张表把每个档位接到自己的译文，
+ * `satisfies` 保证状态域新增一位时这里编译不过，而不是又退回裸 token。
+ */
+const JOB_STATUS_TEXT_KEYS = {
+  completed: "runtime.job.completed",
+  killed: "runtime.job.killed",
+  failed: "runtime.job.failed",
+  stopping: "runtime.job.stopping",
+  running: "runtime.job.running",
+} as const satisfies Record<RuntimeJobStatus, string>;
 
 /**
  * 本卡用到的 `document` 面。
@@ -361,12 +376,7 @@ export function installStyle(doc: DocumentFace, id: string, css: string): () => 
  * @returns 摘掉本次注入的样式
  */
 export function installStyles(doc: DocumentFace): () => void {
-  const disposeShared = ensureCardUiCss(doc);
-  const disposeOwn = installStyle(doc, "dsh-scrapling-settings-css", CARD_CSS);
-  return (): void => {
-    disposeOwn();
-    disposeShared();
-  };
+  return ensureCardUiCss(doc);
 }
 
 /**
@@ -384,90 +394,27 @@ export function controlType(field: FieldSpec, revealed: boolean): "text" | "pass
   return field.secret === true && !revealed ? "password" : "text";
 }
 
-/** 凭据型文本控件：密码框 + 显式「显示/隐藏」开关。 */
-function renderSecretControl(props: {
-  readonly field: FieldSpec;
-  readonly label: string;
-  readonly shown: string;
-  readonly disabled: boolean;
-  readonly revealed: boolean;
-  readonly onReveal: () => void;
-  readonly t: Translate;
-  readonly onChange: (raw: string) => void;
-}): ReactNode {
-  const { field, label, shown, disabled, revealed, onReveal, t, onChange } = props;
-  const input = createElement("input", {
-    type: controlType(field, revealed),
-    // 代理地址会被浏览器与密码管理器当成登录凭据：那会把部署方的代理密码收进一个
-    // 它根本不打算保管的地方，所以这里显式关掉自动填充。
-    autoComplete: "off",
-    spellCheck: false,
-    className: "dsu-input",
-    value: shown,
-    disabled,
-    "data-field": field.key,
-    "aria-label": label,
-    onChange: (event: { target: { value: string } }): void => {
-      onChange(event.target.value);
-    },
-  });
-  const reveal = createElement(
-    "button",
-    {
-      type: "button",
-      className: "dsu-btn dss-reveal",
-      disabled,
-      "aria-pressed": revealed,
-      "aria-label": label,
-      onClick: (): void => {
-        onReveal();
-      },
-    },
-    t(revealed ? "conceal" : "reveal"),
-  );
-  return createElement("div", { className: "dss-secret" }, input, reveal);
-}
-
-/** 数字控件保留「原文进出」语义：非法输入留在框里、由 parseInput 判，保存因此被挡住。 */
-function renderNumberControl(props: {
-  readonly field: FieldSpec;
-  readonly label: string;
-  readonly shown: string;
-  readonly disabled: boolean;
-  readonly onChange: (raw: string) => void;
-}): ReactNode {
-  const { field, label, shown, disabled, onChange } = props;
-  return createElement("input", {
-    // text + inputMode 而不是 type=number：后者的值由浏览器清洗，粘贴非数字或只敲一个
-    // `-`/`e` 时 event.target.value 会变成空串，于是 parseInput 判 clear、buildOps 生成
-    // unset —— 用户输错一位就把自己那条覆盖静默删掉。text 把原文完整交回来。
-    type: "text",
-    inputMode: "numeric",
-    className: "dsu-input",
-    value: shown,
-    disabled,
-    "data-field": field.key,
-    "aria-label": label,
-    onChange: (event: { target: { value: string } }): void => {
-      onChange(event.target.value);
-    },
-  });
-}
-
 /** 一行：共享字段组件负责行式版式与 label↔control 关联。 */
-function renderFieldRow(props: {
+function FieldRow(props: {
   readonly field: FieldSpec;
   readonly t: Translate;
   readonly shown: string;
+  readonly invalidText: string | undefined;
   readonly disabled: boolean;
-  readonly revealed: boolean;
-  readonly onReveal: () => void;
+  readonly revealToken: number;
   readonly onChange: (raw: string) => void;
 }): ReactNode {
-  const { field, t, shown, disabled, revealed, onReveal, onChange } = props;
+  const { field, t, shown, invalidText, disabled, revealToken, onChange } = props;
   const label = t(`field.${field.key}.label`);
   const hint = splitHint(t(`field.${field.key}.hint`));
-  const common = { label, ...hint, field: field.key, disabled };
+  const common = {
+    label,
+    ...hint,
+    field: field.key,
+    disabled,
+    ...(invalidText === undefined ? {} : { invalidText }),
+  };
+  const numberId = `scrapling-${field.key}`;
   if (field.kind === "boolean") {
     return createElement(ToggleField, {
       ...common,
@@ -486,66 +433,115 @@ function renderFieldRow(props: {
     });
   }
   if (field.secret === true) {
-    return createElement(
-      Field,
-      common,
-      renderSecretControl({ field, label, shown, disabled, revealed, onReveal, t, onChange }),
-    );
+    return createElement(SecretField, {
+      ...common,
+      value: shown,
+      revealToken,
+      onChange,
+    });
   }
   if (field.kind === "number") {
+    const describedBy = [
+      hint.detail === undefined ? undefined : `${numberId}-hint`,
+      invalidText === undefined ? undefined : `${numberId}-err`,
+    ]
+      .filter((part) => part !== undefined)
+      .join(" ");
     return createElement(
       Field,
-      common,
-      renderNumberControl({ field, label, shown, disabled, onChange }),
+      { ...common, controlId: numberId },
+      createElement("input", {
+        // text + inputMode 而不是 type=number：后者的值由浏览器清洗，粘贴非数字或只敲一个
+        // `-`/`e` 时 event.target.value 会变成空串，于是 parseInput 判 clear、buildOps 生成
+        // unset —— 用户输错一位就把自己那条覆盖静默删掉。text 把原文完整交回来。
+        id: numberId,
+        type: "text",
+        inputMode: "numeric",
+        className: "dsu-input",
+        value: shown,
+        disabled,
+        "data-field": field.key,
+        "aria-describedby": describedBy.length === 0 ? undefined : describedBy,
+        "aria-invalid": invalidText === undefined ? undefined : true,
+        "aria-errormessage": invalidText === undefined ? undefined : `${numberId}-err`,
+        onChange: (event: { target: { value: string } }): void => {
+          onChange(event.target.value);
+        },
+      }),
     );
   }
   return createElement(TextField, { ...common, value: shown, onChange });
 }
 
-/** 一组字段。 */
-function renderGroup(props: {
+/** 一组字段：成组布尔项用紧凑双列，其余保持单列。 */
+function FieldGroup(props: {
   readonly group: GroupSpec;
   readonly t: Translate;
   readonly shown: (field: FieldSpec) => string;
+  readonly invalidText: (field: FieldSpec) => string | undefined;
   readonly disabled: boolean;
-  readonly revealed: (field: FieldSpec) => boolean;
-  readonly onReveal: (field: FieldSpec) => void;
+  readonly revealToken: number;
   readonly onChange: (field: FieldSpec, raw: string) => void;
 }): ReactNode {
-  const { group, t, shown, disabled, revealed, onReveal, onChange } = props;
+  const { group, t, shown, invalidText, disabled, revealToken, onChange } = props;
+  const bools = group.fields.filter((field) => field.kind === "boolean");
+  const rows = group.fields.map((field) =>
+    createElement(FieldRow, {
+      key: field.key,
+      field,
+      t,
+      shown: shown(field),
+      invalidText: invalidText(field),
+      disabled,
+      revealToken,
+      onChange: (raw) => {
+        onChange(field, raw);
+      },
+    }),
+  );
+  const body =
+    bools.length >= 2 && bools.length === group.fields.length
+      ? createElement(
+          ToggleGrid,
+          null,
+          group.fields.map((field) => {
+            const error = invalidText(field);
+            return createElement(ToggleCell, {
+              key: field.key,
+              label: t(`field.${field.key}.label`),
+              ...splitHint(t(`field.${field.key}.hint`)),
+              field: field.key,
+              disabled,
+              checked: shown(field) === "true",
+              ...(error === undefined ? {} : { invalidText: error }),
+              onChange: (next: boolean) => {
+                onChange(field, String(next));
+              },
+            });
+          }),
+        )
+      : rows;
   return createElement(
     Section,
     { title: t(`group.${group.id}.title`), hint: t(`group.${group.id}.note`) },
-    group.fields.map((field) =>
-      renderFieldRow({
-        field,
-        t,
-        shown: shown(field),
-        disabled,
-        revealed: revealed(field),
-        onReveal: () => {
-          onReveal(field);
-        },
-        onChange: (raw) => {
-          onChange(field, raw);
-        },
-      }),
-    ),
+    body,
   );
 }
 
-/** 顶部那行状态说明。拆成函数是为了不在 JSX 里套三元。 */
-function statusLine(t: Translate, state: FormState, changed: number, invalid: number): string {
-  if (state.status === "loading") {
-    return t("statusLoading");
-  }
-  if (invalid > 0) {
-    return t("statusInvalid", { count: invalid });
-  }
-  if (state.status === "unavailable" || !state.writable) {
-    return t("statusReadonly");
-  }
-  return changed === 0 ? t("statusClean") : t("statusChanged", { count: changed });
+/** 用户把控件改回宿主当前显示的那一值时，这一笔不应再被算成草稿。
+ *
+ *  判断用「显示值」而不是原始存储值：宿主缺席时显示的是字段默认值，用户把它敲回去
+ *  同样是回到原样；而 `buildOps` 里 `fallback` 也会走 unset，留着它只会让保存条一直
+ *  报一项改动、点保存却写了一条没有实际变化的操作。
+ */
+function matchesHostDisplay(
+  field: FieldSpec,
+  value: unknown,
+  host: Record<string, unknown> | undefined,
+): boolean {
+  const current = host?.[field.key];
+  const currentText = current === undefined ? String(field.fallback) : textOf(current);
+  return textOf(value) === currentText;
 }
 
 /** 用户的未保存改动，以及它们所依据的那一版宿主配置。 */
@@ -596,7 +592,8 @@ function renderActions(props: {
 }): ReactNode {
   const { t, saving, editable, changed, invalid, onSave, onUndo } = props;
   return createElement(SaveBar, {
-    dirty: changed > 0 && invalid === 0,
+    dirty: changed > 0,
+    blocked: invalid > 0,
     busy: saving,
     writable: editable,
     error: invalid > 0 ? t("statusInvalid", { count: invalid }) : null,
@@ -615,7 +612,10 @@ function renderActions(props: {
 interface RuntimeState {
   snapshot: RuntimeStatusResult | null;
   busy: string;
+  /** 安装 / 修复 / 取消这三个动作的失败。 */
   failure: string;
+  /** 状态读取的失败：与动作失败分开，卡面文案不同（不是「安装失败」）。 */
+  readFailure: string;
   act: (pack: RuntimePack, mode: "install" | "repair") => void;
   cancel: () => void;
 }
@@ -633,6 +633,7 @@ function useRuntime(reader: RuntimeReader | undefined): RuntimeState {
   const [snapshot, setSnapshot] = useState<RuntimeStatusResult | null>(null);
   const [busy, setBusy] = useState("");
   const [failure, setFailure] = useState("");
+  const [readFailure, setReadFailure] = useState("");
   // 读取接口的请求序号：轮询、动作后的回读与初始装载会同时在途，晚返回的**旧**响应不能覆盖
   // 新快照（作业状态会因此倒退）。只认最后发出的那一笔。
   const requestSeq = useRef(0);
@@ -648,12 +649,12 @@ function useRuntime(reader: RuntimeReader | undefined): RuntimeState {
         return;
       }
       setSnapshot(next);
-      setFailure("");
+      setReadFailure("");
     } catch (error) {
       if (seq !== requestSeq.current) {
         return;
       }
-      setFailure(String(error));
+      setReadFailure(String(error));
     }
   }, [reader]);
   const running = snapshot?.job?.status === "running" || snapshot?.job?.status === "stopping";
@@ -722,7 +723,85 @@ function useRuntime(reader: RuntimeReader | undefined): RuntimeState {
       }
     })();
   }, [reader, refresh, snapshot]);
-  return { snapshot, busy, failure, act, cancel };
+  return { snapshot, busy, failure, readFailure, act, cancel };
+}
+
+/** 能力包状态 → 状态点：就绪为 ok，安装中为 warn，坏掉为 err，未装/占用中为 mute。
+ *  用 `satisfies Record<...>` 钉住值域：新增 PackState 而没配状态点会编译失败。 */
+const PACK_STATE_TONES = {
+  ready: "ok",
+  missing: "mute",
+  corrupt: "err",
+  installing: "warn",
+  blocked: "mute",
+} satisfies Record<PackState, DotTone>;
+
+export function packStateTone(state: PackState | null): DotTone {
+  return state === null ? "mute" : PACK_STATE_TONES[state];
+}
+
+/** 解释器来源 → 状态点：托管 venv / 显式配置 / 仓内 venv / PATH 都能用；只有裸托管
+ *  CPython（`managed`，包里一只依赖都没有）是 warn。 */
+const PYTHON_VIA_TONES = {
+  configured: "ok",
+  "managed-venv": "ok",
+  managed: "warn",
+  repo: "ok",
+  path: "ok",
+} satisfies Record<PythonVia, DotTone>;
+
+export function pythonViaTone(via: PythonVia): DotTone {
+  return PYTHON_VIA_TONES[via];
+}
+
+/** 作业状态 → 状态点：进行中/停止中为 warn，完成为 ok，失败为 err，被取消为 mute。 */
+const JOB_STATUS_TONES = {
+  running: "warn",
+  stopping: "warn",
+  completed: "ok",
+  killed: "mute",
+  failed: "err",
+} satisfies Record<RuntimeJobStatus, DotTone>;
+
+export function jobStatusTone(status: RuntimeJobStatus): DotTone {
+  return JOB_STATUS_TONES[status];
+}
+
+/** 状态行：一颗 8px 状态点 + 一段说明。第三方运行时（Python / 能力包 / 作业）的检查
+ *  结论都走这一种行；点只做视觉锚点，语义由紧邻的文字承担，因此不重复给 aria-label。 */
+function statusLine(tone: DotTone, content: ReactNode, field: string): ReactNode {
+  return createElement(
+    "div",
+    { className: "dsu-inlineRow", "data-field": field },
+    createElement(StatusDot, { tone }),
+    content,
+  );
+}
+
+/** 解释器 + 数据目录：第三方运行时的第一条检查行。 */
+function renderRuntimeInfo(t: Translate, snapshot: RuntimeStatusResult): ReactNode {
+  const pythonViaText = t(pythonViaKey(snapshot.python.via));
+  const pythonLine = `${t("runtimePython")}: ${snapshot.python.path} (${pythonViaText})`;
+  const dataDirLine = `${t("runtimeDataDir")}: ${snapshot.dataDir}`;
+  return statusLine(
+    pythonViaTone(snapshot.python.via),
+    createElement("p", { className: STATUS_CLASS }, pythonLine, createElement("br"), dataDirLine),
+    "runtime-python",
+  );
+}
+
+/** 当前/上一次安装作业：第二条检查行（状态点随 running/stopping/completed/failed/killed 变）。 */
+function renderRuntimeJob(t: Translate, job: RuntimeJobView, running: boolean): ReactNode {
+  const jobPack = t(packLabelKey(job.pack));
+  const jobEndText = t(JOB_STATUS_TEXT_KEYS[job.status]);
+  const jobText = running
+    ? t("runtimeJobRunning", { pack: jobPack })
+    : t("runtimeJobEnded", { status: jobEndText });
+  return statusLine(
+    jobStatusTone(job.status),
+    createElement("p", { className: STATUS_CLASS }, jobText),
+    "runtime-job",
+  );
 }
 
 /** 一条能力包：名称、状态与两个动作。 */
@@ -739,6 +818,12 @@ function renderPackRow(props: {
   const { pack, state, t, disabled, running, activePack, onAct, onCancel } = props;
   const stateText = state === null ? t("statusLoading") : t(packStateKey(state));
   const packLabel = t(packLabelKey(pack));
+  const stateTone = packStateTone(state);
+  const stateLine = statusLine(
+    stateTone,
+    createElement("p", { className: STATUS_CLASS }, stateText),
+    `runtime-pack-${pack}`,
+  );
   const rowDisabled =
     disabled || running || state === null || state === "blocked" || state === "installing";
   const actions: ReactNode[] = [
@@ -748,6 +833,7 @@ function renderPackRow(props: {
         type: "button",
         className: BUTTON_CLASS,
         key: "install",
+        "aria-label": `${packLabel} · ${t("runtimeInstall")}`,
         disabled: rowDisabled || state === "ready",
         onClick: (): void => {
           onAct(pack, "install");
@@ -761,6 +847,7 @@ function renderPackRow(props: {
         type: "button",
         className: BUTTON_CLASS,
         key: "repair",
+        "aria-label": `${packLabel} · ${t("runtimeRepair")}`,
         disabled: rowDisabled || state === "missing",
         onClick: (): void => {
           onAct(pack, "repair");
@@ -777,6 +864,7 @@ function renderPackRow(props: {
           type: "button",
           className: BUTTON_CLASS,
           key: "cancel",
+          "aria-label": `${packLabel} · ${t("runtimeCancel")}`,
           disabled,
           onClick: onCancel,
         },
@@ -786,14 +874,18 @@ function renderPackRow(props: {
   }
   return createElement(
     "div",
-    { className: "dss-pack", key: pack },
+    { className: "dsu-field dsu-fieldRow", key: pack },
     createElement(
       "div",
-      null,
+      { className: "dsu-fieldMeta" },
       createElement("div", { className: "dsu-label" }, packLabel),
-      createElement("p", { className: STATUS_CLASS }, stateText),
+      stateLine,
     ),
-    createElement("div", { className: "dss-packActions" }, ...actions),
+    createElement(
+      "div",
+      { className: "dsu-control" },
+      createElement("div", { className: "dsu-actions" }, ...actions),
+    ),
   );
 }
 
@@ -804,18 +896,44 @@ function renderRuntime(props: {
   readonly snapshot: RuntimeStatusResult | null;
   readonly busy: string;
   readonly failure: string;
+  readonly readFailure: string;
   readonly onAct: (pack: RuntimePack, mode: "install" | "repair") => void;
   readonly onCancel: () => void;
 }): ReactNode {
-  const { reader, t, snapshot, busy, failure, onAct, onCancel } = props;
-  const command = createElement(LogPanel, null, "dsh-scrapling setup --feature <pack> --apply");
+  const { reader, t, snapshot, busy, failure, readFailure, onAct, onCancel } = props;
+  const command = createElement(
+    LogPanel,
+    {
+      label: t("runtimeCommandLabel"),
+      copyText: RUNTIME_CLI_COMMAND,
+      copyLabel: t("copy"),
+      copiedLabel: t("copied"),
+    },
+    RUNTIME_CLI_COMMAND,
+  );
+  const readFailureLine =
+    readFailure === ""
+      ? null
+      : createElement(
+          "div",
+          { role: "alert", "aria-live": "assertive" },
+          createElement(
+            Callout,
+            { tone: "err", field: "runtime-read-failure" },
+            t("runtimeReadFailed", { reason: readFailure }),
+          ),
+        );
   const failureLine =
     failure === ""
       ? null
       : createElement(
-          "p",
-          { className: `${STATUS_CLASS} dsu-error`, role: "alert" },
-          t("runtimeError", { reason: failure }),
+          "div",
+          { role: "alert", "aria-live": "assertive" },
+          createElement(
+            Callout,
+            { tone: "err", field: "runtime-failure" },
+            t("runtimeError", { reason: failure }),
+          ),
         );
   if (reader === undefined) {
     return createElement(
@@ -828,29 +946,12 @@ function renderRuntime(props: {
   const jobsReady = snapshot?.jobsReady ?? false;
   const job: RuntimeJobView | null = snapshot?.job ?? null;
   const running = job !== null && (job.status === "running" || job.status === "stopping");
-  const info =
-    snapshot === null
-      ? null
-      : createElement(
-          "p",
-          { className: STATUS_CLASS },
-          `${t("runtimePython")}: ${snapshot.python.path} (${t(pythonViaKey(snapshot.python.via))})`,
-          createElement("br"),
-          `${t("runtimeDataDir")}: ${snapshot.dataDir}`,
-        );
-  const jobPack = job === null ? "" : t(packLabelKey(job.pack));
-  const jobLine =
-    job === null
-      ? null
-      : createElement(
-          "p",
-          { className: STATUS_CLASS },
-          running
-            ? t("runtimeJobRunning", { pack: jobPack })
-            : t("runtimeJobEnded", { status: job.status }),
-        );
+  const info = snapshot === null ? null : renderRuntimeInfo(t, snapshot);
+  const jobLine = job === null ? null : renderRuntimeJob(t, job, running);
   const jobOutput =
-    job === null || job.output === "" ? null : createElement(LogPanel, null, job.output);
+    job === null || job.output === ""
+      ? null
+      : createElement(LogPanel, { semanticLines: true }, job.output);
   const disabled = busy !== "" || !jobsReady || snapshot === null;
   // 缺键按「未安装」呈现，**不是**「正在读取」：`snapshot` 非空而某个包缺键，成因只有两种
   // ——宿主读状态失败后退成空对象（`lib/runtime-remote.ts` 的 `packsOrEmpty` 降级），或
@@ -870,12 +971,17 @@ function renderRuntime(props: {
       onCancel,
     }),
   );
+  const jobsMissingText = t("runtimeJobsMissing");
   const cliHint =
     snapshot !== null && !jobsReady
       ? createElement(
           "div",
           null,
-          createElement("p", { className: STATUS_CLASS }, t("runtimeJobsMissing")),
+          statusLine(
+            "warn",
+            createElement("p", { className: STATUS_CLASS }, jobsMissingText),
+            "runtime-jobs",
+          ),
           command,
         )
       : null;
@@ -883,10 +989,11 @@ function renderRuntime(props: {
     Section,
     { title: t("runtimeTitle"), hint: t("runtimeHint") },
     info,
+    readFailureLine,
     failureLine,
     jobLine,
     jobOutput,
-    createElement("div", { className: "dss-packs" }, ...rows),
+    createElement("div", { className: "dsu-stack" }, ...rows),
     cliHint,
   );
 }
@@ -933,7 +1040,7 @@ export function SettingsCard(props: CardProps): ReactNode {
   const [failure, setFailure] = useState("");
   const [saving, setSaving] = useState(false);
   // 已被用户点开「显示」的凭据型字段。默认空 —— 页面上一眼能看到的仍然是圆点。
-  const [revealed, setRevealed] = useState<readonly string[]>([]);
+  const [revealToken, setRevealToken] = useState(0);
   // 宿主那边改了值（别处保存、或本卡这笔写完之后回读）要把卡跟着换掉。
   // ⚠ 这条 hook 必须留在下面那个早退之前：React 按调用顺序配对 hook，早退把 useStates
   // 之外的这一枚跳掉，下一次渲染就错位了。
@@ -978,25 +1085,29 @@ export function SettingsCard(props: CardProps): ReactNode {
         return { values, baseRevision, invalid: [...invalid, field.key], invalidText };
       }
       Reflect.deleteProperty(invalidText, field.key);
-      values[field.key] = parsed.kind === "clear" ? null : parsed.value;
-      return { values, baseRevision, invalid, invalidText };
+      // 还原成宿主当前值（或宿主缺席时的默认值）不是改动：删掉这一笔草稿，
+      // 否则用户改出去再改回来，卡上会永远挂着「已改动 1 项」。
+      const nextValue = parsed.kind === "clear" ? null : parsed.value;
+      if (matchesHostDisplay(field, nextValue, state.value)) {
+        Reflect.deleteProperty(values, field.key);
+      } else {
+        values[field.key] = nextValue;
+      }
+      return Object.keys(values).length === 0 && invalid.length === 0
+        ? EMPTY_DRAFT
+        : { values, baseRevision, invalid, invalidText };
     });
   };
   const groups = SETTINGS_GROUPS.map((group) =>
-    renderGroup({
+    createElement(FieldGroup, {
+      key: group.id,
       group,
       t,
       shown: (field) => displayValue(field, state.value, draft.values, draft.invalidText),
+      invalidText: (field) => draft.invalidText[field.key],
       // 保存期间连控件一起锁：否则用户在 await 期间改了别的字段，成功后那笔改动会被清掉。
       disabled: !editable || saving,
-      revealed: (field) => revealed.includes(field.key),
-      onReveal: (field) => {
-        setRevealed((previous) =>
-          previous.includes(field.key)
-            ? previous.filter((key) => key !== field.key)
-            : [...previous, field.key],
-        );
-      },
+      revealToken,
       onChange: onFieldChange,
     }),
   );
@@ -1013,29 +1124,21 @@ export function SettingsCard(props: CardProps): ReactNode {
       setDraft(EMPTY_DRAFT);
       // 遮罩状态跟草稿一起回到干净起点：撤销之后字段显示的是宿主那一版，值已不再是用户
       // 刚敲的凭据，继续「显示」只会在屏幕上多留一份明文。
-      setRevealed([]);
+      setRevealToken((previous) => previous + 1);
       setFailure("");
     },
-  });
-  const status = createElement(StatusBar, {
-    items: [statusLine(t, state, ops.length, draft.invalid.length)],
   });
   const reported =
     failure === ""
       ? null
       : createElement(
-          "p",
-          {
-            className: "dsu-error",
-            role: "alert",
-            "aria-live": "assertive",
-          },
-          failure,
+          "div",
+          { role: "alert", "aria-live": "assertive" },
+          createElement(Callout, { tone: "err", field: "save-error" }, failure),
         );
   return createElement(
     CardForm,
     null,
-    status,
     reported,
     ...groups,
     renderRuntime({
@@ -1044,6 +1147,7 @@ export function SettingsCard(props: CardProps): ReactNode {
       snapshot: runtime.snapshot,
       busy: runtime.busy,
       failure: runtime.failure,
+      readFailure: runtime.readFailure,
       onAct: runtime.act,
       onCancel: runtime.cancel,
     }),

@@ -471,29 +471,25 @@ describe("buildOps", () => {
 });
 
 describe("样式挂载", () => {
-  it("首次挂载注入共享与自有各一段 style，并交出摘掉它们的函数", () => {
+  it("首次挂载只注入共享样式，并交出摘掉它的函数", () => {
     const doc = fakeDocument(false);
     const dispose = installStyles(doc);
-    expect(doc.appended.map((tag) => tag.id)).toStrictEqual([
-      "dsh-card-ui-css",
-      "dsh-scrapling-settings-css",
-    ]);
-    const [shared, own] = doc.appended;
+    expect(doc.appended.map((tag) => tag.id)).toStrictEqual(["dsh-card-ui-css"]);
+    const [shared] = doc.appended;
     dispose();
-    // installStyles 先摘自有样式，再释放共享样式；顺序是 disposer 的实现契约。
-    expect(doc.removed).toStrictEqual([own, shared]);
+    expect(doc.removed).toStrictEqual([shared]);
   });
 
   it("同一 id 注入两次只留一套：第二个 disposer 不抢第一个的活", () => {
     const doc = fakeDocument(false);
     const first = installStyles(doc);
     const second = installStyles(doc);
-    expect(doc.appended).toHaveLength(2);
-    const [shared, own] = doc.appended;
+    expect(doc.appended).toHaveLength(1);
+    const [shared] = doc.appended;
     second();
     expect(doc.removed).toStrictEqual([]);
     first();
-    expect(doc.removed).toStrictEqual([own, shared]);
+    expect(doc.removed).toStrictEqual([shared]);
   });
 
   it("已经在文档里就跳过，不重复注入，摘除函数也不该动别人的东西", () => {
