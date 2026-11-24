@@ -15,6 +15,7 @@
 // **返回值一律是 `unknown`**：sidecar 的载荷是跨语言的 JSON，宿主不该凭信任就断言形状。
 // 工具层必须自己校验；多这一次校验换来的是「Python 侧改坏协议不会静默污染模型上下文」。
 
+import type { Writable } from "node:stream";
 import type { Context } from "@deepseek-ai/cordis";
 import type { SubprocessHandle } from "@deepseek-ai/dsh-subprocess";
 import { z } from "zod";
@@ -49,6 +50,10 @@ export interface SidecarCapabilities {
   readonly extract: boolean;
   /** patchright 浏览器是否就绪。0.5 起浏览器抓取只剩这一套，所以只有这一项。 */
   readonly browser: boolean;
+  /** Scrapling 是否支持 RemoteSession；旧端点上缺这一位时按 false 处理。 */
+  readonly remote?: boolean;
+  /** 可选 pypdf 是否可导入；false 时不注册 PDF 阅读工具。 */
+  readonly documents: boolean;
   /**
    * WebSocket 握手拦不拦得住（旧 Playwright 没有 `route_web_socket` 时是 `false`）。
    *
@@ -124,7 +129,8 @@ export interface CallOptions {
    * 覆盖本次调用的超时；传 null 表示**不设超时**。
    *
    * 爬虫这种量级不定的任务不能用固定超时 —— 30 秒的预算套到一次几分钟的爬取上，
-   * 会让每次成功都在最后一刻被判超时，然后整个进程被拆掉重来。
+   * 会让每次成功都在最后一刻被判超时。普通超时只作废当前请求并通知 Python 取消，
+   * 不拆除共享进程。
    */
   readonly timeoutMs?: number | null;
 }
@@ -133,6 +139,7 @@ export interface CallOptions {
 interface Pending {
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: unknown) => void;
+  readonly cancel: () => void;
   timer: ReturnType<typeof setTimeout> | undefined;
   detachAbort: (() => void) | undefined;
 }
@@ -166,6 +173,8 @@ const CAPABILITIES_SCHEMA = z.object({
   static: z.preprocess((value) => value === true, z.boolean()),
   extract: z.preprocess((value) => value === true, z.boolean()),
   browser: z.preprocess((value) => value === true, z.boolean()),
+  remote: z.preprocess((value) => value === true, z.boolean()),
+  documents: z.preprocess((value) => value === true, z.boolean()),
   writeMethods: z.preprocess((value) => value === true, z.boolean()),
   websocketGuard: z.preprocess(
     (value) => (typeof value === "boolean" ? value : undefined),
@@ -186,6 +195,8 @@ const EMPTY_CAPABILITIES: SidecarCapabilities = {
   static: false,
   extract: false,
   browser: false,
+  remote: false,
+  documents: false,
   writeMethods: false,
 };
 
@@ -208,6 +219,8 @@ export function parseCapabilities(value: unknown): SidecarCapabilities {
     static: staticCapability,
     extract,
     browser,
+    remote,
+    documents,
     writeMethods,
     websocketGuard,
     version,
@@ -218,6 +231,8 @@ export function parseCapabilities(value: unknown): SidecarCapabilities {
     static: staticCapability,
     extract,
     browser,
+    remote,
+    documents,
     writeMethods,
     ...(websocketGuard === undefined ? {} : { websocketGuard }),
     ...(version === undefined ? {} : { version }),
@@ -313,6 +328,15 @@ export class SidecarClient {
     }
   }
 
+  /** 写一整帧；管道写失败属于协议故障，仍走统一的进程回收。 */
+  #writeFrame(stdin: Writable, frame: string, label: string): void {
+    try {
+      stdin.write(frame);
+    } catch (error) {
+      void this.#teardown(`failed to send ${label}: ${String(error)}`, "SIDECAR_CRASHED");
+    }
+  }
+
   /** 放弃所有在途请求：进程没了，继续等下去没有意义。 */
   #rejectAll(error: SidecarError): void {
     const entries = Array.from(this.#pending.values());
@@ -370,12 +394,19 @@ export class SidecarClient {
     entry.reject(new SidecarError(code, asText(message, "unknown sidecar error"), details));
   }
 
-  #onFrame(line: string): void {
+  #onFrame(line: string, origin: SubprocessHandle): void {
     let frame: Record<string, unknown>;
     try {
       frame = decodeFrame(line);
     } catch (error) {
-      this.#log(`[sidecar] unparsable frame: ${String(error)}`);
+      // 普通请求超时不再回收进程，坏帧若只被跳过，同一代后续请求会永远等不到配对响应。
+      // 解码失败说明协议流已不可信，必须作废全部在途请求并换代；origin 防止旧代晚到事件
+      // 误拆已经拉起的新一代。
+      void this.#teardown(
+        `sidecar frame decode failed: ${String(error)}`,
+        "SIDECAR_CRASHED",
+        origin,
+      );
       return;
     }
     if (frame["event"] === "ready") {
@@ -492,6 +523,10 @@ export class SidecarClient {
     });
   }
 
+  #isLiveGeneration(child: SubprocessHandle): boolean {
+    return this.#handle === child && !this.#stopped;
+  }
+
   async #spawnOnce(): Promise<SidecarCapabilities> {
     // 这里不再判 ctx.subprocess 是否存在：插件的 inject 里声明了 subprocess，
     // 没有对应 provider 时 apply 根本不会被调用。真要在单测里跑，就把一个假的
@@ -525,7 +560,7 @@ export class SidecarClient {
     this.#stopPump = pumpFrames(
       stdout,
       (line) => {
-        this.#onFrame(line);
+        this.#onFrame(line, child);
       },
       // 管道报错、帧超限或帧处理抛错都归到这里。少一个 error 监听时这些都是未捕获异常，
       // 会直接掀翻宿主进程，所以这里把 sidecar 拆掉，并让在途请求以一个明确的错误收场。
@@ -559,6 +594,11 @@ export class SidecarClient {
     );
 
     const ready = await this.#waitForReady(this.#options.handshakeTimeoutMs);
+    // ready 的 Promise 兑现不会暂停同一 chunk 的后续帧；坏帧可能已经拆掉这一代，
+    // 或 dispose 已经把它标记为停止。只有仍存活且仍是当前句柄的世代可以安装能力。
+    if (!this.#isLiveGeneration(child)) {
+      throw new SidecarError("SIDECAR_CRASHED", "sidecar handshake generation is no longer live");
+    }
     if (ready["protocol"] !== PROTOCOL_VERSION) {
       const seen = asText(ready["protocol"], "unknown");
       await this.#teardown("protocol mismatch", "SIDECAR_PROTOCOL_MISMATCH", child);
@@ -641,40 +681,46 @@ export class SidecarClient {
     // FrameError。若先登记了 pending 条目，那个条目就没有任何人会回收 —— 只能等各自
     // 的超时，而 timeoutMs 为 null 的爬虫请求会永久留在 #pending 里。
     const frame = `${encodeFrame({ id, method, params: outgoing })}\n`;
+    const cancelFrame = `${encodeFrame({
+      id: `cancel:${id}`,
+      method: "cancel",
+      params: { id },
+    })}\n`;
+    let wroteRequest = false;
 
     // 请求/响应的本质是 deferred：靠 id 把响应接回去，只能事先拿住 resolve/reject。
     // oxlint-disable-next-line promise/avoid-new
     const settled = new Promise<unknown>((resolve, reject) => {
-      const entry: Pending = { resolve, reject, timer: undefined, detachAbort: undefined };
+      const entry: Pending = {
+        resolve,
+        reject,
+        cancel: () => {
+          this.#writeFrame(stdin, cancelFrame, `cancel for ${method}`);
+        },
+        timer: undefined,
+        detachAbort: undefined,
+      };
       // 先落表再挂中止钩子。顺序反了的话，「信号进来时就已中止」这条同步路径会先跑完
-      // abort()（它内部 teardown → #rejectAll() → 把表清空），然后这一行又把已经结清的
-      // entry 塞回表里 —— 每来一次已中止的调用就永久留下一条死条目。
+      // failRequest() 把表清空，然后这一行又把已经结清的 entry 塞回表里。
       this.#pending.set(id, entry);
 
       const { signal } = options;
 
-      // 只作废这一个请求：调用方取消的是「这一次调用」，不是整个常驻进程。原先这里也走
-      // #teardown，于是取消一个 web_fetch 会把同一进程上所有并行的抓取一起带走 ——
-      // 而抓取工具声明的是 isConcurrencySafe: true，并发是常态。
-      //
-      // 被放弃的请求在对端仍可能跑完；它的回帧按 id 配对，而那个 id 已从表里摘掉，
-      // 于是那一帧只是无人认领地落地，不会串到别的请求上。
+      // 只作废这一个请求：先摘 pending，再通知 Python 取消。被放弃的请求仍可能跑完；
+      // 它的回帧按 id 配对，而那个 id 已从表里摘掉，于是不会串到别的请求上。
       const failRequest = (code: SidecarErrorCode, message: string): void => {
         this.#pending.delete(id);
         SidecarClient.#settle(entry, new SidecarError(code, message));
+        if (wroteRequest) {
+          entry.cancel();
+        }
       };
 
       // null = 本次不设超时（爬虫这类量级不定的任务）。写成 `timeoutMs ?? 0` 会立刻超时。
       if (timeoutMs !== null) {
         entry.timer = setTimeout(() => {
-          // 超时仍走拆进程：超时的含义是「这个常驻进程可能已经不响应了」，回收它才有
-          // 自愈。与取消分开，正是因为「超时」与「用户改主意」是两回事。
-          this.#pending.delete(id);
-          SidecarClient.#settle(
-            entry,
-            new SidecarError("SIDECAR_TIMEOUT", `${method} timed out after ${timeoutMs}ms`),
-          );
-          void this.#teardown(`${method} timed out after ${timeoutMs}ms`, "SIDECAR_TIMEOUT");
+          // 普通超时只结算当前请求并发送 cancel；协议/管道/崩溃才回收共享进程。
+          failRequest("SIDECAR_TIMEOUT", `${method} timed out after ${timeoutMs}ms`);
         }, timeoutMs);
       }
 
@@ -693,8 +739,8 @@ export class SidecarClient {
       }
     });
 
-    // 已经中止的那一次在上面就已经从表里摘掉了：请求根本没发出去，也就不该往正在终止的
-    // 管道里再写一帧（写进去既不抛错也不触发 error，只是被静默丢弃）。
+    // 已经中止的那一次在上面就已经从表里摘掉了：请求根本没发出去，请求帧与 cancel 帧
+    // 都不该写进管道。
     if (!this.#pending.has(id)) {
       return settled;
     }
@@ -707,11 +753,8 @@ export class SidecarClient {
       void this.#teardown(`failed to send ${method}: stdin is gone`, "SIDECAR_CRASHED");
       return settled;
     }
-    try {
-      stdin.write(frame);
-    } catch (error) {
-      void this.#teardown(`failed to send ${method}: ${String(error)}`, "SIDECAR_CRASHED");
-    }
+    wroteRequest = true;
+    this.#writeFrame(stdin, frame, method);
     return settled;
   }
 

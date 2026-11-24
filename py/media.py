@@ -177,6 +177,7 @@ def _download_via_stream(
     headers: dict[str, str] | None,
     cookies: dict[str, str] | None,
     impersonate: str,
+    too_large_code: str = "DOWNLOAD_TOO_LARGE",
 ) -> dict[str, Any]:
     """流式下载：逐块落盘并计哈希，内存占用与块同阶，与响应体大小无关。
 
@@ -220,7 +221,7 @@ def _download_via_stream(
             # 头部预检在正文传输之前给出结论；谎报长度的服务端由流式循环里的复核兜住。
             if declared.isdigit() and int(declared) > limit:
                 raise _error(
-                    "DOWNLOAD_TOO_LARGE",
+                    too_large_code,
                     f"download is {int(declared)} bytes by Content-Length, over the {limit}-byte cap",
                 )
             digest = hashlib.sha256()
@@ -232,7 +233,7 @@ def _download_via_stream(
                         # 先判后写：写盘再判会让写到磁盘字节超过上限最多一个块（64 KiB）。
                         if total + len(chunk) > limit:
                             raise _error(
-                                "DOWNLOAD_TOO_LARGE",
+                                too_large_code,
                                 f"download is over the {limit}-byte cap"
                                 + (f" (Content-Length declared {int(declared)})" if declared.isdigit() else ""),
                             )

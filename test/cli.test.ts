@@ -37,6 +37,7 @@ const ACCEPT_RISK = "--accept-risk";
 const CORE = "core";
 const BROWSER = "browser";
 const MCP = "mcp";
+const DOCUMENTS = "documents";
 const CLIENT_KEY = "@deepseek-ai/dsh-mcp-client";
 const OFFICIAL = "official-mcp";
 const ENABLED_LINE = "        officialMcpEnabled: true\n";
@@ -46,6 +47,8 @@ const SERVER_LINE = "        serverName: scrapling";
 const HTTP_LINE = "        transport: streamable-http";
 const HTTP_URL_LINE = "        url: http://127.0.0.1:39217/mcp";
 const STDIO_LINE = "        transport: stdio";
+const TOOL_LOADING_EAGER_LINE = "        toolLoading: eager";
+const TOOL_LOADING_ON_DEMAND_LINE = "        toolLoading: on-demand";
 
 /** 一条与本插件模式一致的 streamable-http 条目，外加钉版客户端。 */
 const CLEAN_MCP_ENTRY = [
@@ -61,6 +64,7 @@ const CLEAN_MCP_ENTRY = [
 ].join("\n");
 
 const SEARCH_ENTRY_ID = "- id: scrapling";
+const ON_DEMAND_CONFIG = `${SEARCH_ENTRY_ID}\n  config:\n    mcpToolLoading: on-demand\n`;
 
 /** 把内置 web provider 指向本插件的那一段（`- id: web` 是宿主的 web 条目）。 */
 const WEB_POINTS_HERE = ["- id: web", "  config:", "    searchProvider: scrapling", ""].join("\n");
@@ -171,7 +175,7 @@ interface Status {
     readonly version: string;
   };
   readonly packs?: Partial<
-    Record<"core" | "browser" | "search" | "media" | "adaptive-redis" | "mcp", string>
+    Record<"core" | "browser" | "search" | "media" | "documents" | "adaptive-redis" | "mcp", string>
   >;
 }
 
@@ -422,6 +426,15 @@ describe("runCli", () => {
     expect(calls).toStrictEqual([`repair:${CORE}`]);
   });
 
+  it("documents 能力包走安装入口并打印独立 requirements", async () => {
+    const packs = harness();
+    await expect(runCli([SETUP, FEATURE, DOCUMENTS], packs.deps)).resolves.toBe(0);
+    expect(packs.calls).toStrictEqual([]);
+    expect(packs.lines.join("\n")).toContain("documents-requirements.txt");
+    await expect(runCli([SETUP, FEATURE, DOCUMENTS, APPLY], packs.deps)).resolves.toBe(0);
+    expect(packs.calls).toStrictEqual([DOCUMENTS]);
+  });
+
   it("offline 走资产目录；adaptive-redis 与 mcp 都走安装入口", async () => {
     const packs = harness();
     await expect(runCli([SETUP, FEATURE, "adaptive-redis"], packs.deps)).resolves.toBe(0);
@@ -474,6 +487,7 @@ describe("runCli", () => {
     const text = lines.join("\n");
     expect(text).toContain(HTTP_LINE);
     expect(text).toContain(HTTP_URL_LINE);
+    expect(text).toContain(TOOL_LOADING_EAGER_LINE);
     expect(text).toContain(
       `dsh plugin --profile <profile> add @deepseek-ai/dsh-mcp-client@${MCP_DEFAULT_CLIENT_PIN}`,
     );
@@ -487,6 +501,13 @@ describe("runCli", () => {
     const written = path.join(dataDir, "mcp", "mcp.patch.yml");
     expect(readFileSync(written, "utf8")).toContain(HTTP_LINE);
     expect(lines.join("\n")).toContain(written);
+  });
+
+  it("--mode mcp 从 --profile 的 mcpToolLoading 派生条目，不新增第二真源", async () => {
+    const { deps, lines, dataDir } = harness();
+    const profile = profileDir(dataDir, ON_DEMAND_CONFIG);
+    await expect(runCli([SETUP, MODE, MCP, PROFILE, profile], deps)).resolves.toBe(0);
+    expect(lines.join("\n")).toContain(TOOL_LOADING_ON_DEMAND_LINE);
   });
 
   it("--port 与 --with-auth 跟着进条目文本", async () => {
@@ -524,7 +545,10 @@ describe("runCli", () => {
 
   it("official-mcp 要 profile 里开开关、命令行认风险，两样缺一退 1", async () => {
     const enabled = harness();
-    const on = profileDir(enabled.dataDir, `${ENABLED_LINE}${SERVER_LINE}\n`);
+    const on = profileDir(
+      enabled.dataDir,
+      `${ENABLED_LINE}    mcpToolLoading: on-demand\n${SERVER_LINE}\n`,
+    );
     await expect(runCli([SETUP, MODE, OFFICIAL, PROFILE, on], enabled.deps)).resolves.toBe(1);
     expect(enabled.lines.join("\n")).toContain("RISK_NOT_ACCEPTED");
 
@@ -539,6 +563,7 @@ describe("runCli", () => {
       runCli([SETUP, MODE, OFFICIAL, ACCEPT_RISK, PROFILE, on], enabled.deps),
     ).resolves.toBe(0);
     expect(enabled.lines.join("\n")).toContain(STDIO_LINE);
+    expect(enabled.lines.join("\n")).toContain(TOOL_LOADING_ON_DEMAND_LINE);
     expect(enabled.lines.join("\n")).toContain("现在还不存在");
     expect(enabled.lines.join("\n")).toContain("setup --feature mcp --apply");
   });
@@ -699,7 +724,9 @@ describe("runCli", () => {
     const text = lines.join("\n");
     expect(text).toContain("SEARCH_BACKEND_INVALID");
     expect(text).toContain("searchBackend=brve 不是本包实现的后端");
-    expect(text).toContain("auto / tavily / bing / brave / serper / duckduckgo / searxng");
+    expect(text).toContain(
+      "auto / tavily / bing / brave / serper / duckduckgo / searxng / deepseek",
+    );
     // 名单里的一档写对时不该被这条判据波及。
     expect(text).not.toContain("SEARCH_AUTH");
   });

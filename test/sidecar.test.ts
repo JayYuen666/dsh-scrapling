@@ -6,9 +6,11 @@
 // Scrapling 不在（安装与否由用户决定），所以只断言握手能力与不依赖浏览器的方法。
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import path from "node:path";
 import { once } from "node:events";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { Readable, Writable } from "node:stream";
 import type { Context } from "@deepseek-ai/cordis";
@@ -47,13 +49,17 @@ interface FakeHandle {
 const readyFrame = (): Record<string, unknown> => ({
   event: "ready",
   protocol: PROTOCOL_VERSION,
-  capabilities: { scrapling: true, static: true, extract: true, browser: false },
+  capabilities: { scrapling: true, static: true, extract: true, browser: false, documents: true },
 });
 
 /** 假 runtime 的可调项。 */
 interface FakeBehaviour {
   /** 握手帧；null 表示不发握手。 */
   ready?: Record<string, unknown> | null;
+  /** 启动时一次推送的完整文本；用于让握手帧与后续帧落在同一个 chunk。 */
+  startupChunk?: string;
+  /** 启动 chunk 推送后立即执行，用来把卸载排进握手 continuation 之前。 */
+  afterStartupChunk?: () => void;
   /** 每收到一个 id，回什么帧。 */
   reply?: (id: string, method: string) => Record<string, unknown> | null;
   /** 每收到一个 id，额外往 stdout 推的原始行（用来喂坏帧与无 id 帧）。 */
@@ -106,7 +112,12 @@ const fakeCtx = (behaviour: FakeBehaviour, spawned: SpawnedHandle): unknown => (
       // 握手帧在 **spawn 之后立刻**发出，而不是等第一次写 —— 对端也是这么做的，
       // 而且 ensureStarted() 这一路本来就不会写任何东西。
       const ready = behaviour.ready === undefined ? readyFrame() : behaviour.ready;
-      if (ready !== null) {
+      if (behaviour.startupChunk !== undefined) {
+        queueMicrotask(() => {
+          push(behaviour.startupChunk!);
+          behaviour.afterStartupChunk?.();
+        });
+      } else if (ready !== null) {
         queueMicrotask(() => {
           push(`${JSON.stringify(ready)}\n`);
         });
@@ -301,6 +312,8 @@ describe("parseCapabilities", () => {
       static: false,
       extract: false,
       browser: false,
+      remote: false,
+      documents: false,
       writeMethods: false,
     });
   });
@@ -308,6 +321,18 @@ describe("parseCapabilities", () => {
   it("非对象给全不可用而不是抛", () => {
     expect(parseCapabilities("nope").scrapling).toBe(false);
     expect(parseCapabilities(null).scrapling).toBe(false);
+  });
+
+  it("documents 只认真布尔，缺报时降级为 false", () => {
+    expect(parseCapabilities({ documents: true }).documents).toBe(true);
+    expect(parseCapabilities({ documents: "yes" }).documents).toBe(false);
+    expect(parseCapabilities({}).documents).toBe(false);
+  });
+
+  it("remote 只认真布尔，缺报时降级为 false", () => {
+    expect(parseCapabilities({ remote: true }).remote).toBe(true);
+    expect(parseCapabilities({ remote: "yes" }).remote).toBe(false);
+    expect(parseCapabilities({}).remote).toBe(false);
   });
 
   it("版本号只在是字符串时带上", () => {
@@ -334,6 +359,8 @@ describe("parseCapabilities", () => {
       static: false,
       extract: false,
       browser: false,
+      remote: false,
+      documents: false,
       writeMethods: true,
       proxy: { configured: true, source: "settings", server: "http://127.0.0.1:7890" },
     });
@@ -358,6 +385,7 @@ describe("sidecar client 与假 runtime", () => {
     const client = makeClient(fakeCtx({ reply: okReply }, spawned) as never, options());
     const caps = await client.ensureStarted();
     expect(caps.scrapling).toBe(true);
+    expect(caps.documents).toBe(true);
     expect(client.alive).toBe(true);
     expect(spawned.count).toBe(1);
     await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
@@ -585,12 +613,37 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
-  it("对端不回应时按超时拆掉进程", async () => {
+  it("普通超时发送 cancel 并只结算当前请求，sidecar 保持存活", async () => {
     const spawned: SpawnedHandle = { count: 0 };
-    const client = makeClient(fakeCtx({}, spawned) as never, options({ requestTimeoutMs: 80 }));
+    const sent: { id: string; method: string; params?: Record<string, unknown> }[] = [];
+    let first = true;
+    const client = makeClient(
+      fakeCtx(
+        {
+          reply: (id, method) => {
+            if (method === "ping" && first) {
+              first = false;
+              return null;
+            }
+            return okReply(id);
+          },
+          onFrame: (frame) => {
+            sent.push(frame);
+          },
+        },
+        spawned,
+      ) as never,
+      options({ requestTimeoutMs: 80 }),
+    );
     await client.ensureStarted();
-    await expect(client.call("ping")).rejects.toThrow(/timed out/u);
-    expect(client.alive).toBe(false);
+    await expect(client.call("ping")).rejects.toMatchObject({ code: "SIDECAR_TIMEOUT" });
+    expect(client.alive).toBe(true);
+    expect(sent.map((frame) => frame.method)).toStrictEqual(["ping", "cancel"]);
+    expect(sent[1]?.params).toStrictEqual({ id: "h1" });
+    // 同一代进程仍能服务后续请求；普通超时不是协议崩溃，不应触发重连。
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    expect(sent.map((frame) => frame.method)).toStrictEqual(["ping", "cancel", "ping"]);
+    expect(spawned.count).toBe(1);
     await client.dispose();
   });
 
@@ -641,36 +694,116 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
-  it("协议版本对不上时报错并拆掉进程", async () => {
+  it("协议版本对不上时报错并拆掉进程，下一次请求另起一代", async () => {
     const spawned: SpawnedHandle = { count: 0 };
-    const client = makeClient(
-      fakeCtx(
-        { ready: { event: "ready", protocol: 99, capabilities: {} }, reply: okReply },
-        spawned,
-      ) as never,
-      options(),
-    );
+    const behaviour: FakeBehaviour = {
+      ready: { event: "ready", protocol: 99, capabilities: {} },
+      reply: okReply,
+    };
+    const client = makeClient(fakeCtx(behaviour, spawned) as never, options());
     await expect(client.ensureStarted()).rejects.toThrow(/protocol/u);
+    expect(client.alive).toBe(false);
+    behaviour.ready = readyFrame();
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    expect(spawned.count).toBe(2);
+    expect(client.alive).toBe(true);
     await client.dispose();
   });
 
-  it("对端送来不可解析的帧时跳过它，后续请求照常", async () => {
+  it("握手帧与坏帧同批到达时启动失败且不安装旧能力，下一次启动使用健康新代", async () => {
     const spawned: SpawnedHandle = { count: 0 };
-    const client = makeClient(
-      fakeCtx(
-        {
-          rawReply: (id) => (id === "h1" ? ["not json at all\n"] : undefined),
-          reply: okReply,
-        },
-        spawned,
-      ) as never,
-      options(),
-    );
-    await client.ensureStarted();
-    // 坏帧被丢掉，同一请求的正常响应照样兑现 —— 这才是要断言的行为。
-    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    const behaviour: FakeBehaviour = {
+      startupChunk: `${JSON.stringify(readyFrame())}\nnot json at all\n`,
+      reply: okReply,
+    };
+    const client = makeClient(fakeCtx(behaviour, spawned) as never, options());
+
+    await expect(client.ensureStarted()).rejects.toMatchObject({ code: "SIDECAR_CRASHED" });
+    const first = spawned.last;
+    expect(client.capabilities).toBeUndefined();
+    expect(client.alive).toBe(false);
+    expect(spawned.count).toBe(1);
+
+    behaviour.startupChunk = `${JSON.stringify(readyFrame())}\n`;
+    await expect(client.ensureStarted()).resolves.toMatchObject({ scrapling: true });
+    expect(spawned.count).toBe(2);
+    expect(spawned.last).not.toBe(first);
+    expect(client.alive).toBe(true);
     await client.dispose();
   });
+
+  it("握手帧已兑现后立即卸载时不安装能力", async () => {
+    const spawned: SpawnedHandle = { count: 0 };
+    const clientRef: { current: SidecarClient | undefined } = { current: undefined };
+    let disposing: Promise<void> | undefined;
+    const behaviour: FakeBehaviour = {
+      startupChunk: `${JSON.stringify(readyFrame())}\n`,
+      afterStartupChunk: () => {
+        if (clientRef.current === undefined) {
+          throw new Error("startup chunk 触发时客户端尚未登记");
+        }
+        disposing = clientRef.current.dispose();
+      },
+    };
+    const client = makeClient(fakeCtx(behaviour, spawned) as never, options());
+    clientRef.current = client;
+
+    const starting = client.ensureStarted();
+    await expect(starting).rejects.toMatchObject({ code: "SIDECAR_CRASHED" });
+    expect(client.capabilities).toBeUndefined();
+    expect(spawned.count).toBe(1);
+    if (disposing === undefined) {
+      throw new Error("startup chunk 没有触发卸载");
+    }
+    await disposing;
+  });
+
+  it.each(["not json at all\n", "[]\n"])(
+    "对端送来协议解码失败的帧 %j 时回收进程并作废全部在途请求，下一次请求另起一代",
+    async (malformed) => {
+      const spawned: SpawnedHandle = { count: 0 };
+      const sent = Promise.withResolvers<null>();
+      let requests = 0;
+      const client = makeClient(
+        fakeCtx(
+          {
+            // 第一代故意不回业务帧；两笔请求都必须在坏帧到达前留在 pending 表里。
+            reply: (id) => (spawned.count === 1 ? null : okReply(id)),
+            onFrame: (frame) => {
+              if (frame.method === "ping") {
+                requests += 1;
+                if (requests === 2) {
+                  sent.resolve(null);
+                }
+              }
+            },
+          },
+          spawned,
+        ) as never,
+        options({ requestTimeoutMs: 5000 }),
+      );
+      await client.ensureStarted();
+      const first = spawned.last!;
+      const pending = [
+        client.call("ping", {}, { timeoutMs: 250 }),
+        client.call("ping", {}, { timeoutMs: 250 }),
+      ];
+      // 同时接住两笔拒绝：旧实现会先后超时，逐条 await 会让另一笔变成未处理拒绝。
+      const outcomes = Promise.allSettled(pending);
+      await sent.promise;
+      first.stdout!.push(malformed);
+      const settled = await outcomes;
+      expect(settled[0]).toMatchObject({ status: "rejected", reason: { code: "SIDECAR_CRASHED" } });
+      expect(settled[1]).toMatchObject({ status: "rejected", reason: { code: "SIDECAR_CRASHED" } });
+      expect(client.alive).toBe(false);
+      expect(spawned.count).toBe(1);
+      await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+      expect(spawned.count).toBe(2);
+      expect(spawned.last).not.toBe(first);
+      expect(client.alive).toBe(true);
+      await client.dispose();
+    },
+  );
 
   it("对端送来没有 id 的帧时被忽略，而不是误配给在途请求", async () => {
     const spawned: SpawnedHandle = { count: 0 };
@@ -914,18 +1047,35 @@ describe("sidecar client 与假 runtime", () => {
     await client.dispose();
   });
 
-  it("取消一个请求不会拆掉常驻进程，也不会连累并行的其它请求", async () => {
+  it("取消发送 cancel 帧，只结算当前请求，迟到回帧不会串到后续请求", async () => {
     const spawned: SpawnedHandle = { count: 0 };
+    const sent: { id: string; method: string; params?: Record<string, unknown> }[] = [];
+    const lines: string[] = [];
+    let slowId = "";
     const client = makeClient(
-      // slow 那个故意不回，等它被取消；ping 正常回，才看得出取消没有连累它。
       fakeCtx(
         {
+          // slow 先不回，等它被取消；随后补一帧成功回包，模拟 Python 在安全边界才观察到取消。
           reply: (id: string, method: string) =>
             method === "slow" ? null : { id, ok: true, result: { pong: true } },
+          onFrame: (frame) => {
+            sent.push(frame);
+            if (frame.method === "slow") {
+              slowId = frame.id;
+              setTimeout(() => {
+                spawned.last?.stdout?.push(`${JSON.stringify(okReply(slowId))}\n`);
+              }, 40);
+            }
+          },
         },
         spawned,
       ) as never,
-      options({ requestTimeoutMs: 5000 }),
+      {
+        ...options({ requestTimeoutMs: 5000 }),
+        log: (line) => {
+          lines.push(line);
+        },
+      },
     );
     await client.ensureStarted();
     const controller = new AbortController();
@@ -933,26 +1083,60 @@ describe("sidecar client 与假 runtime", () => {
     const kept = client.call("ping");
     await delay(20);
     controller.abort();
-    await expect(cancelled).rejects.toThrow(/aborted/u);
-    // 取消的语义是「这一次调用作废」，不是「整个进程报废」。抓取工具声明并发安全，
-    // 取消一个本该只作废一个。
+    await expect(cancelled).rejects.toMatchObject({ code: "SIDECAR_ABORTED" });
+    expect(sent.map((frame) => frame.method)).toStrictEqual(["slow", "ping", "cancel"]);
+    expect(sent[2]?.params).toStrictEqual({ id: slowId });
     expect(client.alive).toBe(true);
-    // 被放弃的那个请求的迟到回帧按 id 配对，配不上就只是没人认领 —— 不该连累它之后
-    // 那个正经请求。
     await expect(kept).resolves.toStrictEqual({ pong: true });
+    // pending 已摘除后，迟到回帧只能落成无主帧，不能兑现给别的请求。
+    await expect
+      .poll(() => lines.includes(`[sidecar] response for unknown id ${slowId}`))
+      .toBe(true);
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    expect(spawned.count).toBe(1);
     await client.dispose();
   });
 
-  it("超时仍回收进程 —— 超时的含义是对端可能已经不响应了", async () => {
+  it("超时的迟到回帧被隔离，后续与并行请求仍由同一进程服务", async () => {
     const spawned: SpawnedHandle = { count: 0 };
+    const lines: string[] = [];
+    let slowId = "";
     const client = makeClient(
-      // 不回任何帧：请求会一直挂着直到超时。
-      fakeCtx({ reply: () => null }, spawned) as never,
-      options({ requestTimeoutMs: 60 }),
+      fakeCtx(
+        {
+          reply: (id: string, method: string) =>
+            method === "slow" ? null : { id, ok: true, result: { pong: true } },
+          onFrame: (frame) => {
+            if (frame.method === "slow") {
+              slowId = frame.id;
+              setTimeout(() => {
+                spawned.last?.stdout?.push(`${JSON.stringify(okReply(slowId))}\n`);
+              }, 50);
+            }
+          },
+        },
+        spawned,
+      ) as never,
+      {
+        ...options({ requestTimeoutMs: 30 }),
+        log: (line) => {
+          lines.push(line);
+        },
+      },
     );
     await client.ensureStarted();
-    await expect(client.call("ping")).rejects.toThrow(/timed out/u);
-    expect(client.alive).toBe(false);
+    const timedOut = client.call("slow", {}, { timeoutMs: 30 });
+    const kept = client.call("ping", {}, { timeoutMs: 1000 });
+    await expect(timedOut).rejects.toMatchObject({ code: "SIDECAR_TIMEOUT" });
+    expect(client.alive).toBe(true);
+    await expect(kept).resolves.toStrictEqual({ pong: true });
+    await expect
+      .poll(() => lines.includes(`[sidecar] response for unknown id ${slowId}`))
+      .toBe(true);
+    await expect(client.call("ping", {}, { timeoutMs: 1000 })).resolves.toStrictEqual({
+      pong: true,
+    });
+    expect(spawned.count).toBe(1);
     await client.dispose();
   });
 
@@ -1002,10 +1186,23 @@ describe("sidecar client 与假 runtime", () => {
     await expect(starting).rejects.toThrow(/disposed|ready frame/u);
   });
 
-  it("进程异常退出时按 crashed 拆掉并作废在途请求", async () => {
+  it("进程异常退出时按 crashed 拆掉并作废在途请求，下一次请求另起一代", async () => {
     const spawned: SpawnedHandle = { count: 0 };
+    let first = true;
     const client = makeClient(
-      fakeCtx({ crashOnExit: true }, spawned) as never,
+      fakeCtx(
+        {
+          crashOnExit: true,
+          reply: (id) => {
+            if (first) {
+              first = false;
+              return null;
+            }
+            return okReply(id);
+          },
+        },
+        spawned,
+      ) as never,
       options({ requestTimeoutMs: 5000 }),
     );
     await client.ensureStarted();
@@ -1014,6 +1211,10 @@ describe("sidecar client 与假 runtime", () => {
     // 直接掐掉进程：结束 stdout 让 done 以 reject 落地，触发客户端的崩溃处理。
     spawned.last?.terminate();
     await expect(pending).rejects.toThrow(SidecarError);
+    expect(client.alive).toBe(false);
+    await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    expect(spawned.count).toBe(2);
+    expect(client.alive).toBe(true);
     await client.dispose();
   });
 
@@ -1068,7 +1269,7 @@ describe("sidecar client 与假 runtime", () => {
   });
 
   it("旧代退出事件晚到时不拆掉新一代进程，也不作废新一代的在途请求", async () => {
-    // 时序：请求超时把第 1 代拆掉，而它的 done 停在测试手里的门上；拆除还卡在
+    // 时序：管道错误把第 1 代拆掉，而它的 done 停在测试手里的门上；拆除还卡在
     // waitForExit 上时，下一个请求把第 2 代拉起来。旧实现里那枚 done 回调无条件
     // #teardown，于是晚到的「旧代已退出」会把第 2 代连同在途请求一起带走。
     // 两道门都由测试兑现：窗口排在观察到的事件之后，不靠毫秒数猜。
@@ -1086,7 +1287,7 @@ describe("sidecar client 与假 runtime", () => {
         spawned,
       ) as never,
       {
-        ...options({ requestTimeoutMs: 30 }),
+        ...options({ requestTimeoutMs: 5000 }),
         log: (line) => {
           lines.push(line);
         },
@@ -1094,9 +1295,11 @@ describe("sidecar client 与假 runtime", () => {
     );
     await client.ensureStarted();
     const first = spawned.last!;
-    await expect(client.call("slow")).rejects.toThrow(/timed out/u);
-    // 新一代就出生在旧代卡在 waitForExit 的那段窗口里。ping 自带宽裕预算：机器一忙时
-    // 它也不该被上面那档 30ms 打掉（那打掉的是一条与本时序无关的超时）。
+    const pending = client.call("slow");
+    await delay(20);
+    first.stderr.emit("error", new Error("old stderr broke"));
+    await expect(pending).rejects.toThrow(SidecarError);
+    // 新一代就出生在旧代卡在 waitForExit 的那段窗口里。
     await expect(client.call("ping", {}, { timeoutMs: 5000 })).resolves.toStrictEqual({
       pong: true,
     });
@@ -1130,7 +1333,7 @@ describe("sidecar client 与假 runtime", () => {
         spawned,
       ) as never,
       {
-        ...options({ requestTimeoutMs: 20 }),
+        ...options({ requestTimeoutMs: 5000 }),
         log: (line) => {
           lines.push(line);
         },
@@ -1138,8 +1341,11 @@ describe("sidecar client 与假 runtime", () => {
     );
     await client.ensureStarted();
     const first = spawned.last!;
-    await expect(client.call("slow")).rejects.toThrow(/timed out/u);
-    // 超时处理器在作废请求之后就地清簿记（`#clearState` 跑在它自己任何 await 之前），
+    const pending = client.call("slow");
+    await delay(20);
+    first.stdout?.emit("error", new Error("old stdout broke"));
+    await expect(pending).rejects.toThrow(SidecarError);
+    // 协议管道失败在作废请求之后就地清簿记（`#clearState` 跑在它自己任何 await 之前），
     // 所以这里不必等：下一次调用出生的必然是新一代。
     await expect(client.call("ping", {}, { timeoutMs: 5000 })).resolves.toStrictEqual({
       pong: true,
@@ -1392,6 +1598,66 @@ describe("sidecar client 与真实 python 进程", () => {
     // 那一组，由回显请求 id 的用例钉住。
     expect(answers).toStrictEqual(Array.from({ length: 8 }, () => ({ pong: true })));
     await client.dispose();
+  });
+
+  it.runIf(available)("真实 bridge 取消慢请求后，ping 与另一请求继续成功", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "dsh-scrapling-cancel-"));
+    const bridgePath = path.join(directory, "cancel_bridge.py");
+    const wrapper = [
+      "import sys, time",
+      `sys.path.insert(0, ${JSON.stringify(path.join(REPO, "py"))})`,
+      "import adapters, bridge",
+      "def slow(_args):",
+      "    print('[test-cancel] started', file=sys.stderr, flush=True)",
+      "    time.sleep(0.25)",
+      "    try:",
+      "        from cancellation import raise_if_cancelled",
+      "        raise_if_cancelled()",
+      "    except Exception as error:",
+      "        print(f'[test-cancel] {type(error).__name__}', file=sys.stderr, flush=True)",
+      "        raise",
+      "    return {'finished': True}",
+      'adapters.METHODS["test.slow"] = slow',
+      "raise SystemExit(bridge.main())",
+      "",
+    ].join("\n");
+    let client: SidecarClient | undefined;
+    try {
+      await writeFile(bridgePath, wrapper, "utf8");
+      const lines: string[] = [];
+      // 只替换入口文件；dispatch、worker、token 绑定与协议读写仍是真实 bridge。
+      client = makeClient(realCtx as never, {
+        pythonBin: LOCAL_PYTHON,
+        bridgePath,
+        cwd: directory,
+        handshakeTimeoutMs: 30_000,
+        requestTimeoutMs: 5000,
+        graceMs: 1000,
+        log: (line: string): void => {
+          lines.push(line);
+        },
+      });
+      await client.ensureStarted();
+      const controller = new AbortController();
+      const slow = client.call("test.slow", {}, { signal: controller.signal, timeoutMs: 5000 });
+      await expect
+        .poll(() => lines.some((line) => line.includes("[test-cancel] started")))
+        .toBe(true);
+      const kept = client.call("ping", {}, { timeoutMs: 5000 });
+      controller.abort();
+      await expect(slow).rejects.toMatchObject({ code: "SIDECAR_ABORTED" });
+      await expect(kept).resolves.toStrictEqual({ pong: true });
+      expect(client.alive).toBe(true);
+      await expect
+        .poll(() => lines.some((line) => line.includes("[test-cancel] RequestCancelled")))
+        .toBe(true);
+      // 被取消的 h1 晚到错误帧仍在 Node 侧按无主 id 丢弃。
+      await expect.poll(() => lines.includes("[sidecar] response for unknown id h1")).toBe(true);
+      await expect(client.call("ping")).resolves.toStrictEqual({ pong: true });
+    } finally {
+      await client?.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it.runIf(available)("dispose 走优雅关闭：进程自己退干净而不是被杀", async () => {

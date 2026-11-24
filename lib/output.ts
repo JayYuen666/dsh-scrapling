@@ -69,6 +69,78 @@ export interface CappedText {
  */
 export const FALLBACK_BUDGET_BYTES = 200_000;
 
+/** 网络历史结构化数组的 JSON 字节总预算；模型入参不能放宽。 */
+export const NETWORK_STRUCTURED_BUDGET_BYTES = 120_000;
+
+/** 按 JSON 字节预算保留后的网络条目及分页信息。 */
+export interface BoundedNetworkEntries {
+  /** 按原顺序保留的条目。 */
+  readonly matches: NetworkEntry[];
+  /** 送入本函数的总条目数。 */
+  readonly count: number;
+  /** 实际保留的条目数。 */
+  readonly returnedCount: number;
+  /** 是否有条目因字节预算被省略。 */
+  readonly truncated: boolean;
+  /** 下一次 afterId 查询的跳过锚点；没有可前进的 id 时不出现。 */
+  readonly nextAfterId?: number;
+}
+
+/** 取能交给 Python afterId 的正整数 id；缺失、非安全整数或非正数都不构成锚点。 */
+function forwardNetworkId(entry: NetworkEntry): number | undefined {
+  const { id } = entry;
+  return typeof id === "number" && Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
+/**
+ * 按 JSON 数组的 UTF-8 字节数增量保留网络条目。
+ *
+ * 预算包含数组方括号与条目间逗号。遇到第一条放不下的条目就停止，不越过它保留后续
+ * 条目。该条目有比前锚点更大的正整数 id 时，直接用它作跳过锚点，让下一页越过这条
+ * 超大记录；否则省略锚点并保留截断标记，避免下一页在原条目上原地循环。全部条目都保
+ * 留时，锚点只取最后一条的 id；最后一条没有 id 时不沿用更早的值。单条超预算时也不
+ * 改造它，而是整条省略，避免交回一个已经超过预算的对象。
+ *
+ * @param matches - 已归一的网络条目
+ * @param budget - JSON 数组字节预算；必须是至少 2 的有限数
+ * @returns 保留条目、总条数、返回条数与分页锚点
+ * @throws RangeError - 预算无法容纳一个空 JSON 数组
+ */
+export function boundNetworkEntries(
+  matches: readonly NetworkEntry[],
+  budget: number,
+): BoundedNetworkEntries {
+  if (!Number.isFinite(budget) || budget < 2) {
+    throw new RangeError("network entry budget must be a finite number of at least 2 bytes");
+  }
+  const limit = Math.floor(budget);
+  const bounded: NetworkEntry[] = [];
+  let usedBytes = 2;
+  let previousAnchor: number | undefined;
+  let nextAfterId: number | undefined;
+  for (const entry of matches) {
+    const entryBytes = Buffer.byteLength(JSON.stringify(entry), "utf8");
+    const separatorBytes = bounded.length === 0 ? 0 : 1;
+    const id = forwardNetworkId(entry);
+    if (usedBytes + separatorBytes + entryBytes > limit) {
+      nextAfterId =
+        id !== undefined && (previousAnchor === undefined || id > previousAnchor) ? id : undefined;
+      break;
+    }
+    bounded.push(entry);
+    usedBytes += separatorBytes + entryBytes;
+    previousAnchor = id ?? previousAnchor;
+    nextAfterId = id;
+  }
+  return {
+    matches: bounded,
+    count: matches.length,
+    returnedCount: bounded.length,
+    truncated: bounded.length < matches.length,
+    ...(nextAfterId === undefined ? {} : { nextAfterId }),
+  };
+}
+
 /**
  * 把调用方给的预算归一成「至少 1 的整数」；非法值回落到兜底。
  *
@@ -306,8 +378,9 @@ function networkLines(matches: readonly NetworkEntry[]): string[] {
 /**
  * 把浏览器抓取结果渲染成模型看的文本，末尾附上网络历史。
  *
- * 网络历史单独再封顶：正文已按 `maxOutputBytes` 截过，而条目数与每条正文的上限都在
- * 对端（`limit` / `body_chars`），叠起来的字节数与那份预算无关。不封这一段，工具回执
+ * 结构化网络数组已由 `boundNetworkEntries` 在执行阶段按固定预算裁剪；这里只约束模型
+ * 可见的文本段。正文已按 `maxOutputBytes` 截过，而条目数与每条正文的上限都在对端
+ * （`limit` / `body_chars`），叠起来的字节数与那份预算无关。不封这一段，工具回执
  * 就能整段绕过输出上限，且没有任何说明。
  *
  * **两段各自按同一档预算封顶**，所以单次回执的字节上限是两倍预算，不是一倍。这是刻意的：
@@ -325,21 +398,31 @@ function renderBrowser(
   networkBudgetBytes: number,
   messages: ScraplingMessages,
 ): string {
-  const body = renderFetch(value, messages);
+  const body = renderFetch(
+    { ...value, truncated: value.contentTruncated ?? value.truncated },
+    messages,
+  );
   const captured = value.xhr;
   if (captured === undefined) {
     return body;
   }
   if (captured.length === 0) {
-    return `${body}\n\n${messages.outputXhrNone}`;
+    const empty = `${body}\n\n${messages.outputXhrNone}`;
+    return value.xhrTruncated === true
+      ? `${empty}\n\n${messages.captureNetworkTruncationHint}`
+      : empty;
   }
   const section = capText(
     networkLines(captured).join("\n"),
     networkBudgetBytes,
-    messages.networkTruncationHint,
+    messages.captureNetworkTruncationHint,
     "network",
   );
-  const footer = section.notice.length > 0 ? `\n\n${section.notice}` : "";
+  let networkNotice = section.notice;
+  if (networkNotice.length === 0 && value.xhrTruncated === true) {
+    networkNotice = messages.captureNetworkTruncationHint;
+  }
+  const footer = networkNotice.length > 0 ? `\n\n${networkNotice}` : "";
   return `${body}\n\n${messages.outputXhrHeading}:\n${section.text}${footer}`;
 }
 

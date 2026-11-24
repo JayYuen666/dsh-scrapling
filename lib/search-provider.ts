@@ -2,8 +2,8 @@
 //
 // 为什么需要它：Scrapling 本身**不是搜索引擎**（源码里 `google_search` 只是一个「加 Google
 // referer 头」的选项），所以这里把「检索」与「读取」拆成两段：检索交给一个可配置的搜索
-// 后端拿 URL 列表，读取交给本插件的 sidecar —— 有浏览器就走渲染，于是内置 web_fetch 结构
-// 上读不到的那些 SPA 页面也能进上下文。
+// 后端拿 URL 列表，读取交给本插件的 sidecar —— 按 webFetchStrategy 静态优先、按需回退渲染，
+// 于是内置 web_fetch 结构上读不到的那些 SPA 页面也能进上下文。
 //
 // 为什么走 provider 而不是同名注册工具：`ToolRuntime.register` 最终落到
 // `NamedEntries.insert`，重名会**抛错**（`tool "X" is already registered`），所以工具名换不掉；
@@ -23,12 +23,93 @@ import type {
 } from "@deepseek-ai/dsh-web";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import type { Reader } from "./config-reader.ts";
+import { DeepSeekRateLimiter, deepseekReady, discoverDeepSeek } from "./deepseek-search.ts";
+import type { DeepSeekAuthLike } from "./deepseek-search.ts";
+import { fetchWithStrategy } from "./fetch-strategy.ts";
+import type { WebFetchStrategy } from "./fetch-strategy.ts";
+import { capText } from "./output.ts";
 import type { SearchBackend } from "./search-backends.ts";
 import type { SidecarClient } from "./sidecar.ts";
 import { SidecarError } from "./sidecar-error.ts";
 
 /** 本 provider 在 ctx.web 的 search 接缝里的 id。 */
 export const SEARCH_PROVIDER_ID = "scrapling";
+
+/** 搜索聚合正文的默认字节预算；可由 searchMaxOutputBytes 热改。 */
+export const DEFAULT_SEARCH_TOTAL_BUDGET_BYTES = 24_000;
+
+/** 发现结果的内存缓存有效期。 */
+export const SEARCH_CACHE_TTL_MS = 300_000;
+
+/** 发现结果缓存的最大条目数。 */
+export const SEARCH_CACHE_MAX_ENTRIES = 128;
+
+const TRACKING_PARAMS = new Set([
+  "fbclid",
+  "gclid",
+  "dclid",
+  "msclkid",
+  "mc_cid",
+  "mc_eid",
+  "_ga",
+  "_gl",
+  "igshid",
+]);
+
+/** 归一化可引用 URL；失败时返回空串。 */
+export function canonicalizeSearchUrl(raw: string, endpoint: string): string {
+  try {
+    const url = new URL(raw, endpoint.length > 0 ? endpoint : undefined);
+    url.hash = "";
+    const tracking = new Set<string>();
+    for (const key of url.searchParams.keys()) {
+      if (key.toLowerCase().startsWith("utm_") || TRACKING_PARAMS.has(key.toLowerCase())) {
+        tracking.add(key);
+      }
+    }
+    for (const key of tracking) {
+      url.searchParams.delete(key);
+    }
+    url.searchParams.sort();
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function cacheEndpoint(raw: string): string {
+  try {
+    const url = new URL(raw);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function discoveryCacheKey(
+  deps: SearchProviderDeps,
+  query: string,
+  limit: number,
+  offset: number,
+): string {
+  const backend = deps.backend();
+  return JSON.stringify([
+    backend,
+    query,
+    limit,
+    offset,
+    cacheEndpoint(deps.searxngEndpoint()),
+    cacheEndpoint(deps.deepseekEndpoint()),
+    deps.apiKey().length > 0,
+    deps.braveApiKey().length > 0,
+    deps.serperApiKey().length > 0,
+    deps.publicFallback(),
+  ]);
+}
 
 /**
  * Brave 与 Serper 的官方 JSON 端点。
@@ -84,16 +165,21 @@ export interface SearchProviderDeps {
    * 读取器：卡上可以随时打开它。
    */
   readonly publicFallback: Reader<boolean>;
-  /** 搜索结果里前几条要真的抓下来渲染。不在卡上，装配后不变。 */
+  /** 搜索结果里前几条要真的抓下来按策略读取。不在卡上，装配后不变。 */
   readonly renderTopN: number;
+  /** 正文读取策略；`webFetchStrategy` 是 volatile，改值下一次抓取就生效。 */
+  readonly fetchStrategy: Reader<WebFetchStrategy>;
   /**
    * 单次抓取的字节预算。读取器：`fetchMaxOutputChars` 是可热改的部署项，且它与
    * `dsh-scrapling_fetch` 等工具共用同一枚设置。
    */
   readonly maxOutputBytes: Reader<number>;
+  /** 一次搜索聚合正文的字节预算；读取器，设置卡改值后下一次搜索生效。 */
+  readonly searchMaxOutputBytes: Reader<number>;
   /**
-   * 每一次 sidecar 调用的超时（毫秒）：发现一次、逐条渲染的各次都吃这一位，
-   * 所以一次 `search` 的自身上界约为 `(1 + renderTopN) × timeoutMs`。
+   * 每一次 sidecar 调用的超时（毫秒）：发现一次、逐条读取的各次都吃这一位。
+   * auto 每条最多先 fetch 再 render，所以一次 `search` 的最坏 sidecar 调用数为
+   * `1 + 2 * renderTopN`。
    *
    * 整次工具调用的上界不在本层：宿主把同一枚设置（`fetchTimeoutMs`）声明在
    * `ToolDefinition.timeoutMs` 上，由它负责取消整笔调用。
@@ -114,6 +200,9 @@ export interface SearchProviderDeps {
    * （`host.ts` 的 `searchProviderOf`）本来就每一侧都传同一个闸门。
    */
   readonly urlGate: (url: string) => Promise<string | undefined>;
+  readonly deepseekAuth?: DeepSeekAuthLike | undefined;
+  readonly deepseekEndpoint: Reader<string>;
+  readonly fetchImpl: typeof fetch;
 }
 
 /** 搜索后端返回的一条结果。 */
@@ -121,6 +210,8 @@ export interface ParsedSearchHit {
   readonly url: string;
   readonly title?: string;
   readonly snippet?: string;
+  readonly summary?: string;
+  readonly publishedAt?: string;
 }
 
 /**
@@ -181,7 +272,7 @@ function hitsOf(payload: Record<string, unknown>): ParsedSearchHit[] {
     if (!isRecord(item)) {
       return [];
     }
-    const { url, title, snippet } = item;
+    const { url, title, snippet, summary, publishedAt } = item;
     if (typeof url !== "string" || url.length === 0) {
       return [];
     }
@@ -190,27 +281,11 @@ function hitsOf(payload: Record<string, unknown>): ParsedSearchHit[] {
         url,
         ...(typeof title === "string" && title.length > 0 ? { title } : {}),
         ...(typeof snippet === "string" && snippet.length > 0 ? { snippet } : {}),
+        ...(typeof summary === "string" && summary.length > 0 ? { summary } : {}),
+        ...(typeof publishedAt === "string" && publishedAt.length > 0 ? { publishedAt } : {}),
       },
     ];
   });
-}
-
-/**
- * 把一条 URL 归一成绝对 URL；相对 URL 拼到搜索端点上。
- *
- * `endpoint` 为空串（后端不认识）时不借任何基准：只有本来就是绝对 URL 的才留得下来，
- * 相对的那一条宁可丢掉，也不拼到一台不是它自己的主机上去。
- *
- * @param raw - 端点返回的 URL 文本
- * @param endpoint - 搜索端点，作为相对 URL 的基准；空串表示没有可用基准
- * @returns 绝对 URL；拼不出来时给空串
- */
-function absolutize(raw: string, endpoint: string): string {
-  try {
-    return new URL(raw, endpoint.length > 0 ? endpoint : undefined).toString();
-  } catch {
-    return "";
-  }
 }
 
 /** 每条后端只认自己那把 key；拼错后端名不会把 Tavily 的 key 递给 Brave。 */
@@ -230,7 +305,7 @@ function selectKey(deps: SearchProviderDeps): string {
  *
  * 一律回落到某个固定端点会把引用拼到另一台主机上（SearXNG 实例回的相对路径拼成 Bing 的
  * 绝对 URL 就是这样），既交给模型引用错了地址，也让闸门按错误的主机下结论。认不出后端时给
- * 空串，交给 {@link absolutize} 把相对 URL 判成拼不出来而丢掉。
+ * 空串，交给 {@link canonicalizeSearchUrl} 把相对 URL 判成拼不出来而丢掉。
  *
  * @param deps - provider 依赖
  * @param backend - 回包里报的实际后端
@@ -274,23 +349,46 @@ function endpointOf(deps: SearchProviderDeps, backend: string): string {
  * @param signal - 取消信号
  * @returns 命中的条目与相对 URL 的基准端点
  */
+interface DiscoverOptions {
+  readonly maxResults: number;
+  readonly offset: number;
+  readonly route: string | undefined;
+  readonly signal: AbortSignal | undefined;
+  readonly rateLimiter: DeepSeekRateLimiter;
+}
+
 async function discover(
   deps: SearchProviderDeps,
   query: string,
-  maxResults: number,
-  signal: AbortSignal | undefined,
-): Promise<{ hits: ParsedSearchHit[]; base: string; note: string | undefined }> {
+  options: DiscoverOptions,
+): Promise<DiscoveryResult> {
   // 一次操作只取一次快照：下面的 JSON 与协议层超时必须是同一刻的值，边发边取会让
   // 「timeoutSeconds 说 30 秒、协议层却等 120 秒」这种自相矛盾的回包成为可能。
+  const { maxResults, offset, route, signal, rateLimiter } = options;
   const backend = deps.backend();
   const timeoutMs = deps.timeoutMs();
   try {
+    if (backend === "deepseek") {
+      const result = await discoverDeepSeek({ ...deps, rateLimiter }, query, {
+        maxResults,
+        offset,
+        route,
+        signal,
+      });
+      return {
+        hits: result.hits,
+        base: deps.deepseekEndpoint(),
+        note: undefined,
+        truncated: result.truncated,
+      };
+    }
     const raw = await deps.sidecar.call(
       "search.discover",
       {
         backend,
         query,
         maxResults,
+        offset,
         apiKey: selectKey(deps),
         apiEndpoint: deps.apiEndpoint,
         bingEndpoint: deps.bingEndpoint,
@@ -309,6 +407,7 @@ async function discover(
       hits: hitsOf(payload),
       base: endpointOf(deps, reported),
       note: noteOf(payload),
+      truncated: false,
     };
   } catch (error: unknown) {
     if (signal?.aborted === true) {
@@ -325,7 +424,7 @@ async function discover(
 }
 
 /** 默认最多回多少条 source；上游不给 maxResults 时用它。 */
-const DEFAULT_MAX_RESULTS = 8;
+const DEFAULT_MAX_RESULTS = 10;
 
 /**
  * 一次搜索最多把多少条命中拿去过闸。
@@ -361,6 +460,19 @@ function boundResults(raw: number | undefined): number {
   return Math.min(raw, MAX_SOURCES);
 }
 
+function boundOffset(raw: unknown): number {
+  if (raw === undefined) {
+    return 0;
+  }
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0 || raw > MAX_SOURCES) {
+    throw new WebError(
+      `offset must be an integer between 0 and ${String(MAX_SOURCES)}`,
+      "SCRAPLING_SEARCH_FAILED",
+    );
+  }
+  return raw;
+}
+
 /**
  * 一条候选归一之后的三种下场。
  *
@@ -386,7 +498,10 @@ type SourceOutcome =
  * @param backend - 当下选中的后端
  * @returns 发得出一次检索时为 true
  */
-function hasCredentialFor(deps: SearchProviderDeps, backend: SearchBackend): boolean {
+function hasCredentialFor(
+  deps: SearchProviderDeps,
+  backend: Exclude<SearchBackend, "deepseek">,
+): boolean {
   switch (backend) {
     case "auto": {
       // auto 会依次试 Tavily、SearXNG，都不行再看 publicFallback（与 py/search.py 一致）。
@@ -435,7 +550,7 @@ async function toSource(
   endpoint: string,
   gate: (url: string) => Promise<string | undefined>,
 ): Promise<SourceOutcome> {
-  const url = absolutize(hit.url, endpoint);
+  const url = canonicalizeSearchUrl(hit.url, endpoint);
   if (url.length === 0) {
     return { kind: "unparsable" };
   }
@@ -454,8 +569,17 @@ async function toSource(
       url: citeable,
       ...(hit.title === undefined ? {} : { title: hit.title }),
       ...(hit.snippet === undefined ? {} : { snippet: hit.snippet }),
+      ...(hit.summary === undefined ? {} : { summary: hit.summary }),
+      ...(hit.publishedAt === undefined ? {} : { publishedAt: hit.publishedAt }),
     },
   };
+}
+
+/** search 只消费正文；完整静态回包只要求对象与字符串正文，不检查 url/status。 */
+type FetchBodyReply = Record<string, unknown> & { readonly content: string };
+
+function isFetchBodyReply(raw: unknown): raw is FetchBodyReply {
+  return isRecord(raw) && typeof raw["content"] === "string";
 }
 
 /** 一条命中的读取结果：正文，或「为什么没正文」。 */
@@ -464,6 +588,8 @@ interface FetchOutcome {
   readonly body: string;
   /** 读失败的原因。整场都失败时用它收场，免得「什么都没读到」被当成成功。 */
   readonly reason: string;
+  /** sidecar 是否已截过这一页。 */
+  readonly truncated: boolean;
 }
 
 /**
@@ -476,7 +602,7 @@ interface FetchOutcome {
  * @param source - 要读的 source
  * @param deps - provider 依赖
  * @param signal - 取消信号
- * @returns 正文与失败原因
+ * @returns 正文、失败原因与 sidecar 的 truncated 标记
  */
 async function fetchContent(
   source: WebSearchSource,
@@ -486,9 +612,8 @@ async function fetchContent(
   try {
     // 同一笔抓取里「发给 sidecar 的字符上限」与「协议层超时」取同一刻的快照。
     const maxContentChars = deps.maxOutputBytes();
-    const timeoutMs = deps.timeoutMs();
-    const raw: unknown = await deps.sidecar.call(
-      deps.sidecar.capabilities?.browser === true ? "render" : "fetch",
+    const raw: unknown = await fetchWithStrategy(
+      deps,
       {
         url: source.url,
         cssSelector: null,
@@ -498,21 +623,31 @@ async function fetchContent(
         networkIdle: false,
         maxContentChars,
       },
-      { ...(signal === undefined ? {} : { signal }), timeoutMs },
+      isFetchBodyReply,
+      signal,
     );
     if (!isRecord(raw)) {
       // 三种「读不到」分开点名：协议违例（回包不是对象、正文不是字符串）是 sidecar 或
       // 本仓解包坏了，「这一页确实没有正文」是目标站的常态。挤成同一句话会把用户送去
       // 查安全策略，而该查的是协议。
-      return { body: "", reason: `the fetch reply was not an object (${typeof raw})` };
+      return {
+        body: "",
+        reason: `the fetch reply was not an object (${typeof raw})`,
+        truncated: false,
+      };
     }
     const { content } = raw;
     if (typeof content !== "string") {
-      return { body: "", reason: `the page came back without a text body (${typeof content})` };
+      return {
+        body: "",
+        reason: `the page came back without a text body (${typeof content})`,
+        truncated: false,
+      };
     }
+    const truncated = raw["truncated"] === true;
     return content.length > 0
-      ? { body: content, reason: "" }
-      : { body: "", reason: "the page came back with no body" };
+      ? { body: content, reason: "", truncated }
+      : { body: "", reason: "the page came back with no body", truncated };
   } catch (error: unknown) {
     // 取消不归到「这条链接死了」：调用方按了取消，语义是整次调用作废，不是这一条没读到。
     // 吞掉它，一次取消就会表现为「搜到了结果但正文全空」，用户无从判断发生了什么。
@@ -523,21 +658,21 @@ async function fetchContent(
     // 是「被安全闸门拦下」还是「sidecar 超时」，这两件事要采取的行动完全不同，
     // 而 String(error) 里只有一个错误类名和消息。
     const code = error instanceof SidecarError ? `${error.code}: ` : "";
-    return { body: "", reason: `${code}${String(error)}` };
+    return { body: "", reason: `${code}${String(error)}`, truncated: false };
   }
 }
 
 /**
- * 把一条 source 渲染成 Markdown 小节。
+ * 把一条 source 的正文组成 Markdown 小节。
  *
  * 读不到就跳过那一条：搜索结果里混着失效链接是常态，不该让整次调用失败。
  *
  * @param source - 要读的 source
  * @param deps - provider 依赖
  * @param signal - 取消信号
- * @returns 小节正文与失败原因
+ * @returns 完整小节正文、失败原因与 sidecar 截断标记
  */
-async function renderBody(
+async function sectionBody(
   source: WebSearchSource,
   deps: SearchProviderDeps,
   signal: AbortSignal | undefined,
@@ -546,16 +681,106 @@ async function renderBody(
   if (outcome.body.length === 0) {
     return outcome;
   }
-  return { body: `## ${source.title ?? source.url}\n\n${outcome.body}`, reason: "" };
+  return {
+    body: `## ${source.title ?? source.url}\n\n${outcome.body}`,
+    reason: "",
+    truncated: outcome.truncated,
+  };
 }
 
 /**
- * 建一个 ctx.web search provider：检索 + 渲染一体。
+ * 建一个 ctx.web search provider：检索 + 按策略读取正文。
  *
  * @param deps - 依赖
  * @returns provider
  */
-export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProvider {
+interface DiscoveryResult {
+  readonly hits: ParsedSearchHit[];
+  readonly base: string;
+  readonly note: string | undefined;
+  readonly truncated: boolean;
+}
+
+interface CacheEntry {
+  readonly expiresAt: number;
+  readonly value: DiscoveryResult;
+}
+
+type DiscoveryCache = Map<string, CacheEntry>;
+
+function cachedDiscovery(cache: DiscoveryCache, key: string, now: number): DiscoveryResult | null {
+  const cached = cache.get(key);
+  if (cached === undefined || cached.expiresAt <= now) {
+    if (cached !== undefined) {
+      cache.delete(key);
+    }
+    return null;
+  }
+  return cached.value;
+}
+
+function storeDiscovery(
+  cache: DiscoveryCache,
+  key: string,
+  value: DiscoveryResult,
+  now: number,
+): void {
+  if (value.hits.length === 0 && value.note !== undefined) {
+    return;
+  }
+  cache.delete(key);
+  while (cache.size >= SEARCH_CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    /* v8 ignore next 3 -- cache.size >= SEARCH_CACHE_MAX_ENTRIES 保证迭代器至少有一项。 */
+    if (oldest === undefined) {
+      break;
+    }
+    cache.delete(oldest);
+  }
+  cache.set(key, { expiresAt: now + SEARCH_CACHE_TTL_MS, value });
+}
+
+export interface ScraplingSearchProvider extends WebSearchProvider {
+  readonly search: (
+    request: WebSearchRequest & { readonly offset?: number },
+    signal?: AbortSignal,
+  ) => Promise<WebSearchResult>;
+}
+
+interface CachedDiscoveryInput {
+  readonly deps: SearchProviderDeps;
+  readonly cache: DiscoveryCache;
+  readonly rateLimiter: DeepSeekRateLimiter;
+  readonly query: string;
+  readonly limit: number;
+  readonly offset: number;
+  readonly route: string | undefined;
+  readonly signal: AbortSignal | undefined;
+}
+
+async function discoverCached(input: CachedDiscoveryInput): Promise<DiscoveryResult> {
+  const { deps, cache, rateLimiter, query, limit, offset, route, signal } = input;
+  signal?.throwIfAborted();
+  const key = discoveryCacheKey(deps, query, limit, offset);
+  const now = Date.now();
+  const cached = cachedDiscovery(cache, key, now);
+  if (cached !== null) {
+    return cached;
+  }
+  const value = await discover(deps, query, {
+    maxResults: limit,
+    offset,
+    route,
+    signal,
+    rateLimiter,
+  });
+  storeDiscovery(cache, key, value, now);
+  return value;
+}
+
+export function createWebSearchProvider(deps: SearchProviderDeps): ScraplingSearchProvider {
+  const cache: DiscoveryCache = new Map();
+  const rateLimiter = new DeepSeekRateLimiter();
   return {
     id: SEARCH_PROVIDER_ID,
 
@@ -605,14 +830,20 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
     // 关掉 require-await」这一侧 —— 反过来写成非 async + Promise.resolve 会撞
     // typescript/promise-function-async，同样要一行豁免，而 async 写法与宿主其余
     // provider 的形状一致。
-    // oxlint-disable-next-line typescript/require-await -- ready 是同步判配置，async 没有可等待的操作
-    async ready(_llmProvider: string | undefined): Promise<boolean> {
+    async ready(llmProvider: string | undefined): Promise<boolean> {
       const reachable = deps.sidecar.alive && deps.sidecar.capabilities?.scrapling === true;
-      return reachable && hasCredentialFor(deps, deps.backend());
+      if (!reachable) {
+        return false;
+      }
+      const backend = deps.backend();
+      if (backend === "deepseek") {
+        return deepseekReady(deps, llmProvider);
+      }
+      return hasCredentialFor(deps, backend);
     },
 
     /**
-     * 检索一次，并把前几条结果真的抓下来渲染。
+     * 检索一次，并把前几条结果真的抓下来按策略读取。
      *
      * 正文放在 `content`：上游把它定义成「provider 生成的答案正文/摘要」，Perplexity 那类
      * provider 就是这么用的。`sources` 仍是可引用的 URL 列表。
@@ -621,14 +852,32 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
      * @param signal - 取消信号
      * @returns 归一后的搜索结果
      */
-    async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
+    async search(
+      request: WebSearchRequest & { readonly offset?: number },
+      signal?: AbortSignal,
+    ): Promise<WebSearchResult> {
       const query = request.query.trim();
       if (query.length === 0) {
         throw new WebError("empty query", "SCRAPLING_SEARCH_FAILED");
       }
       const maxResults = boundResults(request.maxResults);
+      const offset = boundOffset(request.offset);
 
-      const { hits, base, note } = await discover(deps, query, maxResults, signal);
+      const {
+        hits,
+        base,
+        note,
+        truncated: discoveryTruncated,
+      } = await discoverCached({
+        deps,
+        cache,
+        rateLimiter,
+        query,
+        limit: maxResults,
+        offset,
+        route: request.llmProvider,
+        signal,
+      });
       // 抓 HTML 的后端（Bing / DuckDuckGo）一条都没抓到时，会带一句说明：是版式变了，
       // 还是弹了验证码。这句说明此前被整条链路丢掉 —— 回包照样是「成功但没有任何
       // sources」，模型读到的是一次干净的「搜不到」，而真正的原因（抓取层坏了）永远
@@ -642,7 +891,14 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
       // 候选先截到 MAX_SOURCES 再过闸 —— 闸门每条一次 DNS，封顶必须落在过闸之前。
       const candidates = hits.slice(0, MAX_SOURCES);
       const cited = await Promise.all(candidates.map((hit) => toSource(hit, base, deps.urlGate)));
-      const sources = cited.flatMap((outcome) => (outcome.kind === "ok" ? [outcome.source] : []));
+      const seen = new Set<string>();
+      const sources = cited.flatMap((outcome) => {
+        if (outcome.kind !== "ok" || seen.has(outcome.source.url)) {
+          return [];
+        }
+        seen.add(outcome.source.url);
+        return [outcome.source];
+      });
       // 一条都不剩时必须报错，而不是回一次「成功但没有结果」的搜索：后端只回了内网地址
       // 与「搜不到东西」是两件完全不同的事，后者才是用户想看到的那一种。两种丢弃原因分开
       // 点名——只说「被闸门拒绝」会把「后端回了拼不成绝对 URL 的值」也带去查安全策略。
@@ -656,37 +912,50 @@ export function createWebSearchProvider(deps: SearchProviderDeps): WebSearchProv
           "SCRAPLING_SEARCH_FAILED",
         );
       }
-      const bounded = sources.length > maxResults;
+      const bounded = hits.length > maxResults || sources.length > maxResults;
       const kept = bounded ? sources.slice(0, maxResults) : sources;
 
-      // 前 toRender 条并发走 sidecar：URL 闸门在 sidecar.call 里逐条判；浏览器可用时
-      // render 走 Playwright 渲染后再抽，正好补上内置 web_fetch 读不到 SPA 的那块。
-      // Promise.all 保序，所以并发不影响 sources 与正文小节的对应关系。
-      const toRender = Math.max(0, Math.min(deps.renderTopN, kept.length));
+      // 前 toRead 条并发走 sidecar：URL 闸门在每次 sidecar.call 里逐条判；auto 先静态读取，
+      // 正文不足 200 字符且浏览器可用时才追加一次渲染。Promise.all 保序，所以并发不影响
+      // sources 与正文小节的对应关系。
+      const toRead = Math.max(0, Math.min(deps.renderTopN, kept.length));
       const outcomes = await Promise.all(
-        kept.slice(0, toRender).map((source) => renderBody(source, deps, signal)),
+        kept.slice(0, toRead).map((source) => sectionBody(source, deps, signal)),
       );
       const bodies = outcomes.filter((outcome) => outcome.body.length > 0);
 
       // 有 sources 却一条正文都没读到时必须报错。原先一律返回「sources + 没有 content」，
       // 于是全部链接被安全闸门拦下、sidecar 崩了、后端超时 —— 三种完全不同的故障都表现为
       // 一次「成功但没有内容」的搜索。URL 被拦是最需要被看见的一种。
-      if (toRender > 0 && bodies.length === 0) {
+      if (toRead > 0 && bodies.length === 0) {
         // 正文为空的 outcome 一定带 reason（两条产出路径都写了），所以这里不再兜一层
         // 「没有原因」的分支 —— 那种写法既走不到，真走到时也只会印出 undefined。
         const reasons = outcomes.map((outcome) => outcome.reason);
         throw new WebError(
-          `none of the first ${toRender} results could be read: ${reasons.join("; ")}`,
+          `none of the first ${toRead} results could be read: ${reasons.join("; ")}`,
           "SCRAPLING_SEARCH_FAILED",
         );
       }
 
+      const totalBudgetBytes = deps.searchMaxOutputBytes();
+      const joined = bodies.map((outcome) => outcome.body).join("\n\n");
+      const aggregateTruncated = Buffer.byteLength(joined, "utf8") > totalBudgetBytes;
+      let content = joined;
+      // 先量完整聚合值：未超总预算时提前均分，会让一个小节挤掉另一个本可完整保留的小节。
+      // 只有聚合超预算后才分配单页预算，再由聚合封顶处理小节分隔符带来的零头。
+      if (aggregateTruncated) {
+        const pageBudgetBytes = Math.floor(totalBudgetBytes / Math.max(toRead, 1));
+        const pages = bodies.map((outcome) => capText(outcome.body, pageBudgetBytes, "").text);
+        content = capText(pages.join("\n\n"), totalBudgetBytes, "").text;
+      }
       return {
-        ...(bodies.length > 0
-          ? { content: bodies.map((outcome) => outcome.body).join("\n\n") }
-          : {}),
+        ...(bodies.length > 0 ? { content } : {}),
         sources: kept,
-        truncated: bounded,
+        truncated:
+          discoveryTruncated ||
+          bounded ||
+          outcomes.some((outcome) => outcome.truncated) ||
+          aggregateTruncated,
       };
     },
   };

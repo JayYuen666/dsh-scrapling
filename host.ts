@@ -28,10 +28,14 @@ import type { RuntimeJobs } from "./lib/runtime-remote.ts";
 import { defaultInstallerIO, installCapabilityPack } from "./lib/installer.ts";
 import { createUrlPolicy, redactUrlSecrets } from "./lib/url-policy.ts";
 import type { UrlPolicyOptions } from "./lib/url-policy.ts";
+import type { WebFetchStrategy } from "./lib/fetch-strategy.ts";
+import { DEEPSEEK_SEARCH_ENDPOINT, isDeepSeekAuth } from "./lib/deepseek-search.ts";
+import type { DeepSeekAuthLike } from "./lib/deepseek-search.ts";
 import { createWebFetchProvider, PROVIDER_ID } from "./lib/web-provider.ts";
 import {
   BRAVE_SEARCH_ENDPOINT,
   createWebSearchProvider,
+  DEFAULT_SEARCH_TOTAL_BUDGET_BYTES,
   SEARCH_PROVIDER_ID,
   SERPER_SEARCH_ENDPOINT,
 } from "./lib/search-provider.ts";
@@ -42,8 +46,15 @@ import {
   startMcpServer,
 } from "./lib/mcp-server.ts";
 import type { McpServerHandle } from "./lib/mcp-server.ts";
-import { DEFAULT_MCP_PORT, MCP_MODES, MCP_SERVER_NAME, MCP_TOKEN_ENV } from "./lib/mcp-contract.ts";
-import type { McpMode } from "./lib/mcp-contract.ts";
+import {
+  DEFAULT_MCP_PORT,
+  DEFAULT_MCP_TOOL_LOADING,
+  MCP_MODES,
+  MCP_SERVER_NAME,
+  MCP_TOOL_LOADINGS,
+  MCP_TOKEN_ENV,
+} from "./lib/mcp-contract.ts";
+import type { McpMode, McpToolLoading } from "./lib/mcp-contract.ts";
 import { MESSAGES } from "./lib/messages.ts";
 import type { ScraplingMessages } from "./lib/messages.ts";
 import { registerGuidanceSkill } from "./lib/skill.ts";
@@ -67,6 +78,7 @@ import {
   createAnswerTool,
   createCaptureXhrTool,
   createCrawlTool,
+  createDocumentTool,
   createExtractTool,
   createFetchTool,
   createLinksTool,
@@ -142,6 +154,7 @@ export interface Config {
   sessionReadEnabled: Volatile<boolean>;
   sessionActionsEnabled: Volatile<boolean>;
   downloadEnabled: Volatile<boolean>;
+  documentsEnabled: Volatile<boolean>;
   screenshotEnabled: Volatile<boolean>;
   /** 部署级动作门禁；关时动作工具不注册，Python 也硬拒。 */
   allowBrowserActions: boolean;
@@ -149,6 +162,10 @@ export interface Config {
   allowFileDownloads: boolean;
   /** 单次下载的字节上限。 */
   downloadMaxBytes: number;
+  /** PDF 单次读取的字节、页数与输出字符上限；模型只能往下收。 */
+  documentMaxBytes: number;
+  documentMaxPages: number;
+  documentMaxOutputChars: Volatile<number>;
 
   // ---- 抽取与封顶（用户可改，直接影响模型看到的 token 成本）----
   extractionType: Volatile<ExtractionType>;
@@ -210,6 +227,12 @@ export interface Config {
   integrationMode: McpMode;
   /** 本插件 MCP server 的端口；动态注册直接用这一位，手工接入时还要与 profile 里那条 URL 同值。 */
   mcpPort: number;
+  /**
+   * MCP 工具是直接进入工具列表（eager），还是先列目录、由 agent 按需加载（on-demand）。
+   *
+   * 部署级：动态注册与 setup 生成的手工条目都读这一位，改完必须重启宿主。
+   */
+  mcpToolLoading: McpToolLoading;
   /** 官方 MCP 模式的开关：宿主有 mcpManager 时它就是动态注册开关；没有时 setup 生成手工条目还要 --accept-risk 同一次表态。 */
   officialMcpEnabled: boolean;
   /**
@@ -225,6 +248,12 @@ export interface Config {
    * 模型入参到不了这里。
    */
   browserInitScript: string;
+  /**
+   * 已运行浏览器的 CDP 端点；留空不暴露 remote 会话。部署级。
+   *
+   * **安全相关**：能访问该端点就能控制远端浏览器。只从部署配置来，模型入参到不了这里。
+   */
+  browserCdpUrl: string;
   /**
    * 是否改用本机安装的 Google Chrome 而不是引擎自带的 Chromium。部署级。
    *
@@ -293,6 +322,8 @@ export interface Config {
   provideWebFetch: Volatile<boolean>;
   /** 是否注册成 ctx.web 的 search provider。 */
   provideWebSearch: Volatile<boolean>;
+  /** search 与 web_fetch 共用的正文读取策略；默认 auto 静态优先、正文不足时按需渲染。 */
+  webFetchStrategy: Volatile<WebFetchStrategy>;
   /**
    * 发现后端：auto 依次尝试「配了 key 的 API 后端」与 SearXNG，两条都没有时**只有**
    * searchPublicFallback 为 true 才回落到公共引擎（DuckDuckGo → Bing）。默认关（spec D10）。
@@ -313,6 +344,8 @@ export interface Config {
   serperApiKey: Volatile<string>;
   /** SearXNG 实例地址（`searchBackend=searxng` 时必填），例如 `https://searx.example.com`。 */
   searxngEndpoint: Volatile<string>;
+  /** DeepSeek Search API 端点（部署级）；授权由可选 ctx.deepseekAuth 提供。 */
+  deepseekSearchEndpoint: string;
   /** DuckDuckGo HTML 端点（测试或部署覆盖）。 */
   duckduckgoEndpoint: string;
   /** Tavily 端点（部署级；测试或代理可覆盖）。 */
@@ -321,6 +354,8 @@ export interface Config {
   bingEndpoint: string;
   /** 搜索结果里前几条要真的抓下来渲染；0 表示只给链接列表。 */
   searchRenderTopN: number;
+  /** 一次搜索交回模型的聚合正文字节预算；默认 24,000，可在设置卡调整。 */
+  searchMaxOutputBytes: Volatile<number>;
   /**
    * scrapling_answer 用哪个 provider 路由。
    *
@@ -392,12 +427,18 @@ const configSchema = Schema.object({
   sessionReadEnabled: Schema.boolean().default(true).volatile(),
   sessionActionsEnabled: Schema.boolean().default(true).volatile(),
   downloadEnabled: Schema.boolean().default(true).volatile(),
+  documentsEnabled: Schema.boolean().default(true).volatile(),
   screenshotEnabled: Schema.boolean().default(true).volatile(),
   allowBrowserActions: Schema.boolean().default(false),
   allowFileDownloads: Schema.boolean().default(false),
   downloadMaxBytes: Schema.natural()
     .min(1)
     .default(10 * 1024 * 1024),
+  documentMaxBytes: Schema.natural()
+    .min(1)
+    .default(20 * 1024 * 1024),
+  documentMaxPages: Schema.natural().min(1).default(200),
+  documentMaxOutputChars: Schema.natural().min(1).default(200_000).volatile(),
 
   extractionType: Schema.union(["markdown", "html", "text"]).default("markdown").volatile(),
   mainContentOnly: Schema.boolean().default(true).volatile(),
@@ -444,6 +485,8 @@ const configSchema = Schema.object({
   // 端口要与 profile 里那条 dsh-mcp-client 的 URL 同值（手工接入）；动态注册直接用这一位。
   // 改完必须重跑 setup 或重启宿主，doctor 会查。
   mcpPort: Schema.natural().default(DEFAULT_MCP_PORT),
+  // 工具装载档位与宿主 manager/client 同名同域；旧配置缺席时保持 eager。
+  mcpToolLoading: Schema.union([...MCP_TOOL_LOADINGS]).default(DEFAULT_MCP_TOOL_LOADING),
   // 官方 server 的工具集（含 browser_evaluate 这类任意 JS）不经本插件的 guard，所以默认关。
   // 宿主有 mcpManager 时这一位就是动态注册的开关；没有时 setup 还要 --accept-risk 同一次表态
   // 才生成手工条目。条数不写在这里：它随上游版本漂。
@@ -453,6 +496,8 @@ const configSchema = Schema.object({
   browserExecutablePath: Schema.string().default(""),
   // 页面创建时注入的 JS 文件路径：等于让页面执行这个文件，所以只从部署配置来。
   browserInitScript: Schema.string().default(""),
+  // 已运行浏览器的 CDP 端点：强能力，只从部署配置来；空串不暴露 remote 会话。
+  browserCdpUrl: Schema.string().default(""),
   // 改用本机 Google Chrome 而不是自带 Chromium：要求这台机器装了 Chrome。
   browserRealChrome: Schema.boolean().default(false),
   // 走 DNS-over-HTTPS：配代理时防 DNS 泄露。
@@ -478,6 +523,7 @@ const configSchema = Schema.object({
   dataDir: Schema.string().default("").volatile(),
   provideWebFetch: Schema.boolean().default(true).volatile(),
   provideWebSearch: Schema.boolean().default(true).volatile(),
+  webFetchStrategy: Schema.union(["static", "auto", "browser"]).default("auto").volatile(),
   // 取值直接读 lib/search-backends.ts 的那一份数组，不在这里再抄一遍字面量：抄一遍之后
   // 「名单加了一项却忘改 schema」时 CLI 与设置卡认这个值、而配置读入时被 schema 拒掉，
   // TypeScript 帮不上忙（两个独立字面量），症状是「卡上选了它、保存后不生效」。
@@ -487,12 +533,17 @@ const configSchema = Schema.object({
   braveApiKey: Schema.string().default("").volatile(),
   serperApiKey: Schema.string().default("").volatile(),
   searxngEndpoint: Schema.string().default("").volatile(),
+  deepseekSearchEndpoint: Schema.string().default(DEEPSEEK_SEARCH_ENDPOINT),
   duckduckgoEndpoint: Schema.string().default("https://html.duckduckgo.com/html/"),
   tavilyApiEndpoint: Schema.string().default("https://api.tavily.com/search"),
   bingEndpoint: Schema.string().default("https://www.bing.com/search"),
   // 搜索结果里前几条要真的抓下来渲染。渲染正是这半个需求的价值：内置 web_fetch 结构上
   // 读不到 SPA，这里走的是带浏览器的路径。
   searchRenderTopN: Schema.natural().min(0).default(3),
+  searchMaxOutputBytes: Schema.natural()
+    .min(1)
+    .default(DEFAULT_SEARCH_TOTAL_BUDGET_BYTES)
+    .volatile(),
   // 回答模型：三项都留空就是「跟随会话当前模型」，也就是官方内置 web_search 的做法。
   answerProvider: Schema.string().default("").volatile(),
   answerModel: Schema.string().default("").volatile(),
@@ -606,6 +657,7 @@ export interface ToolFlags {
   sessionRead: boolean;
   sessionActions: boolean;
   download: boolean;
+  documents: boolean;
   screenshot: boolean;
 }
 
@@ -635,6 +687,7 @@ export function snapshotFlags(config: Config): ToolFlags {
     // 部署门禁压过卡片开关：关着时工具不注册，模型看不见一个必然被 Python 拒的旋钮。
     sessionActions: config.sessionActionsEnabled.get() && config.allowBrowserActions,
     download: config.downloadEnabled.get() && config.allowFileDownloads,
+    documents: config.documentsEnabled.get(),
     screenshot: config.screenshotEnabled.get(),
   };
 }
@@ -655,6 +708,7 @@ type GuidanceKey =
   | "guidanceSessionRead"
   | "guidanceSessionActions"
   | "guidanceDownload"
+  | "guidanceDocuments"
   | "guidanceScreenshot";
 
 /**
@@ -684,14 +738,22 @@ const GUIDANCE_KEYS: Record<keyof ToolFlags, GuidanceKey> = {
   sessionRead: "guidanceSessionRead",
   sessionActions: "guidanceSessionActions",
   download: "guidanceDownload",
+  documents: "guidanceDocuments",
   screenshot: "guidanceScreenshot",
 };
 
 /** 一个工具对运行环境的最低要求。 */
-export type ToolRequirement = "scrapling" | "browser" | "jobs" | "session-state";
+export type ToolRequirement =
+  | "scrapling"
+  | "browser"
+  | "browser-or-remote"
+  | "jobs"
+  | "session-state"
+  | "documents";
 
 /** 会话状态工具的能力门：`sessionStateDir` 配了才有地方写到磁盘。 */
 const SESSION_STATE_REQUIREMENT = "session-state";
+const BROWSER_OR_REMOTE_REQUIREMENT = "browser-or-remote";
 /**
  * 单实例锁的服务名。dshmarket 热挂子树与 bundle 层会各跑一次 `apply`，第二遍的注册面会撞
  * 「同名已注册」而把 fiber 打成 failed；抢这把锁能把第二遍安静地挡在注册面之外。
@@ -797,13 +859,13 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
   {
     name: "scrapling_session_read",
     flag: "sessionRead",
-    requires: "browser",
+    requires: BROWSER_OR_REMOTE_REQUIREMENT,
     build: createSessionReadTool,
   },
   {
     name: "scrapling_session_act",
     flag: "sessionActions",
-    requires: "browser",
+    requires: BROWSER_OR_REMOTE_REQUIREMENT,
     build: createSessionActTool,
   },
   {
@@ -813,9 +875,15 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     build: createDownloadTool,
   },
   {
+    name: "scrapling_read_document",
+    flag: "documents",
+    requires: "documents",
+    build: createDocumentTool,
+  },
+  {
     name: "scrapling_screenshot",
     flag: "screenshot",
-    requires: "browser",
+    requires: BROWSER_OR_REMOTE_REQUIREMENT,
     build: createScreenshotTool,
   },
 ];
@@ -908,6 +976,9 @@ export function outputBudgetOf(config: Config, toolName: string): number {
   if (toolName === "scrapling_capture_xhr") {
     return config.xhrMaxOutputChars.get();
   }
+  if (toolName === "scrapling_read_document") {
+    return config.documentMaxOutputChars.get();
+  }
   return config.renderMaxOutputChars.get();
 }
 
@@ -919,6 +990,7 @@ export type SkipReason =
   | "disabled"
   | "scrapling-missing"
   | "browser-missing"
+  | "documents-missing"
   | "jobs-unavailable"
   | "attachments-missing"
   | "session-state-unavailable";
@@ -955,11 +1027,17 @@ export function planTools(
   const ready: string[] = [];
   const skipped: { name: string; reason: SkipReason }[] = [];
   const satisfied = (requires: ToolRequirement): SkipReason | typeof NONE => {
+    if (requires === "documents") {
+      return capabilities?.documents === true ? NONE : "documents-missing";
+    }
     // 还没握手成功时一律按「缺 scrapling」处理：没有 scrapling，后面什么都没意义。
     if (capabilities === undefined || !capabilities.scrapling) {
       return "scrapling-missing";
     }
     if (requires === "browser" && !capabilities.browser) {
+      return "browser-missing";
+    }
+    if (requires === "browser-or-remote" && !capabilities.browser && capabilities.remote !== true) {
       return "browser-missing";
     }
     // 作业后端缺失时爬虫必挂：`jobs.start()` 会在发起任何请求之前抛
@@ -1293,7 +1371,8 @@ function startCrawlJob(
         run: (job) => {
           const controller = new AbortController();
           const sink = sinkOf(job, controller.signal, router);
-          // 取消只置 signal；真正拆掉 Python 进程的是 sidecar 客户端收到 abort 后的自毁逻辑。
+          // 取消只置 signal；sidecar 客户端作废当前请求并发送 cancel 帧，不拆共享进程。
+          // 爬虫自身仍由 drainCrawl 的 crawl.stop 显式叫停。
           controller.signal.addEventListener(
             "abort",
             () => {
@@ -1442,7 +1521,7 @@ export function createUrlGate(config: Config): (url: string) => Promise<string> 
 /**
  * 两个 web provider 共用的热改项读取器。
  *
- * 八位 `.volatile()` 的部署项在这里各对应一枚取值函数：设置卡改值**不会重跑 `apply`**
+ * 十位 `.volatile()` 的部署项在这里各对应一枚取值函数：设置卡改值**不会重跑 `apply`**
  * （宿主只把新值提交给已装好的那份配置引用），所以任何在装配时抄下值的写法都会让旋钮
  * 失效而毫无征兆。抽成具名工厂有两个好处：两个 provider 只有一处口径，且「读取器真的每次
  * 现取」可以直接对着它测 —— 不必为了覆盖五个箭头去真起一个 sidecar。
@@ -1451,7 +1530,7 @@ export function createUrlGate(config: Config): (url: string) => Promise<string> 
  * 就够了；混进来反而让调用点看不出哪些是热改位。
  *
  * @param config - 已解析的设置
- * @returns 八位热改项各自的读取器
+ * @returns 十位热改项各自的读取器
  */
 export function providerReadersOf(config: Config): {
   backend: () => SearchBackend;
@@ -1461,7 +1540,9 @@ export function providerReadersOf(config: Config): {
   searxngEndpoint: () => string;
   publicFallback: () => boolean;
   maxOutputBytes: () => number;
+  searchMaxOutputBytes: () => number;
   timeoutMs: () => number;
+  fetchStrategy: () => WebFetchStrategy;
 } {
   return {
     backend: () => config.searchBackend.get(),
@@ -1471,7 +1552,9 @@ export function providerReadersOf(config: Config): {
     searxngEndpoint: () => config.searxngEndpoint.get(),
     publicFallback: () => config.searchPublicFallback.get(),
     maxOutputBytes: () => config.fetchMaxOutputChars.get(),
+    searchMaxOutputBytes: () => config.searchMaxOutputBytes.get(),
     timeoutMs: () => config.fetchTimeoutMs.get(),
+    fetchStrategy: () => config.webFetchStrategy.get(),
   };
 }
 
@@ -1490,10 +1573,11 @@ function registerFetchProvider(ctx: Context, sidecar: SidecarClient, config: Con
   const readers = providerReadersOf(config);
   const provider = createWebFetchProvider({
     sidecar,
-    // 传读取器而不是当下的值：`fetchMaxOutputChars` 与 `fetchTimeoutMs` 都是 volatile 位，
-    // 抄进闭包的值在设置卡改完就永远停在旧值（`apply` 不会重跑）。
+    // 传读取器而不是当下的值：这三个都是 volatile 位，抄进闭包的值在设置卡改完后就永远
+    // 停在旧值（`apply` 不会重跑）。
     maxOutputBytes: readers.maxOutputBytes,
     timeoutMs: readers.timeoutMs,
+    fetchStrategy: readers.fetchStrategy,
   });
   if (!provider.available()) {
     ctx.logger.warn("[dsh-scrapling] 跳过注册 fetch provider：sidecar 尚未可用");
@@ -1517,20 +1601,29 @@ function registerFetchProvider(ctx: Context, sidecar: SidecarClient, config: Con
  * @param config - 已解析的设置
  * @param urlGate - 出站 URL 闸门；与 sidecar 共用同一个，两侧才对同一个地址下结论
  */
+function deepseekAuthOf(ctx: Context): DeepSeekAuthLike | undefined {
+  const value: unknown = ctx.get("deepseekAuth");
+  return isDeepSeekAuth(value) ? value : undefined;
+}
+
 function searchProviderOf(
+  ctx: Context,
   config: Config,
   sidecar: SidecarClient,
   urlGate: (url: string) => Promise<string>,
 ): WebSearchProvider {
   return createWebSearchProvider({
     sidecar,
-    // 八位热改项一律传读取器，与非热改的部署值分开写（见 providerReadersOf）。
+    // 十位热改项一律传读取器，与非热改的部署值分开写（见 providerReadersOf）。
     ...providerReadersOf(config),
     apiEndpoint: config.tavilyApiEndpoint,
     bingEndpoint: config.bingEndpoint,
     braveEndpoint: BRAVE_SEARCH_ENDPOINT,
     serperEndpoint: SERPER_SEARCH_ENDPOINT,
     duckduckgoEndpoint: config.duckduckgoEndpoint,
+    deepseekAuth: deepseekAuthOf(ctx),
+    deepseekEndpoint: () => config.deepseekSearchEndpoint,
+    fetchImpl: globalThis.fetch,
     renderTopN: config.searchRenderTopN,
     urlGate,
   });
@@ -1581,6 +1674,7 @@ interface McpRegistrationEntry {
   toolCallTimeoutMs: number;
   closeTimeoutMs: number;
   reconnect: Record<string, unknown>;
+  toolLoading: McpToolLoading;
 }
 
 function isMcpManager(value: unknown): value is McpManagerLike {
@@ -1646,6 +1740,7 @@ export async function startMcpSurface(args: SurfaceArgs): Promise<McpServerHandl
     toolCallTimeoutMs: 120_000,
     closeTimeoutMs: 5000,
     reconnect: {},
+    toolLoading: config.mcpToolLoading,
   });
   const notice = token.length > 0 ? " · 需要 bearer token" : " · 无 token，只绑回环";
   const via = registered ? "已动态注册到宿主 mcpManager" : "需手配 dsh-mcp-client 接入";
@@ -1678,6 +1773,7 @@ async function registerSurface(args: SurfaceArgs): Promise<void> {
         toolCallTimeoutMs: 120_000,
         closeTimeoutMs: 5000,
         reconnect: {},
+        toolLoading: config.mcpToolLoading,
       });
     ctx.logger.info(
       registered
@@ -1742,6 +1838,8 @@ function readBaseSettings(config: Config, dataDir: string): BaseSettings {
   return {
     downloadDir: path.join(dataDir, "downloads"),
     downloadMaxBytes: config.downloadMaxBytes,
+    documentMaxBytes: config.documentMaxBytes,
+    documentMaxPages: config.documentMaxPages,
     extractionType: config.extractionType.get(),
     mainContentOnly: config.mainContentOnly.get(),
     timeoutMs: config.fetchTimeoutMs.get(),
@@ -1756,6 +1854,7 @@ function readBaseSettings(config: Config, dataDir: string): BaseSettings {
     crawlMaxRuntimeSeconds: config.crawlMaxRuntimeSeconds,
     browserExecutablePath: config.browserExecutablePath,
     browserInitScript: config.browserInitScript,
+    browserCdpUrl: config.browserCdpUrl,
     browserRealChrome: config.browserRealChrome,
     browserDnsOverHttps: config.browserDnsOverHttps,
     recordRequests: config.recordRequests,
@@ -2145,7 +2244,7 @@ async function activate(ctx: Context & SettingsFace, config: Config): Promise<vo
     maxTokens: () => config.answerMaxTokens.get(),
     messages: localeMessages,
   });
-  const searchProvider = searchProviderOf(config, sidecar, urlGate);
+  const searchProvider = searchProviderOf(ctx, config, sidecar, urlGate);
   // 预算按工具分别给：静态抓取的正文、浏览器渲染后的正文、XHR 快照三者体量差一个
   // 数量级，共用一份预算等于把三档调节压成一档——调 fetch 的旋钮会连带改掉 render。
   //

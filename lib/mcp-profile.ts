@@ -15,11 +15,13 @@ import {
   MCP_LISTEN_HOST,
   MCP_SERVER_NAME,
   MCP_TOKEN_ENV,
+  MCP_TOOL_LOADINGS,
   MCP_TRANSPORT_HTTP,
   MCP_TRANSPORT_STDIO,
+  DEFAULT_MCP_TOOL_LOADING,
   mcpUrl,
 } from "./mcp-contract.ts";
-import type { McpMode } from "./mcp-contract.ts";
+import type { McpMode, McpToolLoading } from "./mcp-contract.ts";
 
 /** profile 文本的行分隔与 URL 端口（读不出端口时用它兜一次冒号匹配）。 */
 const LINE_BREAK = /\r\n|\n|\r/u;
@@ -330,7 +332,7 @@ export function inspectProfile(input: ProfileInspection): McpFinding[] {
   ];
 }
 
-/** profile 里与 MCP 有关的那三件事。 */
+/** profile 里与 MCP 有关的四项状态。 */
 export interface ProfileSnapshot {
   readonly patchText: string;
   readonly clientVersion?: string | undefined;
@@ -341,6 +343,8 @@ export interface ProfileSnapshot {
    */
   readonly clientVersionBroken?: boolean | undefined;
   readonly officialMcpEnabled: boolean;
+  /** 部署项 mcpToolLoading；旧 profile 没写时按宿主默认 eager。 */
+  readonly mcpToolLoading: McpToolLoading;
 }
 
 /**
@@ -356,21 +360,22 @@ export interface ProfileSnapshot {
  * 去收紧会让所有真实 profile 都读成关闭。
  */
 const SWITCH_LINE = /^(?<indent>[\t ]*)officialMcpEnabled:(?<value>[^\r\n]*)$/gmu;
+const TOOL_LOADING_LINE = /^(?<indent>[\t ]*)mcpToolLoading:(?<value>[^\r\n]*)$/gmu;
 
 /**
- * 取 `officialMcpEnabled` 的标量文本；同一份文本里出现多次时取**同一缩进档**的最后一条。
+ * 取插件 config 标量文本；同一份文本里出现多次时取**同一缩进档**的最后一条。
  *
  * YAML 的重复键按「后者生效」解析，宿主读到的就是那一条；取第一条会让 doctor 的判据与
  * 宿主实际行为相反（前 false 后 true 时，doctor 说开关没开，而宿主已经把工具端出去了）。
  *
- * 限定「同一缩进档」是防**嵌套同名键**：`headers:` 之类的子映射里再出现一个
- * `officialMcpEnabled` 比插件 config 那一层更深，它不是同一个键。跨档取最后一条会让那条
- * 无关的子键把开关判反。取首个命中的缩进作基准——插件 config 这一档总是先出现。
+ * 限定「同一缩进档」是防**嵌套同名键**：`headers:` 之类的子映射里再出现一个同名键比插件
+ * config 那一层更深，它不是同一个配置项。跨档取最后一条会让无关子键改变部署值。取首个命中的
+ * 缩进作基准——插件 config 这一档总是先出现。
  */
-function switchScalar(text: string): string | undefined {
+function indentedScalar(text: string, pattern: RegExp): string | undefined {
   let baseIndent: string | undefined;
   let raw: string | undefined;
-  for (const match of text.matchAll(SWITCH_LINE)) {
+  for (const match of text.matchAll(pattern)) {
     /* v8 ignore next -- 命名组恒存在（`indent` 在模式里是无条件的），`?? ""` 只是类型收窄 */
     const indent = match.groups?.["indent"] ?? "";
     // 首个命中的缩进作基准：插件 config 那一档总是先出现，比它更深的同名键属于别的映射。
@@ -382,6 +387,24 @@ function switchScalar(text: string): string | undefined {
   const value = raw?.replace(TRAILING_COMMENT, "").trim();
   const quoted = value === undefined ? undefined : QUOTED_SCALAR.exec(value)?.groups;
   return quoted?.["double"] ?? quoted?.["single"] ?? value;
+}
+
+function switchScalar(text: string): string | undefined {
+  return indentedScalar(text, SWITCH_LINE);
+}
+
+/** 读部署项 mcpToolLoading；缺席保持 eager，非法值 fail-closed。 */
+function toolLoadingOf(text: string): McpToolLoading {
+  const value = indentedScalar(text, TOOL_LOADING_LINE);
+  if (value === undefined || value === DEFAULT_MCP_TOOL_LOADING) {
+    return DEFAULT_MCP_TOOL_LOADING;
+  }
+  if (value === "on-demand") {
+    return value;
+  }
+  throw new Error(
+    `mcpToolLoading 配置非法：${JSON.stringify(value)}；只接受 ${MCP_TOOL_LOADINGS.join(" / ")}`,
+  );
 }
 
 function isSwitchOn(text: string): boolean {
@@ -468,7 +491,7 @@ async function assertProfileDirectory(dir: string): Promise<void> {
  * 读一个 profile 目录。
  *
  * @param dir - profile 根目录（`<DSH_HOME>/profiles/<名>`）
- * @returns patch 文本、客户端版本与官方开关；文件缺失即空值
+ * @returns patch 文本、客户端版本、官方开关与 mcpToolLoading（缺省 eager）；文件缺失即空值
  */
 export async function readProfileSnapshot(dir: string): Promise<ProfileSnapshot> {
   await assertProfileDirectory(dir);
@@ -482,6 +505,7 @@ export async function readProfileSnapshot(dir: string): Promise<ProfileSnapshot>
     clientVersion: client.version,
     clientVersionBroken: client.broken,
     officialMcpEnabled: isSwitchOn(patchText),
+    mcpToolLoading: toolLoadingOf(patchText),
   };
 }
 
@@ -506,6 +530,8 @@ export function modePatchFile(mode: ProfileMode): string {
 export function mcpClientPatch(options: {
   readonly port: number;
   readonly withAuth: boolean;
+  /** 缺省保持旧调用方与旧 profile 的 eager 行为。 */
+  readonly toolLoading?: McpToolLoading | undefined;
 }): string {
   const lines = [
     "- insert:",
@@ -516,6 +542,7 @@ export function mcpClientPatch(options: {
     `        transport: ${MCP_TRANSPORT_HTTP}`,
     `        url: ${mcpUrl(options.port, MCP_LISTEN_HOST)}`,
     "        failOnStartupError: false",
+    `        toolLoading: ${options.toolLoading ?? DEFAULT_MCP_TOOL_LOADING}`,
   ];
   if (options.withAuth) {
     lines.push(

@@ -332,7 +332,7 @@ const EXPECTED_SECTION_ORDER = 30;
 /**
  * 替身里渲染器的登记键。
  *
- * 只用 slot 名当键会把 19 个 key 各不相同的 toolview 压成同一格（后写的盖掉前面的），
+ * 只用 slot 名当键会把 20 个 key 各不相同的 toolview 压成同一格（后写的盖掉前面的），
  * 于是「按具体工具取渲染器」这种断言写不出来。宿主本来就是按 name+key 登记的。
  */
 const rendererKey = (slot: string, key: string): string => `${slot}:${key}`;
@@ -558,6 +558,7 @@ describe("apply", () => {
     // 只断言 `toContain("scrapling_answer")` 是不够的：那条曾经放过了「清单里留着已经删掉的
     // scrapling_stealth_fetch、同时缺三个真会话工具」这一整片漂移。两张表的对应关系是集合相等，
     // 判据就得写成集合相等。
+    expect(ROW_TOOLS).toContain("scrapling_read_document");
     expect([...ROW_TOOLS].toSorted()).toStrictEqual(TOOL_SPECS.map((spec) => spec.name).toSorted());
   });
 
@@ -712,7 +713,7 @@ describe("apply", () => {
       `locale:${LOCALE_NS}/en`,
       `locale:${LOCALE_NS}/zh`,
     ]);
-    // 结果行的注销走的是 slots.register 交回的那一位：19 个工具一位都不能少，
+    // 结果行的注销走的是 slots.register 交回的那一位：20 个工具一位都不能少，
     // 少一位就是宿主重载后残留一个渲染器。
     expect(disposed.filter((entry) => entry.startsWith("slot:scrapling_"))).toHaveLength(
       ROW_TOOLS.length,

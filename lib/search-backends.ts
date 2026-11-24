@@ -6,7 +6,7 @@
 // 类型里没有」这类分叉不成立。设置卡的 enum 面（src/settings-fields.ts）读同一份数组，
 // 客户端产物里多的只是一串字面量。
 
-/** 发现后端。`auto` = 按配了的 key / SearXNG 依次挑，两条都没有时只看 searchPublicFallback。 */
+/** 发现后端。`auto` = 按配了的 key / SearXNG 依次挑；deepseek 由 Host 侧 ctx.deepseekAuth 授权。 */
 export const SEARCH_BACKENDS = [
   "auto",
   "tavily",
@@ -15,6 +15,7 @@ export const SEARCH_BACKENDS = [
   "serper",
   "duckduckgo",
   "searxng",
+  "deepseek",
 ] as const;
 
 /**

@@ -495,7 +495,7 @@ describe("测试架：展开器与 effect 时机", () => {
     };
     const rendered = expand(renderProbe());
     // 渲染期一次都不执行：effect 里那句 setCount 若在此刻跑，drawCard 的 cursor 归零会让
-    // 后续槽位错位，而本卡 50 个控件的断言仍可能全绿。
+    // 后续槽位错位，而本卡 54 个控件的断言仍可能全绿。
     expect(seen).toStrictEqual([]);
     expect(hostNodes(rendered)[0]?.props.value).toBe(0);
     runPendingEffects();
@@ -565,7 +565,7 @@ describe("scrapling 设置卡：渲染结构", () => {
 
   afterEach(runCleanups);
 
-  it("page 视图按字段表渲染 7 组、50 个控件，组标题与说明取自字典", () => {
+  it("page 视图按字段表渲染 7 组、54 个控件，组标题与说明取自字典", () => {
     const { form } = formOf({});
     const card = mountCard({ ...PAGE, t, form });
     const tree = card.tree();
@@ -581,7 +581,7 @@ describe("scrapling 设置卡：渲染结构", () => {
     // 这两个数字**刻意不从 SETTINGS_GROUPS 推导**：上面那个循环的期望值来自同一张表，
     // 表被删空时它照样全绿。独立写死的规模才是「字段表面变了要有人确认」的哨兵，
     // 代价是改表时要同步这两个数（本仓判据要求期望值独立写死，不接受自证）。
-    expect(fields).toBe(50);
+    expect(fields).toBe(54);
     expect(SETTINGS_GROUPS).toHaveLength(7);
   });
 

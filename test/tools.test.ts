@@ -15,8 +15,10 @@ import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
 import { pageToText, rowToText } from "../lib/crawl-output.ts";
 import { anySignal, drainCrawl } from "../lib/crawl-support.ts";
 import {
+  boundNetworkEntries,
   capText,
   FALLBACK_BUDGET_BYTES,
+  NETWORK_STRUCTURED_BUDGET_BYTES,
   renderAnswer,
   renderBrowser,
   renderFetch,
@@ -27,6 +29,7 @@ import {
   createAnswerTool,
   createCaptureXhrTool,
   createCrawlTool,
+  createDocumentTool,
   createExtractTool,
   createFetchTool,
   createLinksTool,
@@ -41,7 +44,13 @@ import {
   createSessionStateSaveTool,
   toolTimeoutOf,
 } from "../lib/tools.ts";
-import type { CrawlJobRunner, CrawlJobStarter, CrawlSink, ToolSettings } from "../lib/tools.ts";
+import type {
+  CrawlJobRunner,
+  CrawlJobStarter,
+  CrawlSink,
+  NetworkEntry,
+  ToolSettings,
+} from "../lib/tools.ts";
 import {
   createDownloadTool,
   createScreenshotTool,
@@ -71,6 +80,8 @@ const REAL_SIDECAR_TIMEOUT_MS = 150_000;
 
 /** 测试里反复用到的示例 XHR 接口 URL。 */
 const SAMPLE_API = "https://api.test/items";
+/** 网络边界用例的首条 URL。 */
+const NETWORK_FIRST_URL = "https://a.test/1";
 
 /** 测试里反复用到的示例 URL。 */
 const SAMPLE_URL = "http://example.test/";
@@ -163,6 +174,7 @@ const SETTINGS: ToolSettings = {
   crawlMaxRuntimeSeconds: 1800,
   browserExecutablePath: "",
   browserInitScript: "",
+  browserCdpUrl: "",
   browserRealChrome: false,
   browserDnsOverHttps: false,
   recordRequests: false,
@@ -182,6 +194,8 @@ const SETTINGS: ToolSettings = {
   stripInlineImages: true,
   downloadDir: "/tmp/scrapling-downloads",
   downloadMaxBytes: 10_000_000,
+  documentMaxBytes: 20 * 1024 * 1024,
+  documentMaxPages: 200,
 };
 
 /** 假 sidecar：按 method 回固定结果，并记录收到的参数。 */
@@ -232,7 +246,14 @@ function fakeBrowserSidecar(result: unknown): {
 } {
   const fake = fakeSidecar(result);
   Object.defineProperty(fake.client, "capabilities", {
-    value: { scrapling: true, static: true, extract: true, browser: true, writeMethods: false },
+    value: {
+      scrapling: true,
+      static: true,
+      extract: true,
+      browser: true,
+      remote: true,
+      writeMethods: false,
+    },
     configurable: true,
   });
   return fake;
@@ -276,15 +297,19 @@ function isLowSurrogate(code: number): boolean {
  * @param browser - 这台机器有没有可用的浏览器
  * @returns 该参数的 enum 与 description
  */
-function sessionTypeParam(browser: boolean): { enum?: string[]; description?: string } {
+function sessionTypeParam(
+  browser: boolean,
+  cdpUrl = "",
+  remote = browser,
+): { enum?: string[]; description?: string } {
   const fake = fakeSidecar({});
   Object.defineProperty(fake.client, "capabilities", {
-    value: { scrapling: true, static: true, extract: true, browser, writeMethods: false },
+    value: { scrapling: true, static: true, extract: true, browser, remote, writeMethods: false },
     configurable: true,
   });
   const tool = createSessionOpenTool({
     sidecar: fake.client,
-    settings: SETTINGS,
+    settings: { ...SETTINGS, browserCdpUrl: cdpUrl },
     startCrawlJob: fakeJobStarter,
     answer: fakeAnswer,
   });
@@ -325,7 +350,7 @@ describe("工具级墙钟比内层请求超时多一份余量", () => {
       answer: fakeAnswer,
       attachments: { saveImage: async (): Promise<Record<string, unknown>> => ({}) },
     };
-    // 期望表独立写死（不从实现派生）：18 个工厂 → 工具名。工具面多一个少一个这里就红。
+    // 期望表独立写死（不从实现派生）：20 个工厂 → 工具名。工具面多一个少一个这里就红。
     const builders = new Map<string, (built: typeof deps) => ToolDefinition>([
       ["scrapling_fetch", createFetchTool],
       ["scrapling_extract", createExtractTool],
@@ -345,6 +370,7 @@ describe("工具级墙钟比内层请求超时多一份余量", () => {
       ["scrapling_session_read", createSessionReadTool],
       ["scrapling_session_act", createSessionActTool],
       ["scrapling_download", createDownloadTool],
+      ["scrapling_read_document", createDocumentTool],
       ["scrapling_screenshot", createScreenshotTool],
     ]);
     for (const [name, build] of builders) {
@@ -361,7 +387,7 @@ describe("工具级墙钟比内层请求超时多一份余量", () => {
 
 describe("每个工具都声明调用态卡片（不留默认卡片）", () => {
   // 判据是「工具在时间线上能不能一眼认出来」：不声明 presentCall 就落到宿主默认卡片
-  //（标题是工具名、没有类别图标），19 个工具在时间线上会长得一模一样。类别必须各自
+  //（标题是工具名、没有类别图标），20 个工具在时间线上会长得一模一样。类别必须各自
   // 对路——抓取类给 fetch、检索类给 search、只读本地寄存器给 read、动作类给 other。
   const KINDS = new Map<string, string>([
     ["scrapling_fetch", "fetch"],
@@ -382,6 +408,7 @@ describe("每个工具都声明调用态卡片（不留默认卡片）", () => {
     ["scrapling_session_read", "fetch"],
     ["scrapling_session_act", "search"],
     ["scrapling_download", "fetch"],
+    ["scrapling_read_document", "fetch"],
     ["scrapling_screenshot", "fetch"],
   ]);
 
@@ -408,10 +435,11 @@ describe("每个工具都声明调用态卡片（不留默认卡片）", () => {
     ["scrapling_session_read", { sessionId: "s1" }],
     ["scrapling_session_act", { sessionId: "s1", actions: [{ kind: "click", selector: "#go" }] }],
     ["scrapling_download", { url: `${HOME}/a.bin` }],
+    ["scrapling_read_document", { url: `${HOME}/a.pdf` }],
     ["scrapling_screenshot", { sessionId: "s1" }],
   ]);
 
-  it("19 个工具的卡片类别各自对路，且标题在入参最小时也不空", () => {
+  it("20 个工具的卡片类别各自对路，且标题在入参最小时也不空", () => {
     const fake = fakeSidecar({});
     Object.defineProperty(fake.client, "capabilities", {
       value: { scrapling: true, static: true, extract: true, browser: true, writeMethods: false },
@@ -443,6 +471,7 @@ describe("每个工具都声明调用态卡片（不留默认卡片）", () => {
       createSessionReadTool,
       createSessionActTool,
       createDownloadTool,
+      createDocumentTool,
       createScreenshotTool,
     ].map((build) => build(deps));
     for (const tool of built) {
@@ -550,6 +579,245 @@ describe("capText", () => {
   });
 });
 
+/** 造一批 id 连续、正文长度固定的网络条目，供结构化预算用例使用。 */
+const networkEntries = (count: number, bodyChars = 0): NetworkEntry[] =>
+  Array.from({ length: count }, (_unused, index) => ({
+    id: index + 1,
+    url: `https://api.test/items/${String(index)}`,
+    status: 200,
+    bytes: bodyChars,
+    method: "GET",
+    resourceType: "fetch",
+    ...(bodyChars === 0 ? {} : { body: "x".repeat(bodyChars) }),
+  }));
+
+/** 跨页用例共用的两条 URL；字面值独立于被测的字节预算逻辑。 */
+const NETWORK_OVERSIZED_URL = "https://a.test/oversized";
+const NETWORK_LATER_URL = "https://a.test/later";
+
+describe("boundNetworkEntries", () => {
+  it("导出精确总预算，未超预算时原样保留并报告总条数与返回条数", () => {
+    expect(NETWORK_STRUCTURED_BUDGET_BYTES).toBe(120_000);
+    const matches = networkEntries(2, 10);
+    expect(boundNetworkEntries(matches, 120_000)).toStrictEqual({
+      matches,
+      count: 2,
+      returnedCount: 2,
+      truncated: false,
+      nextAfterId: 2,
+    });
+  });
+
+  it("单条超剩余预算时停止保留，锚点取被省略条目的前进 id", () => {
+    const first: NetworkEntry = {
+      id: 7,
+      url: NETWORK_FIRST_URL,
+      status: 200,
+      bytes: 1,
+      method: "GET",
+      resourceType: "fetch",
+    };
+    const second: NetworkEntry = {
+      url: "https://a.test/2",
+      status: 200,
+      bytes: 1,
+      method: "GET",
+      resourceType: "fetch",
+    };
+    const oversized: NetworkEntry = { ...first, id: 9, body: "x".repeat(1000) };
+    const later: NetworkEntry = { ...first, id: 11, url: "https://a.test/4" };
+    const result = boundNetworkEntries([first, second, oversized, later], 320);
+    expect(result.matches).toStrictEqual([first, second]);
+    expect(result.count).toBe(4);
+    expect(result.returnedCount).toBe(2);
+    expect(result.truncated).toBe(true);
+    expect(result.nextAfterId).toBe(9);
+    expect(Buffer.byteLength(JSON.stringify(result.matches), "utf8")).toBeLessThanOrEqual(320);
+  });
+
+  it("预算只够空数组时返回空列表，并用首条省略记录的 id 作为跳过锚点", () => {
+    expect(boundNetworkEntries(networkEntries(1), 2)).toStrictEqual({
+      matches: [],
+      count: 1,
+      returnedCount: 0,
+      truncated: true,
+      nextAfterId: 1,
+    });
+    expect(boundNetworkEntries([], 2)).toStrictEqual({
+      matches: [],
+      count: 0,
+      returnedCount: 0,
+      truncated: false,
+    });
+  });
+
+  it("保留条目都没有数字 id 时不编造分页锚点", () => {
+    const matches: NetworkEntry[] = [
+      { url: NETWORK_FIRST_URL, status: 200, bytes: 0, method: "GET", resourceType: "fetch" },
+    ];
+    const result = boundNetworkEntries(matches, 120_000);
+    expect(result.matches).toStrictEqual(matches);
+    expect(result.truncated).toBe(false);
+    expect(result).not.toHaveProperty("nextAfterId");
+  });
+
+  it("最后保留条目没有 id 时不沿用更早的旧锚点", () => {
+    const first: NetworkEntry = {
+      id: 7,
+      url: NETWORK_FIRST_URL,
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+    };
+    const last: NetworkEntry = {
+      url: "https://a.test/no-id",
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+    };
+    const result = boundNetworkEntries([first, last], 120_000);
+    expect(result.matches).toStrictEqual([first, last]);
+    expect(result.truncated).toBe(false);
+    expect(result).not.toHaveProperty("nextAfterId");
+  });
+
+  it("省略条目没有前进 id 时省略锚点并保持截断标记", () => {
+    const first: NetworkEntry = {
+      id: 7,
+      url: NETWORK_FIRST_URL,
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+    };
+    const oversized: NetworkEntry = {
+      url: "https://a.test/no-id",
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+      body: "x".repeat(1000),
+    };
+    const result = boundNetworkEntries([first, oversized], 320);
+    expect(result.matches).toStrictEqual([first]);
+    expect(result.truncated).toBe(true);
+    expect(result).not.toHaveProperty("nextAfterId");
+  });
+
+  it("首条超大条目被省略后，下一页按该 id 越过它并保留后续条目", () => {
+    const oversized: NetworkEntry = {
+      id: 5,
+      url: NETWORK_OVERSIZED_URL,
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+      body: "x".repeat(1000),
+    };
+    const later: NetworkEntry = {
+      id: 6,
+      url: NETWORK_LATER_URL,
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+    };
+    const firstPage = boundNetworkEntries([oversized, later], 320);
+    expect(firstPage.matches).toStrictEqual([]);
+    expect(firstPage.truncated).toBe(true);
+    expect(firstPage.nextAfterId).toBe(5);
+
+    const secondPage = boundNetworkEntries([later], 320);
+    expect(secondPage.matches).toStrictEqual([later]);
+    expect(secondPage.truncated).toBe(false);
+    expect(secondPage.nextAfterId).toBe(6);
+  });
+
+  it("中间超大条目被省略后，下一页按该 id 越过它并保留后续条目", () => {
+    const first: NetworkEntry = {
+      id: 3,
+      url: NETWORK_FIRST_URL,
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+    };
+    const oversized: NetworkEntry = {
+      id: 4,
+      url: NETWORK_OVERSIZED_URL,
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+      body: "x".repeat(1000),
+    };
+    const later: NetworkEntry = {
+      id: 5,
+      url: NETWORK_LATER_URL,
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+    };
+    const firstPage = boundNetworkEntries([first, oversized, later], 320);
+    expect(firstPage.matches).toStrictEqual([first]);
+    expect(firstPage.truncated).toBe(true);
+    expect(firstPage.nextAfterId).toBe(4);
+
+    const secondPage = boundNetworkEntries([later], 320);
+    expect(secondPage.matches).toStrictEqual([later]);
+    expect(secondPage.truncated).toBe(false);
+    expect(secondPage.nextAfterId).toBe(5);
+  });
+
+  it("省略条目的 id 不优于前锚点时省略 nextAfterId，避免下一页原地循环", () => {
+    const first: NetworkEntry = {
+      id: 7,
+      url: NETWORK_FIRST_URL,
+      status: 200,
+      bytes: 0,
+      method: "GET",
+      resourceType: "fetch",
+    };
+    for (const id of [0, -1, 6, 6.5, 7, 7.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const oversized: NetworkEntry = { ...first, id, body: "x".repeat(1000) };
+      const result = boundNetworkEntries([first, oversized], 320);
+      expect(result.matches).toStrictEqual([first]);
+      expect(result.truncated).toBe(true);
+      expect(result).not.toHaveProperty("nextAfterId");
+    }
+  });
+
+  it("JSON 方括号与逗号计入预算：139 字节刚好放下两条，138 字节只放下首条", () => {
+    const matches: NetworkEntry[] = [
+      { id: 1, url: "", status: 0, bytes: 0, method: "", resourceType: "" },
+      { id: 2, url: "", status: 0, bytes: 0, method: "", resourceType: "" },
+    ];
+    expect(boundNetworkEntries(matches, 139)).toStrictEqual({
+      matches,
+      count: 2,
+      returnedCount: 2,
+      truncated: false,
+      nextAfterId: 2,
+    });
+    expect(boundNetworkEntries(matches, 138)).toStrictEqual({
+      matches: matches.slice(0, 1),
+      count: 2,
+      returnedCount: 1,
+      truncated: true,
+      nextAfterId: 2,
+    });
+  });
+
+  it("非法预算直接拒绝，不静默放宽或返回超预算对象", () => {
+    for (const budget of [Number.NaN, Number.POSITIVE_INFINITY, 1, -1]) {
+      expect(() => boundNetworkEntries(networkEntries(1), budget)).toThrow(RangeError);
+    }
+  });
+});
+
 const fetchOf = (truncated: boolean, notice: string): Parameters<typeof renderFetch>[0] => ({
   url: SAMPLE_URL,
   statusCode: 200,
@@ -645,7 +913,7 @@ describe("网络历史的封顶", () => {
     const bytes = Buffer.byteLength(many, "utf8");
     expect(bytes).toBeLessThanOrEqual(1024);
     expect((many.match(/- \[id /gu) ?? []).length).toBeLessThan(40);
-    expect(many).toContain("网络历史整体被截断");
+    expect(many).toContain(MESSAGES.zh.captureNetworkTruncationHint);
   });
 
   it("网络段在预算内时不加页脚", () => {
@@ -656,6 +924,23 @@ describe("网络历史的封顶", () => {
 
   it("schema 里没有 xhr 的工具只回正文", () => {
     expect(renderBrowser(browserOf(0, false), 500, MESSAGES.zh).endsWith("正文")).toBe(true);
+  });
+
+  it("正文与结构化网络分别截断时保留两类说明，capture 不输出可复用锚点", () => {
+    const text = renderBrowser(
+      {
+        ...browserOf(1),
+        truncated: true,
+        contentTruncated: true,
+        xhrTruncated: true,
+      },
+      8192,
+      MESSAGES.zh,
+    );
+    expect(text).toContain(MESSAGES.zh.contentTruncationHint);
+    expect(text).toContain("scrapling_session_open");
+    expect(text).toContain("scrapling_session_network");
+    expect(text).not.toContain("nextAfterId=");
   });
 });
 
@@ -2918,7 +3203,7 @@ describe("scrapling_capture_xhr", () => {
     ]);
   });
 
-  it("没有 XHR 时给空数组", async () => {
+  it("没有 XHR 时给空数组，并明确正文与网络都未截断", async () => {
     const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "body", truncated: false });
     const tool = createCaptureXhrTool({
       sidecar: fake.client,
@@ -2927,8 +3212,86 @@ describe("scrapling_capture_xhr", () => {
       answer: fakeAnswer,
     });
     const exec = { signal: new AbortController().signal } as never;
-    const result = (await tool.execute({ url: SAMPLE_URL }, exec)) as { xhr: unknown[] };
-    expect(result.xhr).toStrictEqual([]);
+    const result = (await tool.execute({ url: SAMPLE_URL }, exec)) as {
+      xhr: unknown[];
+      truncated: boolean;
+      contentTruncated: boolean;
+      xhrTruncated: boolean;
+    };
+    expect(result).toMatchObject({
+      xhr: [],
+      truncated: false,
+      contentTruncated: false,
+      xhrTruncated: false,
+    });
+    expect(result).not.toHaveProperty("nextAfterId");
+  });
+
+  it("300 条 XHR 受总预算约束并标截断，但不暴露跨调用不可复用的锚点", async () => {
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      status: 200,
+      content: "body",
+      truncated: false,
+      xhr: networkEntries(300, 400),
+    });
+    const tool = createCaptureXhrTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ url: SAMPLE_URL }, {
+      signal: new AbortController().signal,
+    } as never)) as {
+      xhr: NetworkEntry[];
+      truncated: boolean;
+      contentTruncated: boolean;
+      xhrTruncated: boolean;
+      nextAfterId?: number;
+    };
+    expect(Buffer.byteLength(JSON.stringify(result.xhr), "utf8")).toBeLessThanOrEqual(120_000);
+    expect(result.xhr.length).toBeGreaterThan(0);
+    expect(result.xhr.length).toBeLessThan(300);
+    expect(result.truncated).toBe(true);
+    expect(result.contentTruncated).toBe(false);
+    expect(result.xhrTruncated).toBe(true);
+    expect(result).not.toHaveProperty("nextAfterId");
+    const schema = tool.output.schema as unknown as { properties: Record<string, unknown> };
+    expect(schema.properties).not.toHaveProperty("nextAfterId");
+    const rendered = JSON.stringify(tool.output.render({ url: SAMPLE_URL }, result as never));
+    expect(rendered).toContain("scrapling_session_open");
+    expect(rendered).toContain("scrapling_session_network");
+    expect(rendered).not.toContain("nextAfterId=");
+    expect(rendered).not.toContain(MESSAGES.zh.contentTruncationHint);
+  });
+
+  it("首条 XHR 就超预算时，空结构化列表仍附网络截断说明", () => {
+    const tool = createCaptureXhrTool({
+      sidecar: fakeSidecar({}).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const blocks = tool.output.render(
+      { url: SAMPLE_URL },
+      {
+        url: SAMPLE_URL,
+        statusCode: 200,
+        extractionType: "markdown",
+        content: "body",
+        truncated: true,
+        contentTruncated: false,
+        notice: "",
+        xhr: [],
+        xhrTruncated: true,
+      },
+    );
+    const text = JSON.stringify(blocks);
+    expect(text).toContain(MESSAGES.zh.outputXhrNone);
+    expect(text).toContain("scrapling_session_open");
+    expect(text).toContain("scrapling_session_network");
+    expect(text).not.toContain(MESSAGES.zh.contentTruncationHint);
   });
 
   it("渲染文本末尾列出 XHR 摘要", () => {
@@ -2946,8 +3309,10 @@ describe("scrapling_capture_xhr", () => {
         extractionType: "markdown",
         content: "body",
         truncated: false,
+        contentTruncated: false,
         notice: "",
         xhr: [{ url: SAMPLE_API, status: 200, bytes: 99, method: "GET", resourceType: "fetch" }],
+        xhrTruncated: false,
       },
     );
     const text = JSON.stringify(blocks);
@@ -2960,7 +3325,7 @@ describe("scrapling_capture_xhr", () => {
 const sessionExec = (): never => ({ signal: new AbortController().signal }) as never;
 
 describe("scrapling_session_network", () => {
-  it("把会话 id 与四个筛选参数发给 sidecar，并把回包的 count 原样带出", async () => {
+  it("把会话 id 与四个筛选参数发给 sidecar，count 超过返回数时标截断", async () => {
     const fake = fakeSidecar({ sessionId: "s1", count: 7, matches: [] });
     const tool = createSessionNetworkTool({
       sidecar: fake.client,
@@ -2977,7 +3342,13 @@ describe("scrapling_session_network", () => {
         maxBodyChars: 50,
       },
       sessionExec(),
-    )) as { sessionId: string; count: number; matches: unknown[] };
+    )) as {
+      sessionId: string;
+      count: number;
+      returnedCount: number;
+      truncated: boolean;
+      matches: unknown[];
+    };
     expect(fake.calls[0]).toStrictEqual({
       method: "session.network",
       params: {
@@ -2996,10 +3367,167 @@ describe("scrapling_session_network", () => {
       },
     });
     expect(result.sessionId).toBe("s1");
-    // count 取自回包自己的那一格，不是数出来的条目数（两者此处故意不同）。
+    // count 是 sidecar 报告的总命中数，returnedCount 是 Host 实际交出的条目数。
     expect(result.count).toBe(7);
+    expect(result.returnedCount).toBe(0);
+    expect(result.truncated).toBe(true);
     expect(result.matches).toStrictEqual([]);
   });
+
+  it("host 保留全部 sidecar 候选时，count 更大仍标 truncated", async () => {
+    const fake = fakeSidecar({ sessionId: "s1", count: 300, matches: networkEntries(2, 10) });
+    const tool = createSessionNetworkTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ sessionId: "s1" }, sessionExec())) as {
+      count: number;
+      returnedCount: number;
+      truncated: boolean;
+      nextAfterId?: number;
+      matches: NetworkEntry[];
+    };
+    expect(result.count).toBe(300);
+    expect(result.returnedCount).toBe(2);
+    expect(result.matches).toHaveLength(2);
+    expect(result.truncated).toBe(true);
+    expect(result.nextAfterId).toBe(2);
+  });
+
+  it("300 条历史的结构化 JSON 受总预算约束，count 保留总命中数", async () => {
+    const fake = fakeSidecar({ sessionId: "s1", count: 300, matches: networkEntries(300, 400) });
+    const tool = createSessionNetworkTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute({ sessionId: "s1" }, sessionExec())) as {
+      count: number;
+      returnedCount: number;
+      truncated: boolean;
+      nextAfterId?: number;
+      matches: NetworkEntry[];
+    };
+    expect(Buffer.byteLength(JSON.stringify(result.matches), "utf8")).toBeLessThanOrEqual(120_000);
+    expect(result.count).toBe(300);
+    expect(result.returnedCount).toBe(result.matches.length);
+    expect(result.returnedCount).toBeGreaterThan(0);
+    expect(result.returnedCount).toBeLessThan(300);
+    expect(result.truncated).toBe(true);
+    expect(result.nextAfterId).toBe(result.returnedCount + 1);
+    expect(result.matches.at(-1)?.id).toBe(result.returnedCount);
+    const rendered = JSON.stringify(tool.output.render({ sessionId: "s1" }, result as never));
+    expect(rendered).toContain(`— ${String(result.returnedCount)}/300 XHR/fetch`);
+    expect(rendered).toContain(MESSAGES.zh.networkTruncationHint);
+    expect(rendered).toContain(`nextAfterId=${String(result.returnedCount + 1)}`);
+  });
+
+  it.each([
+    {
+      position: "首条",
+      entries: [
+        {
+          id: 5,
+          url: NETWORK_OVERSIZED_URL,
+          status: 200,
+          bytes: 0,
+          method: "GET",
+          resourceType: "fetch",
+          body: "x".repeat(130_000),
+        },
+        {
+          id: 6,
+          url: NETWORK_LATER_URL,
+          status: 200,
+          bytes: 0,
+          method: "GET",
+          resourceType: "fetch",
+        },
+      ] satisfies NetworkEntry[],
+      firstIds: [],
+      anchor: 5,
+      laterId: 6,
+    },
+    {
+      position: "中间",
+      entries: [
+        {
+          id: 3,
+          url: "https://a.test/first",
+          status: 200,
+          bytes: 0,
+          method: "GET",
+          resourceType: "fetch",
+        },
+        {
+          id: 4,
+          url: NETWORK_OVERSIZED_URL,
+          status: 200,
+          bytes: 0,
+          method: "GET",
+          resourceType: "fetch",
+          body: "x".repeat(130_000),
+        },
+        {
+          id: 5,
+          url: NETWORK_LATER_URL,
+          status: 200,
+          bytes: 0,
+          method: "GET",
+          resourceType: "fetch",
+        },
+      ] satisfies NetworkEntry[],
+      firstIds: [3],
+      anchor: 4,
+      laterId: 5,
+    },
+  ])(
+    "$position 超大条目省略后，nextAfterId 能跨页越过它",
+    async ({ entries, firstIds, anchor, laterId }) => {
+      const fake = fakeSidecar({});
+      Object.assign(fake.client, {
+        call: async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+          fake.calls.push({ method, params });
+          const afterId = typeof params["afterId"] === "number" ? params["afterId"] : 0;
+          const matches = entries.filter((entry) => entry.id > afterId);
+          return { sessionId: "s1", count: matches.length, matches };
+        },
+      });
+      const tool = createSessionNetworkTool({
+        sidecar: fake.client,
+        settings: SETTINGS,
+        startCrawlJob: fakeJobStarter,
+        answer: fakeAnswer,
+      });
+      interface Result {
+        count: number;
+        returnedCount: number;
+        truncated: boolean;
+        nextAfterId?: number;
+        matches: NetworkEntry[];
+      }
+      const firstPage = (await tool.execute({ sessionId: "s1" }, sessionExec())) as Result;
+      expect(firstPage.count).toBe(entries.length);
+      expect(firstPage.returnedCount).toBe(firstIds.length);
+      expect(firstPage.matches.map((entry) => entry.id)).toStrictEqual(firstIds);
+      expect(firstPage.truncated).toBe(true);
+      expect(firstPage.nextAfterId).toBe(anchor);
+
+      const secondPage = (await tool.execute(
+        { sessionId: "s1", afterId: firstPage.nextAfterId },
+        sessionExec(),
+      )) as Result;
+      expect(fake.calls[1]?.params).toMatchObject({ afterId: anchor });
+      expect(secondPage.count).toBe(1);
+      expect(secondPage.returnedCount).toBe(1);
+      expect(secondPage.matches.map((entry) => entry.id)).toStrictEqual([laterId]);
+      expect(secondPage.truncated).toBe(false);
+      expect(secondPage.nextAfterId).toBe(laterId);
+    },
+  );
 
   it("不传筛选参数时四个键按缺省 null/false 发出", async () => {
     const fake = fakeSidecar({ sessionId: "s1", count: 0, matches: [] });
@@ -3127,10 +3655,12 @@ describe("scrapling_session_network", () => {
       {
         sessionId: "s1",
         count: 4,
+        returnedCount: 4,
+        truncated: false,
         matches: [
           // 上游存不下正文时给原因 —— 那一行要说清「没有正文」是哪来的。
           {
-            url: "https://a.test/1",
+            url: NETWORK_FIRST_URL,
             status: 200,
             bytes: 10,
             method: "GET",
@@ -3183,10 +3713,29 @@ describe("scrapling_session_network", () => {
     });
     const blocks = tool.output.render(
       { sessionId: "s9" },
-      { sessionId: "s9", count: 0, matches: [] },
+      { sessionId: "s9", count: 0, returnedCount: 0, truncated: false, matches: [] },
     );
     expect(blocks).toStrictEqual([
       { type: "text", text: "session s9 recorded no XHR/fetch (0 matches)" },
+    ]);
+  });
+
+  it("首条就超预算时仍说明总命中数与截断，不编造 nextAfterId", () => {
+    const tool = createSessionNetworkTool({
+      sidecar: fakeSidecar({}).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const blocks = tool.output.render(
+      { sessionId: "s1" },
+      { sessionId: "s1", count: 1, returnedCount: 0, truncated: true, matches: [] },
+    );
+    expect(blocks).toStrictEqual([
+      {
+        type: "text",
+        text: `session s1 recorded no XHR/fetch (0/1 matches returned)\n\n${MESSAGES.zh.networkTruncationHint}`,
+      },
     ]);
   });
 
@@ -3218,7 +3767,13 @@ describe("scrapling_session_network", () => {
       matches: unknown[];
     };
     // 回包不是对象 → 没有 count 可读，于是退回归一后的条目数（这里归一出来是 0）。
-    expect(result).toStrictEqual({ sessionId: "s1", count: 0, matches: [] });
+    expect(result).toStrictEqual({
+      sessionId: "s1",
+      count: 0,
+      returnedCount: 0,
+      truncated: false,
+      matches: [],
+    });
   });
 });
 
@@ -3465,6 +4020,7 @@ describe("会话工具", () => {
         deployment: {
           browserExecutablePath: SETTINGS.browserExecutablePath,
           browserInitScript: SETTINGS.browserInitScript,
+          browserCdpUrl: SETTINGS.browserCdpUrl,
           browserRealChrome: SETTINGS.browserRealChrome,
           browserDnsOverHttps: SETTINGS.browserDnsOverHttps,
           recordRequests: SETTINGS.recordRequests,
@@ -3474,6 +4030,22 @@ describe("会话工具", () => {
     });
     expect(result.sessionId).toBe("s1");
     expect(result.sessionType).toBe("static");
+  });
+
+  it("remote 开场只把部署 CDP 端点交给 sidecar", async () => {
+    const endpoint = "wss://browser.test/cdp/session-token";
+    const fake = fakeBrowserSidecar({ sessionId: "r1", sessionType: "remote", createdAt: "T" });
+    const tool = createSessionOpenTool({
+      sidecar: fake.client,
+      settings: { ...SETTINGS, browserCdpUrl: endpoint },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute({ sessionType: "remote" }, sessionExec());
+    expect(fake.calls[0]?.params).toMatchObject({
+      sessionType: "remote",
+      deployment: { browserCdpUrl: endpoint },
+    });
   });
 
   it("open 把构造期扩展参数上线，缺省时不发", async () => {
@@ -3819,6 +4391,13 @@ describe("会话工具", () => {
     expect(withoutBrowser.description).not.toContain("stealth");
   });
 
+  it("配好部署级 CDP 端点后才暴露 remote 会话", () => {
+    const endpoint = "ws://127.0.0.1:9222/devtools/browser/test";
+    expect(sessionTypeParam(true, endpoint).enum).toStrictEqual(["static", "stealth", "remote"]);
+    expect(sessionTypeParam(false, endpoint).enum).toStrictEqual(["static"]);
+    expect(sessionTypeParam(false, endpoint, true).enum).toStrictEqual(["static", "remote"]);
+  });
+
   it("静态会话的抓取补上 timeoutSeconds（会话帧原本只发 timeoutMs，那对静态支路无效）", async () => {
     const fake = fakeSidecar({ url: SAMPLE_URL, status: 200, content: "b", truncated: false });
     const tool = createSessionFetchTool({
@@ -3982,6 +4561,35 @@ describe("浏览器会话读/动作/媒体工具", () => {
     expect(fake.calls[0]?.method).toBe("session.read");
     expect(result).toMatchObject({ title: "T", content: "BODY" });
     expect(JSON.stringify(tool.output.render({}, result))).toContain("BODY");
+  });
+
+  it("session_read 把 ARIA 快照选择发给 sidecar 并回显快照类型", async () => {
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      title: "T",
+      content: '- button "Go"',
+      truncated: false,
+      notice: "aria",
+    });
+    const tool = createSessionReadTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await tool.execute(
+      { sessionId: "s1", snapshotType: "aria", cssSelector: "main" },
+      exec,
+    )) as { snapshotType: string };
+    expect(fake.calls[0]?.params).toMatchObject({
+      snapshotType: "aria",
+      cssSelector: "main",
+    });
+    expect(result.snapshotType).toBe("aria");
+    const schema = tool.parameters as unknown as {
+      properties?: Record<string, { enum?: string[] }>;
+    };
+    expect(schema.properties?.["snapshotType"]?.enum).toStrictEqual(["text", "aria"]);
   });
 
   it("session_act 透传动作数组并回显完成数", async () => {
@@ -4188,6 +4796,169 @@ describe("浏览器会话读/动作/媒体工具", () => {
     await expect(bad.execute({ sessionId: "s1", actions: [] }, exec)).rejects.toThrow(
       /missing an integer field: completed/u,
     );
+  });
+
+  it("read_document 使用默认上限并透传流式下载参数", async () => {
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      bytes: 1234,
+      pageCount: 2,
+      pagesRead: 2,
+      content: "PDF BODY",
+      truncated: false,
+    });
+    const tool = createDocumentTool({
+      sidecar: fake.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const headers = { Authorization: "Bearer test" };
+    const cookies = { sid: "test" };
+    const result = (await tool.execute(
+      { url: SAMPLE_URL, headers, cookies, timeoutSeconds: 9 },
+      exec,
+    )) as Record<string, unknown>;
+    expect(fake.calls[0]?.method).toBe("document.read");
+    expect(fake.calls[0]?.params).toMatchObject({
+      url: SAMPLE_URL,
+      maxBytes: 20 * 1024 * 1024,
+      maxPages: 200,
+      maxOutputChars: SETTINGS.maxOutputBytes,
+      headers,
+      cookies,
+      timeoutSeconds: 9,
+      deployment: {
+        documentMaxBytes: SETTINGS.documentMaxBytes,
+        documentMaxPages: SETTINGS.documentMaxPages,
+      },
+    });
+    expect(result).toMatchObject({ pageCount: 2, pagesRead: 2, content: "PDF BODY" });
+    const rendered = (
+      tool.output.render({ url: SAMPLE_URL }, result as never) as { text: string }[]
+    )[0]?.text;
+    expect(rendered).toContain("PDF BODY");
+    expect(rendered).toContain("2");
+    expect(tool.presentCall?.({ url: SAMPLE_URL })).toStrictEqual({
+      card: "generic",
+      title: SAMPLE_URL,
+      kind: "fetch",
+    });
+  });
+
+  it("read_document 只允许模型下调部署上限，非法值原样透传", async () => {
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      bytes: 1,
+      pageCount: 1,
+      pagesRead: 1,
+      content: "x",
+      truncated: false,
+    });
+    const tool = createDocumentTool({
+      sidecar: fake.client,
+      settings: { ...SETTINGS, documentMaxBytes: 5000, documentMaxPages: 3 },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await tool.execute(
+      { url: SAMPLE_URL, maxBytes: 999_999, maxPages: 99, maxOutputChars: 999_999 },
+      exec,
+    );
+    expect(fake.calls[0]?.params).toMatchObject({
+      maxBytes: 5000,
+      maxPages: 3,
+      maxOutputChars: SETTINGS.maxOutputBytes,
+    });
+    await tool.execute({ url: SAMPLE_URL, maxBytes: 1234, maxPages: 1, maxOutputChars: 100 }, exec);
+    expect(fake.calls[1]?.params).toMatchObject({
+      maxBytes: 1234,
+      maxPages: 1,
+      maxOutputChars: 100,
+    });
+    await tool.execute({ url: SAMPLE_URL, maxBytes: 0, maxPages: -1, maxOutputChars: 0 }, exec);
+    expect(fake.calls[2]?.params).toMatchObject({ maxBytes: 0, maxPages: -1, maxOutputChars: 0 });
+  });
+
+  it("read_document 拒绝缺字段的 sidecar 回包", async () => {
+    const tool = createDocumentTool({
+      sidecar: fakeSidecar({ url: SAMPLE_URL, bytes: 1, content: "x", truncated: false }).client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    await expect(tool.execute({ url: SAMPLE_URL }, exec)).rejects.toThrow(
+      /missing an integer field: pageCount/u,
+    );
+  });
+
+  it("read_document 拒绝非对象、坏字段与坏截断标记", async () => {
+    const badPayloads: unknown[] = [
+      "nope",
+      { url: SAMPLE_URL, bytes: 1, pageCount: 1, pagesRead: 1, content: 7, truncated: false },
+      { url: 7, bytes: 1, pageCount: 1, pagesRead: 1, content: "x", truncated: false },
+      { url: SAMPLE_URL, bytes: 1, pageCount: 1.5, pagesRead: 1, content: "x", truncated: false },
+      { url: SAMPLE_URL, bytes: 1, pageCount: 1, pagesRead: 1, content: "x", truncated: "yes" },
+    ];
+    const checks = badPayloads.map(async (payload) => {
+      const tool = createDocumentTool({
+        sidecar: fakeSidecar(payload).client,
+        settings: SETTINGS,
+        startCrawlJob: fakeJobStarter,
+        answer: fakeAnswer,
+      });
+      await expect(tool.execute({ url: SAMPLE_URL }, exec)).rejects.toMatchObject({
+        code: "SIDECAR_REQUEST_FAILED",
+      });
+    });
+    await Promise.all(checks);
+  });
+
+  it("read_document 合并两侧截断标记并投影页数", async () => {
+    const fake = fakeSidecar({
+      url: SAMPLE_URL,
+      bytes: 20,
+      pageCount: 2,
+      pagesRead: 2,
+      content: "abcdefghijklmnop",
+      truncated: false,
+    });
+    const tool = createDocumentTool({
+      sidecar: fake.client,
+      settings: { ...SETTINGS, maxOutputBytes: 10 },
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const capped = (await tool.execute({ url: SAMPLE_URL }, exec)) as Record<string, unknown>;
+    expect(capped["truncated"]).toBe(true);
+    expect(String(capped["content"]).length).toBeLessThanOrEqual(10);
+    expect(tool.output.presentationMeta?.({ url: SAMPLE_URL }, capped as never)).toStrictEqual({
+      url: SAMPLE_URL,
+      bytes: 20,
+      pageCount: 2,
+      truncated: true,
+    });
+    expect(tool.isConcurrencySafe?.({ url: SAMPLE_URL })).toBe(true);
+    expect(JSON.stringify(tool.output.render({ url: SAMPLE_URL }, capped as never))).toContain(
+      MESSAGES.zh.documentTruncationHint,
+    );
+
+    const upstream = fakeSidecar({
+      url: SAMPLE_URL,
+      bytes: 1,
+      pageCount: 1,
+      pagesRead: 1,
+      content: "x",
+      truncated: true,
+    });
+    const second = createDocumentTool({
+      sidecar: upstream.client,
+      settings: SETTINGS,
+      startCrawlJob: fakeJobStarter,
+      answer: fakeAnswer,
+    });
+    const result = (await second.execute({ url: SAMPLE_URL }, exec)) as Record<string, unknown>;
+    expect(result["truncated"]).toBe(true);
   });
 
   it("download 的视图、缺省参数与坏回包", async () => {

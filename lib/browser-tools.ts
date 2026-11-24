@@ -86,8 +86,8 @@ function jsonRecordOf(value: unknown): Record<string, Json> | undefined {
 /**
  * 单个动作 / 单次截图的超时，夹在本次调用的截止之内。
  *
- * 只许往下调：发一个比截止大的值，先到期的是 JS 侧的 SIDECAR_TIMEOUT，而超时按设计
- * 会拆掉常驻进程重连 —— 于是一次点击或截图超时换成全部浏览器会话陪葬。
+ * 只许往下调：发一个比截止大的值，先到期的是 JS 侧的 SIDECAR_TIMEOUT。超时只取消当前
+ * 请求，不拆常驻进程；Python 在动作边界观察到取消，浏览器会话仍可供后续请求使用。
  */
 function actionTimeoutMs(value: unknown, deadlineMs: number): number {
   return callNumber(value, deadlineMs, deadlineMs);
@@ -105,6 +105,11 @@ export function createSessionReadTool(deps: ToolDeps): ToolDefinition {
         type: "string",
         required: true,
         description: messages.sessionReadSessionIdDescription,
+      },
+      snapshotType: {
+        type: "string",
+        enum: ["text", "aria"],
+        description: messages.sessionReadSnapshotTypeDescription,
       },
       extractionType: { type: "string", description: messages.extractionTypeDescription },
       cssSelector: { type: "string", description: messages.sessionReadCssSelectorDescription },
@@ -126,6 +131,7 @@ export function createSessionReadTool(deps: ToolDeps): ToolDefinition {
           title: { type: "string", required: true },
           content: { type: "string", required: true },
           truncated: { type: "boolean", required: true },
+          snapshotType: { type: "string", required: true },
           notice: { type: "string", required: true },
           metadata: { type: "object", additionalProperties: true },
         },
@@ -146,6 +152,7 @@ export function createSessionReadTool(deps: ToolDeps): ToolDefinition {
         "session.read",
         {
           sessionId: args["sessionId"],
+          snapshotType: args["snapshotType"] ?? "text",
           extractionType: args["extractionType"] ?? settings.extractionType,
           cssSelector: args["cssSelector"] ?? null,
           mainContentOnly: args["mainContentOnly"] ?? settings.mainContentOnly,
@@ -169,6 +176,7 @@ export function createSessionReadTool(deps: ToolDeps): ToolDefinition {
         title: textOf(raw, "title"),
         content: capped.text,
         truncated: boolOf(raw, "truncated") || capped.truncated,
+        snapshotType: args["snapshotType"] === "aria" ? "aria" : "text",
         notice,
         ...(metadata === undefined ? {} : { metadata }),
       };

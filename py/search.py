@@ -7,7 +7,14 @@ search provider 交给本 sidecar 的 fetch/render。每条后端都按各家**�
 
 from __future__ import annotations
 
-from typing import Any
+import base64
+import binascii
+import re
+from typing import Any, cast
+from urllib.parse import parse_qs, urlparse
+
+import guard
+from curl_cffi.requests import ProxySpec
 
 DEFAULT_TAVILY_ENDPOINT = "https://api.tavily.com/search"
 DEFAULT_BING_ENDPOINT = "https://www.bing.com/search"
@@ -27,6 +34,11 @@ TAVILY_MAX_RESULTS = 20
 # `3 × timeout + 2s`，比协议层先到期的超时还长 —— 于是 SEARCH_TIMEOUT 永远走不到，
 # 模型看到的是一条含义更模糊的协议层超时。显式传 1 让两层的预算对齐。
 SEARCH_RETRIES = 1
+_CJK_QUERY = re.compile(r"[\u3400-\u9fff]")
+
+
+def _proxies(url: str) -> "ProxySpec | None":
+    return cast("ProxySpec | None", guard.proxies_for(url))
 
 
 class SearchError(ValueError):
@@ -42,6 +54,14 @@ def _positive_int(value: Any, field: str, default: int) -> int:
         return default
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise SearchError("BAD_ARGS", f"{field} must be a positive integer")
+    return value
+
+
+def _offset(value: Any) -> int:
+    if value is None:
+        return 0
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise SearchError("BAD_ARGS", "offset must be a non-negative integer")
     return value
 
 
@@ -83,7 +103,7 @@ def _status_error(status: int, backend: str) -> SearchError | None:
     return None
 
 
-def _tavily(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict[str, Any]:
+def _tavily(args: dict[str, Any], query: str, limit: int, offset: int, timeout: float) -> dict[str, Any]:
     key = args.get("apiKey")
     if not isinstance(key, str) or not key:
         raise SearchError(
@@ -99,11 +119,12 @@ def _tavily(args: dict[str, Any], query: str, limit: int, timeout: float) -> dic
             json={
                 "api_key": key,
                 "query": query,
-                "max_results": min(limit, TAVILY_MAX_RESULTS),
+                "max_results": min(limit + offset, TAVILY_MAX_RESULTS),
                 "search_depth": "basic",
             },
             timeout=timeout,
             retries=SEARCH_RETRIES,
+            proxies=_proxies(endpoint),
         )
     except Exception as error:  # noqa: BLE001 —— 只翻译成带码的失败，不回显请求体
         raise _translate(error, "tavily") from None
@@ -115,20 +136,58 @@ def _tavily(args: dict[str, Any], query: str, limit: int, timeout: float) -> dic
     # 而非对象回包已经在 _json_body 那里判成 SEARCH_FAILED 了。
     hits = _collect(
         payload.get("results"),
-        limit=limit,
+        limit=limit + offset,
         url_key="url",
         title_key="title",
         snippet_key="content",
+        summary_key="summary",
+        date_key="published_date",
     )
-    return {"backend": "tavily", "hits": hits}
+    return {"backend": "tavily", "hits": hits[offset : offset + limit]}
 
 
-def _bing(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict[str, Any]:
+def _bing_target(href: str) -> str:
+    """解包 Bing 的 ck/a 跳板；只接受 Bing 自家主机与 http(s) 目标。"""
+    parts = urlparse(href)
+    host = (parts.hostname or "").lower()
+    if not (host == "bing.com" or host.endswith(".bing.com")) or parts.path != "/ck/a":
+        return href
+    token = parse_qs(parts.query).get("u", [""])[0]
+    if not token.startswith("a1"):
+        return href
+    encoded = token[2:]
+    try:
+        target = base64.b64decode(
+            encoded + "=" * (-len(encoded) % 4),
+            altchars=b"-_",
+            validate=True,
+        ).decode("utf-8")
+    except ValueError, binascii.Error, UnicodeDecodeError:
+        return href
+    parsed = urlparse(target)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
+        return href
+    return target
+
+
+def _bing(args: dict[str, Any], query: str, limit: int, offset: int, timeout: float) -> dict[str, Any]:
     endpoint = _endpoint(args.get("bingEndpoint"), DEFAULT_BING_ENDPOINT, "bingEndpoint")
     from scrapling.fetchers import Fetcher
 
+    params = {
+        "q": query,
+        "first": offset + 1,
+        "count": limit,
+        "setlang": "zh-hans" if _CJK_QUERY.search(query) else "en",
+    }
     try:
-        response = Fetcher.get(endpoint, params={"q": query}, timeout=timeout, retries=SEARCH_RETRIES)
+        response = Fetcher.get(
+            endpoint,
+            params=params,
+            timeout=timeout,
+            retries=SEARCH_RETRIES,
+            proxies=_proxies(endpoint),
+        )
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "bing") from None
     failed = _status_error(int(getattr(response, "status", 0)), "bing")
@@ -149,7 +208,7 @@ def _bing(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict[
         snippet_node = node.css(".b_caption p").first or node.css("p").first
         hits.append(
             {
-                "url": href,
+                "url": _bing_target(href),
                 "title": link.get_all_text(strip=True),
                 "snippet": snippet_node.get_all_text(strip=True) if snippet_node is not None else "",
             }
@@ -191,9 +250,11 @@ def _collect(
     url_key: str,
     title_key: str,
     snippet_key: str,
-) -> list[dict[str, str]]:
-    """把各家形状不同的结果表收成同一份 hits（url/title/snippet）。"""
-    hits: list[dict[str, str]] = []
+    summary_key: str | None = None,
+    date_key: str | None = None,
+) -> list[dict[str, Any]]:
+    """把各家形状不同的结果表收成同一份 hits。"""
+    hits: list[dict[str, Any]] = []
     if not isinstance(items, list):
         return hits
     for item in items:
@@ -204,11 +265,15 @@ def _collect(
             continue
         title = item.get(title_key)
         snippet = item.get(snippet_key)
+        summary = item.get(summary_key) if summary_key is not None else None
+        published = item.get(date_key) if date_key is not None else None
         hits.append(
             {
                 "url": url,
                 "title": title if isinstance(title, str) else "",
                 "snippet": snippet if isinstance(snippet, str) else "",
+                **({"summary": summary} if isinstance(summary, str) and summary else {}),
+                **({"publishedAt": published} if isinstance(published, str) and published else {}),
             }
         )
         if len(hits) >= limit:
@@ -226,7 +291,7 @@ def _nested(payload: dict[str, Any], *keys: str) -> Any:
     return current
 
 
-def _brave(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict[str, Any]:
+def _brave(args: dict[str, Any], query: str, limit: int, offset: int, timeout: float) -> dict[str, Any]:
     key = _require_key(args, "brave")
     endpoint = _endpoint(args.get("braveEndpoint"), DEFAULT_BRAVE_ENDPOINT, "braveEndpoint")
     from scrapling.fetchers import Fetcher
@@ -236,10 +301,11 @@ def _brave(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict
     try:
         response = Fetcher.get(
             endpoint,
-            params={"q": query, "count": min(limit, BRAVE_MAX_COUNT)},
+            params={"q": query, "count": min(limit, BRAVE_MAX_COUNT), "offset": offset},
             headers={"X-Subscription-Token": key, "Accept": "application/json"},
             timeout=timeout,
             retries=SEARCH_RETRIES,
+            proxies=_proxies(endpoint),
         )
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "brave") from None
@@ -257,18 +323,21 @@ def _brave(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict
     return {"backend": "brave", "hits": hits}
 
 
-def _serper(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict[str, Any]:
+def _serper(args: dict[str, Any], query: str, limit: int, offset: int, timeout: float) -> dict[str, Any]:
     key = _require_key(args, "serper")
     endpoint = _endpoint(args.get("serperEndpoint"), DEFAULT_SERPER_ENDPOINT, "serperEndpoint")
     from scrapling.fetchers import Fetcher
 
+    page = offset // limit + 1
+    skip = offset % limit
     try:
         response = Fetcher.post(
             endpoint,
-            json={"q": query, "num": limit},
+            json={"q": query, "num": limit + skip, "page": page},
             headers={"X-API-KEY": key, "Content-Type": "application/json"},
             timeout=timeout,
             retries=SEARCH_RETRIES,
+            proxies=_proxies(endpoint),
         )
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "serper") from None
@@ -278,12 +347,13 @@ def _serper(args: dict[str, Any], query: str, limit: int, timeout: float) -> dic
     payload = _json_body(response, "serper")
     hits = _collect(
         payload.get("organic"),
-        limit=limit,
+        limit=limit + skip,
         url_key="link",
         title_key="title",
         snippet_key="snippet",
+        date_key="date",
     )
-    return {"backend": "serper", "hits": hits}
+    return {"backend": "serper", "hits": hits[skip : skip + limit]}
 
 
 def _duckduckgo_target(href: str) -> str:
@@ -305,12 +375,18 @@ def _duckduckgo_target(href: str) -> str:
     return urlunparse(parts)
 
 
-def _duckduckgo(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict[str, Any]:
+def _duckduckgo(args: dict[str, Any], query: str, limit: int, offset: int, timeout: float) -> dict[str, Any]:
     endpoint = _endpoint(args.get("duckduckgoEndpoint"), DEFAULT_DUCKDUCKGO_ENDPOINT, "duckduckgoEndpoint")
     from scrapling.fetchers import Fetcher
 
     try:
-        response = Fetcher.get(endpoint, params={"q": query}, timeout=timeout, retries=SEARCH_RETRIES)
+        response = Fetcher.get(
+            endpoint,
+            params={"q": query, "s": offset},
+            timeout=timeout,
+            retries=SEARCH_RETRIES,
+            proxies=_proxies(endpoint),
+        )
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "duckduckgo") from None
     failed = _status_error(int(getattr(response, "status", 0)), "duckduckgo")
@@ -344,7 +420,7 @@ def _duckduckgo(args: dict[str, Any], query: str, limit: int, timeout: float) ->
     return result
 
 
-def _searxng(args: dict[str, Any], query: str, limit: int, timeout: float) -> dict[str, Any]:
+def _searxng(args: dict[str, Any], query: str, limit: int, offset: int, timeout: float) -> dict[str, Any]:
     endpoint = args.get("searxngEndpoint")
     if not isinstance(endpoint, str) or not endpoint:
         raise SearchError(
@@ -356,7 +432,13 @@ def _searxng(args: dict[str, Any], query: str, limit: int, timeout: float) -> di
     from scrapling.fetchers import Fetcher
 
     try:
-        response = Fetcher.get(url, params={"q": query, "format": "json"}, timeout=timeout, retries=SEARCH_RETRIES)
+        response = Fetcher.get(
+            url,
+            params={"q": query, "format": "json", "pageno": offset // limit + 1},
+            timeout=timeout,
+            retries=SEARCH_RETRIES,
+            proxies=_proxies(url),
+        )
     except Exception as error:  # noqa: BLE001
         raise _translate(error, "searxng") from None
     failed = _status_error(int(getattr(response, "status", 0)), "searxng")
@@ -369,6 +451,7 @@ def _searxng(args: dict[str, Any], query: str, limit: int, timeout: float) -> di
         url_key="url",
         title_key="title",
         snippet_key="content",
+        date_key="publishedDate",
     )
     return {"backend": "searxng", "hits": hits}
 
@@ -390,6 +473,7 @@ def discover(args: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(query, str) or not query.strip():
         raise SearchError("BAD_ARGS", "query must be a non-empty string")
     limit = _positive_int(args.get("maxResults"), "maxResults", DEFAULT_SEARCH_RESULTS)
+    offset = _offset(args.get("offset"))
     timeout = _timeout(args.get("timeoutSeconds"))
     key = args.get("apiKey")
     resolved = backend
@@ -420,4 +504,4 @@ def discover(args: dict[str, Any]) -> dict[str, Any]:
         "duckduckgo": _duckduckgo,
         "searxng": _searxng,
     }
-    return handlers[resolved](args, query.strip(), limit, timeout)
+    return handlers[resolved](args, query.strip(), limit, offset, timeout)

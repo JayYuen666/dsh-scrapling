@@ -21,6 +21,8 @@ import { SEARCH_BACKENDS } from "../lib/search-backends.ts";
 const pkgDir = path.join(import.meta.dirname, "..");
 const EN = "README.md";
 const ZH = "README.zh-CN.md";
+const DETAIL_EN = "docs/DETAIL.md";
+const DETAIL_ZH = "docs/DETAIL.zh.md";
 const NOTICES = "THIRD_PARTY_NOTICES.md";
 const HOST = "host.ts";
 
@@ -257,6 +259,50 @@ describe("中英文文档对等", () => {
     ).toStrictEqual([]);
   });
 
+  it("抓取策略在 README 与 DETAIL 的两种语言里都写清三档、阈值与无浏览器行为", async () => {
+    const { en, zh } = await readPair();
+    const [detailEn, detailZh] = await Promise.all([
+      readFile(path.join(pkgDir, DETAIL_EN), "utf8"),
+      readFile(path.join(pkgDir, DETAIL_ZH), "utf8"),
+    ]);
+    for (const text of [en, zh, detailEn, detailZh]) {
+      expect(text).toContain("`webFetchStrategy`");
+      expect(text).toContain("`static`");
+      expect(text).toContain("`auto`");
+      expect(text).toContain("`browser`");
+      expect(text).toContain("200");
+    }
+    expect(en).toContain("under 200 characters");
+    expect(zh).toContain("少于 200 字符");
+    expect(detailEn).toContain("under 200 characters");
+    expect(detailZh).toContain("少于 200 字符");
+    expect(en).toContain("Without a browser");
+    expect(zh).toContain("没有浏览器时");
+    expect(detailEn).toContain("Without a browser");
+    expect(detailZh).toContain("没有浏览器时");
+  });
+
+  it("mcp 按需加载在 README 与 DETAIL 的两种语言里写清默认值、loader 与重启语义", async () => {
+    const { en, zh } = await readPair();
+    const [detailEn, detailZh] = await Promise.all([
+      readFile(path.join(pkgDir, DETAIL_EN), "utf8"),
+      readFile(path.join(pkgDir, DETAIL_ZH), "utf8"),
+    ]);
+    for (const text of [en, zh, detailEn, detailZh]) {
+      expect(text).toContain("`mcpToolLoading`");
+      expect(text).toContain("`eager`");
+      expect(text).toContain("`on-demand`");
+      expect(text).toContain("`toolLoading`");
+      expect(text).toContain("mcp__scrapling__load_tools");
+    }
+    expect(en).toContain("restart");
+    expect(zh).toContain("重启");
+    expect(detailEn).toContain("restart");
+    expect(detailZh).toContain("重启");
+    expect(detailEn).toContain("Deployment values stay off the card");
+    expect(detailZh).toContain("部署值留在卡外");
+  });
+
   it("新工具的边界在两份里都写清楚", async () => {
     const { en, zh } = await readPair();
     // 判的是「那一层语义在不在」，不是标识符出现没出现：只 `toContain("baseUrl")` 时，
@@ -328,7 +374,7 @@ describe("设置表与 schema 的 volatile 面对齐", () => {
  * 文档没写，红话点名是哪份文档。两处分开才不用回头猜「哪几处该一起改」。
  */
 const COUNT_PHRASES: Record<number, { en: string; zh: string }> = {
-  19: { en: "Nineteen tools", zh: "十九个工具" },
+  20: { en: "Twenty tools", zh: "二十个工具" },
 };
 
 /**
@@ -410,6 +456,7 @@ const PRIVACY_NAMES: Readonly<Record<string, string>> = {
   serper: "Serper",
   duckduckgo: "DuckDuckGo",
   searxng: "SearXNG",
+  deepseek: "DeepSeek",
 };
 
 /** 两份 README 隐私表里「网络」那一行的行首标记。 */

@@ -7,6 +7,9 @@
 协议（Host -> Python，每行一个 JSON 对象）::
 
     {"id": "7", "method": "fetch", "params": {...}}
+    {"id": "cancel-7", "method": "cancel", "params": {"id": "7"}}
+
+取消只设置请求 token；适配器在抓取、读取与动作的安全边界检查，不强行中断阻塞调用。
 
 响应（Python -> Host，同样一行一个）::
 
@@ -35,6 +38,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -42,7 +46,10 @@ import threading
 import time
 import traceback
 from io import BufferedReader
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
+
+if TYPE_CHECKING:
+    from cancellation import CancellationToken
 
 # 协议帧与日志一律 UTF-8：宿主按 UTF-8 解码本进程的 stdout/stderr，而两者都是管道。
 # 管道在 Windows 上默认走本地 ANSI 代码页；`LC_ALL=C` 配上 `PYTHONUTF8=0` 这类环境
@@ -157,6 +164,8 @@ _QUEUE: list[dict[str, Any]] = []
 _QUEUE_LOCK = threading.Lock()
 _WORKERS_LOCK = threading.Lock()
 _WORKERS: list[threading.Thread] = []
+_REQUEST_TOKENS_LOCK = threading.Lock()
+_REQUEST_TOKENS: dict[str, CancellationToken] = {}
 
 
 def log(message: str) -> None:
@@ -200,6 +209,41 @@ def fail(request_id: Any, code: str, message: str, details: dict[str, Any] | Non
     return {"id": request_id, "ok": False, "error": error}
 
 
+def _register_request(request_id: Any) -> CancellationToken | None:
+    """为已接收的请求登记 token；排队项也登记，出队后先检查再执行。"""
+    from cancellation import CancellationToken
+
+    if not isinstance(request_id, str):
+        return None
+    with _REQUEST_TOKENS_LOCK:
+        token = _REQUEST_TOKENS.get(request_id)
+        if token is None:
+            token = CancellationToken()
+            _REQUEST_TOKENS[request_id] = token
+        return token
+
+
+def _release_request(request_id: Any, token: CancellationToken | None) -> None:
+    """只摘自己这一笔，避免延迟完成或重复 id 误删后来登记的 token。"""
+    if token is None or not isinstance(request_id, str):
+        return
+    with _REQUEST_TOKENS_LOCK:
+        if _REQUEST_TOKENS.get(request_id) is token:
+            _REQUEST_TOKENS.pop(request_id, None)
+
+
+def _cancel_request(request_id: Any) -> bool:
+    """设置运行中或排队请求的取消事件；未知、已完成 id 都是 no-op。"""
+    if not isinstance(request_id, str):
+        return False
+    with _REQUEST_TOKENS_LOCK:
+        token = _REQUEST_TOKENS.get(request_id)
+        if token is None:
+            return False
+        token.cancel()
+        return True
+
+
 # scrapling 的可选 extra（fetchers / rag）会按需导入这些包；只有它们缺失才算
 # 「环境没装对」。其它 ModuleNotFoundError 是本插件自己的导入缺陷，不能包装成
 # 安装提示——用户照提示装完仍然会失败。
@@ -220,12 +264,26 @@ OPTIONAL_DEPENDENCIES = frozenset(
 
 
 def handle(frame: dict[str, Any]) -> dict[str, Any]:
-    """分发一个请求帧。
+    """分发一个请求帧，并把取消 token 绑定到这一次 handler 调用。"""
+    from cancellation import RequestCancelled, bind, raise_if_cancelled
 
-    :param frame - 已解析的请求帧
-    :returns: 响应帧
-    """
+    request_id = frame.get("id")
+    token = _register_request(request_id)
+    try:
+        with bind(token) if token is not None else contextlib.nullcontext():
+            try:
+                raise_if_cancelled()
+                return _handle_request(frame)
+            except RequestCancelled:
+                return fail(request_id, "SIDECAR_ABORTED", f"{frame.get('method')} was cancelled")
+    finally:
+        _release_request(request_id, token)
+
+
+def _handle_request(frame: dict[str, Any]) -> dict[str, Any]:
+    """校验并执行一个已绑定取消上下文的请求。"""
     import adapters
+    from cancellation import RequestCancelled, raise_if_cancelled
 
     request_id = frame.get("id")
     method = frame.get("method")
@@ -243,7 +301,11 @@ def handle(frame: dict[str, Any]) -> dict[str, Any]:
 
     with _SLOTS:
         try:
+            # 等待并发名额期间也可能收到 cancel；拿到名额后再判一次。
+            raise_if_cancelled()
             return ok(request_id, handler(params))
+        except RequestCancelled:
+            raise
         except adapters.AdapterError as error:
             return fail(request_id, error.code, str(error), error.details)
         except ModuleNotFoundError as error:
@@ -482,6 +544,15 @@ def read_loop() -> int:
         if not isinstance(frame, dict):
             emit(fail(None, "BAD_FRAME", "frame must be an object"))
             return True
+        if frame.get("method") == "cancel":
+            params = frame.get("params")
+            target = params.get("id") if isinstance(params, dict) else None
+            if not isinstance(target, str) or not target:
+                emit(fail(frame.get("id"), "BAD_ARGS", "cancel requires a non-empty string id"))
+                return True
+            _cancel_request(target)
+            emit(ok(frame.get("id"), {"cancelled": True}))
+            return True
         if frame.get("method") == "shutdown":
             emit(ok(frame.get("id"), {"stopping": True}))
             _drain_before_exit()
@@ -502,6 +573,7 @@ def read_loop() -> int:
                     f"{depth} requests already queued (limit {MAX_QUEUE_DEPTH})",
                 )
             else:
+                _register_request(frame.get("id"))
                 _QUEUE.append(frame)
                 depth += 1
         if busy_reply is not None:

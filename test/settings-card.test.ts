@@ -139,6 +139,12 @@ describe("字段表与 schema 同解", () => {
     expect(SETTINGS_FIELD_KEYS.toSorted()).toStrictEqual(VOLATILE_KEYS.toSorted());
   });
 
+  it("mcpToolLoading 是默认 eager 的部署级值，不进 volatile 设置卡", () => {
+    expect(PROPERTIES["mcpToolLoading"]?.meta?.default).toBe("eager");
+    expect(PROPERTIES["mcpToolLoading"]?.meta?.volatile).not.toBe(true);
+    expect(SETTINGS_FIELD_KEYS).not.toContain("mcpToolLoading");
+  });
+
   it("locate / links 两枚离线解析开关在字段表里，默认开", () => {
     for (const key of ["locateEnabled", "linksEnabled"]) {
       expect(SETTINGS_FIELD_KEYS).toContain(key);
@@ -171,6 +177,25 @@ describe("字段表与 schema 同解", () => {
       expect(field.options?.length ?? 0).toBeGreaterThan(0);
       expect(field.options).toContain(field.fallback);
     }
+  });
+
+  it("webFetchStrategy 是 static / auto / browser 三档枚举，默认 auto", () => {
+    const field = fieldOf("webFetchStrategy");
+    expect(field.kind).toBe("enum");
+    expect(field.options).toStrictEqual(["static", "auto", "browser"]);
+    expect(field.fallback).toBe("auto");
+    expect(PROPERTIES["webFetchStrategy"]?.meta?.volatile).toBe(true);
+    expect(parseInput(field, "static")).toStrictEqual({ kind: "value", value: "static" });
+    expect(parseInput(field, "browser")).toStrictEqual({ kind: "value", value: "browser" });
+    expect(parseInput(field, "render")).toStrictEqual({ kind: "invalid" });
+  });
+
+  it("pdf 工具开关在卡上且默认开启", () => {
+    const field = fieldOf("documentsEnabled");
+    expect(field.kind).toBe("boolean");
+    expect(field.fallback).toBe(true);
+    expect(field.label.zh).toContain("scrapling_read_document");
+    expect(field.label.en).toContain("scrapling_read_document");
   });
 
   it("键不重复，分组 id 也不重复", () => {

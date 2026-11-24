@@ -8,6 +8,12 @@
     "sha256": "226d696642a8a53d03b4d5b255b1c319b1575a6d44bd723a953c9f507755e36a",
     "sizeBytes": 26834117
   },
+  "documents": {
+    "requirements": "py/documents-requirements.txt",
+    "distribution": "pypdf",
+    "version": "7.1.1",
+    "sha256": "a2a9f3b73270bbe9816db704de961a9b517ef9e98e45b2b5c2d847c623a30407"
+  },
   "unsupported": {
     "darwin-x64": "not verified on this host",
     "linux-x64": "not verified on this host",

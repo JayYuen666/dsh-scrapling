@@ -88,7 +88,7 @@ interface PatchReading {
  * 这里没有引第三方 YAML 依赖（宿主那侧真解析用的是 js-yaml，见 deepseek-harness 的
  * packages/boot/app-boot/src/config-schema/collect.ts），所以自己实现一个只认「本模块会写出的
  * 那几种形态」的读者。它比 JSON.parse 单行反解宽的地方是整段结构：`command:` 只许一行、必须
- * 在 8 位缩进、父一级必须是 `config:`、这一层的键集必须正好是那五个——结构写坏时后面的标量
+ * 在 8 位缩进、父一级必须是 `config:`、这一层的键集必须正好是那六个——结构写坏时后面的标量
  * 断言拦不住，只有把这些形状一起读回来才拦得住。
  *
  * @param patch - 生成的 patch 文本
@@ -108,8 +108,8 @@ function readPatch(patch: string): PatchReading {
       break;
     }
   }
-  // 同层还有 serverName / transport / args 三行，它们也是 8 位缩进，所以父级是「缩进比它浅的
-  // 第一行」，不是上一行。
+  // 同层还有 serverName / transport / args / failOnStartupError / toolLoading 五行，它们也是
+  // 8 位缩进，所以父级是「缩进比它浅的第一行」，不是上一行。
   expect(parent.trim()).toBe("config:");
   const fields: Record<string, string> = {};
   for (const entry of lines.filter((text) => text.startsWith(COMMAND_INDENT))) {
@@ -121,6 +121,7 @@ function readPatch(patch: string): PatchReading {
     "command",
     "failOnStartupError",
     "serverName",
+    "toolLoading",
     "transport",
   ]);
   const rawCommand = fields["command"] ?? "";
@@ -145,6 +146,11 @@ describe("officialMcpPlan", () => {
     // patch 里的 args 必须由 plan.args 派生：两处各写一份字面量时，官方 server 一旦要参数，
     // 改一处就与另一处漂移，而 patch 才是用户真正应用的那份。
     expect(plan.patch).toContain(`        args: ${JSON.stringify(plan.args)}`);
+  });
+
+  it("显式 on-demand 时写进官方条目", () => {
+    const plan = officialMcpPlan({ ...ENABLED, toolLoading: "on-demand" });
+    expect(plan.patch).toContain("        toolLoading: on-demand");
   });
 
   it("dataDir 不是绝对路径时拒绝：相对路径会被宿主按它自己的 cwd 解析", () => {
@@ -196,13 +202,14 @@ describe("官方条目的 command 标量", () => {
     expect(plan.patch).not.toContain(`command: ${plan.command}`);
     expect(read.rawCommand.startsWith('"')).toBe(true);
     expect(read.command).toBe(plan.command);
-    // 同层另四个字段是 plain 标量，原文就该等于这几个字面值。
+    // 同层另五个字段是 plain 标量，原文就该等于这几个字面值。
     expect(read.fields).toStrictEqual({
       serverName: "scrapling",
       transport: "stdio",
       command: read.rawCommand,
       args: "[]",
       failOnStartupError: "true",
+      toolLoading: "eager",
     });
   });
 

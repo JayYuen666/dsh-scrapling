@@ -119,6 +119,7 @@ export const ROW_TOOLS: readonly string[] = [
   "scrapling_session_read",
   "scrapling_session_act",
   "scrapling_download",
+  "scrapling_read_document",
   "scrapling_screenshot",
 ];
 

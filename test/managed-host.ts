@@ -1,5 +1,5 @@
 // 安装器与 runtime 解析只承诺 macOS arm64（`installerSupported()`），而这两条腿的用例
-// 在任何 CI 上都要跑：Linux 上按真实平台跑，量到的是「六个包全 blocked」，不是安装逻辑。
+// 在任何 CI 上都要跑：Linux 上按真实平台跑，量到的是「七个包全 blocked」，不是安装逻辑。
 // 所以用例显式把自己伪装成承诺平台，另外单独留一条用例钉「非承诺平台 → blocked」。
 //
 // 用 defineProperty 而不是 vi.spyOn：同一进程里可能嵌套（文件级伪装 + 单条用例改成

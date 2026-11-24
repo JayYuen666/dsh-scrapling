@@ -61,6 +61,7 @@ const SETTINGS: ToolSettings = {
   crawlMaxRuntimeSeconds: 1800,
   browserExecutablePath: "/tmp/chromium",
   browserInitScript: "/tmp/init.js",
+  browserCdpUrl: "ws://127.0.0.1:9222/devtools/browser/test",
   browserRealChrome: false,
   browserDnsOverHttps: true,
   recordRequests: true,
@@ -80,6 +81,8 @@ const SETTINGS: ToolSettings = {
   stripInlineImages: true,
   downloadDir: "/tmp/scrapling-downloads",
   downloadMaxBytes: 10_000_000,
+  documentMaxBytes: 20 * 1024 * 1024,
+  documentMaxPages: 200,
 };
 
 const SAMPLE_URL = "https://example.com/page";
@@ -250,6 +253,14 @@ const FETCH_REPLY = {
 /** 每个 sidecar 方法的回包：都要长成该工具后处理认得的形状。 */
 const REPLIES: Record<string, unknown> = {
   fetch: FETCH_REPLY,
+  "document.read": {
+    url: SAMPLE_URL,
+    bytes: 1234,
+    pageCount: 2,
+    pagesRead: 2,
+    content: "PDF BODY",
+    truncated: false,
+  },
   render: FETCH_REPLY,
   extract: FETCH_REPLY,
   select: { count: 1, truncated: false, matches: [{ tag: "h1", text: "hi" }] },
@@ -394,10 +405,14 @@ async function driveAllTools(): Promise<Record<string, ToolObservation>> {
     serperEndpoint: "https://google.serper.dev/search",
     duckduckgoEndpoint: "https://html.duckduckgo.com/html/",
     searxngEndpoint: () => "",
+    deepseekEndpoint: () => "https://api.deepseek.com/v1/tools/search",
+    fetchImpl: globalThis.fetch,
     publicFallback: () => false,
     renderTopN: 0,
     maxOutputBytes: () => 4000,
+    searchMaxOutputBytes: () => 24_000,
     timeoutMs: () => 30_000,
+    fetchStrategy: () => "auto",
     urlGate: async (url: string): Promise<string | undefined> => url,
   }).search({ query: "probe" });
   out["web_search provider"] = { calls: search.calls, declared: [] };
@@ -693,6 +708,7 @@ describe("两侧对表：线路上的键必须一一对得上", () => {
       "timeoutMs",
       "deployment.browserExecutablePath",
       "deployment.browserInitScript",
+      "deployment.browserCdpUrl",
       "deployment.recordRequests",
       "deployment.maxRecordedRequests",
     ]) {

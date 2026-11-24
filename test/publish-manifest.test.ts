@@ -466,6 +466,8 @@ describe("发布形态", () => {
     const required = [
       ...runtimePy,
       "py/runtime-requirements.txt",
+      "py/document.py",
+      "py/documents-requirements.txt",
       "runtime-manifest.json",
       "bin/dsh-scrapling.mjs",
     ];
@@ -648,7 +650,7 @@ describe("注释与文档没有内部指涉", () => {
  * 判据不得由被验的那张表派生，所以这里必须写死一个数；其余计数一律从 `TOOL_SPECS` 推。
  * 改动登记表时这一位会红，红话里点名要跟着改的文案位置。
  */
-const TOOL_COUNT_ANCHOR = 19;
+const TOOL_COUNT_ANCHOR = 20;
 
 describe("构建产物可载入", () => {
   it("host.js 真的能 import（内联的宿主包会在模块顶层就炸）", async () => {
@@ -720,7 +722,9 @@ describe("构建产物可载入", () => {
       static: true,
       extract: true,
       browser: true,
-      version: "0.5",
+      remote: true,
+      documents: true,
+      version: "0.5.1",
     };
     // 手写的只有这一处锚点：登记表换了数量，它要响，让人去核对 README 与设置卡文案。
     expect(artifact.TOOL_SPECS).toHaveLength(TOOL_COUNT_ANCHOR);
@@ -728,13 +732,13 @@ describe("构建产物可载入", () => {
     // 全开且能力齐时，注册数等于登记表长度：这条是关系，不是第二个数字。
     expect(ready).toHaveLength(artifact.TOOL_SPECS.length);
     // 关掉浏览器的分支同样要成立。依赖浏览器的那组由登记表的 requires 字段问出来：抄一份
-    // 名单的话，以后加一只 requires 为 browser 的工具，这条断言会照样绿而漏掉它。
-    const browserTools = artifact.TOOL_SPECS.filter((spec) => spec.requires === "browser").map(
-      (spec) => spec.name,
-    );
+    // 名单的话，以后加一只 browser / browser-or-remote 工具，这条断言会照样绿而漏掉它。
+    const browserTools = artifact.TOOL_SPECS.filter(
+      (spec) => spec.requires === "browser" || spec.requires === "browser-or-remote",
+    ).map((spec) => spec.name);
     const { ready: withoutBrowser } = artifact.planTools(
       allOn,
-      { ...full, browser: false },
+      { ...full, browser: false, remote: false },
       true,
       true,
       true,

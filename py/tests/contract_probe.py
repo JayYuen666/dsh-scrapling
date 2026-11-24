@@ -555,7 +555,7 @@ READ_PROBE_ARGS: dict[str, Any] = {
 }
 
 
-# 同一份入参只能走一条分支，而 adapters 里大量读取写在分支里（`session.open` 的两种类型、
+# 同一份入参只能走一条分支，而 adapters 里大量读取写在分支里（`session.open` 的三种类型、
 # `session.fetch` 的两种类型、`fetch` 的 GET 与非 GET，以及只在浏览器会话上读的那几条）。
 # 只跑一遍会把「分支里真读了」误报成「没读」——那种误报一旦进门禁，就逼着人去加豁免，
 # 而豁免加多了，真正的「发了没人读」也跟着沉默。所以按方法列出要走的分支。
@@ -580,6 +580,11 @@ READ_VARIANTS: dict[str, list[dict[str, Any]]] = {
     "session.open": [
         {"sessionType": "static"},
         {"sessionType": "stealth", "cookies": [{"name": "c", "value": "1"}]},
+        {
+            "sessionType": "remote",
+            "cookies": [{"name": "c", "value": "1"}],
+            "deployment": {"browserCdpUrl": "ws://127.0.0.1:1/devtools/browser/probe"},
+        },
     ],
     # 浏览器参数读的是 Playwright cookie 列表，而 fetch 探针的 cookies 是键值对象。
     # 不覆盖的话，_browser_params 会在读 cookies 时抛错，后面的键一个都记不到。

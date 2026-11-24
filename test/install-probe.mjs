@@ -37,6 +37,8 @@ const REQUIRED = [
   "package/py/redact.py",
   "package/py/redis_storage.py",
   "package/py/runtime-requirements.txt",
+  "package/py/document.py",
+  "package/py/documents-requirements.txt",
 ];
 
 /** 出货内容禁止出现的路径片段。

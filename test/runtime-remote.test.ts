@@ -334,7 +334,7 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(installRuntimeRemote({} as never, deps)).toBe(false);
   });
 
-  it("空 dataDir：六个包全都 missing", async () => {
+  it("空 dataDir：七个包全都 missing", async () => {
     const jobs = fakeJobs();
     const ctx = new Context();
     installRuntimeRemote(ctx, depsOf(tempDir(), jobs));
@@ -343,6 +343,7 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(status.packs.browser).toBe("missing");
     expect(status.packs.search).toBe("missing");
     expect(status.packs.media).toBe("missing");
+    expect(status.packs.documents).toBe("missing");
     expect(status.packs["adaptive-redis"]).toBe("missing");
     expect(status.packs.mcp).toBe("missing");
     expect(status.job).toBeNull();
@@ -960,12 +961,13 @@ describe("官方 Typert Remote：runtime 服务", () => {
     expect(seen).toStrictEqual([5004]);
   });
 
-  it("pack 清单覆盖计划里的六个包", () => {
+  it("pack 清单覆盖计划里的七个包", () => {
     expect([...RUNTIME_PACKS]).toStrictEqual([
       CORE,
       BROWSER,
       "search",
       "media",
+      "documents",
       "adaptive-redis",
       "mcp",
     ]);

@@ -1,5 +1,5 @@
 # dsh-scrapling：Scrapling 网页抓取插件（bundle）。
-# 19 个工具（名单以 `host.ts` 的 `TOOL_SPECS` 与 `src/client-entry.ts` 的 `ROW_TOOLS` 为准，
+# 20 个工具（名单以 `host.ts` 的 `TOOL_SPECS` 与 `src/client-entry.ts` 的 `ROW_TOOLS` 为准，
 # 两侧名字一致由 `test/client.test.ts` 判红；这个计数本身由 `test/readme-parity.test.ts` 跟着
 # 登记表核对，所以这里不逐枚列举，也删不掉——注释不必成为第二份清单）。
 # 后端是常驻 Python 进程，经 ctx.subprocess 的 stdin/stdout

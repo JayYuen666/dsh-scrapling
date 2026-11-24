@@ -6,8 +6,8 @@
 // 共同约定：
 //   - `execute` 返回**无损的 JSON 值**，模型看到的文本由 `output.render` 生成；
 //   - 失败一律 throw（注册表转成 isError），不把失败塞进 result 里假装成功；
-//   - `exec.signal` 一路透传给 sidecar —— 超时策略只通知不杀进程，sidecar 客户端
-//     收到 abort 会自己拆掉进程重连；
+//   - `exec.signal` 一路透传给 sidecar —— 取消与普通超时只结算当前请求，并发送 cancel
+//     帧通知 Python；共享进程只有协议/管道/崩溃时才回收；
 //   - 抓回的内容**已在 Python 侧做过隐藏元素清洗**，这里不二次处理，也不提供
 //     关掉它的开关（官方 MCP 在 `mainContentOnly=false` 时会绕过清洗，本插件不重复）。
 
@@ -18,7 +18,9 @@ import type { AttachmentSaver } from "./browser-tools.ts";
 import { anySignal, drainCrawl } from "./crawl-support.ts";
 import type { CrawlJobStarter } from "./crawl-support.ts";
 import {
+  boundNetworkEntries,
   capText,
+  NETWORK_STRUCTURED_BUDGET_BYTES,
   networkLines,
   renderAnswer,
   renderBrowser,
@@ -36,18 +38,27 @@ import {
   browserRequestParamTable,
   callNumber,
   crawlModeParamTable,
+  NETWORK_BOUNDARY_FIELDS,
   NETWORK_ITEM,
   networkReadParams,
   networkReadParamTable,
   METHOD_CAPTURE,
   METHOD_SESSION_NETWORK,
   sessionOpenExtras,
+  sessionTypeDescriptionOf,
+  sessionTypesOf,
   assertOpenArgsFitSession,
   staticRequestParamTable,
   writeBodyParamTable,
 } from "./tool-params.ts";
 import type { ScraplingMessages } from "./messages.ts";
-import { MESSAGES } from "./messages.ts";
+import { messagesOf } from "./messages.ts";
+import { toolTimeoutOf } from "./tool-timeout.ts";
+
+export { messagesOf } from "./messages.ts";
+export { toolTimeoutOf } from "./tool-timeout.ts";
+export { createDocumentTool } from "./document-tool.ts";
+export type { DocumentResult } from "./document-tool.ts";
 
 /** 抽取形态；与 Scrapling 的 extraction_types 一致。 */
 export type ExtractionType = "markdown" | "html" | "text" | "json";
@@ -79,6 +90,9 @@ export interface ToolSettings {
   readonly downloadDir: string;
   /** 单次下载的字节上限。 */
   readonly downloadMaxBytes: number;
+  /** PDF 读取的部署上限；模型参数只能向下收。 */
+  readonly documentMaxBytes: number;
+  readonly documentMaxPages: number;
   /** Python 侧单次请求的硬上限（秒）。与 timeoutMs 是两层：后者管宿主等多久，前者管子进程
    *  自己何时放弃——只设前者，一个卡死的子进程会一直占着宿主的协同超时。 */
   readonly requestTimeoutSeconds: number;
@@ -97,6 +111,8 @@ export interface ToolSettings {
   readonly browserExecutablePath: string;
   /** 页面创建时注入的 JS 文件绝对路径。部署级，模型改不了。 */
   readonly browserInitScript: string;
+  /** CDP 浏览器端点；留空不暴露 remote 会话。部署级，模型改不了。 */
+  readonly browserCdpUrl: string;
   /** 是否改用本机安装的 Google Chrome（而不是自带 Chromium）。部署级。 */
   readonly browserRealChrome: boolean;
   /** 是否让浏览器走 DNS-over-HTTPS（配代理时防 DNS 泄露）。部署级。 */
@@ -136,29 +152,6 @@ export interface ToolSettings {
    * 取舍，不该由被 prompt 注入的模型逐次决定。
    */
   readonly stripInlineImages: boolean;
-}
-
-/**
- * 注册给宿主的工具级墙钟，比本包内层那道请求超时多给的一分钟。
- *
- * **为什么必须严格大于内层**：宿主 `@deepseek-ai/dsh-tool-call-timeout-policy`
- * 在 `tools/execute` 外面套一道截止（`ctx.tools.get(name)?.timeoutMs`），而本包
- * 每次 sidecar 请求自己也有一道同长的截止（`CallOptions.timeoutMs`）。两者取同一个
- * 数时，宿主的截止起点更早（它在 execute 之前就装好了），于是永远是宿主先到期：
- * 结果被换成一句 `tool call timed out after Nms`，本包那条带出路说明的
- * `SidecarError`（`BROWSER_TIMEOUT` / `REQUEST_TIMEOUT` 之类）根本没机会说话。
- * 留一分钟，让内层永远先到期、先归因。内层自己已经把话说清楚，这一枚只兜
- * 「sidecar 完全不响应」那一类挂死。
- */
-const TOOL_TIMEOUT_MARGIN_MS = 60_000;
-
-/**
- * 交给宿主的工具级墙钟：内层请求超时 + 余量。
- * @param settings - 本次装配的部署设置
- * @returns `ToolDefinition.timeoutMs` 的取值（毫秒）
- */
-export function toolTimeoutOf(settings: ToolSettings): number {
-  return settings.timeoutMs + TOOL_TIMEOUT_MARGIN_MS;
 }
 
 /**
@@ -214,7 +207,7 @@ export interface ToolDeps {
    *
    *  为什么是可选而不是必填：本仓 181 处测试夹具都在造 `ToolDeps` 字面量，把它们全部改成
    *  带 `messages` 只会让夹具多一行噪音，而漏传在产品里**只有 host.ts 一处构造点**。
-   *  真实链路是否取到了英文由 `test/i18n.test.ts` 端到端钉住（按英文装配 19 个工具、断言
+   *  真实链路是否取到了英文由 `test/i18n.test.ts` 端到端钉住（按英文装配 20 个工具、断言
    *  描述与参数说明里零中文字符），不靠这一位「必填」来保证。
    */
   readonly messages?: ScraplingMessages | undefined;
@@ -442,11 +435,6 @@ function toFetchResult(raw: unknown, extractionType: string): FetchResult {
  */
 function truncationOf(upstream: boolean, capped: CappedText): boolean {
   return upstream || capped.truncated;
-}
-
-/** 取本次装配的文案目录；`ToolDeps.messages` 缺省时按中文（也就是改造前的行为）。 */
-export function messagesOf(deps: ToolDeps): ScraplingMessages {
-  return deps.messages ?? MESSAGES.zh;
 }
 
 /**
@@ -1564,7 +1552,25 @@ export interface NetworkEntry {
  * 多返回这个字段会被判成 `value.xhr is not a declared property`，工具次次失败。
  */
 export interface BrowserResult extends FetchResult {
+  /** 正文自身是否被截断；与网络历史截断分开记，避免渲染出错误的恢复建议。 */
+  contentTruncated?: boolean;
+  /** 结构化 XHR 数组是否因字节预算被裁剪。 */
+  xhrTruncated?: boolean;
   xhr?: NetworkEntry[];
+}
+
+/** 会话网络历史的结构化结果。 */
+export interface SessionNetworkResult {
+  sessionId: string;
+  /** sidecar 报告的总命中数；Host 字节裁剪不会改写它。 */
+  count: number;
+  /** 实际放入 matches 的条目数。 */
+  returnedCount: number;
+  /** matches 是否因 sidecar 少给或 Host 字节预算而截断。 */
+  truncated: boolean;
+  /** 下一次 afterId 查询的跳过锚点；没有可前进的 id 时不出现。 */
+  nextAfterId?: number;
+  matches: NetworkEntry[];
 }
 
 /** 浏览器工具的公共参数说明。 */
@@ -1898,7 +1904,11 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
           notice: { type: "string", required: true },
           metadata: { type: "object", additionalProperties: true },
           ...(options.withXhr
-            ? { xhr: { type: "array", required: true, items: NETWORK_ITEM } }
+            ? {
+                contentTruncated: { type: "boolean", required: true },
+                xhr: { type: "array", required: true, items: NETWORK_ITEM },
+                xhrTruncated: { type: "boolean", required: true },
+              }
             : {}),
         },
       },
@@ -1922,16 +1932,25 @@ function createBrowserTool(deps: ToolDeps, options: BrowserToolOptions): ToolDef
       });
       const base = toFetchResult(raw, String(payload.params["extractionType"]));
       const capped = capText(base.content, settings.maxOutputBytes, messages.contentRecoveryHint);
-      const result: BrowserResult = {
+      const contentTruncated = truncationOf(base.truncated, capped);
+      const network = options.withXhr
+        ? boundNetworkEntries(toNetworkEntries(raw, "xhr"), NETWORK_STRUCTURED_BUDGET_BYTES)
+        : undefined;
+      return {
         ...base,
         content: capped.text,
-        truncated: truncationOf(base.truncated, capped),
+        truncated: contentTruncated || network?.truncated === true,
         notice: capped.notice,
         // 只在 schema 声明了 xhr 的那个工具上才产出它：schema 是
         // additionalProperties: false，无条件带上会让 render 每一次都被判非法。
-        ...(options.withXhr ? { xhr: toNetworkEntries(raw, "xhr") } : {}),
+        ...(network === undefined
+          ? {}
+          : {
+              contentTruncated,
+              xhr: network.matches,
+              xhrTruncated: network.truncated,
+            }),
       };
-      return result;
     },
     presentCall: (args) => ({ card: "generic", title: args["url"], kind: "fetch" }),
     presentResult: fetchPresentation,
@@ -2136,9 +2155,8 @@ interface SessionOpenResult {
 export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
   const { sidecar, settings } = deps;
   const messages = messagesOf(deps);
-  // 浏览器不可用时把 stealth 从可选值里摘掉：静态会话本来就能用，所以这条工具留着，
-  // 但模型不该看得见一个必然以 SESSION_OPEN_FAILED 收场的取值。
-  const browserReady = sidecar.capabilities?.browser === true;
+  // 浏览器不可用时只留 static；remote 还要端点和上游能力同时就绪。
+  const sessionTypes = sessionTypesOf(sidecar.capabilities, settings.browserCdpUrl);
   return defineTool({
     name: "scrapling_session_open",
     description: messages.sessionOpenToolDescription,
@@ -2146,10 +2164,8 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
       sessionType: {
         type: "string",
         required: true,
-        enum: browserReady ? ["static", "stealth"] : ["static"],
-        description: browserReady
-          ? messages.sessionTypeDescription
-          : messages.sessionTypeStaticOnlyDescription,
+        enum: sessionTypes,
+        description: sessionTypeDescriptionOf(sidecar.capabilities, sessionTypes, messages),
       },
       headless: { type: "boolean", description: messages.sessionOpenHeadlessDescription },
       solveCloudflare: {
@@ -2241,13 +2257,14 @@ export function createSessionOpenTool(deps: ToolDeps): ToolDefinition {
           ...sessionOpenExtras(args),
           // 这几枚旋钮**只在开场生效**：会话内每次 fetch 传过去会被上游 validate_fetch
           // 静默丢掉（见 py/adapters.py 的 FETCH_LEVEL_KEYS）。之前只发 sessionType /
-          // headless / solveCloudflare，于是设置卡上的页面超时、广告拦截、浏览器二进制路径
-          // 与 CDP 端点对浏览器会话全部无效，且不报错。
+          // headless / solveCloudflare，于是设置卡上的页面超时、广告拦截与浏览器二进制路径
+          // 对浏览器会话全部无效，且不报错；CDP 端点则只在 remote 构造分支读取。
           timeoutMs: settings.pageTimeoutMs,
           blockAds: settings.blockAds,
           deployment: {
             browserExecutablePath: settings.browserExecutablePath,
             browserInitScript: settings.browserInitScript,
+            browserCdpUrl: settings.browserCdpUrl,
             browserRealChrome: settings.browserRealChrome,
             browserDnsOverHttps: settings.browserDnsOverHttps,
             recordRequests: settings.recordRequests,
@@ -2357,6 +2374,34 @@ export function createSessionFetchTool(deps: ToolDeps): ToolDefinition {
 }
 
 /**
+ * 渲染会话网络历史；总命中数与实际返回数分开显示。
+ *
+ * @param value - 会话网络结果
+ * @param messages - 当前语言的文案
+ * @returns 模型侧文本
+ */
+function renderSessionNetwork(value: SessionNetworkResult, messages: ScraplingMessages): string {
+  const complete = value.count === value.returnedCount && !value.truncated;
+  let head: string;
+  if (value.matches.length === 0) {
+    const count = complete
+      ? `${value.count} matches`
+      : `${value.returnedCount}/${value.count} matches returned`;
+    head = `session ${value.sessionId} recorded no XHR/fetch (${count})`;
+  } else {
+    const label = complete
+      ? `${value.count} XHR/fetch`
+      : `${value.returnedCount}/${value.count} XHR/fetch${value.truncated ? " (truncated)" : ""}`;
+    head = `session ${value.sessionId} — ${label}:\n${networkLines(value.matches).join("\n")}`;
+  }
+  if (!value.truncated) {
+    return head;
+  }
+  const anchor = value.nextAfterId === undefined ? "" : `\nnextAfterId=${value.nextAfterId}`;
+  return `${head}\n\n${messages.networkTruncationHint}${anchor}`;
+}
+
+/**
  * 建 `scrapling_session_network`：读一个已开会话记下的网络历史。
  *
  * 与 `scrapling_capture_xhr` 的分工：那条是「不知道接口在哪，开一次看看」，这条是
@@ -2383,27 +2428,16 @@ export function createSessionNetworkTool(deps: ToolDeps): ToolDefinition {
         properties: {
           sessionId: { type: "string", required: true },
           count: { type: "integer", required: true },
+          returnedCount: { type: "integer", required: true },
+          ...NETWORK_BOUNDARY_FIELDS,
           matches: { type: "array", required: true, items: NETWORK_ITEM },
         },
       },
-      render: (_args, value) => [
-        {
-          type: "text",
-          text:
-            value.matches.length === 0
-              ? `session ${value.sessionId} recorded no XHR/fetch (${value.count} matches)`
-              : `session ${value.sessionId} — ${value.count} XHR/fetch:\n${networkLines(
-                  value.matches,
-                ).join("\n")}`,
-        },
-      ],
+      render: (_args, value) => [{ type: "text", text: renderSessionNetwork(value, messages) }],
     },
     timeoutMs: toolTimeoutOf(settings),
     isConcurrencySafe: () => false,
-    async execute(
-      args,
-      exec: ToolRunContext,
-    ): Promise<{ sessionId: string; count: number; matches: NetworkEntry[] }> {
+    async execute(args, exec: ToolRunContext): Promise<SessionNetworkResult> {
       const raw = await callSidecar(
         sidecar,
         METHOD_SESSION_NETWORK,
@@ -2413,14 +2447,22 @@ export function createSessionNetworkTool(deps: ToolDeps): ToolDefinition {
         },
         { signal: exec.signal, timeoutMs: settings.timeoutMs },
       );
-      const matches = toNetworkEntries(raw, "matches");
+      const network = boundNetworkEntries(
+        toNetworkEntries(raw, "matches"),
+        NETWORK_STRUCTURED_BUDGET_BYTES,
+      );
+      const count =
+        isRecord(raw) && typeof raw["count"] === "number" ? raw["count"] : network.count;
       return {
         /* v8 ignore next —— 非字符串到不了：schema 声明 sessionId 是必填字符串，而
            defineTool 的包装在校验不过时先抛，根本走不到这里。留着只为工具契约变更时
            不把一次调用打挂。 */
         sessionId: typeof args["sessionId"] === "string" ? args["sessionId"] : "",
-        count: isRecord(raw) && typeof raw["count"] === "number" ? raw["count"] : matches.length,
-        matches,
+        count,
+        returnedCount: network.returnedCount,
+        truncated: network.truncated || network.returnedCount < count,
+        matches: network.matches,
+        ...(network.nextAfterId === undefined ? {} : { nextAfterId: network.nextAfterId }),
       };
     },
     presentCall: (args) => ({ card: "generic", title: args["sessionId"], kind: "search" }),

@@ -2,7 +2,7 @@
 //
 // 为什么要有这一条：`ToolDeps.messages` 是**可选**位（181 处夹具都在造 deps 字面量，只有
 // `host.ts` 一处真构造点）。可选意味着「忘记传」不会编译失败，而症状是英文界面上静默露出
-// 中文。`test/messages.test.ts` 只验字典本身，验不到「字典有没有真的接到 19 个工具与指引段上」。
+// 中文。`test/messages.test.ts` 只验字典本身，验不到「字典有没有真的接到 20 个工具与指引段上」。
 //
 // 判据是**字形**而不是逐条文案比对：漏翻的形态有无数种（半句残留、拼接漏掉一段、参数说明
 // 忘改），而它们都表现为「本该全英文的地方出现了汉字」。所以这里按英文装配一次，把模型能
@@ -17,6 +17,7 @@ import {
   createAnswerTool,
   createCaptureXhrTool,
   createCrawlTool,
+  createDocumentTool,
   createExtractTool,
   createFetchTool,
   createLinksTool,
@@ -43,7 +44,7 @@ import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
 /** 汉字：只判汉字本体，英文里合法使用的 U+2014／U+2026 不在这一类里。 */
 const HAN = /[\u3400-\u4DBF\u4E00-\u9FFF]/u;
 
-/** 一份完整的部署设置：取值不重要，这里只关心它能让 19 个工厂都建出来。 */
+/** 一份完整的部署设置：取值不重要，这里只关心它能让 20 个工厂都建出来。 */
 const SETTINGS: ToolSettings = {
   extractionType: "markdown",
   mainContentOnly: true,
@@ -60,6 +61,7 @@ const SETTINGS: ToolSettings = {
   crawlMaxRuntimeSeconds: 1800,
   browserExecutablePath: "",
   browserInitScript: "",
+  browserCdpUrl: "",
   browserRealChrome: false,
   browserDnsOverHttps: false,
   recordRequests: false,
@@ -77,6 +79,8 @@ const SETTINGS: ToolSettings = {
   stripInlineImages: true,
   downloadDir: "/tmp/scrapling-downloads",
   downloadMaxBytes: 10_000_000,
+  documentMaxBytes: 20 * 1024 * 1024,
+  documentMaxPages: 200,
 };
 
 /**
@@ -134,7 +138,7 @@ const fakeAnswer = async (request: AnswerRequest): Promise<AnswerResult> => ({
  *
  * @param messages - 文案表（英文那一份用来验翻译真的接到了工具上）
  * @param browser - 有没有可用浏览器
- * @returns 19 个工厂都能吃的依赖
+ * @returns 20 个工厂都能吃的依赖
  */
 function depsOf(messages: typeof MESSAGES.en, browser: boolean): ToolDeps {
   return {
@@ -177,7 +181,7 @@ function collectDescriptions(node: unknown, into: string[] = []): string[] {
   return into;
 }
 
-/** 19 个工厂 → 工具名。期望表独立写死；工具面多一个少一个这里就红。 */
+/** 20 个工厂 → 工具名。期望表独立写死；工具面多一个少一个这里就红。 */
 const BUILDERS: readonly (readonly [string, (deps: ToolDeps) => ToolDefinition])[] = [
   ["scrapling_fetch", createFetchTool],
   ["scrapling_extract", createExtractTool],
@@ -197,11 +201,12 @@ const BUILDERS: readonly (readonly [string, (deps: ToolDeps) => ToolDefinition])
   ["scrapling_session_read", createSessionReadTool],
   ["scrapling_session_act", createSessionActTool],
   ["scrapling_download", createDownloadTool],
+  ["scrapling_read_document", createDocumentTool],
   ["scrapling_screenshot", createScreenshotTool],
 ];
 
 describe("英文装配：工具说明与参数说明里零汉字", () => {
-  it("19 个工具在英文那份文案下都不残留中文", () => {
+  it("20 个工具在英文那份文案下都不残留中文", () => {
     const deps = depsOf(MESSAGES.en, true);
     // 唯一一个真的没有参数的工具：它只读内存里的会话寄存器，任何入参都无意义。
     // 把它单列出来，是为了让「每条都该有参数说明」这条前置断言仍然可用 —— 否则为了迁就
@@ -229,7 +234,7 @@ describe("英文装配：工具说明与参数说明里零汉字", () => {
       }
     }
     expect(empty, "没有参数说明的工具与期望表对不上").toStrictEqual(WITHOUT_PARAMETERS);
-    // 全局下限：19 个工具的参数说明合起来是几百条，跌到两位数说明摊平函数又没走到。
+    // 全局下限：20 个工具的参数说明合起来是几百条，跌到两位数说明摊平函数又没走到。
     expect(total, "摊平到的参数说明太少，说明遍历没走到底").toBeGreaterThan(150);
   });
 
@@ -260,7 +265,7 @@ describe("英文装配：工具说明与参数说明里零汉字", () => {
 });
 
 describe("英文装配：system prompt 的指引段", () => {
-  // 15 段全开、每个工具都「可见」时指引最长；这正是英文界面下模型真会读到的那一份。
+  // 16 段全开、每个工具都「可见」时指引最长；这正是英文界面下模型真会读到的那一份。
   const ALL_ON = {
     fetch: true,
     extract: true,
@@ -276,13 +281,14 @@ describe("英文装配：system prompt 的指引段", () => {
     sessionRead: true,
     sessionActions: true,
     download: true,
+    documents: true,
     screenshot: true,
   };
 
-  it("十五段全开时每行都是英文，且真的一行一段", () => {
+  it("十六段全开时每行都是英文，且真的一行一段", () => {
     const text = guidanceFor(ALL_ON, () => true, MESSAGES.en);
     const lines = text.split("\n");
-    expect(lines, "全开时该有十五条指引").toHaveLength(15);
+    expect(lines, "全开时该有十六条指引").toHaveLength(16);
     for (const line of lines) {
       expect(line, "英文指引行残留中文").not.toMatch(HAN);
       expect(line.startsWith("- "), "指引行没以列表符号开头").toBe(true);

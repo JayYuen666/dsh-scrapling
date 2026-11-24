@@ -1,8 +1,10 @@
-"""会话当前页的读取。只碰 ``StealthySession`` 的 page pool，不新建浏览器。"""
+"""会话当前页的读取。只碰浏览器会话的 page pool，不新建浏览器。"""
 
 from __future__ import annotations
 
 from typing import Any
+
+from cancellation import RequestCancelled, raise_if_cancelled
 
 
 def _adapter_error(code: str, message: str, *, details: dict[str, Any] | None = None) -> Exception:
@@ -28,9 +30,12 @@ _ACTION_TYPES = frozenset(
         "wait_time",
         "wait_element",
         "wait_load",
+        "drag",
     }
 )
 _SELECTOR_ACTIONS = frozenset({"click", "textbox", "checkbox", "radio", "combobox", "wait_element"})
+_SNAPSHOT_TYPES = frozenset({"text", "aria"})
+_DRAG_COORDINATES = ("fromX", "fromY", "toX", "toY")
 _ELEMENT_STATES = frozenset({"attached", "detached", "hidden", "visible"})
 _LOAD_STATES = frozenset({"load", "domcontentloaded", "networkidle"})
 
@@ -107,41 +112,67 @@ def read_current_page(
     max_content_chars: int,
     include_metadata: bool,
     strip_inline_images: bool,
+    snapshot_type: str = "text",
 ) -> dict[str, Any]:
-    """读当前就绪页的正文；没有页或页不可用时给出明确错误码。
+    """读当前就绪页的正文或 ARIA 快照；没有页或页不可用时给出明确错误码。"""
+    from adapters import _fake_response, clip, to_payload
 
-    页面池把「没有页」与「页都被占用」分成两件事：前者是还没抓过，后者是别的请求
-    正在用这一页。两者对模型要采取的行动不同，所以不能合并成一个空正文。
-    """
-    from adapters import _fake_response, to_payload
-
+    if snapshot_type not in _SNAPSHOT_TYPES:
+        raise _adapter_error("BAD_ARGS", "snapshotType must be text or aria")
+    raise_if_cancelled()
     page_info = _ready_page(session)
     page = page_info.page
+    payload: dict[str, Any] | None = None
     try:
         if page.is_closed():
             raise _closed_page_error()
-        try:
-            html = page.content()
-        except Exception as error:  # 读到一半页被关掉/崩溃，归成「这一页没了」
-            raise _closed_page_error() from error
-        url, title = _page_identity(page)
-        response = _fake_response(str(html), url, 200)
-        payload = to_payload(
-            response,
-            extraction_type=extraction_type,
-            css_selector=css_selector,
-            main_content_only=main_content_only,
-            max_content_chars=max_content_chars,
-            strip_inline_images=strip_inline_images,
-            include_metadata=include_metadata,
-        )
+        if snapshot_type == "aria":
+            try:
+                raw = (page.locator(css_selector) if css_selector else page).aria_snapshot(mode="ai")
+            except Exception as error:
+                if page.is_closed():
+                    raise _closed_page_error() from error
+                raise _adapter_error(
+                    "SESSION_READ_FAILED",
+                    f"ARIA snapshot failed: {type(error).__name__}: {error}",
+                ) from error
+            raise_if_cancelled()
+            content, truncated = clip(str(raw), max_content_chars)
+            url, title = _page_identity(page)
+        else:
+            try:
+                html = page.content()
+            except Exception as error:  # 读到一半页被关掉/崩溃，归成「这一页没了」
+                raise _closed_page_error() from error
+            raise_if_cancelled()
+            url, title = _page_identity(page)
+            response = _fake_response(str(html), url, 200)
+            payload = to_payload(
+                response,
+                extraction_type=extraction_type,
+                css_selector=css_selector,
+                main_content_only=main_content_only,
+                max_content_chars=max_content_chars,
+                strip_inline_images=strip_inline_images,
+                include_metadata=include_metadata,
+            )
     finally:
         _finish_page(session.page_pool, page_info)
+    if payload is None:
+        return {
+            "url": url,
+            "title": str(title),
+            "content": content,
+            "truncated": truncated,
+            "snapshotType": "aria",
+            "notice": "the page accessibility tree was read from the session's current DOM, not fetched again",
+        }
     return {
         "url": payload["url"],
         "title": str(title),
         "content": payload["content"],
         "truncated": payload["truncated"],
+        "snapshotType": "text",
         "notice": "the page was read from the session's current DOM, not fetched again",
         **({"metadata": payload["metadata"]} if "metadata" in payload else {}),
     }
@@ -166,11 +197,31 @@ def _has_target(action: dict[str, Any]) -> bool:
     return isinstance(target, str) and bool(target)
 
 
+def _drag_selectors(action: dict[str, Any]) -> bool:
+    return "from" in action or "to" in action
+
+
+def _perform_drag(page: Any, action: dict[str, Any], timeout_ms: int) -> None:
+    if _drag_selectors(action):
+        page.locator(action["from"]).drag_to(page.locator(action["to"]), timeout=timeout_ms)
+        return
+    mouse = page.mouse
+    mouse.move(float(action["fromX"]), float(action["fromY"]))
+    mouse.down()
+    try:
+        mouse.move(float(action["toX"]), float(action["toY"]), steps=10)
+    finally:
+        mouse.up()
+
+
 def _perform(page: Any, action: dict[str, Any], timeout_ms: int) -> Any:
     """执行一个已校验的动作；dialog 注册的处理器会返回，由调用方在批次结束时摘掉。"""
     kind = str(action["type"])
     if kind == "wait_time":
         page.wait_for_timeout(int(action["ms"]))
+        return None
+    if kind == "drag":
+        _perform_drag(page, action, timeout_ms)
         return None
     if kind == "wait_load":
         page.wait_for_load_state(str(action.get("state", "load")), timeout=timeout_ms)
@@ -248,6 +299,16 @@ def _validate_actions(value: Any, max_actions: int) -> list[dict[str, Any]]:
                 raise _adapter_error("ACTION_INVALID", "move needs a non-empty target selector or x/y coordinates")
         if kind == "wheel" and (not _number(action.get("deltaX")) or not _number(action.get("deltaY"))):
             raise _adapter_error("ACTION_INVALID", "wheel needs numeric deltaX and deltaY")
+        if kind == "drag":
+            has_selectors = _drag_selectors(action)
+            has_coordinates = any(key in action for key in _DRAG_COORDINATES)
+            if has_selectors and has_coordinates:
+                raise _adapter_error("ACTION_INVALID", "drag cannot mix selectors and coordinates")
+            if has_selectors:
+                if not all(isinstance(action.get(key), str) and action[key] for key in ("from", "to")):
+                    raise _adapter_error("ACTION_INVALID", "drag needs non-empty from/to selectors")
+            elif not all(_number(action.get(key)) for key in _DRAG_COORDINATES):
+                raise _adapter_error("ACTION_INVALID", "drag needs fromX/fromY/toX/toY coordinates")
         if kind == "wait_time":
             ms = action.get("ms")
             if not isinstance(ms, int) or isinstance(ms, bool) or ms < 0:
@@ -311,6 +372,7 @@ def run_actions(
 ) -> dict[str, Any]:
     """按顺序执行结构化动作；首个失败停止并点名下标。"""
     prepared = _validate_actions(actions, max_actions)
+    raise_if_cancelled()
     page_info = _ready_page(session)
     page = page_info.page
     completed = 0
@@ -320,12 +382,17 @@ def run_actions(
             raise _closed_page_error()
         for index, action in enumerate(prepared, start=1):
             try:
+                raise_if_cancelled()
                 handler = _perform(page, action, timeout_ms)
                 if handler is not None:
                     dialog_handlers.append(handler)
+                raise_if_cancelled()
                 completed = index
                 if slowly:
                     page.wait_for_timeout(100)
+                    raise_if_cancelled()
+            except RequestCancelled:
+                raise
             except Exception as error:
                 # 慢速间隔也在这一层里：页在动作之间被关掉时同样按 ACTION_FAILED 点名下标，
                 # 而不是把裸异常漏给宿主。
@@ -334,6 +401,7 @@ def run_actions(
                     f"action {index} ({action['type']}) failed: {type(error).__name__}: {error}",
                     details={"actionIndex": index},
                 ) from error
+        raise_if_cancelled()
         # 终页信息在 finally 之外读：动作全做成了才走这里，而这两项各自兜底（一次关窗或页崩溃
         # 不该把已经完成的批次报成内部异常）。
         url, title = _page_identity(page)

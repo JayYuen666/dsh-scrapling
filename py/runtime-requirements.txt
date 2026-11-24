@@ -1,3 +1,4 @@
+# Optional PDF support is pinned separately in documents-requirements.txt.
 annotated-types==0.8.0 --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
 anyio==4.15.1 --hash=sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101
 apify_fingerprint_datapoints==0.15.0 --hash=sha256:fc9299b3136880f47b468897cd00ac622ad2c2a93e9cc9f972d10dbf5ed2b3aa

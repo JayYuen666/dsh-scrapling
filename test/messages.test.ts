@@ -139,9 +139,9 @@ describe("两语都保住了必须原样出现的协议记号与字面量", () =
     }
   });
 
-  it("十五段指引两语都一条不少，且都以「- 」开头（渲染成 markdown 列表）", () => {
+  it("十六段指引两语都一条不少，且都以「- 」开头（渲染成 markdown 列表）", () => {
     const guidance = KEYS.filter((key) => key.startsWith("guidance"));
-    expect(guidance).toHaveLength(15);
+    expect(guidance).toHaveLength(16);
     for (const key of guidance) {
       expect(ZH[key]?.startsWith("- "), `zh.${key} 没以列表符号开头`).toBe(true);
       expect(EN[key]?.startsWith("- "), `en.${key} 没以列表符号开头`).toBe(true);

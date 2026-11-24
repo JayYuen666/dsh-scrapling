@@ -9,6 +9,8 @@ import type { WebProviderDeps } from "../lib/web-provider.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
 import { SidecarClient } from "../lib/sidecar.ts";
 
+type FetchStrategy = "static" | "auto" | "browser";
+
 /** 造一个不发任何请求的 sidecar 客户端。 */
 function stubSidecar(): SidecarClient {
   return new SidecarClient({} as never, {
@@ -27,9 +29,10 @@ function stubSidecar(): SidecarClient {
  * 读取器本身由 `预算读取器` 那条用例专门钉住（同一个 provider 两次抓取之间改值，第二次要
  * 看到新值），所以这里不必每处手写 `() => 4000`。
  */
-type PlainDeps = Omit<WebProviderDeps, "maxOutputBytes" | "timeoutMs"> & {
+type PlainDeps = Omit<WebProviderDeps, "maxOutputBytes" | "timeoutMs" | "fetchStrategy"> & {
   readonly maxOutputBytes: number;
   readonly timeoutMs: number;
+  readonly fetchStrategy: FetchStrategy;
 };
 
 /**
@@ -47,27 +50,38 @@ function makeDeps(overrides: Partial<PlainDeps> = {}): WebProviderDeps {
     sidecar: stubSidecar(),
     maxOutputBytes: 4000,
     timeoutMs: 30_000,
+    fetchStrategy: "auto",
     ...overrides,
   };
   return {
     ...plain,
     maxOutputBytes: () => plain.maxOutputBytes,
     timeoutMs: () => plain.timeoutMs,
+    fetchStrategy: () => plain.fetchStrategy,
   };
 }
 
 /** 用例里要读默认预算时用它，免得把「读取器」这件事泄漏到断言表达式里。 */
 const DEFAULT_MAX_OUTPUT_BYTES = 4000;
+const START_URL = "https://example.test/start";
+const STATIC_URL = "https://example.test/static";
+const FINAL_URL = "https://example.test/final";
+const RENDERED_BODY = "rendered";
 
 /** 握手后的能力表：`scrapling` 那一档可按用例需要改。 */
-function capabilities(scrapling = true): Record<string, unknown> {
+function capabilities(scrapling = true, browser = false): Record<string, unknown> {
   return {
     scrapling,
     static: true,
     extract: true,
-    browser: false,
+    browser,
     version: "0.5",
   };
+}
+
+/** 一份完整的 fetch/render 回包；策略用例只替换正文、最终 URL 与状态码。 */
+function reply(content: string, url = "u", status = 200): Record<string, unknown> {
+  return { url, status, content, truncated: false };
 }
 
 /**
@@ -123,7 +137,7 @@ describe("available", () => {
   });
 
   it("handshake 过且有 scrapling 才可用", () => {
-    const sidecar = fakeSidecar({ alive: true, caps: capabilities(true) });
+    const sidecar = fakeSidecar({ alive: true, caps: capabilities(true, true) });
     expect(createWebFetchProvider(makeDeps({ sidecar })).available()).toBe(true);
   });
 
@@ -137,7 +151,7 @@ describe("available", () => {
   });
 
   it("有 scrapling 但 sidecar 已死时不可用", () => {
-    const sidecar = fakeSidecar({ alive: true, caps: capabilities(true) });
+    const sidecar = fakeSidecar({ alive: true, caps: capabilities(true, true) });
     expect(createWebFetchProvider(makeDeps({ sidecar })).available()).toBe(true);
     Object.defineProperty(sidecar, "alive", { value: false, configurable: true });
     expect(createWebFetchProvider(makeDeps({ sidecar })).available()).toBe(false);
@@ -145,20 +159,212 @@ describe("available", () => {
 });
 
 describe("fetch", () => {
+  it("auto 的静态正文有 500 字符时只调用 fetch", async () => {
+    const methods: string[] = [];
+    const body = "S".repeat(500);
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> => {
+        methods.push(method);
+        return reply(method === "fetch" ? body : RENDERED_BODY, STATIC_URL, 201);
+      },
+    });
+    const result = await createWebFetchProvider(makeDeps({ sidecar, fetchStrategy: "auto" })).fetch(
+      { url: START_URL },
+    );
+
+    expect(methods).toStrictEqual(["fetch"]);
+    expect(result.url).toBe(STATIC_URL);
+    expect(result.statusCode).toBe(201);
+    expect(result.body).toStrictEqual({ kind: "text", content: body });
+  });
+
+  it("auto 静态正文为空时依次 fetch/render，并采用渲染回包的最终 URL 与状态码", async () => {
+    const methods: string[] = [];
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> => {
+        methods.push(method);
+        return method === "fetch"
+          ? reply("", STATIC_URL, 200)
+          : reply(RENDERED_BODY, FINAL_URL, 201);
+      },
+    });
+    const result = await createWebFetchProvider(makeDeps({ sidecar, fetchStrategy: "auto" })).fetch(
+      { url: START_URL },
+    );
+
+    expect(methods).toStrictEqual(["fetch", "render"]);
+    expect(result.url).toBe(FINAL_URL);
+    expect(result.statusCode).toBe(201);
+    expect(result.body).toStrictEqual({ kind: "text", content: RENDERED_BODY });
+  });
+
+  it.each([
+    { chars: 199, methods: ["fetch", "render"] },
+    { chars: 200, methods: ["fetch"] },
+  ])("auto 以 200 字符为界：$chars 字符走 $methods", async ({ chars, methods }) => {
+    const called: string[] = [];
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> => {
+        called.push(method);
+        return reply("x".repeat(chars));
+      },
+    });
+    await createWebFetchProvider(makeDeps({ sidecar, fetchStrategy: "auto" })).fetch({ url: "u" });
+    expect(called).toStrictEqual(methods);
+  });
+
+  it("static 即使正文为空也不渲染", async () => {
+    const methods: string[] = [];
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> => {
+        methods.push(method);
+        return reply("", STATIC_URL, 202);
+      },
+    });
+    const result = await createWebFetchProvider(
+      makeDeps({ sidecar, fetchStrategy: "static" }),
+    ).fetch({ url: "u" });
+
+    expect(methods).toStrictEqual(["fetch"]);
+    expect(result.url).toBe(STATIC_URL);
+    expect(result.statusCode).toBe(202);
+    expect(result.body).toStrictEqual({ kind: "text", content: "" });
+  });
+
+  it("browser 直接渲染，不先静态抓取", async () => {
+    const methods: string[] = [];
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> => {
+        methods.push(method);
+        return reply(method === "render" ? RENDERED_BODY : "static");
+      },
+    });
+    const result = await createWebFetchProvider(
+      makeDeps({ sidecar, fetchStrategy: "browser" }),
+    ).fetch({ url: "u" });
+
+    expect(methods).toStrictEqual(["render"]);
+    expect(result.body.content).toBe(RENDERED_BODY);
+  });
+
+  it("auto 没有浏览器时保持静态，不因空正文渲染", async () => {
+    const methods: string[] = [];
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> => {
+        methods.push(method);
+        return reply("");
+      },
+    });
+    Object.defineProperty(sidecar, "capabilities", {
+      value: { ...capabilities(true), browser: false },
+      configurable: true,
+    });
+    const result = await createWebFetchProvider(makeDeps({ sidecar })).fetch({ url: "u" });
+
+    expect(methods).toStrictEqual(["fetch"]);
+    expect(result.body.content).toBe("");
+  });
+
+  it("auto 静态回包形状错误时不渲染", async () => {
+    const methods: string[] = [];
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> => {
+        methods.push(method);
+        return "not-an-object";
+      },
+    });
+    await expect(
+      createWebFetchProvider(makeDeps({ sidecar, fetchStrategy: "auto" })).fetch({ url: "u" }),
+    ).rejects.toThrow(/malformed/u);
+    expect(methods).toStrictEqual(["fetch"]);
+  });
+
+  it.each([
+    ["缺少 url", { status: 200, content: "", truncated: false }],
+    ["status 为 0", { url: "u", status: 0, content: "short", truncated: false }],
+  ])("auto 静态回包%s时不渲染，并保留 malformed 错误", async (_label, payload) => {
+    const methods: string[] = [];
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> => {
+        methods.push(method);
+        return method === "fetch" ? payload : reply(RENDERED_BODY);
+      },
+    });
+    let caught: (Error & { code?: string }) | undefined;
+    try {
+      await createWebFetchProvider(makeDeps({ sidecar, fetchStrategy: "auto" })).fetch({
+        url: "u",
+      });
+    } catch (error) {
+      caught = error as Error & { code?: string };
+    }
+
+    expect(methods).toStrictEqual(["fetch"]);
+    expect(caught?.constructor.name).toBe("WebError");
+    expect(caught?.code).toBe("SCRAPLING_FETCH_FAILED");
+    expect(caught?.message).toContain("malformed");
+  });
+
+  it("渲染回包仍然按原输出上限裁剪并标记 truncated", async () => {
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> =>
+        method === "fetch" ? reply("") : reply("y".repeat(9000), FINAL_URL, 201),
+    });
+    const result = await createWebFetchProvider(makeDeps({ sidecar })).fetch({ url: "u" });
+
+    expect(result.url).toBe(FINAL_URL);
+    expect(result.statusCode).toBe(201);
+    expect(result.truncated).toBe(true);
+    expect(Buffer.byteLength(result.body.content, "utf8")).toBeLessThanOrEqual(
+      DEFAULT_MAX_OUTPUT_BYTES,
+    );
+  });
+
+  it("fetchStrategy 是读取器：同一个 provider 会按改动后的策略抓取", async () => {
+    const methods: string[] = [];
+    let strategy: FetchStrategy = "static";
+    const sidecar = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<unknown> => {
+        methods.push(method);
+        return reply(method === "fetch" ? "S".repeat(500) : RENDERED_BODY);
+      },
+    });
+    const provider = createWebFetchProvider({
+      ...makeDeps({ sidecar }),
+      fetchStrategy: () => strategy,
+    });
+
+    await provider.fetch({ url: "u" });
+    strategy = "browser";
+    await provider.fetch({ url: "u" });
+
+    expect(methods).toStrictEqual(["fetch", "render"]);
+  });
+
   it("返回 url/status/body/truncated，markdown 降级成 text", async () => {
     const client = stubSidecar();
     Object.assign(client, {
       call: async (): Promise<unknown> => ({
-        url: "https://example.test/final",
+        url: FINAL_URL,
         status: 201,
         content: "# body",
         truncated: false,
       }),
     });
     const result = await createWebFetchProvider(makeDeps({ sidecar: client })).fetch({
-      url: "https://example.test/start",
+      url: START_URL,
     });
-    expect(result.url).toBe("https://example.test/final");
+    expect(result.url).toBe(FINAL_URL);
     expect(result.statusCode).toBe(201);
     expect(result.body).toStrictEqual({ kind: "text", content: "# body" });
     expect(result.truncated).toBe(false);
@@ -419,9 +625,11 @@ describe("fetch", () => {
   });
 
   it("sidecar 抛错时包成带 code 的 WebError，并把 sidecar 的码带进消息", async () => {
-    const client = stubSidecar();
-    Object.assign(client, {
-      call: async (): Promise<unknown> => {
+    const methods: string[] = [];
+    const client = fakeSidecar({
+      caps: capabilities(true, true),
+      call: async (method): Promise<never> => {
+        methods.push(method);
         throw new SidecarError("URL_BLOCKED", "blocked by the host gate");
       },
     });
@@ -446,6 +654,7 @@ describe("fetch", () => {
     // 但内层 sidecar 码必须留在消息里：「被安全闸门拦下」与「sidecar 超时」要采取的行动不同。
     expect(caught?.message).toContain("URL_BLOCKED");
     expect(caught?.message).toContain("blocked by the host gate");
+    expect(methods).toStrictEqual(["fetch"]);
   });
 
   it("sidecar 抛的不是 SidecarError 时，消息里不带空的码前缀", async () => {

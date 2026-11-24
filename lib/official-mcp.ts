@@ -12,7 +12,9 @@ import {
   MCP_OFFICIAL_ENTRY_ID,
   MCP_SERVER_NAME,
   MCP_TRANSPORT_STDIO,
+  DEFAULT_MCP_TOOL_LOADING,
 } from "./mcp-contract.ts";
+import type { McpToolLoading } from "./mcp-contract.ts";
 
 export interface OfficialMcpOptions {
   /**
@@ -25,6 +27,8 @@ export interface OfficialMcpOptions {
   readonly dataDir: string;
   /** 部署配置里的 `officialMcpEnabled`。 */
   readonly enabled: boolean;
+  /** 部署配置里的 `mcpToolLoading`；缺席保持 eager。 */
+  readonly toolLoading?: McpToolLoading | undefined;
   /**
    * setup 这一次调用有没有带 `--accept-risk`。
    *
@@ -179,6 +183,7 @@ export function officialMcpPlan(options: OfficialMcpOptions): OfficialMcpPlan {
       `        command: ${yamlScalar(command)}`,
       `        args: ${JSON.stringify(args)}`,
       "        failOnStartupError: true",
+      `        toolLoading: ${options.toolLoading ?? DEFAULT_MCP_TOOL_LOADING}`,
       "",
     ].join("\n"),
   };

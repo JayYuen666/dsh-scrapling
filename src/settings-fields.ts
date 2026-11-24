@@ -255,6 +255,16 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         fallback: true,
       },
       {
+        key: "documentsEnabled",
+        kind: "boolean",
+        label: { zh: "scrapling_read_document", en: "scrapling_read_document" },
+        hint: {
+          zh: "读取 PDF 文本与页数；需要可选 documents 能力包（pypdf）。",
+          en: "Read PDF text and page counts; requires the optional documents pack (pypdf).",
+        },
+        fallback: true,
+      },
+      {
         key: "screenshotEnabled",
         kind: "boolean",
         label: { zh: "scrapling_screenshot", en: "scrapling_screenshot" },
@@ -322,6 +332,16 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         hint: {
           zh: "预算按 UTF-8 字节计；会话类工具共用这一档，同一数值也作为 sidecar 的字符上限。",
           en: "UTF-8 bytes; the session tools share this budget, and the same value also caps sidecar characters.",
+        },
+        fallback: 200_000,
+      },
+      {
+        key: "documentMaxOutputChars",
+        kind: "number",
+        label: { zh: "PDF 正文字符上限", en: "PDF text cap" },
+        hint: {
+          zh: "scrapling_read_document 的输出上限；模型只能用更小的值。",
+          en: "Output cap for scrapling_read_document; the model may only lower it.",
         },
         fallback: 200_000,
       },
@@ -542,6 +562,27 @@ export const SETTINGS_GROUPS: readonly GroupSpec[] = [
         fallback: true,
       },
       {
+        key: "webFetchStrategy",
+        kind: "enum",
+        options: ["static", "auto", "browser"],
+        label: { zh: "网页正文抓取策略", en: "Web content fetch strategy" },
+        hint: {
+          zh: "auto：先静态抓取，正文少于 200 字符时再尝试浏览器渲染；static 只静态抓取；browser 直接渲染。没有浏览器时 auto 保持静态抓取。",
+          en: "auto: fetch statically first and render only when the body is under 200 characters; static never renders; browser renders directly. Without a browser, auto stays static.",
+        },
+        fallback: "auto",
+      },
+      {
+        key: "searchMaxOutputBytes",
+        kind: "number",
+        label: { zh: "搜索正文总预算（字节）", en: "Search total body budget (bytes)" },
+        hint: {
+          zh: "一次搜索中所有正文小节的 UTF-8 字节总上限；默认 24000。调大更完整，也直接增加模型上下文与 token 成本。",
+          en: "UTF-8 byte cap across all body sections in one search; defaults to 24000. Larger values keep more text but increase model context and token cost.",
+        },
+        fallback: 24_000,
+      },
+      {
         key: "searchBackend",
         kind: "enum",
         options: [...SEARCH_BACKENDS],
@@ -715,6 +756,7 @@ const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = 
     "runtime.pack.browser": "完整 Chromium",
     "runtime.pack.search": "搜索发现",
     "runtime.pack.media": "截图与下载",
+    "runtime.pack.documents": "PDF 阅读（pypdf）",
     "runtime.pack.adaptive-redis": "自适应存储（Redis）",
     "runtime.pack.mcp": "MCP（未验证）",
   },
@@ -772,6 +814,7 @@ const CHROME: Readonly<Record<BuiltInLang, Readonly<Record<string, string>>>> = 
     "runtime.pack.browser": "Full Chromium",
     "runtime.pack.search": "Search discovery",
     "runtime.pack.media": "Screenshots & downloads",
+    "runtime.pack.documents": "PDF reading (pypdf)",
     "runtime.pack.adaptive-redis": "Adaptive storage (Redis)",
     "runtime.pack.mcp": "MCP (unverified)",
   },

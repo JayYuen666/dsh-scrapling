@@ -1,11 +1,19 @@
-// dsh-scrapling/test/search-provider.test.ts —— ctx.web search provider（检索 + 渲染一体）。
+// dsh-scrapling/test/search-provider.test.ts —— ctx.web search provider（检索 + 按策略读取）。
 //
 // 检索由 sidecar 的 search.discover 完成（Tavily/Bing 两条已验证路径），Host 只负责过闸、
-// 截断与渲染前 N 条。覆盖重点：错误码原样透出、key 不回显、闸门与正文失败的语义。
+// 按 webFetchStrategy 读取前 N 条与截断。覆盖重点：策略分支、错误码、key 不回显、闸门与正文失败的语义。
 
-import { describe, expect, it } from "vitest";
-import { SEARCH_PROVIDER_ID, createWebSearchProvider } from "../lib/search-provider.ts";
+import { describe, expect, it, vi } from "vitest";
+import {
+  DEFAULT_SEARCH_TOTAL_BUDGET_BYTES,
+  SEARCH_CACHE_MAX_ENTRIES,
+  SEARCH_CACHE_TTL_MS,
+  SEARCH_PROVIDER_ID,
+  canonicalizeSearchUrl,
+  createWebSearchProvider,
+} from "../lib/search-provider.ts";
 import type { SearchProviderDeps } from "../lib/search-provider.ts";
+import type { DeepSeekAuthLike, DeepSeekAuthRequestLike } from "../lib/deepseek-search.ts";
 import type { SearchBackend } from "../lib/search-backends.ts";
 import type { SidecarClient } from "../lib/sidecar.ts";
 import { SidecarError } from "../lib/sidecar-error.ts";
@@ -14,16 +22,21 @@ const PAGE_A = "https://a.test/1";
 const PAGE_B = "https://b.test/2";
 const PAGE_C = "https://c.test/3";
 const SEARCH_FAILED = "SCRAPLING_SEARCH_FAILED";
+const NO_BODY_REASON = "came back with no body";
 const DISCOVER = "search.discover";
 const API_ENDPOINT = "https://api.tavily.test/search";
 const BING_ENDPOINT = "https://bing.test/search";
 /** SearXNG 自建实例地址：几处用例都要它，值只写一次。 */
 const SEARX_ENDPOINT = "https://searx.test";
+const DEEPSEEK_ENDPOINT = "https://api.deepseek.test/v1/tools/search";
+const DEEPSEEK_ROUTE = "deepseek-official";
+const PUBLISHED_AT = "2026-11-20";
 
 /** 三把后端 key 的替身值：既配上、又要求只下发自家那一把，值只在这里写一次。 */
 const BRAVE_KEY = "brave-key";
 const SERPER_KEY = "serper-key";
 const TAVILY_KEY = "tavily-key";
+type FetchStrategy = "static" | "auto" | "browser";
 
 /** 假 sidecar 的一次调用记录。 */
 interface SidecarCall {
@@ -100,7 +113,10 @@ type PlainDeps = Omit<
   | "searxngEndpoint"
   | "publicFallback"
   | "maxOutputBytes"
+  | "searchMaxOutputBytes"
   | "timeoutMs"
+  | "fetchStrategy"
+  | "deepseekEndpoint"
 > & {
   readonly backend: SearchBackend;
   readonly apiKey: string;
@@ -109,7 +125,10 @@ type PlainDeps = Omit<
   readonly searxngEndpoint: string;
   readonly publicFallback: boolean;
   readonly maxOutputBytes: number;
+  readonly searchMaxOutputBytes: number;
   readonly timeoutMs: number;
+  readonly fetchStrategy: FetchStrategy;
+  readonly deepseekEndpoint: string;
 };
 
 function deps(over?: Partial<PlainDeps>): SearchProviderDeps {
@@ -128,7 +147,11 @@ function deps(over?: Partial<PlainDeps>): SearchProviderDeps {
     publicFallback: false,
     renderTopN: 2,
     maxOutputBytes: 100_000,
+    searchMaxOutputBytes: DEFAULT_SEARCH_TOTAL_BUDGET_BYTES,
     timeoutMs: 30_000,
+    fetchStrategy: "auto",
+    deepseekEndpoint: DEEPSEEK_ENDPOINT,
+    fetchImpl: globalThis.fetch,
     // 闸门是必填依赖：默认给一枚全放行的，用例要判否时用 blockList/passGate 覆盖。
     urlGate: async (url: string): Promise<string | undefined> => url,
     ...over,
@@ -142,7 +165,10 @@ function deps(over?: Partial<PlainDeps>): SearchProviderDeps {
     searxngEndpoint: () => plain.searxngEndpoint,
     publicFallback: () => plain.publicFallback,
     maxOutputBytes: () => plain.maxOutputBytes,
+    searchMaxOutputBytes: () => plain.searchMaxOutputBytes,
     timeoutMs: () => plain.timeoutMs,
+    fetchStrategy: () => plain.fetchStrategy,
+    deepseekEndpoint: () => plain.deepseekEndpoint,
   };
 }
 
@@ -336,6 +362,46 @@ describe("search provider 的 ready()：内置 web_search 要不要露面", () =
     await expect(readyOf(provider, "deepseek")).resolves.toBe(true);
     expect(calls).toStrictEqual([]);
   });
+
+  it("deepseek 后端按模型路线检查 auth 凭据，不读取 key 也不发网络", async () => {
+    const routes: (string | undefined)[] = [];
+    const auth: DeepSeekAuthLike = {
+      candidates: (request) => {
+        routes.push(request.route);
+        return [
+          {
+            kind: "api-key",
+            endpoint: DEEPSEEK_ENDPOINT,
+            configured: () => Promise.resolve(true),
+            resolve: () => Promise.resolve(undefined),
+          },
+        ];
+      },
+      authorize: () => Promise.resolve(undefined),
+    };
+    const provider = createWebSearchProvider({
+      ...deps({ backend: "deepseek" }),
+      deepseekAuth: auth,
+    });
+
+    await expect(readyOf(provider, DEEPSEEK_ROUTE)).resolves.toBe(true);
+    await expect(readyOf(provider, "other-route")).resolves.toBe(true);
+    expect(routes).toStrictEqual([DEEPSEEK_ROUTE, "other-route"]);
+  });
+
+  it("deepseek 没有 auth 服务或没有已配置凭据时 ready 为 false", async () => {
+    const withoutAuth = createWebSearchProvider(deps({ backend: "deepseek" }));
+    await expect(readyOf(withoutAuth)).resolves.toBe(false);
+    const auth: DeepSeekAuthLike = {
+      candidates: () => [],
+      authorize: () => Promise.resolve(undefined),
+    };
+    const withoutCredential = createWebSearchProvider({
+      ...deps({ backend: "deepseek" }),
+      deepseekAuth: auth,
+    });
+    await expect(readyOf(withoutCredential)).resolves.toBe(false);
+  });
 });
 
 /**
@@ -393,8 +459,14 @@ describe("reading 热改配置", () => {
   });
 });
 
-describe("search provider 检索与渲染", () => {
-  it("走 sidecar 的 search.discover，前 N 条用 render 渲染", async () => {
+describe("search provider 检索与按策略读取", () => {
+  it("省略 maxResults 时按宿主默认请求 10 条", async () => {
+    const calls: SidecarCall[] = [];
+    await createWebSearchProvider(deps({ sidecar: makeSidecar({ calls }) })).search({ query: "q" });
+    expect(calls[0]?.params["maxResults"]).toBe(10);
+  });
+
+  it("auto 先静态抓取，正文不足时对前 N 条回退渲染", async () => {
     const calls: SidecarCall[] = [];
     const sidecar = makeSidecar({
       hits: [
@@ -424,11 +496,426 @@ describe("search provider 检索与渲染", () => {
     ).search({ query: "hello" });
     expect(fallbackCalls[0]?.params).toMatchObject({ backend: "auto", publicFallback: true });
     expect(result.sources.map((source) => source.url)).toStrictEqual([PAGE_A, PAGE_B, PAGE_C]);
-    expect(calls.slice(1).map((call) => call.url)).toStrictEqual([PAGE_A, PAGE_B]);
-    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["render", "render"]);
+    expect(calls.slice(1).map((call) => call.url)).toStrictEqual([PAGE_A, PAGE_B, PAGE_A, PAGE_B]);
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual([
+      "fetch",
+      "fetch",
+      "render",
+      "render",
+    ]);
+    expect(
+      calls
+        .slice(1)
+        .filter((call) => call.url === PAGE_A)
+        .map((call) => call.method),
+    ).toStrictEqual(["fetch", "render"]);
+    expect(
+      calls
+        .slice(1)
+        .filter((call) => call.url === PAGE_B)
+        .map((call) => call.method),
+    ).toStrictEqual(["fetch", "render"]);
     expect(result.content).toContain(`BODY-OF ${PAGE_A}`);
     expect(result.content).not.toContain(`BODY-OF ${PAGE_C}`);
     expect(result.truncated).toBe(false);
+  });
+
+  it("auto 的静态正文有 500 字符时只调用 fetch", async () => {
+    const calls: SidecarCall[] = [];
+    const body = "S".repeat(500);
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A, title: "A" }],
+      calls,
+      onFetch: (method) => ({ content: method === "fetch" ? body : "rendered", truncated: false }),
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({
+      query: "q",
+    });
+
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["fetch"]);
+    expect(result.content).toBe(`## A\n\n${body}`);
+  });
+
+  it.each([
+    { chars: 199, methods: ["fetch", "render"] },
+    { chars: 200, methods: ["fetch"] },
+  ])("auto 以 200 字符为界：$chars 字符走 $methods", async ({ chars, methods }) => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      calls,
+      onFetch: () => ({ content: "x".repeat(chars), truncated: false }),
+    });
+    await createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({ query: "q" });
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(methods);
+  });
+
+  it("static 即使正文为空也不渲染", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      calls,
+      onFetch: () => ({ content: "", truncated: false }),
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 1, fetchStrategy: "static" })).search({
+        query: "q",
+      }),
+    );
+
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["fetch"]);
+    expect(error.code).toBe(SEARCH_FAILED);
+    expect(error.message).toContain(NO_BODY_REASON);
+  });
+
+  it("browser 直接渲染，不先静态抓取", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A, title: "A" }],
+      calls,
+      onFetch: (method) => ({
+        content: method === "render" ? "rendered" : "static",
+        truncated: false,
+      }),
+    });
+    const result = await createWebSearchProvider(
+      deps({ sidecar, renderTopN: 1, fetchStrategy: "browser" }),
+    ).search({ query: "q" });
+
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["render"]);
+    expect(result.content).toBe("## A\n\nrendered");
+  });
+
+  it("auto 没有浏览器时保持静态，不因空正文渲染", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      capabilities: { scrapling: true, browser: false },
+      calls,
+      onFetch: () => ({ content: "", truncated: false }),
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({ query: "q" }),
+    );
+
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["fetch"]);
+    expect(calls[1]?.extractionType).toBe("markdown");
+    expect(error.message).toContain(NO_BODY_REASON);
+  });
+
+  it("auto 静态回包形状错误时不渲染", async () => {
+    const calls: SidecarCall[] = [];
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      calls,
+      onFetch: () => "not-an-object",
+    });
+    const error = await failureOf(() =>
+      createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({ query: "q" }),
+    );
+
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["fetch"]);
+    expect(error.message).toContain("the fetch reply was not an object");
+  });
+
+  it("canonicalize 去 hash、跟踪参数并按 key 排序", () => {
+    expect(
+      canonicalizeSearchUrl("https://Example.COM:443/a/?utm_source=x&b=2&a=1&fbclid=z#frag", ""),
+    ).toBe("https://example.com/a/?a=1&b=2");
+    expect(canonicalizeSearchUrl("/r?b=2&a=1", "https://search.test/base")).toBe(
+      "https://search.test/r?a=1&b=2",
+    );
+    expect(canonicalizeSearchUrl("not a url", "")).toBe("");
+  });
+
+  it("同一查询里 canonical 相同的 URL 只保留一条来源", async () => {
+    const sidecar = makeSidecar({
+      hits: [
+        { url: "https://a.test/path?utm_source=x&b=2#one", title: "first" },
+        { url: "https://A.test:443/path?b=2#two", title: "duplicate" },
+        { url: PAGE_B, title: "second" },
+      ],
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({
+      query: "q",
+    });
+    expect(result.sources).toStrictEqual([
+      { url: "https://a.test/path?b=2", title: "first" },
+      { url: PAGE_B, title: "second" },
+    ]);
+  });
+
+  it("sidecar 命中的 summary/publishedAt 原样进入来源", async () => {
+    const sidecar = makeSidecar({
+      hits: [
+        {
+          url: PAGE_A,
+          title: "A",
+          snippet: "short",
+          summary: "long summary",
+          publishedAt: PUBLISHED_AT,
+        },
+      ],
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 0 })).search({
+      query: "q",
+    });
+    expect(result.sources[0]).toStrictEqual({
+      url: PAGE_A,
+      title: "A",
+      snippet: "short",
+      summary: "long summary",
+      publishedAt: PUBLISHED_AT,
+    });
+  });
+
+  it("发现结果按 300 秒 TTL 缓存，过期后重新发现", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-11-24T00:00:00Z"));
+      const calls: SidecarCall[] = [];
+      const provider = createWebSearchProvider(
+        deps({ sidecar: makeSidecar({ hits: [{ url: PAGE_A }], calls }), renderTopN: 0 }),
+      );
+      await provider.search({ query: "cached" });
+      await provider.search({ query: "cached" });
+      expect(calls.filter((call) => call.method === DISCOVER)).toHaveLength(1);
+      vi.advanceTimersByTime(SEARCH_CACHE_TTL_MS + 1);
+      await provider.search({ query: "cached" });
+      expect(calls.filter((call) => call.method === DISCOVER)).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("发现缓存最多 128 项，超出后淘汰最旧项", async () => {
+    expect(SEARCH_CACHE_MAX_ENTRIES).toBe(128);
+    const calls: SidecarCall[] = [];
+    const provider = createWebSearchProvider(
+      deps({ sidecar: makeSidecar({ hits: [], calls }), renderTopN: 0 }),
+    );
+    async function fillCache(index: number): Promise<void> {
+      if (index >= SEARCH_CACHE_MAX_ENTRIES) {
+        return;
+      }
+      await provider.search({ query: `q-${String(index)}` });
+      await fillCache(index + 1);
+    }
+    await fillCache(0);
+    await provider.search({ query: `q-${String(SEARCH_CACHE_MAX_ENTRIES)}` });
+    await provider.search({ query: "q-0" });
+    expect(calls.filter((call) => call.method === DISCOVER)).toHaveLength(
+      SEARCH_CACHE_MAX_ENTRIES + 2,
+    );
+  });
+
+  it("缓存键包含 SearXNG 端点但不包含 API key 值", async () => {
+    const calls: SidecarCall[] = [];
+    let endpoint = "https://search-one.test";
+    let apiKey = "secret-one";
+    const provider = createWebSearchProvider({
+      ...deps({
+        sidecar: makeSidecar({ hits: [{ url: PAGE_A }], calls }),
+        backend: "auto",
+        renderTopN: 0,
+      }),
+      searxngEndpoint: () => endpoint,
+      apiKey: () => apiKey,
+    });
+    await provider.search({ query: "same" });
+    apiKey = "secret-two";
+    await provider.search({ query: "same" });
+    expect(calls.filter((call) => call.method === DISCOVER)).toHaveLength(1);
+    endpoint = "https://search-two.test";
+    await provider.search({ query: "same" });
+    expect(calls.filter((call) => call.method === DISCOVER)).toHaveLength(2);
+  });
+
+  it("发现失败不写入缓存，下一次仍会重试", async () => {
+    const calls: SidecarCall[] = [];
+    let attempts = 0;
+    const sidecar = makeSidecar({
+      calls,
+      onDiscover: () => {
+        attempts += 1;
+        return attempts === 1
+          ? Promise.reject(new SidecarError("SEARCH_TIMEOUT", "timeout"))
+          : { backend: "bing", hits: [{ url: PAGE_A }] };
+      },
+    });
+    const provider = createWebSearchProvider(deps({ sidecar, renderTopN: 0 }));
+    await expect(provider.search({ query: "retry" })).rejects.toMatchObject({
+      code: "SEARCH_TIMEOUT",
+    });
+    await expect(provider.search({ query: "retry" })).resolves.toMatchObject({
+      sources: [{ url: PAGE_A }],
+    });
+    expect(calls.filter((call) => call.method === DISCOVER)).toHaveLength(2);
+  });
+
+  it("offset 跳过发现结果前面的条目，非法值直接报错", async () => {
+    const calls: SidecarCall[] = [];
+    const hits = [{ url: PAGE_A }, { url: PAGE_B }, { url: PAGE_C }];
+    const sidecar = makeSidecar({
+      calls,
+      onDiscover: (params) => ({
+        backend: "bing",
+        hits: hits.slice(typeof params["offset"] === "number" ? params["offset"] : 0),
+      }),
+    });
+    const provider = createWebSearchProvider(deps({ sidecar, renderTopN: 0 }));
+    const result = await provider.search({ query: "q", maxResults: 1, offset: 1 });
+    expect(result.sources).toStrictEqual([{ url: PAGE_B }]);
+    expect(calls[0]?.params["maxResults"]).toBe(1);
+    expect(calls[0]?.params["offset"]).toBe(1);
+    const errors = await Promise.all(
+      [-1, 1.5].map((offset) => failureOf(() => provider.search({ query: "q", offset }))),
+    );
+    for (const error of errors) {
+      expect(error.code).toBe(SEARCH_FAILED);
+      expect(error.message).toContain("offset");
+    }
+  });
+
+  it("fetchStrategy 是读取器：同一个 provider 会按改动后的策略抓取", async () => {
+    const calls: SidecarCall[] = [];
+    let strategy: FetchStrategy = "static";
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A }],
+      calls,
+      onFetch: (method) => ({
+        content: method === "fetch" ? "S".repeat(500) : "rendered",
+        truncated: false,
+      }),
+    });
+    const provider = createWebSearchProvider({
+      ...deps({ sidecar, renderTopN: 1 }),
+      fetchStrategy: () => strategy,
+    });
+
+    await provider.search({ query: "static-query" });
+    strategy = "browser";
+    await provider.search({ query: "browser-query" });
+
+    expect(calls.map((call) => call.method)).toStrictEqual([DISCOVER, "fetch", DISCOVER, "render"]);
+  });
+
+  it("搜索聚合预算可热改，默认仍是 24,000 字节", async () => {
+    let budget = DEFAULT_SEARCH_TOTAL_BUDGET_BYTES;
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A, title: "A" }],
+      onFetch: () => ({ content: "X".repeat(100), truncated: false }),
+    });
+    const provider = createWebSearchProvider({
+      ...deps({ sidecar, renderTopN: 1 }),
+      searchMaxOutputBytes: () => budget,
+    });
+    const first = await provider.search({ query: "first" });
+    expect(Buffer.byteLength(first.content ?? "", "utf8")).toBeLessThanOrEqual(24_000);
+    expect(first.truncated).toBe(false);
+
+    budget = 20;
+    const second = await provider.search({ query: "second" });
+    expect(Buffer.byteLength(second.content ?? "", "utf8")).toBeLessThanOrEqual(20);
+    expect(second.truncated).toBe(true);
+  });
+
+  it("三条各 20,000 字符的正文按字节共享总预算，并保留每页小节", async () => {
+    const body = "中".repeat(20_000);
+    const sidecar = makeSidecar({
+      hits: [
+        { url: PAGE_A, title: "A" },
+        { url: PAGE_B, title: "B" },
+        { url: PAGE_C, title: "C" },
+      ],
+      onFetch: () => ({ content: body, truncated: false }),
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 3 })).search({
+      query: "q",
+    });
+
+    const content = result.content ?? "";
+    expect(Buffer.byteLength(content, "utf8")).toBeLessThanOrEqual(24_000);
+    expect(result.truncated).toBe(true);
+    expect(content).toContain("## A");
+    expect(content).toContain("## B");
+    expect(content).toContain("## C");
+    expect(content).not.toContain("Omitted ");
+  });
+
+  it("单页均未截断但小节分隔符将总内容推过预算时仍截断", async () => {
+    const sidecar = makeSidecar({
+      hits: [
+        { url: PAGE_A, title: "A" },
+        { url: PAGE_B, title: "B" },
+        { url: PAGE_C, title: "C" },
+      ],
+      onFetch: () => ({ content: "X".repeat(7994), truncated: false }),
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 3 })).search({
+      query: "q",
+    });
+
+    // 每个小节恰为 8,000 字节，单页预算不截断；两个分隔符再把总内容推到 24,004 字节。
+    expect(Buffer.byteLength(result.content ?? "", "utf8")).toBe(24_000);
+    expect(result.truncated).toBe(true);
+    expect(result.content).not.toContain("Omitted ");
+  });
+
+  it("sidecar 单页标了截断时，最终结果也保留 truncated", async () => {
+    const sidecar = makeSidecar({
+      hits: [{ url: PAGE_A, title: "A" }],
+      onFetch: () => ({ content: "短正文", truncated: true }),
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({
+      query: "q",
+    });
+
+    expect(result.content).toBe("## A\n\n短正文");
+    expect(result.truncated).toBe(true);
+  });
+
+  it("总内容未超预算时原样返回且 truncated 为 false", async () => {
+    const sidecar = makeSidecar({
+      hits: [
+        { url: PAGE_A, title: "A" },
+        { url: PAGE_B, title: "B" },
+      ],
+      onFetch: (_method, params) => ({
+        content: `正文 ${typeof params["url"] === "string" ? params["url"] : ""}`,
+        truncated: false,
+      }),
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 2 })).search({
+      query: "q",
+    });
+
+    expect(result.content).toBe(`## A\n\n正文 ${PAGE_A}\n\n## B\n\n正文 ${PAGE_B}`);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("非对称小节总长未超预算时完整保留，不提前套用单页均分", async () => {
+    const largeBody = "L".repeat(9000);
+    const sidecar = makeSidecar({
+      hits: [
+        { url: PAGE_A, title: "A" },
+        { url: PAGE_B, title: "B" },
+        { url: PAGE_C, title: "C" },
+      ],
+      onFetch: (_method, params) => {
+        if (params["url"] === PAGE_A) {
+          return { content: largeBody, truncated: false };
+        }
+        return { content: params["url"] === PAGE_B ? "M" : "N", truncated: false };
+      },
+    });
+    const result = await createWebSearchProvider(deps({ sidecar, renderTopN: 3 })).search({
+      query: "q",
+    });
+
+    expect(result.truncated).toBe(false);
+    expect(Buffer.byteLength(result.content ?? "", "utf8")).toBe(9024);
+    expect(result.content).toBe(`## A\n\n${largeBody}\n\n## B\n\nM\n\n## C\n\nN`);
   });
 
   it("tavily 的 key 只进 sidecar 参数，不进入结果", async () => {
@@ -479,18 +966,6 @@ describe("search provider 检索与渲染", () => {
     ]);
   });
 
-  it("没有浏览器时退回静态抓取，仍是 markdown 抽取", async () => {
-    const calls: SidecarCall[] = [];
-    const sidecar = makeSidecar({
-      hits: [{ url: PAGE_A }],
-      capabilities: { scrapling: true, browser: false },
-      calls,
-    });
-    await createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({ query: "q" });
-    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["fetch"]);
-    expect(calls[1]?.extractionType).toBe("markdown");
-  });
-
   it("renderTopN=0 时只给链接，不发任何抓取", async () => {
     const calls: SidecarCall[] = [];
     const sidecar = makeSidecar({ hits: [{ url: PAGE_A }], calls });
@@ -527,6 +1002,202 @@ describe("search provider 检索与渲染", () => {
     });
     expect(result.sources).toHaveLength(2);
     expect(result.truncated).toBe(true);
+  });
+
+  it("deepseek 后端用 ctx.deepseekAuth 授权并直接调用 Search API", async () => {
+    const calls: SidecarCall[] = [];
+    const authRequests: DeepSeekAuthRequestLike[] = [];
+    const fetchCalls: { input: string; init: RequestInit }[] = [];
+    const authorization = {
+      kind: "api-key" as const,
+      endpoint: DEEPSEEK_ENDPOINT,
+      headers: { authorization: "Bearer deepseek-secret" },
+    };
+    const auth: DeepSeekAuthLike = {
+      candidates: (request) => {
+        authRequests.push(request);
+        return [
+          {
+            kind: "api-key",
+            endpoint: DEEPSEEK_ENDPOINT,
+            configured: () => Promise.resolve(true),
+            resolve: () => Promise.resolve(authorization),
+          },
+        ];
+      },
+      authorize: (request) => {
+        authRequests.push(request);
+        return Promise.resolve(authorization);
+      },
+    };
+    const fetchImpl: typeof fetch = (input, init) => {
+      if (typeof input !== "string") {
+        return Promise.reject(new TypeError("expected string endpoint"));
+      }
+      fetchCalls.push({ input, init: init ?? {} });
+      return Promise.resolve(
+        Response.json({
+          results: [
+            {
+              url: PAGE_A,
+              title: "DeepSeek A",
+              snippet: "snippet A",
+              summary: "summary A",
+              date: "2026-11-20",
+            },
+            { url: PAGE_B, title: "DeepSeek B", snippet: "snippet B", date: null },
+          ],
+        }),
+      );
+    };
+    const provider = createWebSearchProvider({
+      ...deps({ backend: "deepseek", sidecar: makeSidecar({ calls }), renderTopN: 0 }),
+      deepseekAuth: auth,
+      deepseekEndpoint: () => DEEPSEEK_ENDPOINT,
+      fetchImpl,
+    });
+
+    const result = await provider.search({
+      query: "dsh scrapling",
+      maxResults: 2,
+      llmProvider: DEEPSEEK_ROUTE,
+    });
+
+    expect(calls).toStrictEqual([]);
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.input).toBe(DEEPSEEK_ENDPOINT);
+    expect(fetchCalls[0]?.init.method).toBe("POST");
+    expect(fetchCalls[0]?.init.redirect).toBe("error");
+    expect(new Headers(fetchCalls[0]?.init.headers).get("authorization")).toBe(
+      "Bearer deepseek-secret",
+    );
+    const body = fetchCalls[0]?.init.body;
+    if (typeof body !== "string") {
+      throw new TypeError("expected JSON request body");
+    }
+    expect(JSON.parse(body)).toStrictEqual({
+      query: "dsh scrapling",
+      count: 2,
+      need_content: false,
+    });
+    expect(authRequests[0]).toMatchObject({
+      consumer: "@jayyuen66/dsh-scrapling",
+      accepts: ["account", "api-key"],
+      billing: "auto",
+      route: DEEPSEEK_ROUTE,
+      destination: { url: DEEPSEEK_ENDPOINT },
+    });
+    expect(result.sources).toStrictEqual([
+      {
+        url: PAGE_A,
+        title: "DeepSeek A",
+        snippet: "snippet A",
+        summary: "summary A",
+        publishedAt: PUBLISHED_AT,
+      },
+      { url: PAGE_B, title: "DeepSeek B", snippet: "snippet B" },
+    ]);
+    expect(JSON.stringify(result)).not.toContain("deepseek-secret");
+  });
+
+  it("deepseek 没有凭据时报 SEARCH_AUTH，且不发 HTTP 请求", async () => {
+    let fetched = false;
+    const provider = createWebSearchProvider({
+      ...deps({ backend: "deepseek", renderTopN: 0 }),
+      deepseekAuth: { candidates: () => [], authorize: () => Promise.resolve(undefined) },
+      deepseekEndpoint: () => DEEPSEEK_ENDPOINT,
+      fetchImpl: () => {
+        fetched = true;
+        return Promise.resolve(Response.json({ results: [] }));
+      },
+    });
+
+    const error = await failureOf(() => provider.search({ query: "q" }));
+    expect(error.code).toBe("SEARCH_AUTH");
+    expect(fetched).toBe(false);
+  });
+
+  it("deepseek 401 会 reject 凭据并报 SEARCH_AUTH", async () => {
+    let rejected = false;
+    const provider = createWebSearchProvider({
+      ...deps({ backend: "deepseek", renderTopN: 0 }),
+      deepseekAuth: {
+        candidates: () => [],
+        authorize: () =>
+          Promise.resolve({
+            kind: "account",
+            endpoint: DEEPSEEK_ENDPOINT,
+            headers: { "x-dsh-auth-token": "account-secret" },
+            reject: () => {
+              rejected = true;
+              return Promise.resolve();
+            },
+          }),
+      },
+      deepseekEndpoint: () => DEEPSEEK_ENDPOINT,
+      fetchImpl: () => Promise.resolve(new Response("unauthorized", { status: 401 })),
+    });
+
+    const error = await failureOf(() => provider.search({ query: "q" }));
+    expect(error.code).toBe("SEARCH_AUTH");
+    expect(rejected).toBe(true);
+  });
+
+  it("deepseek 429 与畸形响应分别报 SEARCH_RATE_LIMIT / SEARCH_FAILED", async () => {
+    const limited = createWebSearchProvider({
+      ...deps({ backend: "deepseek", renderTopN: 0 }),
+      deepseekAuth: {
+        candidates: () => [],
+        authorize: () =>
+          Promise.resolve({ kind: "api-key", endpoint: DEEPSEEK_ENDPOINT, headers: {} }),
+      },
+      deepseekEndpoint: () => DEEPSEEK_ENDPOINT,
+      fetchImpl: () => Promise.resolve(new Response("limited", { status: 429 })),
+    });
+    const limitedError = await failureOf(() => limited.search({ query: "q" }));
+    expect(limitedError.code).toBe("SEARCH_RATE_LIMIT");
+
+    const malformed = createWebSearchProvider({
+      ...deps({ backend: "deepseek", renderTopN: 0 }),
+      deepseekAuth: {
+        candidates: () => [],
+        authorize: () =>
+          Promise.resolve({ kind: "api-key", endpoint: DEEPSEEK_ENDPOINT, headers: {} }),
+      },
+      deepseekEndpoint: () => DEEPSEEK_ENDPOINT,
+      fetchImpl: () => Promise.resolve(Response.json({ results: "nope" })),
+    });
+    const malformedError = await failureOf(() => malformed.search({ query: "q" }));
+    expect(malformedError.code).toBe("SCRAPLING_SEARCH_FAILED");
+  });
+
+  it("deepseek 搜索把调用方取消信号传给授权与 HTTP", async () => {
+    const controller = new AbortController();
+    const seen: AbortSignal[] = [];
+    const provider = createWebSearchProvider({
+      ...deps({ backend: "deepseek", renderTopN: 0 }),
+      deepseekAuth: {
+        candidates: () => [],
+        authorize: (_request: DeepSeekAuthRequestLike, signal?: AbortSignal) => {
+          if (signal !== undefined) {
+            seen.push(signal);
+          }
+          return Promise.resolve({ kind: "api-key", endpoint: DEEPSEEK_ENDPOINT, headers: {} });
+        },
+      },
+      deepseekEndpoint: () => DEEPSEEK_ENDPOINT,
+      fetchImpl: (_input, init) => {
+        if (init?.signal !== undefined && init.signal !== null) {
+          seen.push(init.signal);
+        }
+        controller.abort();
+        return Promise.reject(new DOMException("aborted", "AbortError"));
+      },
+    });
+
+    await expect(provider.search({ query: "q" }, controller.signal)).rejects.toThrow(/aborted/u);
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    expect(seen.every((signal) => signal.aborted)).toBe(true);
   });
 
   it("源地址全部过准入闸门：判否的条目不进 sources", async () => {
@@ -778,7 +1449,7 @@ describe("search provider 错误与取消", () => {
     const cases = [
       { reply: "not-an-object", cause: "the fetch reply was not an object" },
       { reply: { content: 12_345, status: 200 }, cause: "without a text body" },
-      { reply: { content: "", status: 200 }, cause: "came back with no body" },
+      { reply: { content: "", status: 200 }, cause: NO_BODY_REASON },
     ] as const;
     const outcomes = await Promise.all(
       cases.map(async (item) => {
@@ -801,14 +1472,17 @@ describe("search provider 错误与取消", () => {
     );
   });
 
-  it("URL 全被安全闸门拦下时报错，原因里点名 URL_BLOCKED", async () => {
+  it("URL 全被安全闸门拦下时报错，原因里点名 URL_BLOCKED，且不触发渲染", async () => {
+    const calls: SidecarCall[] = [];
     const sidecar = makeSidecar({
       hits: [{ url: PAGE_A }],
+      calls,
       onFetch: () => Promise.reject(new SidecarError("URL_BLOCKED", "169.254.169.254: metadata")),
     });
     const error = await failureOf(() =>
       createWebSearchProvider(deps({ sidecar, renderTopN: 1 })).search({ query: "q" }),
     );
+    expect(calls.slice(1).map((call) => call.method)).toStrictEqual(["fetch"]);
     expect(error.code).toBe(SEARCH_FAILED);
     expect(error.message).toContain("URL_BLOCKED");
   });

@@ -14,13 +14,12 @@
 //   协议层却等 120 秒」这种自相矛盾的回包会成为可能；
 // - 非 volatile 的部署值不必套这层，传字面量就行，多了反而让调用点看不出哪些是热改位。
 //
-// 引用面：`lib/search-provider.ts` 与 `lib/web-provider.ts` 各 import 一次（类型面）；test/ 与
-// docs/ 下**没有 import**，只有两处注释提到本文件名（`test/protocol-conformance.test.ts` 与
-// `test/search-provider.test.ts` 各一句），所以它们不受改名影响 —— 别把「零命中」当成判据，
-// 它不成立。
-// 受影响面：`lib/search-provider.ts` 的 `SearchProviderDeps` 与 `lib/web-provider.ts` 的
-// `WebProviderDeps` 会 import 本类型的 `Reader<Value>`（改的是它们的字段类型），随之需要同步
-// 改的测试是 `test/search-provider.test.ts`、`test/web-provider.test.ts`、
+// 引用面：`lib/fetch-strategy.ts`、`lib/search-provider.ts` 与 `lib/web-provider.ts` 各 import
+// 一次（类型面）；test/ 与 docs/ 下**没有 import**，只有两处注释提到本文件名
+// （`test/protocol-conformance.test.ts` 与 `test/search-provider.test.ts` 各一句），所以它们不受
+// 改名影响 —— 别把「零命中」当成判据，它不成立。
+// 受影响面：三个 lib 模块的依赖接口会 import 本类型的 `Reader<Value>`（改的是字段类型），
+// 随之需要同步改的测试是 `test/search-provider.test.ts`、`test/web-provider.test.ts`、
 // `test/protocol-conformance.test.ts` 三处的依赖字面量；README 与 DETAIL 里描述的
 // 「设置卡改值即时生效」行为不变，无需改写。
 

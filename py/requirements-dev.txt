@@ -9,3 +9,5 @@ ruff==0.17.0
 mypy==2.4.0
 coverage==7.16.2
 bandit==1.9.4
+# PDF 是可选能力包；契约探针与 PDF 用例必须装上，否则 document.read 会在读取参数前退出。
+pypdf==7.1.1

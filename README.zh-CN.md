@@ -90,8 +90,9 @@ python -m patchright install chromium
 ```
 
 - **为什么是 `rag` 而不是 `fetchers`：** `rag` 就是 `fetchers` 再加上 `markdownify`，而 `extractionType` 默认是 `markdown` —— 装成 `fetchers` 的话，第一次抓取就会在 Markdown 转换处抛 `ModuleNotFoundError`。
-- **版本范围：** 本包在 Scrapling **0.5** 上开发与验证，依赖的 `Selector`、`Spider`、`SessionManager` 与转换器的去噪接口都不是稳定 API 面，所以上界钉在 `0.6` 之前；装到范围外时守卫照常运行，但反注入清洗与爬虫链路可能不按预期。0.5 里浏览器后端只剩 patchright（原来独立的 stealth 抓取工具随之删除，反检测参数都在 `scrapling_render` 上）；`capture_xhr` 改成会话级记录（于是有了 `scrapling_session_network`）；`extra_flags` 改为叠加 —— 本包一支都不发，WebRTC 防泄露由 `blockWebrtc` 开关承担。
+- **版本范围：** 本包在 Scrapling **0.5.1** 上开发与验证，依赖的 `Selector`、`Spider`、`SessionManager` 与转换器的去噪接口都不是稳定 API 面，所以上界钉在 `0.6` 之前；装到范围外时守卫照常运行，但反注入清洗与爬虫链路可能不按预期。0.5 里浏览器后端只剩 patchright（原来独立的 stealth 抓取工具随之删除，反检测参数都在 `scrapling_render` 上）；`capture_xhr` 改成会话级记录（于是有了 `scrapling_session_network`）；`extra_flags` 改为叠加 —— 本包一支都不发，WebRTC 防泄露由 `blockWebrtc` 开关承担。
 - **不用安装器时，浏览器引擎由你负责。** 可选 CLI 能装已验证的 macOS arm64 资产；插件自身在装载时不下载任何东西。没有浏览器时它只是不注册依赖浏览器的工具，模型不会浪费一轮去调用它们。
+- **PDF 阅读是可选的。** 安装 `documents` 能力包会装入钉版 pypdf 7.1.1；也可以把同一版本装进 `pythonBin` 选中的解释器。缺 pypdf 时 sidecar 照常启动，`capabilities.documents` 为 false，模型看不到 `scrapling_read_document`。
 - **`dependencies` 里没有 `@deepseek-ai/*`，这是契约**（`test/publish-manifest.test.ts` 钉住）。消费方 profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包一旦进了 `dependencies` 就会物化成真实存在的第二份副本，模块级状态与运行中的宿主裂开 —— 每次原生工具调用都抛错，而构建与测试一路绿。产物按值 import 的宿主包都是 required peer 并保持外部化；门禁会把构建产物真的载入一次、断言没有内联的宿主包正文。
 - **产物是 ESM-only 且从不提交** —— `prepack` 重建它，发出去的永远是当前源码产出的那份。
 
@@ -109,10 +110,10 @@ dsh-scrapling setup --feature browser --apply
 dsh-scrapling setup --status
 ```
 
-- `core` 装托管 Python 3.14.9、Scrapling 0.5 与钉死的 wheel；`browser` 再加完整 Chromium（不是 headless shell）。
-- `search`、`media`、`mcp` 与 `adaptive-redis` 都以 `core` 的 venv 为载体：`mcp` 带来 `official-mcp` 模式要的官方 `scrapling-mcp` server（随钉住的 `mcp` 包进来；它的工具集由上游决定，不是本插件的能力），`adaptive-redis` 带来 `adaptiveStorage: redis` 背后的 `redis` 客户端。六个包都可安装；设置卡把每个包报成 `ready`、`missing`、`corrupt` 或 `installing`。
+- `core` 装托管 Python 3.14.9、Scrapling 0.5.1 与钉死的 wheel；`browser` 再加完整 Chromium（不是 headless shell）。
+- `search`、`media`、`documents`、`mcp` 与 `adaptive-redis` 都以 `core` 的 venv 为载体：`documents` 从独立的哈希锁定 requirements 文件装入钉版 pypdf 7.1.1；`mcp` 带来 `official-mcp` 模式要的官方 `scrapling-mcp` server（随钉住的 `mcp` 包进来；它的工具集由上游决定，不是本插件的能力），`adaptive-redis` 带来 `adaptiveStorage: redis` 背后的 `redis` 客户端。七个包都可安装；设置卡把每个包报成 `ready`、`missing`、`corrupt` 或 `installing`。
 - `--feature` 默认 dry-run；`--apply` 才写到磁盘。`--repair` 重装且不碰用户数据；`--uninstall <包> [--purge]` 删运行时文件，只有 `--purge` 才连 `elements_storage.db` 与 `downloads/` 一起删。
-- `--offline <目录>` 全程不联网：`<目录>` 里要有 Python 归档（文件名与清单 URL 的最后一段一致，浏览器与 `curl -O` 写到磁盘的 `cpython-3.14.9+…-install_only.tar.gz` 可用，百分号转义那种写法也认），以及一个 `wheels/` 目录（每条钉版一枚 wheel，可用 `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <目录>/wheels` 生成）。Python 归档的哈希校验与联网路径一致，pip 带 `--no-index`；缺归档或缺 wheelhouse 时报 `INSTALL_OFFLINE_ASSETS`，不会悄悄退回联网。
+- `--offline <目录>` 全程不联网：`<目录>` 里要有 Python 归档（文件名与清单 URL 的最后一段一致，浏览器与 `curl -O` 写到磁盘的 `cpython-3.14.9+…-install_only.tar.gz` 可用，百分号转义那种写法也认），以及一个 `wheels/` 目录（每条钉版一枚 wheel，可用 `pip download --only-binary=:all: --require-hashes -r py/runtime-requirements.txt -d <目录>/wheels` 生成；安装 `documents` 包时再加 `-r py/documents-requirements.txt`）。Python 归档的哈希校验与联网路径一致，pip 带 `--no-index`；缺归档或缺 wheelhouse 时报 `INSTALL_OFFLINE_ASSETS`，不会悄悄退回联网。
 - `setup --status` 打印一份 JSON：`dataDir`、`profile`、`runtime`、`packs` 与 `state`。带 `--profile <目录>` 时读该 profile 的 `cordis.patch.yml`，按本包条目里的 `pythonBin` 与 `dataDir`（宿主真正在用的那两个设置）解析解释器，`packs` 与 `state` 也改报那份目录——条目里没写 `dataDir` 时这两项回落 CLI 自己的默认目录；不带 `--profile` 时 `profile.path` 为 `null`，输出里有一句说明没读 profile，`runtime` 回落到 CLI 自己的链（托管 venv → 裸托管解释器 → 仓内 `_env/.venv` → PATH `python3`）。要拿 `--status` 和设置卡上的解释器对照，就带上 `--profile`。
 - profile 同时有远程读取接口与作业后端时，设置卡能经 `scraplingRuntime` 发起同一套安装/修复/取消；否则显示可照抄的 CLI 命令。
 - `integrationMode` 只在部署配置里；宿主有 `mcpManager`（rc.2 的 web 组合包）时，MCP server 在装载时自动动态注册；`setup --mode` 负责为没有该服务的 CLI/headless profile 打印或写出客户端条目，`doctor` 用来核对一份 profile —— 见 [MCP 模式](#mcp-模式)。`official-mcp` 起的是托管 venv 里的 `scrapling-mcp`，由 `mcp` 能力包装进去（`setup --feature mcp --apply`）。
@@ -128,7 +129,7 @@ dsh-scrapling setup --status
 
 ## <img src="https://api.iconify.design/lucide/circle-slash.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它不提供什么
 
-- **它不是搜索引擎。** 检索由 Python sidecar 走六条后端之一（`searchBackend`：`auto` / `tavily` / `bing` / `brave` / `serper` / `duckduckgo` / `searxng`）；Scrapling 自己的 `google_search` 选项只是加一个 Google referer 头。每条后端都要自己的配置（`tavilyApiKey`、`braveApiKey`、`serperApiKey`、`searxngEndpoint`）—— 选中却没配的后端报 `SEARCH_AUTH`，不会静默换到别的后端。
+- **它不是搜索引擎。** 检索使用七条后端之一（`searchBackend`：`auto` / `tavily` / `bing` / `brave` / `serper` / `duckduckgo` / `searxng` / `deepseek`）。前六条在 Python sidecar 中运行并使用各自配置；`deepseek` 在 Host 中通过可选 `ctx.deepseekAuth` 调用直接 Search API。Scrapling 自己的 `google_search` 选项只是加 Google referer 头。选中却没配凭据的后端报 `SEARCH_AUTH`，不会静默切换。
 - **npm tarball 里没有解释器与浏览器。** 它们来自你的机器，或来自可选的 CLI 安装器 —— 后者把已验证的 macOS arm64 资产装进 `dataDir/runtime`；装载时缺什么就少注册什么，不会临时去下载。
 - **它不在宿主侧新增 HTTP 路由。** 设置卡是宿主的配置表单，本包没有自己的 `/api` 面。唯一真会 listen 的是 `integrationMode: mcp` 下那个 MCP server，只绑 `127.0.0.1`（`http://127.0.0.1:<mcpPort>/mcp`）：非 `/mcp` 路径回 404，声明超过 1 MiB 的正文回 413、不带 `Content-Length` 的回 411，Bearer token 只从环境变量 `DSH_SCRAPLING_MCP_TOKEN` 读，没设时启动会往 stderr 打一条「无鉴权、本机任意进程可调」的告知。
 - **它不加 dsh 子命令。** 本包自己的 `dsh-scrapling` CLI 管运行时能力包，另外管没有 `mcpManager` 的 profile 上那半套手工 MCP 接法：`setup --mode native|mcp|official-mcp` 生成客户端条目、带 `--apply` 时写到 `<dataDir>/mcp/<模式>.patch.yml`（profile 本体一个字不改），`doctor --mode` 拿那份条目与 profile 的 `cordis.patch.yml` 逐条核对。`setup --status` 给了 `--profile` 时读的也是那份文件里的 `pythonBin` 与 `dataDir`。
@@ -138,13 +139,13 @@ dsh-scrapling setup --status
 - `dsh.bundle.patch` 指向 `cordis.patch.yml`，里面有一条 `- id: dsh-plugin-shared` 供应行（必须保持开启；停用后卡片会失去 shared 组件供应），再加一条 `- id: scrapling`、`name` 用**裸包名** —— 宿主只扫裸包名条目的 `dsh.client` 声明。设置卡组件来自 shared 的客户端行，以 `@jayyuen66/dsh-plugin-shared/client` 外置；宿主模块表提供 `react`、`zod` 与这条 shared 供应。
 - client 半注册两处：设置卡（坐在 `plugins.bundle.config` 槽上，键是 bundle 包名 —— 宿主按 `entryKey: pkg.name` 派发，所以卡画在本包的详情页上），以及每个工具在 `tool.call.toolview` 上的一行结果，用官方 tool-call 视图 props 画。
 - 设置命名空间就是条目 id `scrapling`；优先级为 设置卡现值 > 注册行 `config:` > schema 默认值。把一项改回默认值保存的是**清除覆盖**而不是写入同一个值，将来默认值变了你这一项也会跟着变。
-- 卡上多数取值每次调用现读 —— 抽取类与浏览器类旋钮、四个输出预算、`fetchTimeoutMs`、`answerMaxTokens`、问答路由与搜索侧设置 —— **保存后下一次工具调用就生效**。装配时读一次、改完要重启的是：十五个工具开关、`provideWebFetch` / `provideWebSearch`、`pythonBin`、`failFastOnMissingPython`、`dataDir`、`sidecarHandshakeTimeoutMs` / `sidecarGraceMs`，以及闸门与 sidecar 进程环境那几项（`proxyUrl`、`proxyBypass`、`allowedHosts`、`nat64Prefixes`、`syntheticDnsRanges`）。
-- 关掉某个工具时，它的指引也一并消失，但分两层看：**常驻段只有一段摘要**（跨工具的选型规则，不点名具体工具），而逐工具那十五句全文注册成一枚虚拟 skill `scrapling`。两侧都按「那个 scope 真注册着哪些工具」现取 —— 没装浏览器的机器上 skill 正文里没有 render / capture_xhr 那几句，sidecar 没起来的机器**既没有常驻段也不注册 skill**（正文为空时注册一枚点开什么都没有的条目只会污染模型的 skill 目录）。宿主没有 skill 服务（精简 profile）时插件照常装配，只是少了这枚 skill，常驻段也不追加那句「完整指引见 skill」。常驻段排在内置 `web_fetch` 指引旁边。
+- 卡上多数取值每次调用现读 —— 抽取类与浏览器类旋钮、五个输出预算、`fetchTimeoutMs`、`answerMaxTokens`、问答路由与搜索侧设置 —— **保存后下一次工具调用就生效**。装配时读一次、改完要重启的是：十六个工具开关、`provideWebFetch` / `provideWebSearch`、`pythonBin`、`failFastOnMissingPython`、`dataDir`、`sidecarHandshakeTimeoutMs` / `sidecarGraceMs`，以及闸门与 sidecar 进程环境那几项（`proxyUrl`、`proxyBypass`、`allowedHosts`、`nat64Prefixes`、`syntheticDnsRanges`）。
+- 关掉某个工具时，它的指引也一并消失，但分两层看：**常驻段只有一段摘要**（跨工具的选型规则，不点名具体工具），而逐工具那十六句全文注册成一枚虚拟 skill `scrapling`。两侧都按「那个 scope 真注册着哪些工具」现取 —— 没装浏览器的机器上 skill 正文里没有 render / capture_xhr 那几句，sidecar 没起来的机器**既没有常驻段也不注册 skill**（正文为空时注册一枚点开什么都没有的条目只会污染模型的 skill 目录）。宿主没有 skill 服务（精简 profile）时插件照常装配，只是少了这枚 skill，常驻段也不追加那句「完整指引见 skill」。常驻段排在内置 `web_fetch` 指引旁边。
 - `scrapling_crawl` 登记自己的作业类型，`job_list` 因此把它的作业标成爬虫而不是 shell 作业。
 
 ## <img src="https://api.iconify.design/lucide/globe.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 工具一览
 
-十九个工具、十五枚设置开关（七个 session/state 工具共用开关），全部有测试覆盖：
+二十个工具、十六枚设置开关（七个 session/state 工具共用开关），全部有测试覆盖：
 
 | 工具 | 后端 | 需要浏览器 | 并发 |
 |---|---|---|---|
@@ -155,16 +156,25 @@ dsh-scrapling setup --status
 | `scrapling_render` | `StealthySession`（patchright） | 是 | 串行；反检测开关（`solveCloudflare` / `hideCanvas` / `blockWebrtc`）也在这一条上 |
 | `scrapling_capture_xhr` | 单页临时会话、页级记录 | 是 | 串行 |
 | `scrapling_session_open` / `scrapling_session_fetch` / `scrapling_session_network` / `scrapling_session_state_save` / `scrapling_session_state_load` / `scrapling_session_list` / `scrapling_session_close` | Scrapling 会话类 | 仅浏览器会话 | 串行 |
-| `scrapling_session_read` | 读浏览器会话当前页的 DOM | 是 | 串行 |
-| `scrapling_session_act` | 会话页上的结构化动作（部署门禁） | 是 | 串行 |
+| `scrapling_session_read` | 读浏览器会话当前页的正文或 AI 模式 ARIA 快照 | 是 | 串行 |
+| `scrapling_session_act` | 会话页上的结构化动作，含选择器/坐标拖放（部署门禁） | 是 | 串行 |
 | `scrapling_download` | 下载字节到 `dataDir/downloads`（部署门禁） | 否 | 可并发 |
+| `scrapling_read_document` | 流式读取 PDF 文本，依赖可选 pypdf | 否 | 可并发；默认 20 MiB / 200 页 / 200000 字符 |
 | `scrapling_screenshot` | PNG/JPEG 截图交给 attachment 服务 | 是 | 串行 |
 | `scrapling_crawl` | Scrapling Spider 框架（`content` / `sitemap` / `feed` / `shopify`），作为作业运行 | 否 | 串行 |
 | `scrapling_answer` | 任一抓取路径 + `ctx.llm` | `render: true` 时是 | 串行 |
 
-- **配额。** 同开会话至多 8 个（其中浏览器会话 3 个，每个是一个真实的 Chromium 进程）、同时在跑的爬虫 2 个、单页正文按 `*MaxOutputChars` 封顶、单个协议帧 8 MB、待处理队列 16 帧。撞上限返回明确的错误码（`SESSION_LIMIT` / `CRAWL_BUSY` / `BAD_FRAME`），由模型自己退避。
+- **配额。** 同开会话至多 8 个（其中浏览器会话 3 个；`stealth` 启动本机 Chromium，`remote` 连接 CDP）、同时在跑的爬虫 2 个、单页正文按 `*MaxOutputChars` 封顶、单个协议帧 8 MB、待处理队列 16 帧。撞上限返回明确的错误码（`SESSION_LIMIT` / `CRAWL_BUSY` / `BAD_FRAME`），由模型自己退避。
 - **`scrapling_crawl` 立刻返回作业 id** —— 一次爬取是分钟级的，而工具调用有超时。用 `job_list` 看进度、`job_output` 读结果、`job_kill` 中断；这一工具要求作业后端能 attach controller，没有的 profile 干脆不注册它（单页抓取不受影响）。爬虫另有总时长上限（`crawlMaxRuntimeSeconds`），且不会爬出起始域。礼貌性默认沿用 Scrapling spider 的默认值 —— **不遵守** robots.txt、每域延迟 0、最多 4 个请求并发 —— 它是部署决定，不是某次调用的参数（见[设置项](#设置项)）。
 - **`scrapling_answer` 先抓页面，再带着问题交给模型**，直接拿结论而不是整页正文。默认跟随当前会话正在用的模型（读的是会话的活请求头，中途换模型也跟着变），不额外烧一份额度；要单独指定就用 `answerProvider` / `answerModel`。网页正文是**不可信输入** —— 提示把它显式框成数据，但这道防线是提示层面的：它降低风险，不等于消除风险。
+
+### 浏览器会话、ARIA 与拖放
+
+只有 sidecar 报告支持 `RemoteSession` 且部署配置填了 `browserCdpUrl` 时，`sessionType=remote` 才会出现。端点接受 `ws://`、`wss://`、`http://` 或 `https://`，连接已经运行的 Chromium 并创建独立 context，不需要本机安装 Chromium；这是强能力，绝不进入模型入参。关闭会话会释放该 context 与连接。
+
+`scrapling_session_read` 接受 `snapshotType: "text" | "aria"`（默认 `text`）。ARIA 使用 Patchright 的 AI 模式无障碍快照，并可用 `cssSelector` 收窄范围，比原始 DOM 文本更容易定位按钮、链接与表单控件。
+
+`scrapling_session_act` 新增 `type: "drag"`，两种写法互斥：`{ "type": "drag", "from": "#source", "to": "#target" }`，或 `{ "type": "drag", "fromX": 10, "fromY": 20, "toX": 100, "toY": 80 }`。它仍要求 `allowBrowserActions: true`；remote 与本机浏览器会话都受同一道 URL 守卫和动作门禁约束。
 
 ### 渲染还是静态
 
@@ -182,19 +192,25 @@ dsh-scrapling setup --status
 1. `provideWebFetch` / `provideWebSearch` 保持默认（`true`）；
 2. 在**部署配置**里把 `fetchProvider` / `searchProvider` 设为 `"scrapling"`。
 
+两条正文读取路径共用 `webFetchStrategy`（默认 `auto`）：`static` 始终静态读取；`auto` 先静态读取，正文少于 200 字符时才渲染；`browser` 直接渲染。没有浏览器时 `auto` 保持静态读取。网络错误或回包形状错误按失败返回，不把它当成渲染理由。
+
 配了 id 就以它为准，这就是第 2 步必须做的原因 —— 而两个 provider 都可用、又没点名时，`ctx.web` 会给 `WEB_PROVIDER_AMBIGUOUS`，对应工具直接不可用。把那一行指向本插件后，有两个反向风险：
 
 - **sidecar 起不来时，内置 `web_fetch` 报 `WEB_PROVIDER_CONFIGURED_UNAVAILABLE`**，而不是悄悄退回纯 HTTP。
 - **fetch provider 会真正执行输出预算**：正文超过 `fetchMaxOutputChars` 时按头尾窗口实际裁剪并标记 `truncated`，不是原样放行只打一个标记。失败保留 sidecar 的错误码前缀（`URL_BLOCKED`、`SIDECAR_TIMEOUT`、`SIDECAR_UNAVAILABLE`），策略拒绝、进程崩溃与超时可以区分。
 - **日后卸掉插件却留着那一行**，内置工具报 `WEB_PROVIDER_CONFIGURED_MISSING` —— 要回去把 `fetchProvider` / `searchProvider` 一并撤掉。
 
-搜索拆成两截，因为 Scrapling 自己不是搜索引擎：**检索**在 Python sidecar 里走 `searchBackend` 指定的后端 —— Tavily、Bing HTML、Brave（API）、Serper（API）、DuckDuckGo HTML 或 SearXNG（JSON API）；**读取**由本插件完成 —— 前 `searchRenderTopN` 条会真的抓下来并在有浏览器时渲染，一次 `web_search` 同时拿到「哪些页面相关」与「这些页面实际说了什么」。`auto` 有 `tavilyApiKey` 走 Tavily、配了 `searxngEndpoint` 走 SearXNG；两者都没有时，只有打开 `searchPublicFallback` 才会走公共引擎（Bing；显式选 `duckduckgo` 后端时才走 DuckDuckGo），否则 provider 不可用、`web_search` 报 `SEARCH_BACKEND_MISSING` 而不是把查询发出去。本机只对 Tavily 与 Bing 打过真实端点；Brave、Serper、DuckDuckGo 与 SearXNG 按各家文档形状实现、用本地 stub 验证，真实 key 与真实实例仍未验。返回的 URL 逐条过与抓取同一道闸门；单条页面读不到只跳过那一条，搜索结果里混着失效链接是常态。
+搜索拆成两截，因为 Scrapling 自己不是搜索引擎：省略 `maxResults` 时默认取 10 条，与 dsh 的 `web_search` 一致；**检索**由 `searchBackend` 选择 —— Tavily、Bing HTML、Brave（API）、Serper（API）、DuckDuckGo HTML、SearXNG（JSON API），或通过可选 `ctx.deepseekAuth` 调用 DeepSeek 直接 Search API；**读取**仍由本插件完成 —— 前 `searchRenderTopN` 条按 `webFetchStrategy` 真的抓下来，一次 `web_search` 同时拿到「哪些页面相关」与「这些页面实际说了什么」。`auto` 保持既有 Tavily → SearXNG → 明确允许的公共引擎顺序；DeepSeek 需显式设 `searchBackend=deepseek`。没有可用发现路径时 provider 不可用，`web_search` 报 `SEARCH_BACKEND_MISSING`，不会擅自查询。本机只对 Tavily 与 Bing 打过真实端点；其余 sidecar 后端按文档形状用本地 stub 验证。DeepSeek 覆盖授权与 HTTP 契约测试，未用真实凭据发请求。返回 URL 逐条过与抓取同一道闸门；单条读不到只跳过该条。
+
+来源 URL 在引用前归一化：去掉 fragment 与常见跟踪参数、按 key 排序查询串，重复 URL 保留第一条。后端提供的 `summary` 与 `publishedAt` 原样保留。MCP `search` 另接受 `offset`（0–100）：支持原生分页的后端直接使用；DeepSeek API 没有 offset，本插件一次最多取 50 条后在本地切片。成功发现结果在内存中缓存 300 秒、最多 128 项；缓存键包含查询、页码、后端和脱敏端点，绝不包含 API key 值或授权头。DeepSeek 直接调用按每个 provider 实例每秒 5 次节流；共享同一账号的其他进程之间不做协调。所有发现后端与抓取共用同一套代理策略，`proxyBypass: "*"` 会显式直连。Bing 对中文查询使用 `setlang=zh-hans`，其余使用 `setlang=en`，并把 `ck/a` 跳板链接解包为原始 URL。
 
 有一个后果需要知道：`dsh-web` 的抓取正文是 `html | text` 的**封闭**联合，没有 `markdown` 这一档，加一种 kind 是跨包的协同改动，不是插件能扩展的。所以 fetch provider 把 Scrapling 的 Markdown 输出报成 `text`，内置渲染路径显示完全正常。要 `html` 或 CSS 选择器时直接用 `scrapling_fetch`。
 
 ## <img src="https://api.iconify.design/lucide/plug-zap.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> MCP 模式
 
 `integrationMode` 在三种互斥的接入方式里选一种。它是部署配置（`cordis.patch.yml` 的 `config:` 块），插件装配时读一次，改完必须重启。
+
+`mcpToolLoading` 同样只从部署配置读，默认 `eager`，保持服务器工具直接进入工具列表的既有行为。工具定义太大、不适合随每次请求发送时设成 `on-demand`：系统提示词只列每个工具的原始名称与描述首行，模型经 `mcp__scrapling__load_tools` 加载需要的工具。加载的工具只加入调用方 agent 的列表；子 agent、fork 与恢复的会话开始时都没有已加载工具。动态 `mcpManager` 注册与 `setup` 生成的手工条目都把这个值写成 `toolLoading`；改完必须重启。使用手工条目时，还要重跑 `setup --mode <模式> --profile <profile 目录> --apply` 并重新应用生成的 patch —— 只重启不会改写那条已有条目。
 
 | 模式 | 注册什么 |
 |---|---|
@@ -206,7 +222,7 @@ dsh-scrapling setup --status
 
 - **端点** `http://127.0.0.1:<mcpPort>/mcp`（`mcpPort`，默认 `39217`）。只绑回环；声明正文超过 1 MiB 的请求直接 `413`，其他路径 `404`。server 是无会话形态：每条请求各起一份协议对象，跨请求不留状态。
 - **鉴权**默认关。设了环境变量 `DSH_SCRAPLING_MCP_TOKEN` 之后，每个请求都必须带 `Authorization: Bearer <token>`。这一枚只从环境读、绝不从 profile 读，所以它不会落进配置文件。
-- **工具**就是 native 注册的那批 `ToolDefinition`：同一份 JSON Schema、同一套参数校验、同一个渲染器。`scrapling_answer` 不端出去 —— 它要走宿主会话的模型路由，外部客户端没有这一层。`search` 只在 MCP 面上有，因为 MCP 客户端没有 `ctx.web` 那个接缝。门禁一致：`allowBrowserActions=false` 时没有 `session_act`，`allowFileDownloads=false` 时没有 `download`，没有可用搜索后端时 `search` 也不出现。
+- **工具**就是 native 注册的那批 `ToolDefinition`：同一份 JSON Schema、同一套参数校验、同一个渲染器。`scrapling_answer` 不端出去 —— 它要走宿主会话的模型路由，外部客户端没有这一层。`search` 只在 MCP 面上有，因为 MCP 客户端没有 `ctx.web` 那个接缝；它接受 `query`、`maxResults` 与 `offset`，返回可引用 URL、摘要、可选 `summary` / `publishedAt`、有界正文和 `structuredContent`。门禁一致：`allowBrowserActions=false` 时没有 `session_act`，`allowFileDownloads=false` 时没有 `download`，没有可用搜索后端时 `search` 也不出现。
 - **结果**是文本内容；截图改为 MCP 的 image content，而不是宿主 attachment。工具失败回 `isError` 加可读消息，不会把连接掐断。
 - **名字**：MCP 原始名是工具名去掉 `scrapling_` 前缀，dsh 的 MCP 客户端再显示成 `mcp__scrapling__<原始名>`。
 
@@ -229,6 +245,7 @@ dsh-scrapling setup --status
 | `scrapling_session_read` | `session_read` |
 | `scrapling_session_act` | `session_act` |
 | `scrapling_download` | `download` |
+| `scrapling_read_document` | `read_document` |
 | `scrapling_screenshot` | `screenshot` |
 | —（只在 `ctx.web`） | `search` |
 
@@ -251,6 +268,7 @@ dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.3-alpha.2
         transport: streamable-http
         url: http://127.0.0.1:39217/mcp
         failOnStartupError: false
+        toolLoading: eager
         # 只有设了 DSH_SCRAPLING_MCP_TOKEN 才加：
         # headers:
         #   Authorization: !!js '`Bearer ${process.env.DSH_SCRAPLING_MCP_TOKEN}`'
@@ -262,7 +280,7 @@ dsh plugin --profile <名> add @deepseek-ai/dsh-mcp-client@0.2.3-alpha.2
 
 ### <img src="https://api.iconify.design/lucide/wrench.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> `setup --mode` 与 `doctor`
 
-`setup --mode` 产出上面那段条目文本，它不改写任何 profile。不带 `--apply` 是 dry-run；带上就写到 `<dataDir>/mcp/<模式>.patch.yml` 并把路径打出来 —— 把它并进 `cordis.patch.yml` 仍是你的动作，因为宿主没有安全追加那个文件的接口（`dsh --dump-config` 会把 profile 根配置整个重写一遍）。
+`setup --mode` 产出上面那段条目文本，它不改写任何 profile。不带 `--apply` 是 dry-run；带上就写到 `<dataDir>/mcp/<模式>.patch.yml` 并把路径打出来 —— 把它并进 `cordis.patch.yml` 仍是你的动作，因为宿主没有安全追加那个文件的接口（`dsh --dump-config` 会把 profile 根配置整个重写一遍）。带 `--profile <profile 目录>` 时从该 profile 的 `mcpToolLoading` 派生 `toolLoading`；不带时用向后兼容的 `eager` 默认值，不再另开一个命令行真源。
 
 ```sh
 dsh-scrapling setup --mode mcp --port 45991 --with-auth --apply
@@ -282,10 +300,10 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 | --- | --- | --- | --- |
 | `pythonBin` | string | `""` | 解释器名或绝对路径。留空时按 `lib/runtime.ts` 的固定链走：托管 venv `dataDir/runtime/venv`（`setup --feature core --apply` 把每个 wheel 都装在这里）→ 裸托管解释器 `dataDir/runtime/python/<版本>`（装了一半的机器）→ 仓内 `_env/.venv`（可用才算，只有源码检出才有）→ `PATH` 上的 `python3`（Windows 上是 `python`） |
 | `failFastOnMissingPython` | boolean | `true` | sidecar 进程起不来（路径错、协议对不上、握手超时）时拒绝加载。解释器起得来但没装 Scrapling 时，无论这枚开关如何都只降级为「工具不可用」，日志点名解释器路径 |
-| `fetchEnabled` / `extractEnabled` / `locateEnabled` / `linksEnabled` / `renderEnabled` / `captureXhrEnabled` / `networkEnabled` / `sessionEnabled` / `sessionStateEnabled` / `crawlEnabled` / `answerEnabled` / `sessionReadEnabled` / `sessionActionsEnabled` / `downloadEnabled` / `screenshotEnabled` | boolean | `true` | 每个工具一枚总闸。`sessionStateEnabled` 管登录态存取那一对，它们还要部署侧配好 `sessionStateDir` |
+| `fetchEnabled` / `extractEnabled` / `locateEnabled` / `linksEnabled` / `renderEnabled` / `captureXhrEnabled` / `networkEnabled` / `sessionEnabled` / `sessionStateEnabled` / `crawlEnabled` / `answerEnabled` / `sessionReadEnabled` / `sessionActionsEnabled` / `downloadEnabled` / `documentsEnabled` / `screenshotEnabled` | boolean | `true` | 每个工具一枚总闸。`sessionStateEnabled` 管登录态存取那一对，它们还要部署侧配好 `sessionStateDir` |
 | `extractionType` | enum | `markdown` | `markdown` / `html` / `text`；三条路径过同一套反注入清洗，`html` 额外剥事件处理器属性，因此**不是字节级原始 HTML** |
 | `mainContentOnly` | boolean | `true` | 抽取范围 |
-| `*MaxOutputChars` | natural | fetch / extract / render `200000`，xhr `120000` | 各工具的输出封顶。sidecar 先按字符截一次，宿主再按字节预算统一处理。`scrapling_render` 与 `scrapling_capture_xhr` 在正文之外还带一份 XHR 历史，那一段按**同一档预算另外**封顶 —— 所以这类调用的一次回执可达两倍预算 |
+| `*MaxOutputChars` | natural | fetch / extract / render / document `200000`，xhr `120000` | 各工具的输出封顶。sidecar 先按字符截一次，宿主再按字节预算统一处理。`scrapling_render` 与 `scrapling_capture_xhr` 在正文之外还带一份 XHR 历史，那一段按**同一档预算另外**封顶 —— 所以这类调用的一次回执可达两倍预算 |
 | `crawlMaxItems` | natural | `1000` | 给模型可传的 `maxPages` 封的顶。越界的 `maxPages` 原样透传，让 sidecar 报参数错误，而不是由本包悄悄夹成看起来合法的值 |
 | `stripInlineImages` | boolean | `true` | 剥掉正文里内嵌的 `data:` URI 图片、只留 alt 文本 —— 对模型是纯 token 噪音。代码围栏内的原样保留；不含内联图的页面逐字节不变。剥图发生在封顶**之前**。只有把内联图当**原始数据**读（配色、指纹）时才关 |
 | `headless` / `networkIdle` | boolean | `true` / `false` | 浏览器模式，以及页面是否要等到网络空闲才被读取 |
@@ -295,7 +313,9 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 | `sidecarHandshakeTimeoutMs` / `fetchTimeoutMs` / `sidecarGraceMs` | natural | `30000` / `120000` / `5000` | 握手预算、单次调用的协同超时（声明在各工具的 `timeoutMs` 上）、超时后等进程退出的宽限。`scrapling_crawl` 不传超时 —— 一次爬取是分钟级的 |
 | `dataDir` | string | `""` | sidecar 工作目录（`adaptive` 指纹库落这里）；留空 = `~/.dsh-scrapling`。目录建不出来时由 `failFastOnMissingPython` 决定：拒绝加载，或降级为不注册任何工具 |
 | `provideWebFetch` / `provideWebSearch` | boolean | `true` | 是否注册 `ctx.web` 的两个 provider —— 见[替代内置的抓取与搜索](#替代内置的抓取与搜索) |
-| `searchBackend` / `tavilyApiKey` | enum / secret | `auto` / `""` | 发现后端（`auto` / `tavily` / `bing` / `brave` / `serper` / `duckduckgo` / `searxng`）与 Tavily key。`auto` 有 key 走 Tavily、配了 `searxngEndpoint` 走 SearXNG；两者都没有时只有打开 `searchPublicFallback` 才回落公共引擎（否则报 `SEARCH_BACKEND_MISSING`）；选中却没配自家 key（或实例）的后端报 `SEARCH_AUTH` |
+| `webFetchStrategy` | enum | `auto` | `static` 始终静态读取；`auto` 先静态读取，正文少于 200 字符时才渲染；`browser` 直接渲染。没有浏览器时 `auto` 保持静态读取。网络错误与回包形状错误按失败返回，不触发渲染 |
+| `searchMaxOutputBytes` | number | `24000` | 一次搜索全部正文小节的 UTF-8 字节总上限；调大会增加上下文与 token 成本 |
+| `searchBackend` / `tavilyApiKey` | enum / secret | `auto` / `""` | 发现后端（`auto` / `tavily` / `bing` / `brave` / `serper` / `duckduckgo` / `searxng` / `deepseek`）与 Tavily key。`deepseek` 使用可选 Host `ctx.deepseekAuth`；其余后端保留各自凭据。`auto` 保持 Tavily → SearXNG → 明确允许的公共回退 |
 | `searchPublicFallback` | boolean | `false` | 允许 `auto` 在既没有 key、也没有 SearXNG 时回落到公共的 Bing —— `py/search.py` 把 `auto` 按 `tavily` → `searxng` → `bing` 定案，DuckDuckGo 不在 `auto` 的位置里，要用得显式设 `searchBackend=duckduckgo`。**默认关是刻意的**：打开就等于把查询词发给第三方公共引擎 |
 | `braveApiKey` / `serperApiKey` | secret | `""` | Brave Search 与 Serper.dev 的 key |
 | `searxngEndpoint` | string | `""` | SearXNG 实例的基址（会拼上 `…/search?format=json`）；为空表示这条后端不可用，报 `SEARCH_AUTH` |
@@ -312,7 +332,9 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 | --- | --- | --- |
 | `requestTimeoutSeconds` / `maxUrlLength` | `120` / `2048` | Python 侧单次请求的硬上限；URL 长度上限与内置抓取对齐 |
 | `allowWriteMethods` | `false` | 模型能不能改对端状态 —— 见[安全说明](#安全说明) |
+| `mcpToolLoading` | `eager` | `eager` 直接注册 MCP 工具；`on-demand` 让它们先不进入各 agent 的工具列表，由 `mcp__scrapling__load_tools` 按需加载。动态注册与手工条目都写成 `toolLoading`，改完必须重启；手工条目要用 `setup --mode --profile` 重新生成 |
 | `browserExecutablePath` / `browserInitScript` | `""` | 强能力：让 Chromium 执行指定文件、往每个页面注入 JS。只从部署配置来，模型入参到不了 |
+| `browserCdpUrl` | `""` | `sessionType=remote` 使用的 CDP 端点，接受 ws/wss/http/https；留空不显示 remote 会话。只从部署配置来，不进工具 schema 或日志 |
 | `browserRealChrome` / `browserDnsOverHttps` | `false` | 改用本机安装的 Google Chrome；浏览器 DNS 走 DoH（配代理时防 DNS 泄露） |
 | `recordRequests` / `maxRecordedRequests` | `false` / `100` | 浏览器会话是否默认记录网络历史（模型可在 `scrapling_session_open` 上按次用 `recordNetwork` 打开），以及一个会话最多留多少条 |
 | `sessionStateDir` | `""` | 存放 Playwright 兼容登录态文件的目录。模型只能给**纯文件名**，目录始终是部署方的决定；留空禁用存取这一对 |
@@ -322,9 +344,11 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 | `crawlRespectRobots` | `false` | 遵守 robots.txt；打开后，robots.txt **取回失败**（网络异常或 HTTP 5xx）的域按禁止处理而不是当作允许，而**没有** robots.txt 的站点（HTTP 404，最常见的形态）视作允许全部 |
 | `crawlDownloadDelayMs` / `crawlConcurrentRequests` / `crawlAutothrottle` / `crawlStrategy` | `0` / `4` / `false` / `bfs` | 请求间隔、并发数、自适应限速、广度或深度优先 |
 | `crawlCheckpointDir` | `""` | 把爬取队列写到磁盘，重启后从断点接着走而不是回到起始 URL |
-| `tavilyApiEndpoint` / `bingEndpoint` / `searchRenderTopN` | `https://api.tavily.com/search` / `https://www.bing.com/search` / `3` | 发现端点（测试或代理可覆盖），以及前几条要真的抓下来渲染（`0` = 只给链接列表） |
+| `tavilyApiEndpoint` / `bingEndpoint` / `searchRenderTopN` | `https://api.tavily.com/search` / `https://www.bing.com/search` / `3` | 发现端点（测试或代理可覆盖），以及前几条按 `webFetchStrategy` 读取的结果条数（`0` = 只给链接列表） |
 | `duckduckgoEndpoint` | `https://html.duckduckgo.com/html/` | DuckDuckGo HTML 端点；镜像或测试 stub 可覆盖 |
-| `allowBrowserActions` / `allowFileDownloads` / `downloadMaxBytes` | `false` / `false` / `10485760` | 部署级动作与下载门禁，以及单次下载的字节上限。两枚门禁默认关，关时对应工具也不注册给模型 |
+| `deepseekSearchEndpoint` | `https://api.deepseek.com/v1/tools/search` | DeepSeek 直接 Search API 端点；只允许 HTTPS、禁止内嵌凭据，修改后需重启 |
+| `allowBrowserActions` / `allowFileDownloads` / `downloadMaxBytes` | `false` / `false` / `10485760` | 部署级动作与持久下载门禁，以及单次下载的字节上限。两枚门禁默认关，关时对应工具也不注册给模型 |
+| `documentMaxBytes` / `documentMaxPages` | `20971520` / `200` | PDF 读取的硬上限；模型参数只能往下收。PDF 字节流式写入临时文件，所有路径都会删除 |
 
 ## <img src="https://api.iconify.design/lucide/network.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 代理
 
@@ -375,7 +399,7 @@ dsh-scrapling doctor --mode mcp --profile <profileDir>
 | 规则 | 内容 |
 | --- | --- |
 | 写盘 | sidecar 工作目录（`dataDir`，默认 `~/.dsh-scrapling`）里会有：`adaptiveStorage: sqlite`（默认）时 Scrapling `adaptive` 的指纹库、`scrapling_download` 的位置 `downloads/`、`setup --feature … --apply` 装进去的托管 Python 与 Chromium（`runtime/`）、`setup --mode … --apply` 生成的 MCP 条目（`mcp/<模式>.patch.yml`）。`adaptiveStorage: redis` 时指纹不落 `dataDir`，改按 `<前缀>:<注册域>:<sha256(identifier)>` 写进 `redisUrl` 指向的 Redis —— 默认是回环，换成别的机器就等于把这份数据交给那台机器。`crawlCheckpointDir` 配了才由上游 `Collector(crawldir=…)` 落爬取队列，留空不落。配了 `sessionStateDir` 时登录态文件写在那个目录下。截图交宿主 attachment 服务保管，落在哪里由宿主决定。设置值在宿主的设置文档里 |
-| 网络 | 抓取发往模型给的 URL，配了代理就走代理。搜索查询由 Python sidecar 发往 `searchBackend` 选中的那一个后端 —— Tavily（`api.tavily.com`，key 随请求体送出）、Bing（`www.bing.com`，不带凭据）、Brave（`api.search.brave.com`，走 `X-Subscription-Token`）、Serper（`google.serper.dev`，走 `X-API-KEY`）、DuckDuckGo（`html.duckduckgo.com`，不带凭据），或 `searxngEndpoint` 指向的自建 SearXNG 实例。每个后端只收到自己那把凭据（`tavilyApiKey` / `braveApiKey` / `serperApiKey`）与查询串，key 绝不写日志。打开 `searchPublicFallback` 时 `auto` 会把查询发给不带任何凭据的公共引擎。`scrapling_answer` 把抓到的页面正文与问题经宿主 `llm` 服务送出 —— 路由到的模型在远端时，这些内容就离开了本机 |
+| 网络 | 抓取发往模型给的 URL，配了代理就走代理。搜索查询发往 `searchBackend` 选中的那一个后端 —— Tavily（`api.tavily.com`，key 随请求体送出）、Bing（`www.bing.com`，不带凭据）、Brave（`api.search.brave.com`，走 `X-Subscription-Token`）、Serper（`google.serper.dev`，走 `X-API-KEY`）、DuckDuckGo（`html.duckduckgo.com`，不带凭据）、`searxngEndpoint` 指向的自建 SearXNG 实例，或 `deepseekSearchEndpoint` 指向的 DeepSeek 直接 Search API。前六条在 Python sidecar 中运行；DeepSeek 在 Host 中通过可选 `ctx.deepseekAuth` 运行。每个后端只收到自己的凭据与查询串，key 绝不写日志。打开 `searchPublicFallback` 时 `auto` 会把查询发给不带任何凭据的公共引擎。`scrapling_answer` 把抓到的页面正文与问题经宿主 `llm` 服务送出 —— 路由到的模型在远端时，这些内容就离开了本机 |
 | 日志 | 选中的解释器、探测到的能力、代理摘要（`scheme://host:port` 加来自哪一档 —— 绝无凭据） |
 | 内存 | 会话、cookie 与录下的网络历史都在 sidecar 进程里，随进程一起消失 |
 | 遥测 | 无 |

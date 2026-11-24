@@ -75,6 +75,9 @@ TAVILY_PAYLOAD = b'{"results":[{"url":"https://a.test/1","title":"A","content":"
 ACT_PAGE = b"""<!doctype html><html><head><title>ACT</title></head><body>
 <input id="q"><button id="go" onclick="document.getElementById('out').textContent =
   'clicked:' + document.getElementById('q').value">go</button>
+<div id="drag-source" draggable="true">drag me</div>
+<div id="drag-target" ondragover="event.preventDefault()"
+  ondrop="document.getElementById('out').textContent='dropped'">drop here</div>
 <div id="out">idle</div></body></html>"""
 
 BING_HTML = b"""<!doctype html><html><body>
@@ -374,6 +377,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(f"body-{number}".encode(), "application/octet-stream")
             return
         if route == "/bing":
+            with _SEEN_LOCK:
+                _SEEN_LIMITS.append({"backend": "bing", "query": dict(parse_qsl(self.path.partition("?")[2]))})
             self._send(BING_HTML, "text/html; charset=utf-8")
             return
         if route == "/bingempty":
@@ -398,9 +403,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         if route in ("/searxng", "/searxng/search"):
+            with _SEEN_LOCK:
+                _SEEN_LIMITS.append({"backend": "searxng", "query": dict(parse_qsl(self.path.partition("?")[2]))})
             self._send(SEARXNG_PAYLOAD, "application/json")
             return
         if route == "/ddg":
+            with _SEEN_LOCK:
+                _SEEN_LIMITS.append({"backend": "duckduckgo", "query": dict(parse_qsl(self.path.partition("?")[2]))})
             self._send(DDG_HTML, "text/html; charset=utf-8")
             return
         if route == "/ddgempty":
@@ -467,6 +476,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(TAVILY_PAYLOAD, "application/json")
             return
         if route == "/serper":
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode(errors="replace") if length else ""
+            with _SEEN_LOCK:
+                _SEEN_LIMITS.append({"backend": "serper", "body": json.loads(raw or "{}")})
             self._send(SERPER_PAYLOAD, "application/json")
             return
         if route == "/serper429":
@@ -1372,6 +1385,16 @@ def run_session_read(sidecar: Sidecar, base: str) -> None:
         result = read.get("result", {})
         check("session.read 有正文", "Server Price" in result.get("content", ""), repr(result)[:240])
         check("session.read 有 title", result.get("title") == "SPA Rendered", repr(result)[:200])
+        aria = sidecar.call(
+            "session.read",
+            {"sessionId": session_id, "snapshotType": "aria", "maxContentChars": 20_000},
+        )
+        aria_result = aria.get("result", {})
+        check(
+            "session.read ARIA 快照带语义正文",
+            aria_result.get("snapshotType") == "aria" and "Server Price" in aria_result.get("content", ""),
+            repr(aria)[:240],
+        )
         expect_frame_error(
             "NO_CURRENT_PAGE",
             sidecar.call("session.read", {"sessionId": fresh_id}),
@@ -1418,6 +1441,23 @@ def run_session_actions(sidecar: Sidecar, base: str) -> None:
             "clicked:hello" in read.get("result", {}).get("content", ""),
             repr(read)[:240],
         )
+        dragged = sidecar.call(
+            "session.act",
+            {
+                "sessionId": session_id,
+                "actions": [{"type": "drag", "from": "#drag-source", "to": "#drag-target"}],
+            },
+        )
+        check("drag 动作完成", dragged.get("result", {}).get("completed") == 1, repr(dragged)[:240])
+        after_drag = sidecar.call(
+            "session.read",
+            {"sessionId": session_id, "extractionType": "text", "maxContentChars": 5000},
+        )
+        check(
+            "drag 结果进了当前页",
+            "dropped" in after_drag.get("result", {}).get("content", ""),
+            repr(after_drag)[:240],
+        )
         failed = sidecar.call(
             "session.act",
             {
@@ -1451,6 +1491,183 @@ def run_session_actions(sidecar: Sidecar, base: str) -> None:
         )
     finally:
         blocked.close()
+
+
+def _pdf_bytes(texts: list[str]) -> bytes:
+    """造一份最小 PDF：每页一段 Helvetica 文本，xref 偏移按实际字节计算。"""
+    objects: list[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    page_refs: list[bytes] = []
+    for index, text in enumerate(texts):
+        page_id = 4 + index * 2
+        content_id = page_id + 1
+        page_refs.append(f"{page_id} 0 R".encode())
+        escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET\n".encode()
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>".encode()
+        )
+        objects.append(b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"endstream")
+    objects[1] = b"<< /Type /Pages /Count " + str(len(texts)).encode() + b" /Kids [" + b" ".join(page_refs) + b"] >>"
+    body = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for number, obj in enumerate(objects, 1):
+        offsets.append(len(body))
+        body.extend(f"{number} 0 obj\n".encode() + obj + b"\nendobj\n")
+    xref = len(body)
+    body.extend(f"xref\n0 {len(objects) + 1}\n".encode())
+    body.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        body.extend(f"{offset:010d} 00000 n \n".encode())
+    body.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return bytes(body)
+
+
+def run_documents(sidecar: Sidecar) -> None:
+    """PDF：文本/页数、三类拒绝、缺依赖与临时文件清理。"""
+    sys.path.insert(0, str(PY_DIR))
+    try:
+        import adapters
+        import bridge
+        import guard
+    finally:
+        sys.path.remove(str(PY_DIR))
+    try:
+        import document
+    except ImportError as error:
+        check("document 模块存在", False, repr(error))
+        return
+
+    from pypdf import PdfReader, PdfWriter
+
+    plain = _pdf_bytes(["PDF FIRST PAGE", "PDF SECOND PAGE"])
+    scanned = _pdf_bytes([""])
+    long_text = _pdf_bytes(["A" * 100, "B" * 100])
+    encrypted_buffer = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.encrypt("secret")
+    writer.write(encrypted_buffer)
+    fixtures = {
+        "/plain.pdf": plain,
+        "/scanned.pdf": scanned,
+        "/encrypted.pdf": encrypted_buffer.getvalue(),
+        "/invalid.pdf": b"not a pdf",
+        "/long.pdf": long_text,
+    }
+
+    class DocumentHandler(http.server.BaseHTTPRequestHandler):
+        """回 PDF 夹具；liar 路径故意不给 Content-Length。"""
+
+        def do_GET(self) -> None:  # BaseHTTPRequestHandler 的命名约定
+            """按路径回一份字节。"""
+            body = fixtures.get(self.path.partition("?")[0], plain)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            if self.path.partition("?")[0] != "/liar.pdf":
+                self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            with suppress(ConnectionError):
+                self.wfile.write(body)
+
+        def log_message(self, *args: Any) -> None:
+            """静默本地夹具日志。"""
+
+    server, base = _serve(DocumentHandler)
+    saved_hosts = guard.ALLOWED_HOSTS
+    saved_tempdir = tempfile.tempdir
+    temp_root = Path(tempfile.mkdtemp(prefix="dsh-document-temp-"))
+    guard.configure(allowed_hosts=frozenset({"127.0.0.1"}))
+    tempfile.tempdir = str(temp_root)
+    try:
+        check("PDF 夹具是两页可读文本", len(PdfReader(io.BytesIO(plain)).pages) == 2, "")
+        result = adapters.document_read({"url": base + "/plain.pdf"})
+        check("document.read 返回两页文本", result["pageCount"] == 2, repr(result)[:200])
+        check(
+            "document.read 保留每页文本",
+            "PDF FIRST PAGE" in result["content"] and "PDF SECOND PAGE" in result["content"],
+            repr(result["content"])[:200],
+        )
+        check("document.read 成功后临时目录为空", list(temp_root.iterdir()) == [], repr(list(temp_root.iterdir())))
+        frame = sidecar.call("document.read", {"url": base + "/plain.pdf"})
+        check("sidecar document.read 成功", frame.get("ok") is True, repr(frame)[:200])
+        check("sidecar 回传页数", frame.get("result", {}).get("pageCount") == 2, repr(frame)[:200])
+        expect_error("PDF_TOO_LARGE", lambda: adapters.document_read({"url": base + "/plain.pdf", "maxPages": 1}))
+        expect_error(
+            "PDF_TOO_LARGE", lambda: adapters.document_read({"url": base + "/plain.pdf", "maxBytes": len(plain) - 1})
+        )
+        expect_error(
+            "PDF_TOO_LARGE", lambda: adapters.document_read({"url": base + "/liar.pdf", "maxBytes": len(plain) - 1})
+        )
+        expect_error("PDF_ENCRYPTED", lambda: adapters.document_read({"url": base + "/encrypted.pdf"}))
+        expect_error("PDF_SCANNED", lambda: adapters.document_read({"url": base + "/scanned.pdf"}))
+        expect_error("FETCH_FAILED", lambda: adapters.document_read({"url": base + "/invalid.pdf"}))
+        expect_error("BAD_ARGS", lambda: adapters.document_read({"url": base + "/plain.pdf", "deployment": []}))
+        with_headers = adapters.document_read(
+            {
+                "url": base + "/plain.pdf",
+                "headers": {"X-Test": "yes"},
+                "cookies": {"sid": "test"},
+                "impersonate": "chrome",
+                "timeoutSeconds": 5,
+            }
+        )
+        check("document.read 支持鉴权请求与静态指纹", with_headers["pageCount"] == 2, repr(with_headers)[:160])
+        clipped = adapters.document_read({"url": base + "/long.pdf", "maxOutputChars": 120})
+        check(
+            "document.read 输出按字符截断",
+            len(clipped["content"]) <= 120 and clipped["truncated"] is True,
+            repr(clipped)[:200],
+        )
+        expect_error("BAD_ARGS", lambda: adapters.document_read({"url": base + "/plain.pdf", "maxPages": 0}))
+        expect_error("BAD_ARGS", lambda: adapters.document_read({"url": base + "/plain.pdf", "maxBytes": False}))
+        expect_error("URL_BLOCKED", lambda: adapters.document_read({"url": "ws://8.8.8.8/plain.pdf"}))
+        check("所有失败路径也清空临时目录", list(temp_root.iterdir()) == [], repr(list(temp_root.iterdir())))
+
+        saved_pypdf = sys.modules.get("pypdf")
+        sys.modules["pypdf"] = None  # type: ignore[assignment]
+        try:
+            check(
+                "缺 pypdf 时能力为 false",
+                document.available() is False and adapters.capabilities()["documents"] is False,
+                "",
+            )
+            expect_error("DEPENDENCY_MISSING", lambda: adapters.document_read({"url": base + "/plain.pdf"}))
+            missing = bridge.handle(
+                {"id": "doc-missing", "method": "document.read", "params": {"url": base + "/plain.pdf"}}
+            )
+            check(
+                "缺 pypdf 时 bridge 仍回 DEPENDENCY_MISSING",
+                missing.get("error", {}).get("code") == "DEPENDENCY_MISSING",
+                repr(missing)[:200],
+            )
+        finally:
+            if saved_pypdf is None:
+                sys.modules.pop("pypdf", None)
+            else:
+                sys.modules["pypdf"] = saved_pypdf
+
+        saved_available = document.available
+        document.available = lambda: True
+        sys.modules["pypdf"] = None  # type: ignore[assignment]
+        try:
+            expect_error("DEPENDENCY_MISSING", lambda: adapters.document_read({"url": base + "/plain.pdf"}))
+        finally:
+            document.available = saved_available
+            if saved_pypdf is None:
+                sys.modules.pop("pypdf", None)
+            else:
+                sys.modules["pypdf"] = saved_pypdf
+        check("依赖竞态也清空临时目录", list(temp_root.iterdir()) == [], repr(list(temp_root.iterdir())))
+    finally:
+        guard.configure(allowed_hosts=frozenset(saved_hosts))
+        tempfile.tempdir = saved_tempdir
+        shutil.rmtree(temp_root, ignore_errors=True)
+        server.shutdown()
 
 
 def run_download(base: str) -> None:
@@ -1774,6 +1991,13 @@ class _UnitLocator:
     def press(self, key: str, **kwargs: Any) -> None:
         self.calls.append(f"press:{self.selector}:{key}")
 
+    def drag_to(self, target: _UnitLocator, **kwargs: Any) -> None:
+        self.calls.append(f"drag:{self.selector}->{target.selector}")
+
+    def aria_snapshot(self, **kwargs: Any) -> str:
+        self.calls.append(f"aria:{self.selector}:{kwargs.get('mode')}")
+        return '- button "Go"'
+
     def count(self) -> int:
         return self.matches
 
@@ -1792,8 +2016,14 @@ class _UnitInput:
     def wheel(self, delta_x: float, delta_y: float) -> None:
         self.calls.append(f"wheel:{delta_x},{delta_y}")
 
-    def move(self, x: float, y: float) -> None:
+    def move(self, x: float, y: float, **kwargs: Any) -> None:
         self.calls.append(f"mouse-move:{x},{y}")
+
+    def down(self) -> None:
+        self.calls.append("mouse-down")
+
+    def up(self) -> None:
+        self.calls.append("mouse-up")
 
     def press(self, key: str) -> None:
         self.calls.append(f"key:{key}")
@@ -1829,6 +2059,10 @@ class _UnitPage:
 
     def content(self) -> str:
         return self._html
+
+    def aria_snapshot(self, **kwargs: Any) -> str:
+        self.calls.append(f"aria:page:{kwargs.get('mode')}")
+        return '- button "Go"'
 
     def title(self) -> str:
         return self._title
@@ -1904,6 +2138,612 @@ def _png_bytes(width: int, height: int) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", width, height)
 
 
+def run_cancellation_units() -> None:
+    """逐请求 token、bridge 错误映射与安全阶段边界；不依赖网络或浏览器。"""
+    inserted = str(PY_DIR) not in sys.path
+    if inserted:
+        sys.path.insert(0, str(PY_DIR))
+    try:
+        try:
+            import cancellation
+        except ImportError as error:
+            check("cancellation 模块可导入", False, repr(error))
+            return
+        import adapters
+        import bridge
+        import session_page
+    finally:
+        if inserted:
+            sys.path.remove(str(PY_DIR))
+
+    def active_token() -> cancellation.CancellationToken:
+        token = cancellation.current_token()
+        if token is None:
+            raise AssertionError("当前请求没有绑定 cancellation token")
+        return token
+
+    check("未绑定请求时 raise_if_cancelled 是 no-op", cancellation.current_token() is None, "")
+    cancellation.raise_if_cancelled()
+    token = cancellation.CancellationToken()
+    check("新 token 尚未取消", token.cancelled is False, "")
+    with cancellation.bind(token):
+        check("bind 后 current_token 返回同一枚 token", cancellation.current_token() is token, "")
+        cancellation.raise_if_cancelled()
+        token.cancel()
+        token.cancel()
+        check("cancel 幂等", token.cancelled is True, "")
+        try:
+            cancellation.raise_if_cancelled()
+            check("阶段边界抛 RequestCancelled", False, "放行")
+        except cancellation.RequestCancelled:
+            check("阶段边界抛 RequestCancelled", True, "")
+    check("离开 bind 后恢复无 token 上下文", cancellation.current_token() is None, "")
+
+    outer = cancellation.CancellationToken()
+    inner = cancellation.CancellationToken()
+    with cancellation.bind(outer):
+        with cancellation.bind(inner):
+            check("嵌套 bind 使用内层 token", cancellation.current_token() is inner, "")
+        check("嵌套 bind 退出后恢复外层", cancellation.current_token() is outer, "")
+
+    def cancel_at_boundary(_params: dict[str, Any]) -> Any:
+        active_token().cancel()
+        cancellation.raise_if_cancelled()
+
+    adapters.METHODS["test-cancel-boundary"] = cancel_at_boundary
+    try:
+        mapped = bridge.handle({"id": "cancel-map", "method": "test-cancel-boundary", "params": {}})
+    finally:
+        adapters.METHODS.pop("test-cancel-boundary", None)
+    check(
+        "bridge 把 RequestCancelled 映射成 SIDECAR_ABORTED",
+        (mapped.get("error") or {}).get("code") == "SIDECAR_ABORTED",
+        repr(mapped),
+    )
+    check("完成后 cancel 未知 id 是 no-op", bridge._cancel_request("cancel-map") is False, "")
+    check("未知 id 的 cancel 可重复调用", bridge._cancel_request("missing") is False, "")
+
+    called: list[str] = []
+
+    def queued_handler(_params: dict[str, Any]) -> Any:
+        called.append("ran")
+        return {"ran": True}
+
+    adapters.METHODS["test-cancel-queued"] = queued_handler
+    try:
+        bridge._register_request("queued")
+        check("cancel 命中已接收请求", bridge._cancel_request("queued") is True, "")
+        check("重复 cancel 同一请求仍幂等", bridge._cancel_request("queued") is True, "")
+        queued = bridge.handle({"id": "queued", "method": "test-cancel-queued", "params": {}})
+    finally:
+        adapters.METHODS.pop("test-cancel-queued", None)
+    check("排队期间取消的请求不进入 handler", called == [], repr(called))
+    check(
+        "排队期间取消也回 SIDECAR_ABORTED",
+        (queued.get("error") or {}).get("code") == "SIDECAR_ABORTED",
+        repr(queued),
+    )
+
+    worker = adapters._SessionWorker()
+    first = cancellation.CancellationToken()
+    second = cancellation.CancellationToken()
+    try:
+        with cancellation.bind(first):
+            check("SessionWorker 保留第一笔请求的 token", worker.run(cancellation.current_token) is first, "")
+        with cancellation.bind(second):
+            check("SessionWorker 不串用上一笔请求的 token", worker.run(cancellation.current_token) is second, "")
+        with cancellation.bind(first):
+            first.cancel()
+            try:
+                worker.run(cancellation.raise_if_cancelled)
+                check("SessionWorker 安全边界观察到取消", False, "放行")
+            except cancellation.RequestCancelled:
+                check("SessionWorker 安全边界观察到取消", True, "")
+    finally:
+        worker.stop()
+
+    class _CancelAfterFetch:
+        @staticmethod
+        def get(_url: str, **_kwargs: Any) -> Any:
+            active_token().cancel()
+            return adapters._fake_response("<html><body>late</body></html>", "https://example.com/", 200)
+
+    saved_fetcher = adapters.Fetcher
+    adapters.Fetcher = _CancelAfterFetch  # type: ignore[misc,assignment]
+    fetch_token = cancellation.CancellationToken()
+    try:
+        with cancellation.bind(fetch_token):
+            try:
+                adapters.fetch({"url": "https://example.com/"})
+                check("fetch 返回后在投影前观察取消", False, "放行")
+            except cancellation.RequestCancelled:
+                check("fetch 返回后在投影前观察取消", True, "")
+    finally:
+        adapters.Fetcher = saved_fetcher  # type: ignore[misc]
+
+    class _CancelSession:
+        def get(self, _url: str, **_kwargs: Any) -> Any:
+            active_token().cancel()
+            return adapters._fake_response("<html><body>late</body></html>", "https://example.com/", 200)
+
+    session_id = adapters._new_session_id()
+    adapters._SESSIONS[session_id] = {
+        "session": _CancelSession(),
+        "type": "static",
+        "lock": threading.Lock(),
+    }
+    session_token = cancellation.CancellationToken()
+    try:
+        with cancellation.bind(session_token):
+            try:
+                adapters.session_fetch({"sessionId": session_id, "url": "https://example.com/"})
+                check("session.fetch 不把取消包成 FETCH_FAILED", False, "放行")
+            except cancellation.RequestCancelled:
+                check("session.fetch 不把取消包成 FETCH_FAILED", True, "")
+    finally:
+        adapters._SESSIONS.pop(session_id, None)
+
+    class _CancelAfterContent(_UnitPage):
+        def content(self) -> str:
+            html = super().content()
+            active_token().cancel()
+            return html
+
+    read_info = _UnitPageInfo(_CancelAfterContent(), ready=False)
+    read_pool = _UnitPool([read_info])
+    read_token = cancellation.CancellationToken()
+    try:
+        with cancellation.bind(read_token):
+            try:
+                session_page.read_current_page(
+                    _UnitSession(read_pool),
+                    extraction_type="text",
+                    css_selector=None,
+                    main_content_only=False,
+                    max_content_chars=1000,
+                    include_metadata=False,
+                    strip_inline_images=False,
+                )
+                check("读取 DOM 后观察取消", False, "放行")
+            except cancellation.RequestCancelled:
+                check("读取 DOM 后观察取消", True, "")
+    finally:
+        check("读取取消仍把页还给池子", read_info.ready is True, repr(read_pool.removed))
+
+    class _CancelAfterWait(_UnitPage):
+        def wait_for_timeout(self, ms: int) -> None:
+            super().wait_for_timeout(ms)
+            active_token().cancel()
+
+    action_page = _CancelAfterWait()
+    action_info = _UnitPageInfo(action_page, ready=False)
+    action_pool = _UnitPool([action_info])
+    action_token = cancellation.CancellationToken()
+    try:
+        with cancellation.bind(action_token):
+            try:
+                session_page.run_actions(
+                    _UnitSession(action_pool),
+                    actions=[{"type": "wait_time", "ms": 1}, {"type": "click", "target": "#go"}],
+                    slowly=False,
+                    max_actions=5,
+                    timeout_ms=1000,
+                )
+                check("动作之间观察取消且不执行下一动作", False, "放行")
+            except cancellation.RequestCancelled:
+                check("动作之间观察取消且不执行下一动作", True, "")
+    finally:
+        check("动作取消仍把页还给池子", action_info.ready is True, repr(action_pool.removed))
+    check("取消后没有执行第二个动作", action_page.calls == ["wait_time:1"], repr(action_page.calls))
+
+
+def run_owner_queue_cancellation_units() -> None:
+    """属主线程队列的出队取消、清理豁免、状态存取与 session.open 构造期取消。"""
+    inserted = str(PY_DIR) not in sys.path
+    if inserted:
+        sys.path.insert(0, str(PY_DIR))
+    try:
+        import adapters
+        import bridge
+        import cancellation
+        import session_page  # noqa: F401 —— media.screenshot 在属主线程延迟导入，提前装载真实模块
+    finally:
+        if inserted:
+            sys.path.remove(str(PY_DIR))
+
+    def queued_case(
+        label: str,
+        request: Callable[[str], Any],
+        executed: list[str],
+        session: Any,
+        closer: Any,
+    ) -> None:
+        worker = adapters._SessionWorker()
+        session_id = adapters._new_session_id()
+        adapters._SESSIONS[session_id] = {
+            "session": session,
+            "closer": closer,
+            "type": "stealth",
+            "lock": threading.Lock(),
+            "worker": worker,
+        }
+
+        started = threading.Event()
+        release = threading.Event()
+        first_results: list[str] = []
+        first_errors: list[BaseException] = []
+        second_errors: list[BaseException] = []
+        second = cancellation.CancellationToken()
+
+        def block_owner() -> str:
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("owner thread was not released")
+            return "released"
+
+        def run_first() -> None:
+            try:
+                first_results.append(worker.run(block_owner))
+            except BaseException as error:  # noqa: BLE001 —— 线程结果必须完整回收
+                first_errors.append(error)
+
+        def run_second() -> None:
+            try:
+                with cancellation.bind(second):
+                    request(session_id)
+            except BaseException as error:  # noqa: BLE001 —— 断言取消异常，不能掀翻测试进程
+                second_errors.append(error)
+
+        first_thread = threading.Thread(target=run_first, daemon=True)
+        second_thread = threading.Thread(target=run_second, daemon=True)
+        try:
+            first_thread.start()
+            check(f"{label} 首笔任务已占用属主线程", started.wait(5), "")
+            second_thread.start()
+            # SimpleQueue 没有「入队完成」事件；轮询真实队列长度，等到首笔已被取走、
+            # 第二笔确实留在队列里之后再取消，避免测成「调用前就已取消」。
+            deadline = time.monotonic() + 5
+            while worker._jobs.qsize() == 0 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            check(f"{label} 第二笔任务已排队", worker._jobs.qsize() == 1, str(worker._jobs.qsize()))
+            second.cancel()
+            release.set()
+            for thread in (first_thread, second_thread):
+                thread.join(5)
+            check(f"{label} 两笔调用线程均已结束", not first_thread.is_alive() and not second_thread.is_alive(), "")
+            check(f"{label} 首笔任务正常完成", first_errors == [] and first_results == ["released"], repr(first_errors))
+            check(
+                f"{label} 排队期间取消抛 RequestCancelled",
+                len(second_errors) == 1 and isinstance(second_errors[0], cancellation.RequestCancelled),
+                repr(second_errors),
+            )
+            check(f"{label} 真实操作从未执行", executed == [], repr(executed))
+            with cancellation.bind(second):
+                adapters._close_entry(session_id)
+            check(f"{label} 取消上下文中的清理任务仍执行", getattr(closer, "closed", 0) == 1, repr(closer))
+            check(f"{label} 清理后没有注册表条目", session_id not in adapters._SESSIONS, repr(adapters._SESSIONS))
+            check(f"{label} 清理后属主线程已停止", worker.alive() is False, "")
+        finally:
+            release.set()
+            for thread in (first_thread, second_thread):
+                if thread.ident is not None:
+                    thread.join(5)
+            if worker.alive():
+                worker.stop()
+            adapters._SESSIONS.pop(session_id, None)
+
+    class _FetchSession:
+        def __init__(self, executed: list[str]) -> None:
+            self.executed = executed
+            self.closed = 0
+
+        def fetch(self, _url: str, **_kwargs: Any) -> Any:
+            self.executed.append("fetch")
+            return adapters._fake_response("<html><body>late</body></html>", "https://example.com/", 200)
+
+        def close(self) -> None:
+            self.closed += 1
+
+    fetch_executed: list[str] = []
+    fetch_session = _FetchSession(fetch_executed)
+    queued_case(
+        "session.fetch",
+        lambda session_id: adapters.session_fetch({"sessionId": session_id, "url": "https://example.com/"}),
+        fetch_executed,
+        fetch_session,
+        fetch_session,
+    )
+
+    class _Closer:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    shot_executed: list[str] = []
+    shot_pool = _UnitPool([_UnitPageInfo(_UnitPage(shot=_png_bytes(1, 1)))])
+    shot_session = _UnitSession(shot_pool)
+    original_screenshot = adapters.media.screenshot
+
+    def screenshot_with_probe(session: Any, **kwargs: Any) -> dict[str, Any]:
+        shot_executed.append("screenshot")
+        return original_screenshot(session, **kwargs)
+
+    # 只替换截图出口记执行次数；排队、token 复制与 media 的 finally 都走真实实现。
+    adapters.media.screenshot = screenshot_with_probe
+    try:
+        queued_case(
+            "screenshot",
+            lambda session_id: adapters.screenshot({"sessionId": session_id, "imageType": "png"}),
+            shot_executed,
+            shot_session,
+            _Closer(),
+        )
+    finally:
+        adapters.media.screenshot = original_screenshot
+
+    class _StateSession:
+        def __init__(self, executed: list[str]) -> None:
+            self.executed = executed
+            self.closed = 0
+
+        def save_state(self, _path: str) -> None:
+            self.executed.append("save")
+
+        def load_state(self, _path: str) -> None:
+            self.executed.append("load")
+
+        def close(self) -> None:
+            self.closed += 1
+
+    with tempfile.TemporaryDirectory(prefix="dsh-scrapling-state-cancel-") as state_dir:
+        state_cases = (
+            (
+                "session.state_save",
+                lambda session_id: adapters.session_state_save(
+                    {"sessionId": session_id, "name": "login", "deployment": {"sessionStateDir": state_dir}}
+                ),
+            ),
+            (
+                "session.state_load",
+                lambda session_id: adapters.session_state_load(
+                    {"sessionId": session_id, "name": "login", "deployment": {"sessionStateDir": state_dir}}
+                ),
+            ),
+        )
+        for label, request in state_cases:
+            executed: list[str] = []
+            session = _StateSession(executed)
+            queued_case(label, request, executed, session, session)
+
+    _check_session_open_cancellation(adapters, cancellation)
+    _check_session_state_cancellation(adapters, cancellation, bridge)
+
+
+def _check_session_state_cancellation(adapters: Any, cancellation: Any, bridge: Any) -> None:
+    """状态存取在运行中取消时重抛取消，真实存储错误仍映射为 STATE_FAILED。"""
+
+    class _StateSession:
+        def __init__(self, *, cancel: bool = False, fail: bool = False) -> None:
+            self.cancel = cancel
+            self.fail = fail
+            self.executed: list[str] = []
+            self.closed = 0
+
+        def _state(self, operation: str) -> None:
+            self.executed.append(operation)
+            if self.cancel:
+                token = cancellation.current_token()
+                if token is None:
+                    raise AssertionError("状态存取在属主线程丢失了 cancellation token")
+                token.cancel()
+                cancellation.raise_if_cancelled()
+            if self.fail:
+                raise OSError("state storage failed")
+
+        def save_state(self, _path: str) -> None:
+            self._state("save")
+
+        def load_state(self, _path: str) -> None:
+            self._state("load")
+
+        def close(self) -> None:
+            self.closed += 1
+
+    def mount(session: _StateSession) -> tuple[str, adapters._SessionWorker]:
+        worker = adapters._SessionWorker()
+        session_id = adapters._new_session_id()
+        adapters._SESSIONS[session_id] = {
+            "session": session,
+            "closer": session,
+            "type": "stealth",
+            "lock": threading.Lock(),
+            "worker": worker,
+        }
+        return session_id, worker
+
+    with tempfile.TemporaryDirectory(prefix="dsh-scrapling-state-running-") as state_dir:
+        for label, saving in (("save", True), ("load", False)):
+            method = "session.state_save" if saving else "session.state_load"
+
+            def params(session_id: str) -> dict[str, Any]:
+                return {"sessionId": session_id, "name": "login", "deployment": {"sessionStateDir": state_dir}}
+
+            def invoke(session_id: str, *, saving: bool = saving) -> dict[str, Any]:
+                return (
+                    adapters.session_state_save(params(session_id))
+                    if saving
+                    else adapters.session_state_load(params(session_id))
+                )
+
+            session = _StateSession(cancel=True)
+            session_id, _worker = mount(session)
+            try:
+                try:
+                    with cancellation.bind(cancellation.CancellationToken()):
+                        invoke(session_id)
+                    check(f"{label} 运行中取消重抛 RequestCancelled", False, "放行")
+                except cancellation.RequestCancelled:
+                    check(f"{label} 运行中取消重抛 RequestCancelled", True, "")
+                except adapters.AdapterError as error:
+                    check(f"{label} 运行中取消重抛 RequestCancelled", False, error.code)
+                check(f"{label} 取消发生在真实操作内", session.executed == [label], repr(session.executed))
+            finally:
+                adapters._close_entry(session_id)
+
+            session = _StateSession(cancel=True)
+            session_id, _worker = mount(session)
+            try:
+                mapped = bridge.handle({"id": f"state-cancel-{label}", "method": method, "params": params(session_id)})
+                check(
+                    f"bridge 把 {label} 运行中取消映射为 SIDECAR_ABORTED",
+                    (mapped.get("error") or {}).get("code") == "SIDECAR_ABORTED",
+                    repr(mapped),
+                )
+            finally:
+                adapters._close_entry(session_id)
+
+            session = _StateSession(fail=True)
+            session_id, _worker = mount(session)
+            try:
+                try:
+                    with cancellation.bind(cancellation.CancellationToken()):
+                        invoke(session_id)
+                    check(f"{label} 真实状态错误仍为 STATE_FAILED", False, "放行")
+                except adapters.AdapterError as error:
+                    check(f"{label} 真实状态错误仍为 STATE_FAILED", error.code == "STATE_FAILED", error.code)
+            finally:
+                adapters._close_entry(session_id)
+
+
+def _check_session_open_cancellation(adapters: Any, cancellation: Any) -> None:
+    """构造返回前收到取消时，关闭会话、释放名额并停止属主线程。"""
+    from unittest.mock import patch
+
+    class _CancelOnConstruct:
+        def __init__(self) -> None:
+            self.construct_threads: list[int] = []
+            self.close_threads: list[int] = []
+            self.closed = 0
+
+        def close(self) -> None:
+            self.close_threads.append(threading.get_ident())
+            self.closed += 1
+
+    created = _CancelOnConstruct()
+    workers: list[adapters._SessionWorker] = []
+    original_worker = adapters._SessionWorker
+
+    def recording_worker() -> adapters._SessionWorker:
+        worker = original_worker()
+        workers.append(worker)
+        return worker
+
+    def cancel_during_construction(_kind: str, _args: dict[str, Any]) -> tuple[Any, Any]:
+        created.construct_threads.append(threading.get_ident())
+        token = cancellation.current_token()
+        if token is None:
+            raise AssertionError("session.open construction lost the cancellation token")
+        token.cancel()
+        return created, created
+
+    session_id = "cancel-during-open"
+    before = len(adapters._SESSIONS)
+    cancelled = False
+    with (
+        patch.object(adapters, "_make_session", cancel_during_construction),
+        patch.object(adapters, "_SessionWorker", recording_worker),
+    ):
+        try:
+            with cancellation.bind(cancellation.CancellationToken()):
+                try:
+                    adapters.session_open({"sessionType": "stealth", "sessionId": session_id})
+                except cancellation.RequestCancelled:
+                    cancelled = True
+            check("session.open 构造期取消重抛 RequestCancelled", cancelled, "")
+            check("session.open 取消后不占注册表名额", len(adapters._SESSIONS) == before, repr(adapters._SESSIONS))
+            check("session.open 取消后没有会话条目", session_id not in adapters._SESSIONS, repr(adapters._SESSIONS))
+            check("session.open 取消后关闭了已构造会话", created.closed == 1, repr(created.close_threads))
+            check(
+                "session.open 在属主线程关闭已构造会话",
+                len(created.construct_threads) == 1 and created.close_threads == created.construct_threads,
+                repr((created.construct_threads, created.close_threads)),
+            )
+            check("session.open 取消后停止属主线程", len(workers) == 1 and workers[0].alive() is False, repr(workers))
+        finally:
+            if session_id in adapters._SESSIONS:
+                adapters._close_entry(session_id)
+            for worker in workers:
+                if worker.alive():
+                    worker.stop()
+            adapters._SESSIONS.pop(session_id, None)
+
+
+def run_remote_session_units() -> None:
+    """remote 会话只连接 CDP，不把本机浏览器启动参数递给远端。"""
+    sys.path.insert(0, str(PY_DIR))
+    try:
+        import adapters
+        import scrapling.fetchers as fetchers
+    finally:
+        sys.path.remove(str(PY_DIR))
+    from unittest.mock import patch
+
+    captured: dict[str, dict[str, Any]] = {}
+
+    def session_class(kind: str) -> type:
+        class _Stub:
+            def __init__(self, **kwargs: Any) -> None:
+                captured[kind] = kwargs
+
+            def start(self) -> None:
+                captured[kind]["started"] = True
+
+        return _Stub
+
+    endpoint = "wss://browser.test/cdp/session-token"
+    with (
+        patch.object(fetchers, "RemoteSession", session_class("remote")),
+        patch.object(fetchers, "StealthySession", session_class("stealth")),
+    ):
+        try:
+            adapters._make_session(
+                "remote",
+                {
+                    "deployment": {
+                        "browserCdpUrl": endpoint,
+                        "browserRealChrome": True,
+                        "browserExecutablePath": sys.executable,
+                    }
+                },
+            )
+            remote = captured.get("remote", {})
+            check("remote 使用 RemoteSession", bool(remote), repr(captured))
+            check("remote 收到 CDP 端点", remote.get("cdp_url") == endpoint, repr(remote))
+            check("remote 固定创建独立 context", remote.get("new_context") is True, repr(remote))
+            check(
+                "remote 不传本机启动参数",
+                "real_chrome" not in remote and "executable_path" not in remote,
+                repr(remote),
+            )
+            check("remote 没有误用 StealthySession", "stealth" not in captured, repr(captured))
+        except Exception as error:  # noqa: BLE001 —— RED 期要看到缺失功能的失败而不是中断整套
+            check("remote 会话构造", False, repr(error))
+
+        for label, deployment in (
+            ("缺少 CDP 端点", {}),
+            ("非法 CDP 协议", {"browserCdpUrl": "file:///tmp/browser"}),
+        ):
+            try:
+                adapters._make_session("remote", {"deployment": deployment})
+                check(label, False, "放行")
+            except adapters.AdapterError as error:
+                check(label, error.code == "BAD_ARGS", error.code)
+
+    check("能力帧报告 remote", adapters.capabilities().get("remote") is True, repr(adapters.capabilities()))
+
+
 def run_session_page_units() -> None:
     """会话当前页读取与结构化动作的纯逻辑：不碰真浏览器，替身页只记调用。"""
     sys.path.insert(0, str(PY_DIR))
@@ -1952,6 +2792,15 @@ def run_session_page_units() -> None:
     check("move 无 target 走 mouse.move", perform({"type": "move", "x": 3, "y": 4}) == ["mouse-move:3.0,4.0"])
     check("move 有 target 走 hover", perform({"type": "move", "target": "#spot"}) == ["hover:#spot"])
     check("click 走 locator.click", perform({"type": "click", "target": "#go"}) == ["click:#go"])
+    check(
+        "drag 选择器模式调用 locator.drag_to",
+        perform({"type": "drag", "from": "#a", "to": "#b"}) == ["drag:#a->#b"],
+    )
+    check(
+        "drag 坐标模式按下、移动并松开鼠标",
+        perform({"type": "drag", "fromX": 1, "fromY": 2, "toX": 3, "toY": 4})
+        == ["mouse-move:1.0,2.0", "mouse-down", "mouse-move:3.0,4.0", "mouse-up"],
+    )
     check("textbox 填值", perform({"type": "textbox", "target": "#q", "value": "hi"}) == ["fill:#q=hi"])
     check("checkbox 默认勾上", perform({"type": "checkbox", "target": "#c"}) == ["check:#c"])
     check("checkbox 可取消", perform({"type": "checkbox", "target": "#c", "checked": False}) == ["uncheck:#c"])
@@ -2007,6 +2856,23 @@ def run_session_page_units() -> None:
         strip_inline_images=False,
     )
     check("include_metadata 带出 metadata", isinstance(with_meta.get("metadata"), dict), repr(sorted(with_meta)))
+    aria_page = _UnitPage()
+    aria = session_page.read_current_page(
+        _UnitSession(_UnitPool([_UnitPageInfo(aria_page)])),
+        extraction_type="text",
+        css_selector="main",
+        main_content_only=False,
+        max_content_chars=5,
+        include_metadata=False,
+        strip_inline_images=False,
+        snapshot_type="aria",
+    )
+    check(
+        "ARIA 读取调用元素快照并按字符裁剪",
+        aria["content"] == "- but" and aria["truncated"] is True and aria["snapshotType"] == "aria",
+        repr(aria),
+    )
+    check("ARIA 读取使用 ai 模式", "aria:main:ai" in aria_page.calls, repr(aria_page.calls))
     closed_info = _UnitPageInfo(_UnitPage(closed=True))
     closed_pool = _UnitPool([closed_info])
     # 页已关闭用 PAGE_CLOSED 而不是 PAGE_BUSY：这一页紧接着会被摘出池子，按「retry shortly」
@@ -2125,6 +2991,9 @@ def run_session_page_units() -> None:
     invalid({"type": "wait_load", "state": {}}, "dict 类型的 wait_load state 给 ACTION_INVALID")
     # 空 target / 空 key / 非布尔 checked 曾在执行期才炸，错误码被包装成 ACTION_FAILED。
     invalid({"type": "move", "target": ""}, "move 的空 target 在预校验拒掉")
+    invalid({"type": "drag", "from": "#a"}, "drag 缺终点在预校验拒掉")
+    invalid({"type": "drag", "fromX": 1, "fromY": 2, "toX": 3}, "drag 缺终点坐标在预校验拒掉")
+    invalid({"type": "drag", "from": "#a", "to": "#b", "fromX": 1}, "drag 混用选择器与坐标在预校验拒掉")
     invalid({"type": "press_key", "key": ""}, "press_key 的空 key 在预校验拒掉")
     invalid({"type": "checkbox", "target": "#c", "checked": "false"}, "checkbox 的非布尔 checked 在预校验拒掉")
     # wait_time 无上界时模型可以要几个小时，把整批动作与 page pool 的槽位一起占死；
@@ -2662,6 +3531,92 @@ def run_payload_metadata() -> None:
     check("非 JSON 报 NOT_JSON", raised)
 
 
+def run_search_proxy_units() -> None:
+    """搜索请求与抓取请求共用代理策略；绕过星号必须显式直连。"""
+    sys.path.insert(0, str(PY_DIR))
+    try:
+        import guard
+        import scrapling.fetchers as fetchers
+        import search
+    finally:
+        sys.path.remove(str(PY_DIR))
+
+    captured: dict[str, Any] = {}
+
+    class _Response:
+        status = 200
+        html_content = '<li class="b_algo"><h2><a href="https://a.test">A</a></h2><p>S</p></li>'
+
+    class _Fetcher:
+        response_class: type = _Response
+
+        @classmethod
+        def get(cls, url: str, **kwargs: Any) -> Any:
+            captured["url"] = url
+            captured.update(kwargs)
+            return cls.response_class()
+
+    saved_fetcher = fetchers.Fetcher
+    saved_proxy = guard.PROXY_URL
+    saved_bypass = guard._BYPASS_ENTRIES
+    try:
+        fetchers.Fetcher = _Fetcher  # type: ignore[misc,assignment]
+        guard.PROXY_URL = "http://proxy.test:8080"
+        guard._BYPASS_ENTRIES = ("*",)
+        result = search.discover({"backend": "bing", "query": "q", "bingEndpoint": "https://www.bing.com/search"})
+        check("搜索仍返回结果", result["hits"][0]["url"] == "https://a.test", repr(result))
+        check(
+            "proxyBypass=* 时搜索显式直连",
+            captured.get("proxies") == {"all": ""},
+            repr(captured),
+        )
+
+        captured.clear()
+        guard._BYPASS_ENTRIES = ()
+        search.discover({"backend": "bing", "query": "q", "bingEndpoint": "https://www.bing.com/search"})
+        check(
+            "搜索使用部署代理",
+            captured.get("proxies") == {"all": "http://proxy.test:8080"},
+            repr(captured),
+        )
+
+        encoded = base64.b64encode(b"https://a.test/path?x=1").decode("ascii")
+        redirect = f"https://www.bing.com/ck/a?!&&u=a1{encoded}&ntb=1"
+
+        class _RedirectResponse:
+            status = 200
+            html_content = f'<li class="b_algo"><h2><a href="{redirect}">A</a></h2><p>S</p></li>'
+
+        captured.clear()
+        _Fetcher.response_class = _RedirectResponse
+        localized = search.discover(
+            {"backend": "bing", "query": "之了课堂", "bingEndpoint": "https://www.bing.com/search"}
+        )
+        check(
+            "中文 Bing 查询带 setlang=zh-hans",
+            captured.get("params", {}).get("setlang") == "zh-hans",
+            repr(captured),
+        )
+        check(
+            "Bing 跳板解包为原始 URL",
+            localized["hits"][0]["url"] == "https://a.test/path?x=1",
+            repr(localized),
+        )
+
+        captured.clear()
+        _Fetcher.response_class = _Response
+        search.discover({"backend": "bing", "query": "q", "bingEndpoint": "https://www.bing.com/search"})
+        check(
+            "英文 Bing 查询显式使用 setlang=en",
+            captured.get("params", {}).get("setlang") == "en",
+            repr(captured),
+        )
+    finally:
+        fetchers.Fetcher = saved_fetcher  # type: ignore[misc]
+        guard.PROXY_URL = saved_proxy
+        guard._BYPASS_ENTRIES = saved_bypass
+
+
 def run_search_discovery(base: str) -> None:
     """Tavily/Bing 发现层：命中形状、auto 选择与凭证错误。"""
     sys.path.insert(0, str(PY_DIR))
@@ -2953,6 +3908,75 @@ def run_search_backends(base: str) -> None:
     )
 
     expect_error("BAD_ARGS", lambda: discover(backend="google"))
+
+    collected = search._collect(
+        [
+            {
+                "url": "https://meta.test/a",
+                "title": "Meta",
+                "snippet": "short",
+                "summary": "long",
+                "publishedDate": "2026-11-20",
+            }
+        ],
+        limit=8,
+        url_key="url",
+        title_key="title",
+        snippet_key="snippet",
+        summary_key="summary",
+        date_key="publishedDate",
+    )
+    check(
+        "search 元数据映射保留 summary/publishedAt",
+        collected[0].get("summary") == "long" and collected[0].get("publishedAt") == "2026-11-20",
+        repr(collected),
+    )
+
+    with _SEEN_LOCK:
+        _SEEN_LIMITS.clear()
+    discover(backend="bing", offset=2, bingEndpoint=base + "/bing")
+    discover(backend="brave", apiKey="k", offset=2, braveEndpoint=base + "/braveecho")
+    discover(backend="serper", apiKey="k", offset=2, serperEndpoint=base + "/serper")
+    discover(backend="duckduckgo", offset=2, duckduckgoEndpoint=base + "/ddg")
+    discover(backend="searxng", offset=2, searxngEndpoint=base + "/searxng")
+    discover(backend="tavily", apiKey="k", offset=2, apiEndpoint=base + "/tavilyecho")
+    with _SEEN_LOCK:
+        paged = list(_SEEN_LIMITS)
+    check(
+        "bing offset 映射 first=3",
+        any(item["backend"] == "bing" and item["query"].get("first") == "3" for item in paged),
+        repr(paged)[:300],
+    )
+    check(
+        "brave offset 原样下发",
+        any(item["backend"] == "brave" and item["query"].get("offset") == "2" for item in paged),
+        repr(paged)[:300],
+    )
+    check(
+        "serper offset 映射 page 并扩大 num",
+        any(
+            item["backend"] == "serper" and item["body"].get("page") == 1 and item["body"].get("num") == 10
+            for item in paged
+        ),
+        repr(paged)[:300],
+    )
+    check(
+        "duckduckgo offset 映射 s",
+        any(item["backend"] == "duckduckgo" and item["query"].get("s") == "2" for item in paged),
+        repr(paged)[:300],
+    )
+    check(
+        "searxng offset 映射 pageno",
+        any(item["backend"] == "searxng" and item["query"].get("pageno") == "1" for item in paged),
+        repr(paged)[:300],
+    )
+    check(
+        "tavily 无 offset 时扩大 max_results",
+        any(item["backend"] == "tavily" and item["body"].get("max_results") == 10 for item in paged),
+        repr(paged)[:300],
+    )
+    expect_error("BAD_ARGS", lambda: discover(backend="bing", offset=-1))
+    expect_error("BAD_ARGS", lambda: discover(backend="bing", offset=1.5))
 
 
 def run_search_wire(sidecar: Sidecar, base: str) -> None:
@@ -5838,6 +6862,83 @@ def run_network_summary() -> None:
         with_body[0].get("body") == "xxxxx" and with_body[0].get("bodyTruncated") is True,
         repr(with_body),
     )
+
+    class _SizedItem(_Item):
+        """带指定正文长度与连续 id 的网络记录。"""
+
+        def __init__(self, index: int, body_chars: int) -> None:
+            self.url = f"https://a.test/api/{index}"
+            self.meta = {"network_id": index + 1, "resource_type": "fetch"}
+            self.body = b"x" * body_chars
+
+    # 期望值独立写死：模型把两个旋钮拧到 9999 / 999999 也不能越过本包的 200 / 20_000 / 120_000。
+    sizes = [25_000, 20_000, 20_000, 20_000, 20_000, 19_999, 10] + [1000] * 198
+    bounded_query = adapters._network_read({"networkLimit": 9999, "includeBody": True, "maxBodyChars": 999999})
+    check("networkLimit 被夹到 200", bounded_query.limit == 200, repr(bounded_query))
+    check("maxBodyChars 被夹到 20_000", bounded_query.body_chars == 20_000, repr(bounded_query))
+    bounded = adapters._network_summary(
+        _Recorder([_SizedItem(index, size) for index, size in enumerate(sizes)]),
+        query=bounded_query,
+    )
+    body_lengths = [len(str(item.get("body", ""))) for item in bounded]
+    check("实际最多返回 200 条", len(bounded) == 200, repr(len(bounded)))
+    check("单条正文最多 20_000 字符", max(body_lengths, default=0) == 20_000, repr(body_lengths[:8]))
+    check("总正文最多 120_000 字符", sum(body_lengths) == 120_000, repr(sum(body_lengths)))
+    check("超过单条上限时标记 bodyTruncated", bounded[0].get("bodyTruncated") is True, repr(bounded[0]))
+    check("总预算只剩 1 个字符时只保留 1 个", bounded[6].get("body") == "x", repr(bounded[6]))
+    check("总预算耗尽后仍保留条目但正文为空并标记截断", bounded[7].get("body") == "", repr(bounded[7]))
+    check("总预算截断也标记 bodyTruncated", bounded[7].get("bodyTruncated") is True, repr(bounded[7]))
+    check("截断后仍按原顺序保留连续 id", bounded[-1].get("id") == 200, repr(bounded[-1]))
+
+    # count 是 Scrapling 过滤后、networkLimit 与逐条投影前的记录数。这里用上游真正的
+    # NetworkRecorder.search 造出 205 条保留记录，再让 session.network 只投影前 200 条。
+    from scrapling.engines._browsers._network import NetworkRecorder
+
+    class _Request:
+        resource_type = "fetch"
+        post_data_buffer = None
+
+    recorder = NetworkRecorder(enabled=True, max_requests=300)
+    context = object()
+    listeners: dict[str, Any] = {}
+    recorder._contexts[context] = listeners
+    for index in range(205):
+        recorder._store(_Request(), cast(Any, _SizedItem(index, 1)), 0, context, listeners)
+
+    class _Session:
+        def __init__(self, network: Any) -> None:
+            self.network = network
+
+    session = _Session(recorder)
+    worker = adapters._SessionWorker()
+    session_id = adapters._new_session_id()
+    adapters._SESSIONS[session_id] = {"session": session, "type": "stealth", "worker": worker}
+    try:
+        limited = adapters.session_network({"sessionId": session_id, "networkLimit": 200})
+        check("真实 limit 截断时 count 仍为过滤后的 205 条", limited.get("count") == 205, repr(limited.get("count")))
+        check(
+            "真实 limit 截断时只投影 200 条",
+            len(limited.get("matches", [])) == 200,
+            repr(len(limited.get("matches", []))),
+        )
+
+        class _BadItem:
+            @property
+            def meta(self) -> Any:
+                raise RuntimeError("bad item")
+
+        session.network = _Recorder([_SizedItem(0, 1), _BadItem(), _SizedItem(2, 1)])
+        projected = adapters.session_network({"sessionId": session_id, "networkLimit": 3})
+        check("逐条投影失败不减少 count", projected.get("count") == 3, repr(projected.get("count")))
+        check(
+            "逐条投影失败只减少 matches",
+            [item.get("id") for item in projected.get("matches", [])] == [1, 3],
+            repr(projected.get("matches")),
+        )
+    finally:
+        adapters._SESSIONS.pop(session_id, None)
+        worker.stop()
+
     no_body = adapters._network_summary(
         _Recorder([_Item()]),
         query=adapters._network_read({"networkLimit": 10, "maxBodyChars": 5}),
@@ -7374,6 +8475,7 @@ def run_inprocess_capabilities() -> None:
 
     report = adapters.capabilities()
     check("capabilities 报 scrapling 可用", report["scrapling"] is True, repr(report)[:120])
+    check("capabilities 报 documents 布尔值", isinstance(report.get("documents"), bool), repr(report)[:160])
     check(
         "capabilities 有 version / browser / proxy",
         {"version", "browser", "proxy"} <= set(report),
@@ -8197,6 +9299,7 @@ def main() -> int:
         caps = ready.get("capabilities", {})
         check("报告了 scrapling 可用性", "scrapling" in caps, repr(caps)[:140])
         check("报告了浏览器可用性", "browser" in caps, repr(caps)[:140])
+        check("报告了 PDF 能力", isinstance(caps.get("documents"), bool), repr(caps)[:160])
         check("能力帧如实标出写方法这一档（本次部署为开）", caps.get("writeMethods") is True, repr(caps)[:160])
         print(f"     capabilities = {json.dumps(caps, ensure_ascii=False)}")
         run(sidecar, base, caps)
@@ -8209,12 +9312,15 @@ def main() -> int:
         print("\n== payload 元数据与 JSON 抽取 ==")
         run_payload_metadata()
         print("\n== 检索发现（Tavily/Bing 夹具）==")
+        run_search_proxy_units()
         run_search_discovery(base)
         print("\n== 检索层的错误形状 ==")
         run_search_shapes(base)
         run_search_backends(base)
         print("\n== 检索发现（真 bridge 帧）==")
         run_search_wire(sidecar, base)
+        print("\n== PDF 阅读 ==")
+        run_documents(sidecar)
         print("\n== 文件下载 ==")
         run_download(base)
         print("\n== 写方法与请求件（对端收到了什么）==")
@@ -8278,6 +9384,9 @@ def main() -> int:
     run_network_summary()
 
     print("\n== 进程内单元（替身页与纯函数）==")
+    run_cancellation_units()
+    run_owner_queue_cancellation_units()
+    run_remote_session_units()
     run_session_page_units()
     run_media_units()
     run_redis_storage()

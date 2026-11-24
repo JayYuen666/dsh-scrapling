@@ -8,12 +8,13 @@ import path from "node:path";
 import {
   clientInstallCommand,
   DEFAULT_MCP_PORT,
+  DEFAULT_MCP_TOOL_LOADING,
   isMcpMode,
   MCP_MODES,
   MCP_CLIENT_PINS,
   MCP_TOKEN_ENV,
 } from "./mcp-contract.ts";
-import type { McpMode } from "./mcp-contract.ts";
+import type { McpMode, McpToolLoading } from "./mcp-contract.ts";
 import { officialMcpBinary, officialMcpPlan, OfficialMcpError } from "./official-mcp.ts";
 import {
   inspectProfile,
@@ -35,13 +36,14 @@ import {
   withInstallLock,
 } from "./installer.ts";
 import { resolveRuntime, runtimeManifest } from "./runtime.ts";
+import { RUNTIME_PACKS } from "./runtime-shape.ts";
 import type { PackState } from "./runtime-shape.ts";
 
 /** patch 文本的行分隔与行尾注释。 */
 const LINE_BREAK = /\r\n|\n|\r/u;
 const TRAILING_INLINE_COMMENT = /[\t ]#.*$/u;
 
-const FEATURES = ["core", "browser", "search", "media", "adaptive-redis", "mcp"] as const;
+const FEATURES = RUNTIME_PACKS;
 type Feature = (typeof FEATURES)[number];
 const FEATURE_NAMES: ReadonlySet<string> = new Set(FEATURES);
 
@@ -275,6 +277,7 @@ function patchForMode(input: {
   readonly acceptRisk: boolean;
   readonly dataDir: string;
   readonly enabled: boolean;
+  readonly toolLoading: McpToolLoading;
 }): ModeOutput {
   if (input.mode === "native") {
     return {
@@ -288,7 +291,11 @@ function patchForMode(input: {
       ? `Authorization 在宿主装载时从宿主进程环境的 ${MCP_TOKEN_ENV} 求值：变量缺席会写成 "Bearer undefined"，加鉴权前先确认宿主环境里已设置它。`
       : "";
     return {
-      text: mcpClientPatch({ port: input.port, withAuth: input.withAuth }),
+      text: mcpClientPatch({
+        port: input.port,
+        withAuth: input.withAuth,
+        toolLoading: input.toolLoading,
+      }),
       note: `mcp 模式起的是本插件的 server，URL 里的端口要与部署项 mcpPort 同值（当前按 ${String(input.port)} 生成）。${authNote}`,
       install: clientInstallCommand(),
     };
@@ -297,6 +304,7 @@ function patchForMode(input: {
     dataDir: input.dataDir,
     enabled: input.enabled,
     acceptedRisk: input.acceptRisk,
+    toolLoading: input.toolLoading,
   });
   return { text: plan.patch, note: plan.risk, install: plan.installCommand };
 }
@@ -333,6 +341,7 @@ async function setupMode(flags: FlagMap, deps: CliDeps): Promise<number> {
     acceptRisk: flags.has("accept-risk"),
     dataDir: deps.dataDir,
     enabled: snapshot?.officialMcpEnabled === true,
+    toolLoading: snapshot?.mcpToolLoading ?? DEFAULT_MCP_TOOL_LOADING,
   });
   deps.log(out.text);
   deps.log(out.note);
@@ -767,6 +776,9 @@ function installPlan(feature: Feature, deps: CliDeps): string {
     feature === "browser"
       ? `core venv 依赖：${requirements}，再装一份完整 Chromium（patchright）`
       : `core venv 依赖：${requirements}`,
+    ...(feature === "documents"
+      ? [`documents 依赖：${path.join(deps.repoRoot, runtimeManifest.documents.requirements)}`]
+      : []),
     `落地位置：${path.join(deps.dataDir, "runtime")}（Python 在 runtime/python/，wheel 在 runtime/venv/）`,
   ];
   return lines.join("\n");

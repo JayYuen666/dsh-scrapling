@@ -22,6 +22,7 @@ from __future__ import annotations
 import codecs
 import concurrent.futures
 import contextlib
+import contextvars
 import json
 import queue
 import re
@@ -31,11 +32,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
+from urllib.parse import urlparse
 
+import document
 import extraction
 import guard
 import media
 import search
+from cancellation import RequestCancelled, raise_if_cancelled
 from redact import redact_url_secrets
 
 # Scrapling 缺失时不要让整个 sidecar 起不来：桥接层会把它报成能力缺失，
@@ -52,10 +56,13 @@ DEFAULT_EXTRACTION = "markdown"
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_TIMEOUT_MS = 30_000
 DEFAULT_MAX_CONTENT_CHARS = 200_000
-# 一次读网络历史最多回多少条、单条正文最多回多少字符。上游为每条响应体存下的是 1 MiB
-# 量级，而这份摘要是给模型看的 —— 两个预算都由本包定，不由上游存了多少决定。
+# 一次读网络历史的条目数、单条正文与总正文三条上限。上游为每条响应体存下的是 1 MiB
+# 量级，而这份摘要是给模型看的 —— 三条预算都由本包定，不由上游存了多少决定。
 DEFAULT_NETWORK_ENTRIES = 50
-DEFAULT_NETWORK_BODY_CHARS = 20_000
+NETWORK_MAX_ENTRIES = 200
+NETWORK_MAX_BODY_CHARS = 20_000
+NETWORK_MAX_TOTAL_BODY_CHARS = 120_000
+DEFAULT_NETWORK_BODY_CHARS = NETWORK_MAX_BODY_CHARS
 EXTRACTION_TYPES = ("markdown", "html", "text", "json")
 # adaptive 指纹库的文件名。**相对路径**：bridge 由宿主以部署侧的 dataDir 为工作目录拉起
 # （见 host.ts 的 sidecar env），相对路径正好把库落进 dataDir —— Scrapling 自己的默认值
@@ -160,25 +167,30 @@ def _safe_headers(headers: Any) -> dict[str, str]:
     return {str(key): str(value) for key, value in headers.items() if str(key).lower() not in _SENSITIVE_HEADERS}
 
 
-def _network_summary(
+def _network_summary_with_count(
     network: Any,  # 上游的 NetworkRecorder
     *,
     query: _NetworkQuery,
-) -> list[dict[str, Any]]:
-    """把会话网络历史压成给模型看的条目。
+) -> tuple[list[dict[str, Any]], int]:
+    """把会话网络历史压成给模型看的条目，并独立报告过滤后的记录数。
 
     只取 XHR/fetch 与 HTTP 错误（``include_static=False``）：这条路径的用途是「页面数据来自
     接口而不是 DOM 时，找到那个接口」，静态资源只会把列表淹掉。
 
-    正文只在显式要求时回传，并按 ``max_body_chars`` 逐条截断 —— 上游为每条响应体设了
-    1 MiB、会话总量 20 MiB 的硬上限，那几十倍于模型预算的量级不该由「上游记了什么」决定
-    「模型看见什么」。没存下正文时上游会在 ``meta['body_note']`` 里写原因，一并带出去，
-    这样「这条接口没正文」与「这个接口本来就空」不是同一件事。
+    ``count`` 在 ``networkLimit`` 与逐条投影之前计算：上游 ``NetworkRecorder.search`` 的
+    ``limit=None`` 返回全部过滤结果，因此单条投影失败也不会把总数一起减掉。
+
+    正文只在显式要求时回传，并按 ``max_body_chars`` 逐条截断；所有条目的正文字符总数另受
+    ``NETWORK_MAX_TOTAL_BODY_CHARS`` 约束。上游为每条响应体设了 1 MiB、会话总量 20 MiB 的
+    硬上限，那几十倍于模型预算的量级不该由「上游记了什么」决定「模型看见什么」。没存下正文时
+    上游会在 ``meta['body_note']`` 里写原因，一并带出去，这样「这条接口没正文」与「这个接口
+    本来就空」不是同一件事。
 
     URL 里的凭据型查询参数在这一层就脱敏：这份摘要是给模型看的，而模型用不上一个
     access token 却会把整条 URL 原样复述出去。
     """
     summary: list[dict[str, Any]] = []
+    total_body_chars = 0
     try:
         if query.request_id is not None:
             record = network.get(query.request_id)
@@ -190,12 +202,13 @@ def _network_summary(
                 resource_type=query.resource_type,
                 status=query.status,
                 after_id=query.after_id,
-                limit=query.limit,
+                limit=None,
                 include_static=query.include_static,
             )
     except Exception:  # noqa: BLE001 —— 记录器未启用或上游改了口径：当成「没有历史」
-        return summary
-    for item in records:
+        return summary, 0
+    count = len(records)
+    for item in records[: query.limit]:
         try:
             meta = item.meta if isinstance(item.meta, dict) else {}
             body = item.body
@@ -217,15 +230,30 @@ def _network_summary(
                     entry["bodyNote"] = note
             elif query.include_body:
                 text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
-                clipped, truncated = clip(text, query.body_chars)
-                entry["body"] = clipped
-                if truncated:
+                remaining = NETWORK_MAX_TOTAL_BODY_CHARS - total_body_chars
+                if remaining == 0:
+                    entry["body"] = ""
                     entry["bodyTruncated"] = True
+                else:
+                    clipped, truncated = clip(text, min(query.body_chars, remaining))
+                    entry["body"] = clipped
+                    total_body_chars += len(clipped)
+                    if truncated:
+                        entry["bodyTruncated"] = True
             summary.append(entry)
         # 单条摘要失败不该拖垮整次读取；继续处理下一条。
         except Exception:  # noqa: BLE001, S112  # nosec B112
             continue
-    return summary
+    return summary, count
+
+
+def _network_summary(
+    network: Any,  # 上游的 NetworkRecorder
+    *,
+    query: _NetworkQuery,
+) -> list[dict[str, Any]]:
+    """只返回投影后的条目；一次性 capture 不需要过滤后的总数。"""
+    return _network_summary_with_count(network, query=query)[0]
 
 
 def _extraction(args: dict[str, Any]) -> tuple[str, str | None, bool, int]:
@@ -418,6 +446,7 @@ def to_payload(
     文本照旧剥 data URI（内联图片对模型不可读，还会白吃 ``maxContentChars`` 的额度）并受
     同一个 ``maxContentChars`` 封顶——与 html/text/markdown 三条路径同一套收口（spec:363）。
     """
+    raise_if_cancelled()
     if extraction_type == "json":
         try:
             parsed = response.json()
@@ -464,6 +493,7 @@ def to_payload(
     }
     if include_metadata:
         payload["metadata"] = _response_metadata(response, redirects)
+    raise_if_cancelled()
     return payload
 
 
@@ -671,6 +701,7 @@ def fetch(args: dict[str, Any]) -> dict[str, Any]:
     allowed, reason = guard.url_allowed(url)
     if not allowed:
         raise AdapterError("URL_BLOCKED", f"{url}: {reason}")
+    raise_if_cancelled()
     try:
         response = getattr(Fetcher, method.lower())(url, **params)
     except Exception as error:
@@ -787,11 +818,8 @@ SESSION_ONLY_KEYS = frozenset(
 # 与模型入参走同一条通道而它承载的是**部署表态**：类型错了静默生效比报错更糟（例如
 # maxRecordedRequests 收到字符串，上游会拿它当容量直接炸会话构造）。
 #
-# 这里没有 CDP 端点那一枚：Scrapling 0.5.1 把 `cdp_url` 收归 RemoteSession，递给
-# StealthSession 会 `TypeError`（`engines/_browsers/_validators.py` 的
-# 「cdp_url and new_context require RemoteSession」那条），而本包没有远端会话模式。
-# 递过去在 0.5 上能用、在 0.5.1 上炸会话构造，等于让同一条文档范围 `>=0.5,<0.6` 里
-# 的两个版本行为分叉，所以这个旋钮整体撤掉。
+# CDP 端点不在这张表里：它只属于 RemoteSession 的构造参数，递给 StealthySession
+# 会被上游明确拒绝。remote 分支在 _make_session 里单独读取并校验部署值。
 _DEPLOYMENT_KNOBS: tuple[tuple[str, str, type], ...] = (
     ("browserExecutablePath", "executable_path", str),
     ("browserInitScript", "init_script", str),
@@ -954,6 +982,7 @@ def render(args: dict[str, Any]) -> dict[str, Any]:
 
     params = _browser_params(args, url)
     params["page_setup"] = page_setup
+    raise_if_cancelled()
     response = StealthyFetcher.fetch(url, **params)
     return to_payload(
         response,
@@ -985,6 +1014,9 @@ class _NetworkQuery(NamedTuple):
 def _network_read(args: dict[str, Any]) -> _NetworkQuery:
     """抽出「读网络历史」的过滤与投影参数并校验。
 
+    条目数与单条正文只压上限，不把 0、负数或非整数静默改成合法值；总正文在
+    ``_network_summary`` 逐条累计。
+
     :param args: 协议参数
     :returns: 归一后的查询参数
     """
@@ -1005,9 +1037,15 @@ def _network_read(args: dict[str, Any]) -> _NetworkQuery:
         raise AdapterError("BAD_ARGS", "requestId must be a positive integer or null")
     return _NetworkQuery(
         pattern=_url_pattern(args),
-        limit=_positive_int(args.get("networkLimit"), "networkLimit", DEFAULT_NETWORK_ENTRIES),
+        limit=min(
+            _positive_int(args.get("networkLimit"), "networkLimit", DEFAULT_NETWORK_ENTRIES),
+            NETWORK_MAX_ENTRIES,
+        ),
         include_body=bool(args.get("includeBody", False)),
-        body_chars=_positive_int(args.get("maxBodyChars"), "maxBodyChars", DEFAULT_NETWORK_BODY_CHARS),
+        body_chars=min(
+            _positive_int(args.get("maxBodyChars"), "maxBodyChars", DEFAULT_NETWORK_BODY_CHARS),
+            NETWORK_MAX_BODY_CHARS,
+        ),
         method=method.upper() if isinstance(method, str) else None,
         status=status,
         resource_type=resource_type,
@@ -1036,6 +1074,7 @@ def _capture_once(
     """
     from scrapling.fetchers import StealthySession
 
+    raise_if_cancelled()
     session_params = _session_browser_params(args)
     # 与 _make_session 对齐：浏览器会话的代理只能在构造期给，而 _session_browser_params
     # 按 SESSION_ONLY_KEYS 把它连同 block_webrtc 一起过滤掉了。不在这里补，配了代理的
@@ -1053,8 +1092,11 @@ def _capture_once(
     session = StealthySession(**session_params)
     try:
         session.start()
+        raise_if_cancelled()
         response = session.fetch(url, **fetch_params)
+        raise_if_cancelled()
         records = _network_summary(session.network, query=query)
+        raise_if_cancelled()
     finally:
         # 这条会话不进注册表，所以没有别人会替它收尸 —— 成败都要在这里关掉。
         with contextlib.suppress(Exception):
@@ -1147,6 +1189,8 @@ def _adaptive_kwargs(args: dict[str, Any], url: str) -> dict[str, Any]:
 def select(args: dict[str, Any]) -> dict[str, Any]:
     """对已有 HTML 做选择，返回命中文本、属性或多字段行。"""
     from scrapling.parser import Selector
+
+    raise_if_cancelled()
 
     html = args.get("html")
     if not isinstance(html, str):
@@ -1251,6 +1295,7 @@ def select(args: dict[str, Any]) -> dict[str, Any]:
         page = Selector(html, url=url or "")
         nodes, notice = query_nodes(page, use_adaptive=False)
 
+    raise_if_cancelled()
     limit = _positive_int(args.get("limit"), "limit", 200)
     budget = _positive_int(args.get("maxContentChars"), "maxContentChars", DEFAULT_MAX_CONTENT_CHARS)
     include_attributes = bool(args.get("includeAttributes", False))
@@ -1261,6 +1306,7 @@ def select(args: dict[str, Any]) -> dict[str, Any]:
     if fields is not None:
         if not isinstance(fields, dict):
             raise AdapterError("BAD_ARGS", "fields must be an object or null")
+        raise_if_cancelled()
         try:
             rows, fields_truncated = extraction.collect_fields(
                 list(nodes)[:limit],
@@ -1271,6 +1317,7 @@ def select(args: dict[str, Any]) -> dict[str, Any]:
             )
         except ValueError as error:
             raise AdapterError("BAD_ARGS", str(error)) from error
+        raise_if_cancelled()
         return {
             "count": len(nodes),
             "truncated": fields_truncated or len(nodes) > limit,
@@ -1282,6 +1329,7 @@ def select(args: dict[str, Any]) -> dict[str, Any]:
     spent = 0
     clipped = False
     for node in nodes:
+        raise_if_cancelled()
         if len(matches) >= limit:
             break
         item = extraction.serialize_match(
@@ -1376,13 +1424,24 @@ def _websocket_guard_capability() -> bool:
     return guard.websocket_guard_supported(Page)
 
 
+def _remote_session_available() -> bool:
+    """当前 Scrapling 是否导出 RemoteSession；不连接端点也能判断。"""
+    try:
+        from scrapling.fetchers import RemoteSession
+    except ImportError:
+        return False
+    return callable(RemoteSession)
+
+
 def capabilities() -> dict[str, Any]:
     """报告本进程当前具备的能力，供 Host 侧决定注册哪些工具。"""
     report: dict[str, Any] = {
         "scrapling": SCRAPLING_AVAILABLE,
         "static": SCRAPLING_AVAILABLE,
         "extract": SCRAPLING_AVAILABLE,
+        "documents": document.available(),
         "browser": False,
+        "remote": False,
         # 写方法这一档**与 scrapling 在不在无关**：它是部署表态，而排障的人得能一眼看出
         # 「这台到底许不许写」，而不是等到发 POST 被拒才发现环境里少一个变量。
         "writeMethods": guard.ALLOW_WRITE_METHODS,
@@ -1393,6 +1452,7 @@ def capabilities() -> dict[str, Any]:
     # 0.5 只剩 patchright 那一套浏览器，所以这一项就是「浏览器抓取能不能用」的全部答案 ——
     # 0.4.15 时代那两个「普通浏览器 / 反检测浏览器」各自探测的规则已经没有第二个引擎可标。
     report["browser"] = _probe_browser("patchright.sync_api")
+    report["remote"] = _remote_session_available()
     # 浏览器守卫覆盖面的那一半（WebSocket 握手）在这里报出：拦不住时 install 只会往 stderr
     # 记一行，而那要等第一个页面建起来才看得见 —— 排障的人得在装载阶段就知道。
     report["websocketGuard"] = _websocket_guard_capability()
@@ -1404,18 +1464,24 @@ def capabilities() -> dict[str, Any]:
 
 def _wrap_extraction(fn: Callable[[dict[str, Any]], dict[str, Any]], args: dict[str, Any]) -> dict[str, Any]:
     """把 extraction 的 ValueError 归成协议里的 BAD_ARGS。"""
+    raise_if_cancelled()
     try:
-        return fn(args)
+        result = fn(args)
     except ValueError as error:
         raise AdapterError("BAD_ARGS", str(error)) from error
+    raise_if_cancelled()
+    return result
 
 
 def _wrap_search(fn: Callable[[dict[str, Any]], dict[str, Any]], args: dict[str, Any]) -> dict[str, Any]:
     """把 SearchError 的码原样转成协议错误。"""
+    raise_if_cancelled()
     try:
-        return fn(args)
+        result = fn(args)
     except search.SearchError as error:
         raise AdapterError(error.code, str(error)) from error
+    raise_if_cancelled()
+    return result
 
 
 def search_discover(args: dict[str, Any]) -> dict[str, Any]:
@@ -1432,6 +1498,7 @@ METHODS = {
     "select": select,
     "locate": lambda args: _wrap_extraction(extraction.locate, args),
     "links": lambda args: _wrap_extraction(extraction.links, args),
+    "document.read": lambda args: document.read(args),
     "search.discover": search_discover,
 }
 
@@ -1443,24 +1510,26 @@ METHODS = {
 # 会话把这份状态留在 sidecar 进程里跨请求复用 —— 这是 Scrapling 相对
 # 「每次调用都重新来」最实用的一块。
 #
-# 两种类型与 Scrapling 的一一对应：
+# 三种类型与 Scrapling 的一一对应：
 #   static  -> FetcherSession（curl_cffi）
-#   stealth -> StealthySession（patchright，0.5 起唯一的浏览器引擎）
+#   stealth -> StealthySession（patchright，本机启动浏览器）
+#   remote  -> RemoteSession（patchright，连接部署指定的 CDP 浏览器）
 # ---------------------------------------------------------------------------
 
 _SESSION_CLASSES = {
     "static": "FetcherSession",
     "stealth": "StealthySession",
+    "remote": "RemoteSession",
 }
 
-# 吃内存的那几类（每个都是一个真实浏览器进程）：名额与专属执行线程都按它判。
-_BROWSER_KINDS = frozenset({"stealth"})
+# 浏览器类会话：名额与专属执行线程都按它判。remote 不启动本机进程，但仍占用 page pool。
+_BROWSER_KINDS = frozenset({"stealth", "remote"})
 
 # 会话注册表。sidecar 是常驻进程，这里就是它的内存；进程退出时全部随之消失。
 # 值里存 {"session": <对象>, "type": <str>, "created_at": <iso8601>, "lock": Lock,
 # "worker": _SessionWorker | None}；正在构造中的条目只有
 # {"pending": True, "type": <str>, "lock": Lock}，那样它就已经占了名额。
-# lock 从占位那一刻就存在，所以构造期与使用期是同一把锁；worker 只在 browser/stealth
+# lock 从占位那一刻就存在，所以构造期与使用期是同一把锁；worker 只在 stealth/remote
 # 上出现（见下），static 为 None。
 _SESSIONS: dict[str, dict[str, Any]] = {}
 
@@ -1490,7 +1559,7 @@ class _SessionWorker:
     ``greenlet.error: cannot switch to a different thread``。而 bridge 的 worker 是
     「谁抢到帧谁处理」，还会空闲 50ms 就退出换新线程：会话在 A 线程里开、下一个请求
     几乎必然落在 B 线程。按会话加锁只能保证「不同时用」，保证不了「同一线程用」——
-    所以每个 browser/stealth 会话配一条专用线程，open/fetch/close 全部投递到它，
+    所以每个 stealth/remote 会话配一条专用线程，open/fetch/close 全部投递到它，
     串行执行；调用线程原地等结果。static（curl_cffi）没有线程亲和，不走这套。
     """
 
@@ -1519,10 +1588,11 @@ class _SessionWorker:
             except BaseException as error:  # noqa: BLE001 —— 任务异常必须回到调用方线程
                 done.set_exception(error)
 
-    def run(self, fn: Callable[[], Any]) -> Any:  # 会话调用的返回形态由引擎定
+    def run(self, fn: Callable[[], Any], *, cancellable: bool = True) -> Any:  # 会话调用的返回形态由引擎定
         """把 fn 投递到属主线程执行，并阻塞调用线程直到它结束。
 
         :param fn: 要在属主线程上执行的调用
+        :param cancellable: 请求任务在真实操作前复查取消；关闭会话等清理任务传 False
         :returns: fn 的返回值
         :raises AdapterError: 这条线程已经停止，投进去也没有人会执行
         :raises BaseException: fn 抛什么这里就抛什么
@@ -1532,7 +1602,18 @@ class _SessionWorker:
         if self._closed.is_set():
             raise AdapterError("NO_SUCH_SESSION", "session has already been closed")
         done: concurrent.futures.Future[Any] = concurrent.futures.Future()
-        self._jobs.put((fn, done))
+        # 新线程不会自动继承调用线程的 contextvar；每笔任务复制当前请求上下文，
+        # 否则会话抓取/动作在属主线程上看不到 bridge 绑定的取消 token。
+        context = contextvars.copy_context()
+
+        def invoke() -> Any:
+            # 入队前取消只是第一道检查；任务可能在队列里等很久，必须出队后、真实操作前
+            # 再查一次。清理任务显式豁免，否则取消中的 close 会把自己跳过并漏掉浏览器。
+            if cancellable:
+                raise_if_cancelled()
+            return fn()
+
+        self._jobs.put((lambda: context.run(invoke), done))
         try:
             return done.result(timeout=_WORKER_RESULT_TIMEOUT_SECONDS)
         except concurrent.futures.TimeoutError:
@@ -1559,6 +1640,19 @@ def _new_session_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _remote_cdp_url(args: dict[str, Any]) -> str:
+    """读取部署级 CDP 端点；缺失或协议不符时在连接前报参数错误。"""
+    deployment = args.get("deployment")
+    raw = deployment.get("browserCdpUrl") if isinstance(deployment, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        raise AdapterError("BAD_ARGS", "remote sessions require deployment.browserCdpUrl")
+    endpoint = raw.strip()
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"ws", "wss", "http", "https"} or not parsed.netloc:
+        raise AdapterError("BAD_ARGS", "browserCdpUrl must be a ws/wss/http/https URL with a host")
+    return endpoint
+
+
 def _make_session(kind: str, args: dict[str, Any]) -> Any:
     """按类型造一个**已启动**的会话对象。
 
@@ -1567,7 +1661,7 @@ def _make_session(kind: str, args: dict[str, Any]) -> Any:
     cookie 与登录态 —— 那是会话存在的理由。绕过清单因此对浏览器会话不逐 URL 生效（对
     静态会话生效，那边是每次请求各自的参数，换代理不丢任何东西）。
 
-    :param kind: static / browser / stealth
+    :param kind: static / stealth / remote
     :param args: 创建参数
     :returns: 已 start（或已进入上下文）的会话对象
     :raises AdapterError: 类型不认识，或构造/启动失败
@@ -1587,8 +1681,6 @@ def _make_session(kind: str, args: dict[str, Any]) -> Any:
         logic = wrapper.__enter__()
         # wrapper 要留在登记条目里，close 时才能 __exit__。
         return logic, wrapper
-
-    from scrapling.fetchers import StealthySession
 
     # 只有开场才生效的那些设置（block_ads / record_requests / headless / locale /
     # timezone_id / useragent / executable_path / timeout）必须在这里进会话：
@@ -1613,7 +1705,21 @@ def _make_session(kind: str, args: dict[str, Any]) -> Any:
     # 是直连的：模型明确填了 blockWebrtc=false 也会被静默盖掉。
     # 这里整体重写，不继承那份结论。
     common["block_webrtc"] = bool(args.get("blockWebrtc")) or proxy is not None
-    session = StealthySession(**common)
+    session: Any
+    if kind == "remote":
+        from scrapling.fetchers import RemoteSession
+
+        endpoint = _remote_cdp_url(args)
+        # RemoteSession 只接受 context 级参数；real_chrome 会被上游明确拒绝，
+        # executable_path 与 headless 则只对本机启动有意义。
+        common.pop("real_chrome", None)
+        common.pop("executable_path", None)
+        common.pop("headless", None)
+        session = RemoteSession(cdp_url=endpoint, new_context=True, **common)
+    else:
+        from scrapling.fetchers import StealthySession
+
+        session = StealthySession(**common)
     session.start()
     return session, session
 
@@ -1670,7 +1776,7 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
         _SESSIONS[session_id] = placeholder
     entry_lock = placeholder["lock"]
 
-    # browser/stealth 先起属主线程，构造（含 sync_playwright 的启动）整个发生在它上面
+    # stealth/remote 先起属主线程，构造（含 sync_playwright 的启动）整个发生在它上面
     # —— greenlet 绑定从此指向这条线程，之后每次 fetch/close 都转交回来。static 没有
     # 线程亲和，留在调用线程即可。
     worker: _SessionWorker | None = None
@@ -1680,6 +1786,13 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
         else:
             worker = _SessionWorker()
             usable, closer = worker.run(lambda: _make_session(kind, args))
+    except RequestCancelled:
+        if worker is not None:
+            worker.stop()
+        with _SESSION_LOCK:
+            if _SESSIONS.get(session_id) is placeholder:
+                _SESSIONS.pop(session_id, None)
+        raise
     except BaseException as error:
         if worker is not None:
             worker.stop()
@@ -1688,6 +1801,23 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
         if isinstance(error, AdapterError):
             raise
         raise AdapterError("SESSION_OPEN_FAILED", f"{type(error).__name__}: {error}") from error
+
+    try:
+        # 构造可能耗时数百毫秒；返回后先复查，取消时刚建好的浏览器必须先关掉，绝不能
+        # 插进注册表等一个永远不会到来的请求。清理任务在属主线程执行且不受取消影响。
+        raise_if_cancelled()
+    except RequestCancelled:
+        abandoned_entry = {"closer": closer, "type": kind, "lock": entry_lock}
+        if worker is not None:
+            with contextlib.suppress(Exception):
+                worker.run(lambda: _release_entry(abandoned_entry), cancellable=False)
+            worker.stop()
+        else:
+            _release_entry(abandoned_entry)
+        with _SESSION_LOCK:
+            if _SESSIONS.get(session_id) is placeholder:
+                _SESSIONS.pop(session_id, None)
+        raise
 
     with _SESSION_LOCK:
         abandoned = placeholder.get("closed_while_pending") is True
@@ -1704,7 +1834,7 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
                 "settings": _session_settings(kind, args),
                 # 同一把锁：占位时建的那把，盖回来而不是新建 —— 新建会让构造期与使用期各锁各的。
                 "lock": entry_lock,
-                # browser/stealth 的专属执行线程；static 为 None（见 _SessionWorker 的说明）。
+                # stealth/remote 的专属执行线程；static 为 None（见 _SessionWorker 的说明）。
                 "worker": worker,
             }
             created_at = _SESSIONS[session_id]["created_at"]
@@ -1716,7 +1846,7 @@ def session_open(args: dict[str, Any]) -> dict[str, Any]:
             # 浏览器会话的 close 必须在属主线程上跑：Playwright 的同步 API 与创建它的线程
             # 绑定，跨线程调用抛 greenlet 错误，而 _release_entry 会 suppress 掉它 ——
             # 随后 stop() 又把属主线程收掉，这个 Chromium 就再没有任何线程能关。
-            worker.run(lambda: _release_entry(abandoned_entry))
+            worker.run(lambda: _release_entry(abandoned_entry), cancellable=False)
             worker.stop()
         else:
             _release_entry(abandoned_entry)
@@ -1768,6 +1898,7 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
     # 两种实现也都对「多线程同时用同一份会话」零容忍 —— Playwright 的同步 API 靠 greenlet
     # 一次只服务一个线程，curl_cffi 的 Session 文档原话是「一个时刻一个会话」。表现是看不懂
     # 的崩溃，甚至是上下文串台 —— 所以在结构上就不给这个可能。
+    raise_if_cancelled()
     try:
         if entry["type"] == "static":
             with entry["lock"]:
@@ -1775,6 +1906,7 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
                 # 会持锁使用一份已关闭的会话，异常最终被归成 FETCH_FAILED——语义错位。
                 if entry.get("closed") is True:
                     raise AdapterError("NO_SUCH_SESSION", f"no such session: {session_id}")
+                raise_if_cancelled()
                 # 与一次性 fetch 同一条复判：static 会话的请求不经过浏览器的 page.route，
                 # 少了这一道，「Host 判完 → curl_cffi 自己再解析」之间就是敞开的。
                 allowed, reason = guard.url_allowed(url)
@@ -1841,7 +1973,10 @@ def session_fetch(args: dict[str, Any]) -> dict[str, Any]:
             worker: _SessionWorker | None = entry["worker"]
             if worker is None:  # pragma: no cover —— 浏览器条目必有属主线程
                 raise AdapterError("NO_SUCH_SESSION", "session has no owner thread")
+            raise_if_cancelled()
             response = worker.run(lambda: session.fetch(url, **params))
+    except RequestCancelled:
+        raise
     except AdapterError:
         raise
     except Exception as error:
@@ -1866,6 +2001,9 @@ def session_read(args: dict[str, Any]) -> dict[str, Any]:
     if entry["type"] == "static":
         raise AdapterError("BAD_ARGS", "only browser sessions keep a current page")
     extraction_type, css_selector, main_content_only, limit = _extraction(args)
+    snapshot_type = args.get("snapshotType", "text")
+    if not isinstance(snapshot_type, str) or snapshot_type not in {"text", "aria"}:
+        raise AdapterError("BAD_ARGS", "snapshotType must be text or aria")
     worker: _SessionWorker | None = entry["worker"]
     if worker is None:  # pragma: no cover —— 浏览器条目必有属主线程
         raise AdapterError("NO_SUCH_SESSION", "session has no owner thread")
@@ -1880,6 +2018,7 @@ def session_read(args: dict[str, Any]) -> dict[str, Any]:
             max_content_chars=limit,
             include_metadata=bool(args.get("includeMetadata", False)),
             strip_inline_images=_strip_inline_images(args),
+            snapshot_type=snapshot_type,
         )
     )
 
@@ -1917,6 +2056,11 @@ def session_act(args: dict[str, Any]) -> dict[str, Any]:
 def download(args: dict[str, Any]) -> dict[str, Any]:
     """受门禁保护的下载入口。"""
     return media.download(args)
+
+
+def document_read(args: dict[str, Any]) -> dict[str, Any]:
+    """PDF 文本读取入口。"""
+    return document.read(args)
 
 
 def screenshot(args: dict[str, Any]) -> dict[str, Any]:
@@ -2080,7 +2224,7 @@ def _close_entry(session_id: Any) -> None:
         # 浏览器会话的 close 是一次 Playwright 远端调用，必须在属主线程上做；转交进去
         # 还天然排在在途 fetch 之后 —— 「抓取进行中收到 close」会等抓取落地再关，而
         # 不是把一次正在跑的抓取从底下抽走。
-        worker.run(lambda: _release_entry(entry))
+        worker.run(lambda: _release_entry(entry), cancellable=False)
         worker.stop()
         return
     # static 没有属主线程，用 entry 锁：否则「抓取进行中收到 close」会把一次正在跑的
@@ -2130,8 +2274,8 @@ def session_network(args: dict[str, Any]) -> dict[str, Any]:
     worker: _SessionWorker | None = entry["worker"]
     if worker is None:  # pragma: no cover —— 浏览器条目必有属主线程
         raise AdapterError("NO_SUCH_SESSION", "session has no owner thread")
-    matches = worker.run(lambda: _network_summary(recorder, query=query))
-    return {"sessionId": session_id, "count": len(matches), "matches": matches}
+    matches, count = worker.run(lambda: _network_summary_with_count(recorder, query=query))
+    return {"sessionId": session_id, "count": count, "matches": matches}
 
 
 def _state_path(args: dict[str, Any]) -> str:
@@ -2198,6 +2342,8 @@ def _session_state(args: dict[str, Any], *, saving: bool) -> dict[str, Any]:
                 Path(target).chmod(0o600)
         else:
             worker.run(lambda: session.load_state(target))
+    except RequestCancelled:
+        raise
     except FileNotFoundError as error:
         if saving:
             # save 路径的 FileNotFoundError 只能是目录在 mkdir 之后又不可用（竞态、权限）：

@@ -373,6 +373,7 @@ describe("resolveRuntime", () => {
   it("unsupported 的值必须是字符串：平台名到原因的映射写成数字也算坏", () => {
     const text = JSON.stringify({
       darwinArm64: runtimeManifest.darwinArm64,
+      documents: runtimeManifest.documents,
       unsupported: { "win32-x64": 2 },
     });
     expect(() => parseRuntimeManifest(text)).toThrow(/unsupported/u);
@@ -390,6 +391,30 @@ describe("resolveRuntime", () => {
       pythonPath: python,
       via: "repo",
     });
+  });
+
+  it("documents 清单钉住 requirements 路径、版本与文件哈希", () => {
+    expect(runtimeManifest.documents).toMatchObject({
+      requirements: "py/documents-requirements.txt",
+      distribution: "pypdf",
+      version: "7.1.1",
+    });
+    expect(runtimeManifest.documents.sha256).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  it("documents 清单拒绝路径穿越与坏哈希", () => {
+    for (const patch of [
+      { requirements: "../documents-requirements.txt" },
+      { sha256: "ABC" },
+      { version: "latest" },
+    ]) {
+      const text = JSON.stringify({
+        darwinArm64: runtimeManifest.darwinArm64,
+        unsupported: runtimeManifest.unsupported,
+        documents: { ...runtimeManifest.documents, ...patch },
+      });
+      expect(() => parseRuntimeManifest(text)).toThrow(/documents/u);
+    }
   });
 
   it("manifest 钉死 macOS arm64 的哈希与版本", () => {

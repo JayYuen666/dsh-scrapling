@@ -25,6 +25,8 @@ import type {
 } from "@deepseek-ai/dsh-web";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import type { Reader } from "./config-reader.ts";
+import { fetchWithStrategy } from "./fetch-strategy.ts";
+import type { WebFetchStrategy } from "./fetch-strategy.ts";
 import { capText } from "./output.ts";
 import { SidecarError } from "./sidecar-error.ts";
 import type { SidecarClient } from "./sidecar.ts";
@@ -51,6 +53,8 @@ export interface WebProviderDeps {
   readonly maxOutputBytes: Reader<number>;
   /** 单次抓取的协同超时（毫秒）。同样因为 `fetchTimeoutMs` 是 volatile，传读取器。 */
   readonly timeoutMs: Reader<number>;
+  /** 正文读取策略；改值下一次 fetch 就生效。 */
+  readonly fetchStrategy: Reader<WebFetchStrategy>;
 }
 
 /** 本 provider 在 ctx.web 里的 id。 */
@@ -115,6 +119,25 @@ function isUsableStatus(status: unknown): status is number {
   return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599;
 }
 
+/** sidecar 原始回包里参与 web_fetch 协议校验的字段。 */
+type FetchReplyPayload = Pick<FetchReply, "url" | "status" | "content"> & {
+  readonly truncated?: unknown;
+};
+
+/** 完整静态回包是否合乎 web_fetch 协议；自动回退前必须先过这一关。 */
+function isFetchReply(raw: unknown): raw is FetchReplyPayload {
+  if (!isRecord(raw)) {
+    return false;
+  }
+  const { url, status, content } = raw;
+  return (
+    typeof url === "string" &&
+    url.length > 0 &&
+    isUsableStatus(status) &&
+    typeof content === "string"
+  );
+}
+
 /**
  * 读 sidecar 的 fetch 回包；类型与取值一起判。
  *
@@ -127,16 +150,13 @@ function isUsableStatus(status: unknown): status is number {
  * @throws WebError - 形状或取值不合这条协议（`SCRAPLING_FETCH_FAILED`）
  */
 function replyOf(raw: unknown): FetchReply {
-  if (isRecord(raw)) {
-    const { url, status, content, truncated } = raw;
-    if (
-      typeof url === "string" &&
-      url.length > 0 &&
-      isUsableStatus(status) &&
-      typeof content === "string"
-    ) {
-      return { url, status, content, sourceTruncated: truncated === true };
-    }
+  if (isFetchReply(raw)) {
+    return {
+      url: raw.url,
+      status: raw.status,
+      content: raw.content,
+      sourceTruncated: raw.truncated === true,
+    };
   }
   throw new WebError(
     `sidecar returned a malformed fetch reply: ${describeRaw(raw)}`,
@@ -167,7 +187,7 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
     /**
      * 抓一个 URL。
      *
-     * `ctx.web` 的请求里只有 url，所以抽取策略来自本 provider 自己的配置；
+     * `ctx.web` 的请求里只有 url，所以读取策略来自 `webFetchStrategy`；
      * 需要 cssSelector / render / stealth 的走本插件那七个工具，不要用这条路径。
      *
      * @param request - 请求
@@ -180,11 +200,10 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
       // 预算必须是同一刻的三个值，否则「回包说裁到 200k 字符、本地却按另一个预算再裁一次」
       // 这种自相矛盾的结果会成为可能。
       const maxOutputBytes = deps.maxOutputBytes();
-      const timeoutMs = deps.timeoutMs();
       let raw: unknown;
       try {
-        raw = await sidecar.call(
-          "fetch",
+        raw = await fetchWithStrategy(
+          deps,
           {
             url: request.url,
             cssSelector: null,
@@ -192,8 +211,8 @@ export function createWebFetchProvider(deps: WebProviderDeps): WebFetchProvider 
             mainContentOnly: true,
             maxContentChars: maxOutputBytes,
           },
-          // exactOptionalPropertyTypes 下不能直接透传可选的 signal。
-          { ...(signal === undefined ? {} : { signal }), timeoutMs },
+          isFetchReply,
+          signal,
         );
       } catch (error: unknown) {
         // 取消不是故障：sidecar 在 signal 中止时抛的是 SIDECAR_ABORTED，包成抓取失败

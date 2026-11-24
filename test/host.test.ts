@@ -48,6 +48,7 @@ import type { Config as ConfigType, ToolFlags, ToolPlan } from "../host.ts";
 import type { Volatile } from "@deepseek-ai/cordis";
 import { Context } from "@deepseek-ai/cordis";
 import type { SidecarCapabilities } from "../lib/sidecar.ts";
+import type { WebSearchProvider } from "@deepseek-ai/dsh-web";
 import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
 import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
 import { LOCAL_PYTHON } from "./python-bin.ts";
@@ -85,6 +86,7 @@ const ALL_ON: ToolFlags = {
   sessionRead: true,
   sessionActions: true,
   download: true,
+  documents: true,
   screenshot: true,
 };
 
@@ -104,6 +106,7 @@ const ALL_OFF: ToolFlags = {
   sessionRead: false,
   sessionActions: false,
   download: false,
+  documents: false,
   screenshot: false,
 };
 
@@ -126,6 +129,7 @@ const FULL_CAPS: SidecarCapabilities = {
   static: true,
   extract: true,
   browser: true,
+  documents: true,
   version: "0.5",
   writeMethods: false,
 };
@@ -156,6 +160,14 @@ function volatileRef(key: string): Volatile<unknown> {
     throw new Error(`config field is not a volatile ref: ${key}`);
   }
   return ref as unknown as Volatile<unknown>;
+}
+
+/** 从 schema 产物里读出一枚 volatile 引用的当前值；形状不对时直接点名失败。 */
+function volatileValueOf(raw: unknown): unknown {
+  if (!isRecord(raw) || typeof raw["get"] !== "function") {
+    throw new Error("config field is not a volatile ref");
+  }
+  return Reflect.apply(raw["get"], raw, []);
 }
 
 /** 设置服务 `describe()` 交回的一行：命名空间名加它当前的取值。 */
@@ -274,6 +286,7 @@ function toolsStub(): { names: string[]; face: unknown } {
 }
 
 type Mode = "native" | "mcp" | "official-mcp";
+type ToolLoading = "eager" | "on-demand";
 
 /**
  * 造一份与宿主同形的配置：volatile 字段是引用，部署级字段是真值。
@@ -301,6 +314,8 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     (overrides[key] as "bfs" | "dfs" | undefined) ?? fallback;
   const plainChoice3 = (key: string, fallback: Mode): Mode =>
     (overrides[key] as Mode | undefined) ?? fallback;
+  const plainToolLoading = (key: string, fallback: ToolLoading): ToolLoading =>
+    (overrides[key] as ToolLoading | undefined) ?? fallback;
   return {
     pythonBin: pick("pythonBin", ""),
     failFastOnMissingPython: pick("failFastOnMissingPython", true),
@@ -318,13 +333,18 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     sessionReadEnabled: pick("sessionReadEnabled", true),
     sessionActionsEnabled: pick("sessionActionsEnabled", true),
     downloadEnabled: pick("downloadEnabled", true),
+    documentsEnabled: pick("documentsEnabled", true),
     screenshotEnabled: pick("screenshotEnabled", true),
     allowBrowserActions: plainFlag("allowBrowserActions", false),
     allowFileDownloads: plainFlag("allowFileDownloads", false),
     downloadMaxBytes: plain("downloadMaxBytes", 10 * 1024 * 1024),
+    documentMaxBytes: plain("documentMaxBytes", 20 * 1024 * 1024),
+    documentMaxPages: plain("documentMaxPages", 200),
+    documentMaxOutputChars: pick("documentMaxOutputChars", 200_000),
     extractionType: pick("extractionType", "markdown"),
     mainContentOnly: pick("mainContentOnly", true),
     fetchMaxOutputChars: pick("fetchMaxOutputChars", 200_000),
+    searchMaxOutputBytes: pick("searchMaxOutputBytes", 24_000),
     extractMaxOutputChars: pick("extractMaxOutputChars", 200_000),
     renderMaxOutputChars: pick("renderMaxOutputChars", 200_000),
     xhrMaxOutputChars: pick("xhrMaxOutputChars", 120_000),
@@ -343,6 +363,7 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     maxUrlLength: plain("maxUrlLength", 2048),
     browserExecutablePath: plainText("browserExecutablePath", ""),
     browserInitScript: plainText("browserInitScript", ""),
+    browserCdpUrl: plainText("browserCdpUrl", ""),
     browserRealChrome: plainFlag("browserRealChrome", false),
     browserDnsOverHttps: plainFlag("browserDnsOverHttps", false),
     recordRequests: plainFlag("recordRequests", false),
@@ -359,17 +380,23 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
     allowWriteMethods: plainFlag("allowWriteMethods", false),
     integrationMode: plainChoice3("integrationMode", "native"),
     mcpPort: plain("mcpPort", 39_217),
+    mcpToolLoading: plainToolLoading("mcpToolLoading", "eager"),
     officialMcpEnabled: plainFlag("officialMcpEnabled", false),
     nat64Prefixes: pick("nat64Prefixes", ""),
     dataDir: pick("dataDir", ""),
     provideWebFetch: pick("provideWebFetch", true),
     provideWebSearch: pick("provideWebSearch", true),
+    webFetchStrategy: pick("webFetchStrategy", "auto"),
     searchBackend: pick("searchBackend", "auto"),
     searchPublicFallback: pick("searchPublicFallback", false),
     tavilyApiKey: pick("tavilyApiKey", ""),
     braveApiKey: pick("braveApiKey", ""),
     serperApiKey: pick("serperApiKey", ""),
     searxngEndpoint: pick("searxngEndpoint", ""),
+    deepseekSearchEndpoint: plainText(
+      "deepseekSearchEndpoint",
+      "https://api.deepseek.com/v1/tools/search",
+    ),
     duckduckgoEndpoint: plainText("duckduckgoEndpoint", "https://html.duckduckgo.com/html/"),
     tavilyApiEndpoint: plainText("tavilyApiEndpoint", "https://api.tavily.com/search"),
     bingEndpoint: plainText("bingEndpoint", "https://www.bing.com/search"),
@@ -386,6 +413,7 @@ function makeConfig(overrides: Record<string, unknown> = {}): ConfigType {
 
 /** 本仓探测脚本用的解释器是否就位。不就位时下面这些用例整条跳过，而不是跑起来却什么都不校验。 */
 const HAS_LOCAL_PYTHON = existsSync(LOCAL_PYTHON);
+const DEEPSEEK_TEST_ENDPOINT = "https://search.example.test/v1/tools/search";
 
 /** 工具没被注册时的报错文案。 */
 const NOT_REGISTERED = "scrapling_crawl was not registered";
@@ -449,6 +477,65 @@ describe("config schema", () => {
     expect(volatileRef("provideWebSearch").get()).toBe(true);
   });
 
+  it("webFetchStrategy 默认 auto，且只接受 static / auto / browser", () => {
+    expect(volatileRef("webFetchStrategy").get()).toBe("auto");
+    for (const strategy of ["static", "auto", "browser"] as const) {
+      const ref = asRecord(configSchema({ webFetchStrategy: strategy }))["webFetchStrategy"];
+      expect(volatileValueOf(ref)).toBe(strategy);
+    }
+    expect(() => configSchema({ webFetchStrategy: "render" as never })).toThrow(
+      /webFetchStrategy/u,
+    );
+  });
+
+  it("搜索聚合预算默认 24,000 字节，可热改且不低于 1", () => {
+    expect(volatileRef("searchMaxOutputBytes").get()).toBe(24_000);
+    for (const value of [1, 64_000, 128_000]) {
+      const ref = asRecord(configSchema({ searchMaxOutputBytes: value }))["searchMaxOutputBytes"];
+      expect(volatileValueOf(ref)).toBe(value);
+    }
+    expect(() => configSchema({ searchMaxOutputBytes: 0 })).toThrow(/searchMaxOutputBytes/u);
+  });
+
+  it("deepseek 搜索端点默认官方地址，且属于部署配置", () => {
+    const config = asRecord(configSchema({}));
+    expect(config["deepseekSearchEndpoint"]).toBe("https://api.deepseek.com/v1/tools/search");
+    expect(config["deepseekSearchEndpoint"]).not.toBeTypeOf("object");
+    expect(
+      asRecord(configSchema({ deepseekSearchEndpoint: DEEPSEEK_TEST_ENDPOINT }))[
+        "deepseekSearchEndpoint"
+      ],
+    ).toBe(DEEPSEEK_TEST_ENDPOINT);
+  });
+
+  it("mcpToolLoading 默认 eager，只接受 eager / on-demand，且属于部署配置", () => {
+    const config = asRecord(configSchema({}));
+    expect(config["mcpToolLoading"]).toBe("eager");
+    expect(config["mcpToolLoading"]).not.toBeTypeOf("object");
+    for (const toolLoading of ["eager", "on-demand"] as const) {
+      expect(asRecord(configSchema({ mcpToolLoading: toolLoading }))["mcpToolLoading"]).toBe(
+        toolLoading,
+      );
+    }
+    expect(() => configSchema({ mcpToolLoading: "lazy" as never })).toThrow(/mcpToolLoading/u);
+  });
+
+  it("browserCdpUrl 默认留空且属于部署配置", () => {
+    const config = asRecord(configSchema({}));
+    expect(config["browserCdpUrl"]).toBe("");
+    expect(config["browserCdpUrl"]).not.toBeTypeOf("object");
+    const endpoint = "http://127.0.0.1:9222";
+    expect(asRecord(configSchema({ browserCdpUrl: endpoint }))["browserCdpUrl"]).toBe(endpoint);
+  });
+
+  it("pdf 默认上限与开关符合任务契约", () => {
+    expect(volatileRef("documentsEnabled").get()).toBe(true);
+    const config = asRecord(configSchema({}));
+    expect(config["documentMaxBytes"]).toBe(20 * 1024 * 1024);
+    expect(config["documentMaxPages"]).toBe(200);
+    expect(volatileRef("documentMaxOutputChars").get()).toBe(200_000);
+  });
+
   it("抽取默认 markdown 且只取 body —— 与 dsh 内置 web_fetch 的呈现规则对齐", () => {
     expect(volatileRef("extractionType").get()).toBe("markdown");
     expect(volatileRef("mainContentOnly").get()).toBe(true);
@@ -488,9 +575,9 @@ describe("volatile 快照", () => {
 });
 
 describe("工具注册计划", () => {
-  it("全开且环境齐备（含 sessionStateDir）时十九个工具全注册", () => {
+  it("全开且环境齐备（含 sessionStateDir）时二十个工具全注册", () => {
     const { ready, skipped } = planTools(ALL_ON, FULL_CAPS, true, true, true);
-    expect(ready).toHaveLength(19);
+    expect(ready).toHaveLength(20);
     expect(ready).toStrictEqual(TOOL_SPECS.map((spec) => spec.name));
     expect(skipped).toStrictEqual([]);
   });
@@ -499,7 +586,7 @@ describe("工具注册计划", () => {
     // sessionStateDir 留空是出厂状态：sidecar 对这两只一律回 SESSION_STATE_DISABLED，
     // 注册出去就是两只注定失败的工具，所以计划里直接不出现（F4/F11）。
     const plan = planTools(ALL_ON, FULL_CAPS, true);
-    expect(plan.ready).toHaveLength(17);
+    expect(plan.ready).toHaveLength(18);
     expect(plan.ready).not.toContain("scrapling_session_state_save");
     expect(plan.ready).not.toContain("scrapling_session_state_load");
     expect(plan.skipped).toStrictEqual([
@@ -510,7 +597,7 @@ describe("工具注册计划", () => {
 
   it("用户关掉的工具不注册，原因记为 disabled", () => {
     const plan = planTools({ ...ALL_ON, crawl: false, answer: false }, FULL_CAPS, true, true, true);
-    expect(plan.ready).toHaveLength(17);
+    expect(plan.ready).toHaveLength(18);
     expect(plan.skipped).toStrictEqual([
       { name: "scrapling_crawl", reason: "disabled" },
       { name: "scrapling_answer", reason: "disabled" },
@@ -537,6 +624,7 @@ describe("工具注册计划", () => {
       "scrapling_crawl",
       "scrapling_answer",
       "scrapling_download",
+      "scrapling_read_document",
     ]);
     expect(plan.skipped).toStrictEqual([
       { name: "scrapling_render", reason: BROWSER_MISSING },
@@ -545,6 +633,16 @@ describe("工具注册计划", () => {
       { name: "scrapling_session_act", reason: BROWSER_MISSING },
       { name: "scrapling_screenshot", reason: BROWSER_MISSING },
     ]);
+  });
+
+  it("只有 remote 能力时也注册会话读取、动作与截图", () => {
+    const caps: SidecarCapabilities = { ...FULL_CAPS, browser: false, remote: true };
+    const plan = planTools(ALL_ON, caps, true, true, true);
+    expect(plan.ready).toContain("scrapling_session_read");
+    expect(plan.ready).toContain("scrapling_session_act");
+    expect(plan.ready).toContain("scrapling_screenshot");
+    expect(plan.ready).not.toContain("scrapling_render");
+    expect(plan.ready).not.toContain("scrapling_capture_xhr");
   });
 
   it("没有 attachment 服务时截图不注册，其余照常", () => {
@@ -566,17 +664,33 @@ describe("工具注册计划", () => {
     expect(open.download).toBe(true);
   });
 
-  it("scrapling 缺失时一个工具都不注册", () => {
+  it("scrapling 缺失时只保留独立的 PDF 阅读能力", () => {
     const caps: SidecarCapabilities = { ...FULL_CAPS, scrapling: false };
     const plan = planTools(ALL_ON, caps, true);
-    expect(plan.ready).toStrictEqual([]);
-    expect(plan.skipped).toHaveLength(TOOL_SPECS.length);
+    expect(plan.ready).toStrictEqual(["scrapling_read_document"]);
+    expect(plan.skipped).toHaveLength(TOOL_SPECS.length - 1);
   });
 
-  it("尚未握手成功（capabilities 为 undefined）等价于缺 scrapling", () => {
+  it("缺 pypdf 时 PDF 工具不注册，其余工具照常", () => {
+    const caps: SidecarCapabilities = { ...FULL_CAPS, documents: false };
+    const plan = planTools(ALL_ON, caps, true, true, true);
+    expect(plan.ready).not.toContain("scrapling_read_document");
+    expect(plan.skipped).toContainEqual({
+      name: "scrapling_read_document",
+      reason: "documents-missing",
+    });
+  });
+
+  it("尚未握手成功时所有工具都不可注册，并按依赖点名原因", () => {
     const plan = planTools(ALL_ON, undefined, true);
     expect(plan.ready).toStrictEqual([]);
-    expect(plan.skipped.every((item) => item.reason === "scrapling-missing")).toBe(true);
+    expect(
+      plan.skipped.every((item) =>
+        item.name === "scrapling_read_document"
+          ? item.reason === "documents-missing"
+          : item.reason === "scrapling-missing",
+      ),
+    ).toBe(true);
   });
 
   it("全关时 ready 为空、skipped 记满 disabled", () => {
@@ -623,6 +737,7 @@ describe("每个工具的输出预算各走各的旋钮", () => {
       extractMaxOutputChars: 222,
       renderMaxOutputChars: 333,
       xhrMaxOutputChars: 444,
+      documentMaxOutputChars: 555,
     });
     expect(outputBudgetOf(config, "scrapling_fetch")).toBe(111);
     expect(outputBudgetOf(config, "scrapling_extract")).toBe(222);
@@ -632,6 +747,7 @@ describe("每个工具的输出预算各走各的旋钮", () => {
     expect(outputBudgetOf(config, "scrapling_links")).toBe(222);
     expect(outputBudgetOf(config, "scrapling_render")).toBe(333);
     expect(outputBudgetOf(config, "scrapling_capture_xhr")).toBe(444);
+    expect(outputBudgetOf(config, "scrapling_read_document")).toBe(555);
     // 会话类产出的是句柄与列表而非页面正文，跟渲染同档；爬虫、网络历史与登录态存取同理。
     expect(outputBudgetOf(config, "scrapling_session_list")).toBe(333);
     expect(outputBudgetOf(config, "scrapling_session_network")).toBe(333);
@@ -867,12 +983,12 @@ describe("host 侧文案跟随官方 locale 偏好", () => {
     expect(text).not.toContain("scrapling_fetch");
   });
 
-  it("英文栏的十五条指引一条不漏，且逐条都不残留中文", () => {
+  it("英文栏的十六条指引一条不漏，且逐条都不残留中文", () => {
     // skill 正文就是 `guidanceFor(全开, 全部可见, messages)` 的产物，它在真装配里按
-    // `plan.ready` 现算、随语言表切换。这里直接打那一层：把 19 个工具都拉起来要真 sidecar，
+    // `plan.ready` 现算、随语言表切换。这里直接打那一层：把 20 个工具都拉起来要真 sidecar，
     // 而这条验的是**文案**，与注册环境无关。
     const en = guidanceFor(ALL_ON, EVERYWHERE, MESSAGES.en);
-    expect(en.split("\n"), "全开时该有十五条指引").toHaveLength(Object.keys(ALL_ON).length);
+    expect(en.split("\n"), "全开时该有十六条指引").toHaveLength(Object.keys(ALL_ON).length);
     expect(en).not.toMatch(HAN_RESIDUE);
     expect(en).toContain("scrapling_fetch");
     // 反向钉子：中文那一份必须真的含汉字，否则上面那句「不残留中文」在恒空实现下也会绿。
@@ -1277,7 +1393,7 @@ describe("apply", () => {
       const settingsRegistrations: string[] = [];
       const registered: string[] = [];
       const jobsStub = {
-        // 这条验的是「全能力时 19 个工具全注册」，所以作业后端要报可用；本用例不发起作业，
+        // 这条验的是「全能力时 20 个工具全注册」，所以作业后端要报可用；本用例不发起作业，
         // 这一支只是把 id 回掉，不代表 apply 里存在什么探测作业。
         start: (): string => CRAWL_JOB_ID,
         // 本包起作业时自己挂 controller（见 startUnderCrawlController）。
@@ -1383,6 +1499,7 @@ describe("apply", () => {
             "scrapling_crawl",
             "scrapling_answer",
             "scrapling_session_read",
+            ...(caps.documents ? ["scrapling_read_document"] : []),
           ]
         : [
             "scrapling_fetch",
@@ -1392,6 +1509,7 @@ describe("apply", () => {
             ...sessionTools,
             "scrapling_crawl",
             "scrapling_answer",
+            ...(caps.documents ? ["scrapling_read_document"] : []),
           ];
       expect(registered).toStrictEqual(expected);
 
@@ -1418,6 +1536,7 @@ describe("apply", () => {
           sessionReadEnabled: false,
           sessionActionsEnabled: false,
           downloadEnabled: false,
+          documentsEnabled: false,
           screenshotEnabled: false,
         }),
       );
@@ -1496,6 +1615,7 @@ const CRAWL_SETTINGS = {
   crawlMaxRuntimeSeconds: 600,
   browserExecutablePath: "",
   browserInitScript: "",
+  browserCdpUrl: "",
   browserRealChrome: false,
   browserDnsOverHttps: false,
   recordRequests: false,
@@ -1515,6 +1635,8 @@ const CRAWL_SETTINGS = {
   stripInlineImages: true,
   downloadDir: path.join(os.tmpdir(), "scrapling-downloads"),
   downloadMaxBytes: 10_000_000,
+  documentMaxBytes: 20 * 1024 * 1024,
+  documentMaxPages: 200,
 } satisfies ToolSettings;
 
 /**
@@ -1833,6 +1955,8 @@ interface JobHarness {
   terminated: () => number;
   /** 注册到 ctx.web 的 provider，按接缝分。 */
   webProviders: { fetch: string[]; search: string[] };
+  /** 最近注册的 search provider，供 ready() 契约直接调用。 */
+  searchProvider: WebSearchProvider | undefined;
   /** 拆掉夹具自己起的 sidecar，免得拖到进程退出。 */
   dispose: () => void;
 }
@@ -1842,7 +1966,13 @@ interface JobHarness {
  *
  * @returns 替身
  */
-function makeJobHarness({ withoutJobs = false }: { withoutJobs?: boolean } = {}): JobHarness {
+function makeJobHarness({
+  withoutJobs = false,
+  services = {},
+}: {
+  withoutJobs?: boolean;
+  services?: Record<string, unknown>;
+} = {}): JobHarness {
   const tools = new Map<string, { execute?: (args: unknown, run: unknown) => unknown }>();
   const state: {
     hooks?: { cancel: () => void; done: Promise<unknown> };
@@ -1852,6 +1982,7 @@ function makeJobHarness({ withoutJobs = false }: { withoutJobs?: boolean } = {})
   } = { terminated: 0, output: [], progress: [] };
   const disposers: (() => unknown)[] = [];
   const webProviders: { fetch: string[]; search: string[] } = { fetch: [], search: [] };
+  let searchProvider: WebSearchProvider | undefined;
   // 可选服务按文档用 ctx.get(name) 取，夹具要同时给 get 与 jobs。
   //
   // 这个夹具**复刻真实注册表的闸门**：没有 controller 附着时 start 抛
@@ -1931,18 +2062,23 @@ function makeJobHarness({ withoutJobs = false }: { withoutJobs?: boolean } = {})
         webProviders.fetch.push(provider.id);
         return (): void => undefined;
       },
-      registerSearchProvider: (provider: { id: string }): (() => void) => {
+      registerSearchProvider: (provider: WebSearchProvider): (() => void) => {
         webProviders.search.push(provider.id);
+        searchProvider = provider;
         return (): void => undefined;
       },
     },
-    get: (service: string): unknown => (withoutJobs || service !== "jobs" ? undefined : jobsStub),
+    get: (service: string): unknown =>
+      services[service] ?? (withoutJobs || service !== "jobs" ? undefined : jobsStub),
     jobs: jobsStub,
   } as unknown as never;
   return {
     ctx,
     tools,
     webProviders,
+    get searchProvider(): WebSearchProvider | undefined {
+      return searchProvider;
+    },
     dispose: (): void => {
       for (const disposeOne of disposers) {
         disposeOne();
@@ -2179,7 +2315,7 @@ describe("爬虫作业的取消与失败", () => {
 });
 
 describe("两个 web provider 的热改项读取器", () => {
-  it("八位读取器每次都取当下的值，而不是装配时的快照", () => {
+  it("十位读取器每次都取当下的值，而不是装配时的快照", () => {
     // 判据是「同一个读取器对象，两次调用之间改配置」。抄了值的实现第二次仍回旧值，
     // 而生产里的症状是「设置卡拧了旋钮、运行行为一点没变」，回包与日志都看不出异常。
     const holder = {
@@ -2190,7 +2326,9 @@ describe("两个 web provider 的热改项读取器", () => {
       searxngEndpoint: "",
       publicFallback: false,
       maxOutputBytes: 200_000,
+      searchMaxOutputBytes: 24_000,
       timeoutMs: 120_000,
+      fetchStrategy: "auto" as "static" | "auto" | "browser",
     };
     const config = makeConfig({});
     Object.assign(config, {
@@ -2201,7 +2339,9 @@ describe("两个 web provider 的热改项读取器", () => {
       searxngEndpoint: { get: () => holder.searxngEndpoint },
       searchPublicFallback: { get: () => holder.publicFallback },
       fetchMaxOutputChars: { get: () => holder.maxOutputBytes },
+      searchMaxOutputBytes: { get: () => holder.searchMaxOutputBytes },
       fetchTimeoutMs: { get: () => holder.timeoutMs },
+      webFetchStrategy: { get: () => holder.fetchStrategy },
     });
     const readers = providerReadersOf(config);
     expect([
@@ -2212,8 +2352,10 @@ describe("两个 web provider 的热改项读取器", () => {
       readers.searxngEndpoint(),
       readers.publicFallback(),
       readers.maxOutputBytes(),
+      readers.searchMaxOutputBytes(),
       readers.timeoutMs(),
-    ]).toStrictEqual(["tavily", "", "", "", "", false, 200_000, 120_000]);
+      readers.fetchStrategy(),
+    ]).toStrictEqual(["tavily", "", "", "", "", false, 200_000, 24_000, 120_000, "auto"]);
 
     Object.assign(holder, {
       backend: "searxng",
@@ -2223,7 +2365,9 @@ describe("两个 web provider 的热改项读取器", () => {
       searxngEndpoint: "https://searx.test",
       publicFallback: true,
       maxOutputBytes: 4000,
+      searchMaxOutputBytes: 64_000,
       timeoutMs: 30_000,
+      fetchStrategy: "browser",
     });
     expect([
       readers.backend(),
@@ -2233,7 +2377,9 @@ describe("两个 web provider 的热改项读取器", () => {
       readers.searxngEndpoint(),
       readers.publicFallback(),
       readers.maxOutputBytes(),
+      readers.searchMaxOutputBytes(),
       readers.timeoutMs(),
+      readers.fetchStrategy(),
     ]).toStrictEqual([
       "searxng",
       "tvly-live",
@@ -2242,7 +2388,9 @@ describe("两个 web provider 的热改项读取器", () => {
       "https://searx.test",
       true,
       4000,
+      64_000,
       30_000,
+      "browser",
     ]);
   });
 });
@@ -2442,6 +2590,50 @@ describe("接管 ctx.web 的两个接缝", () => {
       harness.dispose();
     }
   });
+
+  it.runIf(HAS_LOCAL_PYTHON)(
+    "search 接缝：deepseek 从可选 auth 服务与部署端点执行 ready",
+    async () => {
+      const requests: { destination: { url: string } }[] = [];
+      const deepseekAuth = {
+        candidates: (request: { destination: { url: string } }) => {
+          requests.push(request);
+          return [
+            {
+              kind: "api-key",
+              endpoint: request.destination.url,
+              configured: () => Promise.resolve(true),
+              resolve: () => Promise.resolve(undefined),
+            },
+          ];
+        },
+        authorize: () => Promise.resolve(undefined),
+      };
+      const harness = makeJobHarness({ services: { deepseekAuth } });
+      try {
+        await apply(
+          harness.ctx,
+          makeConfig({
+            pythonBin: LOCAL_PYTHON,
+            provideWebFetch: false,
+            provideWebSearch: true,
+            searchBackend: "deepseek",
+            deepseekSearchEndpoint: DEEPSEEK_TEST_ENDPOINT,
+            allowedHosts: LOOPBACK_ALLOWLIST,
+          }),
+        );
+        expect(harness.webProviders.search).toStrictEqual(["scrapling"]);
+        const provider = harness.searchProvider;
+        if (provider?.ready === undefined) {
+          throw new Error("search provider must implement ready()");
+        }
+        await expect(provider.ready("deepseek-official")).resolves.toBe(true);
+        expect(requests[0]?.destination.url).toBe(DEEPSEEK_TEST_ENDPOINT);
+      } finally {
+        harness.dispose();
+      }
+    },
+  );
 
   it("fetch 接缝：sidecar 不可用时跳过注册并记一条警告", async () => {
     // spawn 一律抛 = sidecar 起不来；provider 的 available() 契约要求只看本地状态，
@@ -2758,35 +2950,40 @@ async function tearDown(harness: ReturnType<typeof surfaceHarness>): Promise<voi
 }
 
 describe("mcp 模式的装配", () => {
-  it("mcpManager 可用时把自有 server 动态注册为 streamable-http", async () => {
-    const harness = surfaceHarness();
-    const calls: { name: string; entry: Record<string, unknown> }[] = [];
-    (harness.ctx as { get: (name: string) => unknown }).get = (serviceName) =>
-      serviceName === "mcpManager"
-        ? {
-            register: (serverName: string, entry: Record<string, unknown>) => {
-              calls.push({ name: serverName, entry });
-              return () => {
-                /* 撤除由 ctx.effect 管，测试不单独断言 */
-              };
-            },
-          }
-        : undefined;
-    await startMcpSurface({
-      ctx: harness.ctx as never,
-      config: makeConfig({ mcpPort: 0 }),
-      plan: MCP_PLAN,
-      depsFor: STUB_DEPS,
-      search: LIVE_SEARCH as never,
-      env: {},
-    });
-    expect(calls).toHaveLength(1);
-    const [call] = calls;
-    expect(call?.name).toBe("scrapling");
-    expect(call?.entry["transport"]).toBe("streamable-http");
-    expect(String(call?.entry["url"])).toContain("127.0.0.1");
-    expect(harness.logs.join("\n")).toContain("已动态注册到宿主 mcpManager");
-  });
+  it.each(["eager", "on-demand"] as const)(
+    "mcpManager 可用时把自有 server 动态注册为 streamable-http（toolLoading=%s）",
+    async (toolLoading) => {
+      const harness = surfaceHarness();
+      const calls: { name: string; entry: Record<string, unknown> }[] = [];
+      (harness.ctx as { get: (name: string) => unknown }).get = (serviceName) =>
+        serviceName === "mcpManager"
+          ? {
+              register: (serverName: string, entry: Record<string, unknown>) => {
+                calls.push({ name: serverName, entry });
+                return () => {
+                  /* 撤除由 ctx.effect 管，测试不单独断言 */
+                };
+              },
+            }
+          : undefined;
+      await startMcpSurface({
+        ctx: harness.ctx as never,
+        config: makeConfig({ mcpPort: 0, mcpToolLoading: toolLoading }),
+        plan: MCP_PLAN,
+        depsFor: STUB_DEPS,
+        search: LIVE_SEARCH as never,
+        env: {},
+      });
+      expect(calls).toHaveLength(1);
+      const [call] = calls;
+      expect(call?.name).toBe("scrapling");
+      expect(call?.entry["transport"]).toBe("streamable-http");
+      expect(call?.entry["toolLoading"]).toBe(toolLoading);
+      expect(String(call?.entry["url"])).toContain("127.0.0.1");
+      expect(harness.logs.join("\n")).toContain("已动态注册到宿主 mcpManager");
+      await tearDown(harness);
+    },
+  );
 
   it("mcpManager 注册抛错时回退既有接入并告警", async () => {
     const harness = surfaceHarness();
@@ -2847,33 +3044,38 @@ describe("mcp 模式的装配", () => {
     await Promise.all(harness.disposers.map((dispose) => dispose()));
   });
 
-  it("official-mcp 模式且开关打开时把官方 server 动态注册到宿主", async () => {
-    const harness = degradedHarness();
-    const calls: { name: string; entry: Record<string, unknown> }[] = [];
-    (harness.ctx as { get: (name: string) => unknown }).get = (serviceName) =>
-      serviceName === "mcpManager"
-        ? {
-            register: (serverName: string, entry: Record<string, unknown>) => {
-              calls.push({ name: serverName, entry });
-              return (): void => undefined;
-            },
-          }
-        : undefined;
-    await apply(
-      harness.ctx,
-      makeConfig({
-        pythonBin: "",
-        failFastOnMissingPython: false,
-        integrationMode: "official-mcp",
-        officialMcpEnabled: true,
-      }),
-    );
-    expect(harness.names).toStrictEqual([]);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.entry["transport"]).toBe("stdio");
-    expect(harness.infos.join("\n")).toContain("官方 scrapling-mcp 已动态注册");
-    await Promise.all(harness.disposers.map((dispose) => dispose()));
-  });
+  it.each(["eager", "on-demand"] as const)(
+    "official-mcp 模式且开关打开时把官方 server 动态注册到宿主（toolLoading=%s）",
+    async (toolLoading) => {
+      const harness = degradedHarness();
+      const calls: { name: string; entry: Record<string, unknown> }[] = [];
+      (harness.ctx as { get: (name: string) => unknown }).get = (serviceName) =>
+        serviceName === "mcpManager"
+          ? {
+              register: (serverName: string, entry: Record<string, unknown>) => {
+                calls.push({ name: serverName, entry });
+                return (): void => undefined;
+              },
+            }
+          : undefined;
+      await apply(
+        harness.ctx,
+        makeConfig({
+          pythonBin: "",
+          failFastOnMissingPython: false,
+          integrationMode: "official-mcp",
+          mcpToolLoading: toolLoading,
+          officialMcpEnabled: true,
+        }),
+      );
+      expect(harness.names).toStrictEqual([]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.entry["transport"]).toBe("stdio");
+      expect(calls[0]?.entry["toolLoading"]).toBe(toolLoading);
+      expect(harness.infos.join("\n")).toContain("官方 scrapling-mcp 已动态注册");
+      await Promise.all(harness.disposers.map((dispose) => dispose()));
+    },
+  );
 
   it.runIf(HAS_LOCAL_PYTHON)(
     "mcp 模式下真宿主、真 sidecar 与真 MCP 客户端能走通一次 fetch",

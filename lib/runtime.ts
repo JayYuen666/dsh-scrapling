@@ -41,8 +41,16 @@ export interface RuntimeAsset {
   sizeBytes: number;
 }
 
+export interface RuntimeDocumentsPack {
+  requirements: "py/documents-requirements.txt";
+  distribution: "pypdf";
+  version: string;
+  sha256: string;
+}
+
 export interface RuntimeManifest {
   darwinArm64: RuntimeAsset;
+  documents: RuntimeDocumentsPack;
   unsupported: Record<string, string>;
 }
 
@@ -73,8 +81,16 @@ const RUNTIME_ASSET_SCHEMA = z.object({
   sizeBytes: z.int().positive(),
 });
 
+const DOCUMENTS_PACK_SCHEMA = z.object({
+  requirements: z.literal("py/documents-requirements.txt"),
+  distribution: z.literal("pypdf"),
+  version: z.string().regex(/^\d+\.\d+\.\d+$/u, "version 必须是三段数字的版本号"),
+  sha256: z.string().regex(SHA256_HEX, "sha256 必须是 64 位小写十六进制"),
+});
+
 const RUNTIME_MANIFEST_SCHEMA: z.ZodType<RuntimeManifest> = z.object({
   darwinArm64: RUNTIME_ASSET_SCHEMA,
+  documents: DOCUMENTS_PACK_SCHEMA,
   unsupported: z.record(z.string(), z.string()),
 });
 
@@ -152,6 +168,9 @@ function loadRuntimeManifest(): RuntimeManifest {
 export const runtimeManifest: RuntimeManifest = {
   get darwinArm64() {
     return loadRuntimeManifest().darwinArm64;
+  },
+  get documents() {
+    return loadRuntimeManifest().documents;
   },
   get unsupported() {
     return loadRuntimeManifest().unsupported;

@@ -9,6 +9,7 @@ export const RUNTIME_PACKS = [
   "browser",
   "search",
   "media",
+  "documents",
   "adaptive-redis",
   "mcp",
 ] as const;

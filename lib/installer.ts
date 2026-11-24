@@ -776,6 +776,10 @@ export async function installCore(options: {
   dataDir: string;
   repoRoot: string;
   io: InstallerIO;
+  /** 是否把可选 documents 的钉版 requirements 一起装进 venv。 */
+  documents?: boolean;
+  /** 本次装的是 documents 包时，提交状态要同时标记它。 */
+  markDocuments?: boolean;
   /** 离线资产目录：给了就只从 `<assets>/wheels` 取 wheel，pip 不许联网。 */
   assets?: string;
 }): Promise<void> {
@@ -787,6 +791,22 @@ export async function installCore(options: {
     // 旧 venv 挪去这里而不是直接删：换装失败时要能把它原样搬回来。
     const previousVenv = path.join(runtimeDir, ".tmp", `venv-previous-${randomUUID()}`);
     const requirements = path.join(options.repoRoot, "py", "runtime-requirements.txt");
+    const requirementFiles = [requirements];
+    if (options.documents === true) {
+      const documentsRequirements = path.join(
+        options.repoRoot,
+        runtimeManifest.documents.requirements,
+      );
+      const bytes = await readFile(documentsRequirements);
+      const digest = createHash("sha256").update(bytes).digest("hex");
+      if (digest !== runtimeManifest.documents.sha256) {
+        throw new InstallError(
+          "INSTALL_HASH_MISMATCH",
+          `documents requirements hash ${digest} does not match ${runtimeManifest.documents.sha256}`,
+        );
+      }
+      requirementFiles.push(documentsRequirements);
+    }
     let movedAside = false;
     // 「换装完成」以状态写成功为准，不是以 rename 成功为准：venv 换过去之后还要把
     // state.json 写成功，那才算这一次安装真的落地。rename 成功而状态写入失败时若就此收工，
@@ -813,8 +833,7 @@ export async function installCore(options: {
           "install",
           "--only-binary=:all:",
           "--require-hashes",
-          "-r",
-          requirements,
+          ...requirementFiles.flatMap((file) => ["-r", file]),
           ...offlineArgs,
         ],
         { env: { PIP_DISABLE_PIP_VERSION_CHECK: "1" } },
@@ -851,6 +870,7 @@ export async function installCore(options: {
       const packs = {
         ...(isPlainRecord(previous["packs"]) ? previous["packs"] : {}),
         core: "ready",
+        ...(options.markDocuments === true ? { documents: "ready" } : {}),
       };
       await writeRuntimeState(options.dataDir, {
         ...previous,
@@ -878,6 +898,17 @@ async function hasChromiumUnder(browsersPath: string): Promise<boolean> {
 
 async function chromiumInstalled(dataDir: string): Promise<boolean> {
   return hasChromiumUnder(path.join(dataDir, "runtime", "browsers"));
+}
+
+/** documents 的就绪判据：钉版 pypdf 的 dist-info 真在共享 venv 里。 */
+async function documentsInstalled(dataDir: string): Promise<boolean> {
+  const marker = `${runtimeManifest.documents.distribution}-${runtimeManifest.documents.version}.dist-info`;
+  try {
+    const entries = await readdir(path.join(dataDir, "runtime", "venv"), { recursive: true });
+    return entries.some((entry) => path.basename(entry) === marker);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -952,6 +983,7 @@ export async function packStates(
       browser: "blocked",
       search: "blocked",
       media: "blocked",
+      documents: "blocked",
       "adaptive-redis": "blocked",
       mcp: "blocked",
     };
@@ -961,11 +993,16 @@ export async function packStates(
   const packs: Record<string, unknown> = isPlainRecord(raw) ? raw : {};
   const core = stateOf(packs["core"], executable(managedVenvPythonPath(dataDir)));
   const browser = stateOf(packs["browser"], await chromiumInstalled(dataDir));
+  const documents = stateOf(
+    packs["documents"],
+    core === "ready" && (await documentsInstalled(dataDir)),
+  );
   const result: Record<RuntimePack, PackState> = {
     core,
     browser,
     search: core,
     media: core,
+    documents,
     // adaptive-redis 的客户端与官方 server 的二进制都与 core 同住一个 venv：它们各自是
     // 一条依赖 / 一个入口，钉在 runtime-requirements 里，所以这两包的就绪状态就是 core 的。
     "adaptive-redis": core,
@@ -1059,11 +1096,15 @@ export async function installCapabilityPack(
   const pythonPath = await ensurePython(dataDir, io, signal, asset, assets);
   throwIfAborted(signal);
   onProgress?.(`installing core packages into ${pythonPath}`);
+  const previous = await readRuntimeState(dataDir);
+  const previousPacks = isPlainRecord(previous["packs"]) ? previous["packs"] : {};
   await installCore({
     pythonPath,
     dataDir,
     repoRoot,
     io,
+    documents: pack === "documents" || previousPacks["documents"] === "ready",
+    markDocuments: pack === "documents",
     ...(assets === undefined ? {} : { assets }),
   });
   throwIfAborted(signal);

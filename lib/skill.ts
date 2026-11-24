@@ -1,8 +1,8 @@
-// lib/skill.ts —— 把十五段工具指引注册成一枚**虚拟 skill**（rc.2 的 `ctx.skills.register()`）。
+// lib/skill.ts —— 把十六段工具指引注册成一枚**虚拟 skill**（rc.2 的 `ctx.skills.register()`）。
 //
 // 为什么要有这一层：指引全文（`guidanceFor` 的产物）原本整段常驻 systemPrompt，全开时中文
 // 2.3KB、英文 2.9KB，每个会话都要背。而其中「选错抓取方式会白花时间或漏内容」的只有少数几条
-// （静态优先、渲染更慢更吃内存、整站走 crawl），其余是十九个工具各自「什么时候换到它」的细则，
+// （静态优先、渲染更慢更吃内存、整站走 crawl），其余是二十个工具各自「什么时候换到它」的细则，
 // 只在真要用的时候才需要。所以拆成两份：
 //   · systemPrompt 只留摘要（`messages.guidanceSummary`），逐条对应「不做就会走错路」；
 //   · 全文注册成 skill，模型按名加载（`skill({ name: "scrapling" })`）。

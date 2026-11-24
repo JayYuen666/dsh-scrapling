@@ -98,6 +98,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 | --- | --- | --- | --- |
 | `@jayyuen66/dsh-plugin-shared` | catalog（根 ^0.2.13） | MIT | 设置卡的共享组件供应行与 shared 子路径 |
 | `scrapling` | 0.5 | BSD-3-Clause | Python sidecar |
+| `pypdf` | 7.1.1 | BSD-3-Clause | 可选 `documents` 能力包的 PDF 文本读取 |
 | `browserforge` | 1.2.4 | MIT | Scrapling 静态抓取的浏览器头生成 |
 | `apify-fingerprint-datapoints` | 0.15.0 | Apache-2.0 | browserforge 的指纹数据 |
 | `playwright` | 1.64.1 | Apache-2.0（Microsoft） | 网络守卫 |
@@ -108,7 +109,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 | `zod` | catalog（伞根 4.6.7） | MIT | Host 侧 `lib/runtime.ts` / `lib/sidecar.ts` 的形状校验走本包 dependencies 里的 zod；设置卡 `src/runtime-reader.ts`、`src/settings-card.ts` 的 strict codec 由宿主 `PLATFORM_MODULES` 提供；CLI 单文件产物内联 |
 
 其余随 venv 安装的固定版本（含 `click`、`protego`、`curl_cffi`、`lxml` 等）见
-`py/runtime-requirements.txt`，每一行都带 SHA256；本文件不复述整张表。
+`py/runtime-requirements.txt`，每一行都带 SHA256；可选 pypdf 单独钉在
+`py/documents-requirements.txt`，同样带 wheel 的 SHA256；本文件不复述整张表。
 
 ## 运行时下载的资产（不随 npm 分发）
 

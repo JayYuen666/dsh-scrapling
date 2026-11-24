@@ -2,6 +2,7 @@ import { ToolArgsError } from "@deepseek-ai/dsh-tools";
 
 import type { ScraplingMessages } from "./messages.ts";
 import { format } from "./messages.ts";
+import type { SidecarCapabilities } from "./sidecar.ts";
 
 /**
  * 本次调用的数值参数：调用值优先，缺省用部署值；给了 cap 就只压上限。
@@ -20,6 +21,30 @@ export function callNumber(
   cap = Number.POSITIVE_INFINITY,
 ): number {
   return typeof value === "number" ? Math.min(value, cap) : fallback;
+}
+
+export function sessionTypesOf(
+  capabilities: SidecarCapabilities | undefined,
+  cdpUrl: string,
+): string[] {
+  const remote = capabilities?.remote === true && cdpUrl.trim().length > 0;
+  if (capabilities?.browser === true) {
+    return remote ? ["static", "stealth", "remote"] : ["static", "stealth"];
+  }
+  return remote ? ["static", "remote"] : ["static"];
+}
+
+export function sessionTypeDescriptionOf(
+  capabilities: SidecarCapabilities | undefined,
+  sessionTypes: string[],
+  messages: ScraplingMessages,
+): string {
+  if (capabilities?.browser === true) {
+    return messages.sessionTypeDescription;
+  }
+  return sessionTypes.includes("remote")
+    ? messages.sessionTypeRemoteDescription
+    : messages.sessionTypeStaticOnlyDescription;
 }
 
 /**
@@ -45,6 +70,12 @@ export const NETWORK_ITEM = {
     bodyTruncated: { type: "boolean" as const },
   },
 };
+
+/** 会话网络历史的截断标记与分页锚点 schema；一次性 capture 不返回可复用锚点。 */
+export const NETWORK_BOUNDARY_FIELDS = {
+  truncated: { type: "boolean" as const, required: true as const },
+  nextAfterId: { type: "integer" as const },
+} as const;
 
 /**
  * 读网络历史的那几个参数，按方法分档。

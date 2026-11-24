@@ -19,6 +19,12 @@ export const MCP_LISTEN_HOST = "127.0.0.1";
 /** `mcpPort` 设置的默认值，也是 setup 生成 URL 时的默认端口。 */
 export const DEFAULT_MCP_PORT = 39_217;
 
+/** 宿主 mcpManager 与 dsh-mcp-client 共有的工具装载档位。 */
+export const MCP_TOOL_LOADINGS = ["eager", "on-demand"] as const;
+export type McpToolLoading = (typeof MCP_TOOL_LOADINGS)[number];
+/** 旧配置没有这一项时保持既有行为：服务器工具直接进入工具列表。 */
+export const DEFAULT_MCP_TOOL_LOADING: McpToolLoading = "eager";
+
 /** 本插件 server 用的传输名；客户端与官方 server 的 stdio 条目靠它区分。 */
 export const MCP_TRANSPORT_HTTP = "streamable-http";
 export const MCP_TRANSPORT_STDIO = "stdio";

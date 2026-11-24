@@ -7,6 +7,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
+import { HarnessError } from "@deepseek-ai/dsh-error";
 import { fieldOf, isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import {
   MCP_LISTEN_HOST,
@@ -47,7 +48,7 @@ export interface McpImageSink {
 export interface McpSearchSurface {
   readonly available: () => boolean;
   readonly search: (
-    request: { query: string; maxResults?: number },
+    request: { query: string; maxResults?: number; offset?: number },
     signal?: AbortSignal,
   ) => Promise<unknown>;
 }
@@ -91,7 +92,7 @@ export interface McpServerHandle {
 }
 
 /** MCP server 自述的版本；由 test/publish-manifest.test.ts 钉成 package.json 同值。 */
-export const MCP_SERVER_VERSION = "0.1.16";
+export const MCP_SERVER_VERSION = "0.1.17";
 
 const RAW_PREFIX = "scrapling_";
 
@@ -235,6 +236,10 @@ const searchParameters = (messages: ScraplingMessages) =>
       type: "integer",
       description: messages.mcpSearchMaxResultsDescription,
     },
+    offset: {
+      type: "integer",
+      description: messages.mcpSearchOffsetDescription,
+    },
   }) as const;
 
 const SEARCH_OUTPUT_SCHEMA = {
@@ -254,6 +259,8 @@ const SEARCH_OUTPUT_SCHEMA = {
           url: { type: "string", required: true },
           title: { type: "string", required: true },
           snippet: { type: "string", required: true },
+          summary: { type: "string" },
+          publishedAt: { type: "string" },
         },
       },
     },
@@ -270,7 +277,13 @@ interface SearchValue {
   readonly query: string;
   readonly count: number;
   readonly truncated: boolean;
-  readonly sources: { url: string; title: string; snippet: string }[];
+  readonly sources: {
+    url: string;
+    title: string;
+    snippet: string;
+    summary?: string;
+    publishedAt?: string;
+  }[];
   readonly content: string;
 }
 
@@ -281,11 +294,28 @@ function normalizeSearch(query: string, raw: unknown): SearchValue {
     query,
     count: sources.length,
     truncated: isRecord(raw) ? raw["truncated"] === true : false,
-    sources: sources.map((item) => ({
-      url: textOf(fieldOf(item, "url")),
-      title: textOf(fieldOf(item, "title")),
-      snippet: textOf(fieldOf(item, "snippet")),
-    })),
+    sources: sources.map((item) => {
+      const summary = textOf(fieldOf(item, "summary"));
+      const publishedAt = textOf(fieldOf(item, "publishedAt"));
+      const source: {
+        url: string;
+        title: string;
+        snippet: string;
+        summary?: string;
+        publishedAt?: string;
+      } = {
+        url: textOf(fieldOf(item, "url")),
+        title: textOf(fieldOf(item, "title")),
+        snippet: textOf(fieldOf(item, "snippet")),
+      };
+      if (summary.length > 0) {
+        source.summary = summary;
+      }
+      if (publishedAt.length > 0) {
+        source.publishedAt = publishedAt;
+      }
+      return source;
+    }),
     content: isRecord(raw) ? textOf(raw["content"]) : "",
   };
 }
@@ -296,11 +326,14 @@ function renderSearch(value: SearchValue, messages: ScraplingMessages): string {
     lines.push("(no sources passed the URL gate)");
   }
   for (const [index, item] of value.sources.entries()) {
-    const label = item.title.length > 0 ? item.title : item.url;
+    const label = item.title.length > 0 ? `[${item.title}](${item.url})` : item.url;
     lines.push(`${String(index + 1)}. ${label}`);
     if (item.snippet.length > 0) {
       lines.push(`   ${item.snippet}`);
     }
+  }
+  if (value.content.length > 0) {
+    lines.push("", value.content);
   }
   if (value.truncated) {
     lines.push(messages.mcpSearchTruncatedNote);
@@ -329,10 +362,17 @@ export function mcpSearchTool(
         { type: "text", text: renderSearch(value, messages) },
       ],
     },
-    async execute(args: { query: string; maxResults?: number }, exec: ToolRunContext) {
-      const { maxResults, query } = args;
+    async execute(
+      args: { query: string; maxResults?: number; offset?: number },
+      exec: ToolRunContext,
+    ) {
+      const { maxResults, offset, query } = args;
       const raw = await provider.search(
-        { query, ...(maxResults === undefined ? {} : { maxResults }) },
+        {
+          query,
+          ...(maxResults === undefined ? {} : { maxResults }),
+          ...(offset === undefined ? {} : { offset }),
+        },
         exec.signal,
       );
       return normalizeSearch(query, raw);
@@ -346,7 +386,11 @@ async function runEntry(
   args: unknown,
   signal: AbortSignal,
   sink?: McpImageSink,
-): Promise<{ content: McpContent[]; isError?: boolean }> {
+): Promise<{
+  content: McpContent[];
+  structuredContent?: Record<string, unknown>;
+  isError?: boolean;
+}> {
   const params = args ?? {};
   try {
     // 每个工具只读 exec 上的 signal（native 的单测同样只给这一位），MCP 请求的取消信号
@@ -355,11 +399,14 @@ async function runEntry(
     const exec = { signal } as ToolRunContext;
     const value = jsonOf(await entry.definition.execute(params, exec));
     const blocks = entry.definition.output.render(params, value) as readonly unknown[];
-    return { content: projectBlocks(blocks, sink) };
+    return {
+      content: projectBlocks(blocks, sink),
+      ...(isRecord(value) ? { structuredContent: value } : {}),
+    };
   } catch (error) {
-    // String(error) 而不是 error.message：这一层接的是第三方依赖抛出的任何东西，
-    // 只认 Error 形状会在非 Error 抛出时留下一个空字符串。
-    return { isError: true, content: [{ type: "text", text: String(error) }] };
+    // HarnessError 的 code 是宿主定义的机器可读分流位；普通 Error 与非 Error 抛出仍保留原文。
+    const text = error instanceof HarnessError ? `[${error.code}] ${error.message}` : String(error);
+    return { isError: true, content: [{ type: "text", text }] };
   }
 }
 
@@ -583,11 +630,16 @@ export async function startMcpServer(options: McpServerOptions): Promise<McpServ
       { capabilities: { tools: {} } },
     );
     protocol.setRequestHandler(types.ListToolsRequestSchema, () => ({
-      tools: options.entries.map((entry) => ({
-        name: entry.name,
-        description: entry.definition.description,
-        inputSchema: entry.definition.parameters,
-      })),
+      tools: options.entries.map((entry) => {
+        const { schema } = entry.definition.output;
+        return {
+          name: entry.name,
+          description: entry.definition.description,
+          inputSchema: entry.definition.parameters,
+          // MCP 的结构化输出只收对象根；其它根类型没有对应字段，直接省略。
+          ...(schema.type === "object" ? { outputSchema: schema } : {}),
+        };
+      }),
     }));
     protocol.setRequestHandler(types.CallToolRequestSchema, async (call, extra) => {
       const entry = options.entries.find((item) => item.name === call.params.name);

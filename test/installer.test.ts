@@ -49,10 +49,17 @@ import { managedPythonPath, runtimeManifest } from "../lib/runtime.ts";
 // 还原阶段的 rename 会被单独打开：只有「从 .tmp/venv-previous-* 出发」的那一次失败，
 // 其余文件操作全走真实实现。判的是「还原失败时旧 venv 不被收尾清理删掉」。
 const renameGate = vi.hoisted(() => ({ failRestore: false, failCopy: false }));
+const documentsReaddirGate = vi.hoisted(() => ({ fail: false }));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
+    readdir: async (...args: Parameters<typeof actual.readdir>) => {
+      if (documentsReaddirGate.fail && String(args[0]).endsWith(path.join("runtime", "venv"))) {
+        throw new Error("simulated documents readdir failure");
+      }
+      return actual.readdir(...args);
+    },
     cp: async (
       from: Parameters<typeof actual.cp>[0],
       to: Parameters<typeof actual.cp>[1],
@@ -118,6 +125,12 @@ const STORAGE_DB = "elements_storage.db";
 const CHROMIUM_DIR = "chromium-1";
 const CHROME_MAC = "chrome-mac";
 const ASSET_URL = "https://example.invalid/asset";
+const DOCUMENTS_REQUIREMENTS_FILE = "documents-requirements.txt";
+const DOCUMENTS_MARKER = "pypdf-7.1.1.dist-info";
+const PYTHON_VERSION_DIR = "python3.14";
+const DOCUMENTS_SITE = path.join("lib", PYTHON_VERSION_DIR, "site-packages");
+const DOCUMENTS_REQUIREMENTS =
+  "pypdf==7.1.1 --hash=sha256:04c5680d4b4cfa04ab505b09393fc949860c34a4dad6565284d11a2f5c3ce8b1\n";
 const INSTALL_LOCK = "install.lock";
 const OLD_MARKER = "old-marker";
 const OLD_MARKER_BODY = "still installed\n";
@@ -193,6 +206,15 @@ function fakeIO(overrides: Partial<InstallerIO> = {}): InstallerIO {
   };
 }
 
+function markDocumentsInstall(argv: readonly string[]): void {
+  if (!argv.includes("pip") || !argv.some((item) => item.endsWith(DOCUMENTS_REQUIREMENTS_FILE))) {
+    return;
+  }
+  const staging = path.dirname(path.dirname(argv[0] ?? ""));
+  const marker = path.join(staging, DOCUMENTS_SITE, DOCUMENTS_MARKER);
+  mkdirSync(marker, { recursive: true });
+}
+
 function venvSpawner(calls: string[][], pip: SpawnResult): InstallerIO["spawn"] {
   return async (argv): Promise<SpawnResult> => {
     calls.push([...argv]);
@@ -205,6 +227,7 @@ function venvSpawner(calls: string[][], pip: SpawnResult): InstallerIO["spawn"] 
       writeFileSync(path.join(target, "bin", "python3"), "#!/bin/sh\n", { mode: 0o755 });
       return { code: 0, stdout: "", stderr: "" };
     }
+    markDocumentsInstall(argv);
     return pip;
   };
 }
@@ -213,6 +236,7 @@ function requirementsRepoRoot(): string {
   const repoRoot = tempDir();
   mkdirSync(path.join(repoRoot, "py"), { recursive: true });
   writeFileSync(path.join(repoRoot, "py", "runtime-requirements.txt"), "scrapling==0.5\n");
+  writeFileSync(path.join(repoRoot, "py", DOCUMENTS_REQUIREMENTS_FILE), DOCUMENTS_REQUIREMENTS);
   return repoRoot;
 }
 
@@ -475,8 +499,8 @@ describe("installPython", () => {
       extract: async (_archive, destination) => {
         const bin = path.join(destination, "python", "bin");
         await mkdir(bin, { recursive: true });
-        await writeFile(path.join(bin, "python3.14"), "#!/bin/sh\n", { mode: 0o755 });
-        await symlink("python3.14", path.join(bin, "python3"));
+        await writeFile(path.join(bin, PYTHON_VERSION_DIR), "#!/bin/sh\n", { mode: 0o755 });
+        await symlink(PYTHON_VERSION_DIR, path.join(bin, "python3"));
       },
     });
     const result = await installPython(asset, dataDir, io);
@@ -1297,6 +1321,19 @@ describe("installCore", () => {
     expect((error as InstallError).code).toBe("INSTALL_FAILED");
   });
 
+  it("documents requirements 与清单哈希不符时拒绝安装", async () => {
+    const repoRoot = requirementsRepoRoot();
+    writeFileSync(path.join(repoRoot, "py", DOCUMENTS_REQUIREMENTS_FILE), "pypdf==0.0.0\n");
+    const error = await installCore({
+      pythonPath: MANAGED_PYTHON,
+      dataDir: tempDir(),
+      repoRoot,
+      io: fakeIO(),
+      documents: true,
+    }).catch((error_: unknown) => error_);
+    expect((error as InstallError).code).toBe("INSTALL_HASH_MISMATCH");
+  });
+
   it("没有 wheel 时映射成 INSTALL_NO_WHEEL", async () => {
     const calls: string[][] = [];
     const error = await installCore({
@@ -1380,6 +1417,7 @@ const CORE_PACK = "core";
 const BROWSER_PACK = "browser";
 const MCP_PACK = "mcp";
 const REDIS_PACK = "adaptive-redis";
+const DOCUMENTS_PACK = "documents";
 
 function fakeExecutable(file: string): void {
   mkdirSync(path.dirname(file), { recursive: true });
@@ -1405,6 +1443,7 @@ function packSpawner(): InstallerIO["spawn"] {
       mkdirSync(path.join(browsers, CHROMIUM_DIR, CHROME_MAC), { recursive: true });
       writeFileSync(path.join(browsers, CHROMIUM_DIR, CHROME_MAC, "Chromium"), "");
     }
+    markDocumentsInstall(argv);
     return { code: 0, stdout: "", stderr: "" };
   };
 }
@@ -1419,7 +1458,7 @@ describe("packStates", () => {
     restorePlatform?.();
   });
 
-  it("非 macOS arm64：六个包全 blocked，安装被拒并点名平台", async () => {
+  it("非 macOS arm64：七个包全 blocked，安装被拒并点名平台", async () => {
     const restore = mockPlatform("linux", "x64");
     try {
       const states = await packStates(tempDir());
@@ -1436,13 +1475,14 @@ describe("packStates", () => {
     }
   });
 
-  it("空目录：六个包同态缺失；没有包再被拦", async () => {
+  it("空目录：七个包同态缺失；没有包再被拦", async () => {
     const states = await packStates(tempDir());
     expect(states).toStrictEqual({
       core: "missing",
       browser: "missing",
       search: "missing",
       media: "missing",
+      documents: "missing",
       [REDIS_PACK]: "missing",
       mcp: "missing",
     });
@@ -1462,6 +1502,32 @@ describe("packStates", () => {
     const states = await packStates(dataDir);
     expect(states.core).toBe("corrupt");
     expect(states.browser).toBe("corrupt");
+  });
+
+  it("documents 标 ready 但 pypdf 不在时是 corrupt，dist-info 在场才 ready", async () => {
+    const dataDir = tempDir();
+    readyCore(dataDir);
+    writePackState(dataDir, { core: "ready", documents: "ready" });
+    const before = await packStates(dataDir);
+    expect(before.documents).toBe("corrupt");
+    const marker = path.join(dataDir, "runtime", "venv", DOCUMENTS_SITE, DOCUMENTS_MARKER);
+    mkdirSync(marker, { recursive: true });
+    const after = await packStates(dataDir);
+    expect(after.documents).toBe("ready");
+  });
+
+  it("core ready 但 venv 读不到时 documents 判 corrupt", async () => {
+    const dataDir = tempDir();
+    readyCore(dataDir);
+    writePackState(dataDir, { core: "ready", documents: "ready" });
+    documentsReaddirGate.fail = true;
+    try {
+      const states = await packStates(dataDir);
+      expect(states.core).toBe("ready");
+      expect(states.documents).toBe("corrupt");
+    } finally {
+      documentsReaddirGate.fail = false;
+    }
   });
 
   it("文件齐了是 ready，安装中的那一包单独标 installing", async () => {
@@ -1515,7 +1581,7 @@ describe("installCapabilityPack", () => {
     restorePlatform?.();
   });
 
-  it("六个包都不再被拦：装 adaptive-redis 走与 core 同一条路", async () => {
+  it("七个包都不再被拦：装 adaptive-redis 走与 core 同一条路", async () => {
     const bytes = new TextEncoder().encode("archive");
     const asset = { ...runtimeManifest.darwinArm64, sha256: sha256(bytes) };
     const calls: string[][] = [];
@@ -1532,6 +1598,55 @@ describe("installCapabilityPack", () => {
       }),
     });
     expect(calls.some((argv) => argv.includes("pip"))).toBe(true);
+  });
+
+  it("state.packs 是坏形状时按空状态安装", async () => {
+    const dataDir = tempDir();
+    fakeExecutable(managedPythonPath(dataDir));
+    writePackState(dataDir, []);
+    await installCapabilityPack(CORE_PACK, {
+      dataDir,
+      repoRoot: requirementsRepoRoot(),
+      io: fakeIO({ spawn: venvSpawner([], { code: 0, stdout: "", stderr: "" }) }),
+    });
+    const state = await readRuntimeState(dataDir);
+    expect(state["packs"]).toStrictEqual({ core: "ready" });
+  });
+
+  it("documents 安装钉版 requirements，并可从 corrupt 修复为 ready", async () => {
+    const dataDir = tempDir();
+    fakeExecutable(managedPythonPath(dataDir));
+    writePackState(dataDir, { core: "ready", documents: "ready" });
+    const before = await packStates(dataDir);
+    expect(before.documents).toBe("corrupt");
+    const calls: string[][] = [];
+    await repairCapabilityPack(DOCUMENTS_PACK, {
+      dataDir,
+      repoRoot: requirementsRepoRoot(),
+      io: fakeIO({ spawn: venvSpawner(calls, { code: 0, stdout: "", stderr: "" }) }),
+    });
+    const pip = calls.find((argv) => argv.includes("pip"));
+    expect(pip).toContain("--require-hashes");
+    expect(pip?.some((item) => item.endsWith(DOCUMENTS_REQUIREMENTS_FILE))).toBe(true);
+    const after = await packStates(dataDir);
+    expect(after.documents).toBe("ready");
+  });
+
+  it("重装 core 保留已装的 documents 依赖与状态", async () => {
+    const dataDir = tempDir();
+    fakeExecutable(managedPythonPath(dataDir));
+    const calls: string[][] = [];
+    const io = fakeIO({ spawn: venvSpawner(calls, { code: 0, stdout: "", stderr: "" }) });
+    const repoRoot = requirementsRepoRoot();
+    await installCapabilityPack(DOCUMENTS_PACK, { dataDir, repoRoot, io });
+    await installCapabilityPack(CORE_PACK, { dataDir, repoRoot, io });
+    const pipCalls = calls.filter((argv) => argv.includes("pip"));
+    expect(pipCalls).toHaveLength(2);
+    expect(
+      pipCalls.every((argv) => argv.some((item) => item.endsWith(DOCUMENTS_REQUIREMENTS_FILE))),
+    ).toBe(true);
+    const states = await packStates(dataDir);
+    expect(states.documents).toBe("ready");
   });
 
   it("已有托管解释器时不重新下载", async () => {

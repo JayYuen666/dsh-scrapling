@@ -11,6 +11,7 @@ import { Server } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MCP_TOKEN_ENV } from "../lib/mcp-contract.ts";
 import { MESSAGES } from "../lib/messages.ts";
+import { SidecarError } from "../lib/sidecar-error.ts";
 import {
   allowedEndpoints,
   createMcpImageSink,
@@ -463,6 +464,16 @@ function toolFor(payload: unknown): ToolDefinition {
   return mcpSearchTool({ available: () => true, search: async () => payload }, MESSAGES.zh);
 }
 
+const SEARCH_URL = "http://93.184.216.34/a";
+
+const SEARCH_RESULT = {
+  content: "正文",
+  sources: [{ url: SEARCH_URL, title: "示例", snippet: "摘要" }],
+  truncated: false,
+};
+
+const SEARCH_ENTRIES = mcpToolEntries([], toolFor(SEARCH_RESULT));
+
 describe("boundPort", () => {
   it("tcp 形态交出端口", () => {
     expect(boundPort({ address: "127.0.0.1", family: "IPv4", port: 4321 })).toBe(4321);
@@ -517,18 +528,61 @@ describe("mcpSearchTool", () => {
   });
 
   it("标题缺失退回 URL，摘要缺失就不加那一行", async () => {
-    const body = await textOf(toolFor({ sources: [{ url: "http://93.184.216.34/a" }] }), "z");
-    expect(body).toContain("1. http://93.184.216.34/a");
+    const body = await textOf(toolFor({ sources: [{ url: SEARCH_URL }] }), "z");
+    expect(body).toContain(`1. ${SEARCH_URL}`);
     expect(body.split("\n")).toHaveLength(2);
   });
 
-  it("标题与摘要都在时各占一行，摘要有自己的缩进", async () => {
+  it("标题与摘要都在时文本保留 URL、摘要与正文", async () => {
     const body = await textOf(
-      toolFor({ sources: [{ url: "http://93.184.216.34/a", title: "示例", snippet: "摘要" }] }),
+      toolFor({
+        sources: [{ url: SEARCH_URL, title: "示例", snippet: "摘要" }],
+        content: "正文",
+      }),
       "w",
     );
-    expect(body).toContain("1. 示例");
+    expect(body).toContain(`1. [示例](${SEARCH_URL})`);
     expect(body).toContain("   摘要");
+    expect(body).toContain("正文");
+  });
+
+  it("offset 与来源元数据原样穿过 MCP search", async () => {
+    const requests: { query: string; maxResults?: number; offset?: number }[] = [];
+    const definition = mcpSearchTool(
+      {
+        available: () => true,
+        search: async (request) => {
+          requests.push(request);
+          return {
+            sources: [
+              {
+                url: SEARCH_URL,
+                title: "示例",
+                snippet: "摘要",
+                summary: "长摘要",
+                publishedAt: "2026-11-20",
+              },
+            ],
+            content: "正文",
+          };
+        },
+      },
+      MESSAGES.zh,
+    );
+    const value = (await definition.execute({ query: "q", maxResults: 2, offset: 3 }, exec)) as {
+      sources: Record<string, unknown>[];
+    };
+    expect(requests).toStrictEqual([{ query: "q", maxResults: 2, offset: 3 }]);
+    expect(value.sources[0]).toStrictEqual({
+      url: SEARCH_URL,
+      title: "示例",
+      snippet: "摘要",
+      summary: "长摘要",
+      publishedAt: "2026-11-20",
+    });
+    expect(definition.parameters["properties"]).toMatchObject({
+      offset: { type: "integer" },
+    });
   });
 
   it("非对象的结果也走得通（render 与 normalize 各自兜一层）", async () => {
@@ -698,13 +752,101 @@ describe("startMcpServer", () => {
     await closeClient(client);
   });
 
+  it("search 在 tools/list 公布结构化输出 schema", async () => {
+    const handle = await serve({ port: 0, entries: SEARCH_ENTRIES });
+    const client = await clientFor(handle.port);
+    const listed = await client.listTools();
+    const search = listed.tools.find((tool) => tool.name === "search");
+    expect(search?.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        count: { type: "integer" },
+        truncated: { type: "boolean" },
+        sources: { type: "array" },
+        content: { type: "string" },
+      },
+    });
+    expect(search?.outputSchema?.required).toStrictEqual([
+      "query",
+      "count",
+      "truncated",
+      "sources",
+      "content",
+    ]);
+    await closeClient(client);
+  });
+
   it("调用走同一份执行上下文，参数原样到达", async () => {
     const handle = await serve({ port: 0, entries: ENTRIES });
     const client = await clientFor(handle.port);
     const result = await client.callTool({ name: "fetch", arguments: { query: "hello" } });
     expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toStrictEqual({ echo: "ok" });
     expect(JSON.stringify(result.content)).toContain("ok");
     expect(JSON.stringify(result.content)).toContain("hello");
+    await closeClient(client);
+  });
+
+  it("标量输出不公布 outputSchema，也不交出 structuredContent", async () => {
+    const definition = defineTool({
+      name: "scrapling_text",
+      description: "返回文本",
+      parameters: {},
+      output: {
+        schema: { type: "string" },
+        render: (_args, value) => [{ type: "text", text: value }],
+      },
+      execute: async () => "ok",
+    });
+    const handle = await serve({
+      port: 0,
+      entries: mcpToolEntries([{ name: "scrapling_text", definition }]),
+    });
+    const client = await clientFor(handle.port);
+    const listed = await client.listTools();
+    expect(listed.tools).toHaveLength(1);
+    expect(listed.tools[0]).not.toHaveProperty("outputSchema");
+    const result = await client.callTool({ name: "text", arguments: {} });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(JSON.stringify(result.content)).toContain("ok");
+    await closeClient(client);
+  });
+
+  it("search 成功时同时交回结构化内容与可读文本", async () => {
+    const handle = await serve({ port: 0, entries: SEARCH_ENTRIES });
+    const client = await clientFor(handle.port);
+    await client.listTools();
+    const result = await client.callTool({ name: "search", arguments: { query: "w" } });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toStrictEqual({
+      query: "w",
+      count: 1,
+      truncated: false,
+      sources: [{ url: SEARCH_URL, title: "示例", snippet: "摘要" }],
+      content: "正文",
+    });
+    expect(JSON.stringify(result.content)).toContain(SEARCH_URL);
+    expect(JSON.stringify(result.content)).toContain("正文");
+    await closeClient(client);
+  });
+
+  it("带机器可读码的 SidecarError 错误文本保留消息", async () => {
+    const definition = mcpSearchTool(
+      {
+        available: () => true,
+        search: async () => {
+          throw new SidecarError("SEARCH_TIMEOUT", "backend timed out");
+        },
+      },
+      MESSAGES.zh,
+    );
+    const handle = await serve({ port: 0, entries: mcpToolEntries([], definition) });
+    const client = await clientFor(handle.port);
+    const result = await client.callTool({ name: "search", arguments: { query: "w" } });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain("[SEARCH_TIMEOUT] backend timed out");
     await closeClient(client);
   });
 

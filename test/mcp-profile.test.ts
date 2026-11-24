@@ -439,7 +439,26 @@ describe("readProfileSnapshot", () => {
     );
     expect(snapshot.clientVersion).toBe(PINNED);
     expect(snapshot.officialMcpEnabled).toBe(true);
+    expect(snapshot.mcpToolLoading).toBe("eager");
     expect(snapshot.patchText).toContain("streamable-http");
+  });
+
+  it("旧 profile 缺 mcpToolLoading 时默认 eager", async () => {
+    const snapshot = await readProfileSnapshot(profile(PLUGIN_ENTRY, "{}"));
+    expect(snapshot.mcpToolLoading).toBe("eager");
+  });
+
+  it("profile 显式 mcpToolLoading: on-demand 时读回 on-demand", async () => {
+    const snapshot = await readProfileSnapshot(
+      profile(`${PLUGIN_ENTRY}        mcpToolLoading: on-demand\n`, "{}"),
+    );
+    expect(snapshot.mcpToolLoading).toBe("on-demand");
+  });
+
+  it("mcpToolLoading 写了非法值时拒绝读回，不静默回落 eager", async () => {
+    await expect(
+      readProfileSnapshot(profile(`${PLUGIN_ENTRY}        mcpToolLoading: lazy\n`, "{}")),
+    ).rejects.toThrow(/mcpToolLoading/u);
   });
 
   it("文件缺失按「没有这份配置」读，其它读失败不压成空串", async () => {
@@ -623,6 +642,18 @@ describe("生成的条目文本", () => {
     );
   });
 
+  it.each(["eager", "on-demand"] as const)("mcp 条目携带 toolLoading=%s", (toolLoading) => {
+    expect(mcpClientPatch({ port: DEFAULT_MCP_PORT, withAuth: false, toolLoading })).toContain(
+      `        toolLoading: ${toolLoading}`,
+    );
+  });
+
+  it("mcp 条目缺省携带 toolLoading: eager，保持旧调用方兼容", () => {
+    expect(mcpClientPatch({ port: DEFAULT_MCP_PORT, withAuth: false })).toContain(
+      "        toolLoading: eager",
+    );
+  });
+
   it("URL 用独立的字面量钉住，端口改了它跟着改", () => {
     expect(mcpClientPatch({ port: DEFAULT_MCP_PORT, withAuth: false })).toContain(
       "        url: http://127.0.0.1:39217/mcp",
@@ -655,6 +686,17 @@ describe("生成的条目文本", () => {
       }),
     ).toStrictEqual([]);
     expect(plan.serverName).toBe(MCP_SERVER_NAME);
+    expect(plan.patch).toContain("        toolLoading: eager");
+  });
+
+  it.each(["eager", "on-demand"] as const)("官方条目携带 toolLoading=%s", (toolLoading) => {
+    const plan = officialMcpPlan({
+      dataDir: DATA_DIR,
+      enabled: true,
+      acceptedRisk: true,
+      toolLoading,
+    });
+    expect(plan.patch).toContain(`        toolLoading: ${toolLoading}`);
   });
 
   it("native 文本不含条目，读回 native 模式一条问题都不报", () => {
